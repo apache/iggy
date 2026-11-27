@@ -24,7 +24,8 @@ use ext_php_rs::{
     types::{ZendHashTable, Zval},
 };
 use iggy::prelude::{
-    IggyDuration, Partition as RustPartition, Topic as RustTopic, TopicDetails as RustTopicDetails,
+    IggyByteSize, IggyDuration, Partition as RustPartition, Topic as RustTopic,
+    TopicDetails as RustTopicDetails,
 };
 
 use crate::options::{options_array, unsigned_scalar};
@@ -178,6 +179,22 @@ impl TopicDetails {
                 .geo_durations
                 .long_term_rewrite_max_interval,
         )
+    }
+
+    /// The memory each node keeps for what the topic's reads fetch from the object store, in
+    /// bytes (a decimal string above `PHP_INT_MAX`). 0 keeps nothing they fetch. Null when the
+    /// topic sets none, and each node applies its own `[tiered_storage] read_cache_size`.
+    #[php(getter, change_case = "snake_case")]
+    pub fn read_cache_size(&self) -> PhpResult<Zval> {
+        byte_size(self.inner.resolved_options().read_cache.size)
+    }
+
+    /// The most that readahead fetches in front of a sequential reader of the topic, in bytes (a
+    /// decimal string above `PHP_INT_MAX`). 0 turns readahead off. Null when the topic sets none,
+    /// and each node applies its own `[tiered_storage] read_ahead`.
+    #[php(getter, change_case = "snake_case")]
+    pub fn read_ahead(&self) -> PhpResult<Zval> {
+        byte_size(self.inner.resolved_options().read_cache.read_ahead)
     }
 }
 
@@ -333,6 +350,22 @@ impl Topic {
                 .long_term_rewrite_max_interval,
         )
     }
+
+    /// The memory each node keeps for what the topic's reads fetch from the object store, in
+    /// bytes (a decimal string above `PHP_INT_MAX`). 0 keeps nothing they fetch. Null when the
+    /// topic sets none, and each node applies its own `[tiered_storage] read_cache_size`.
+    #[php(getter, change_case = "snake_case")]
+    pub fn read_cache_size(&self) -> PhpResult<Zval> {
+        byte_size(self.inner.resolved_options().read_cache.size)
+    }
+
+    /// The most that readahead fetches in front of a sequential reader of the topic, in bytes (a
+    /// decimal string above `PHP_INT_MAX`). 0 turns readahead off. Null when the topic sets none,
+    /// and each node applies its own `[tiered_storage] read_ahead`.
+    #[php(getter, change_case = "snake_case")]
+    pub fn read_ahead(&self) -> PhpResult<Zval> {
+        byte_size(self.inner.resolved_options().read_cache.read_ahead)
+    }
 }
 
 /// One partition of a topic.
@@ -400,6 +433,14 @@ fn duration_micros(duration: Option<IggyDuration>) -> PhpResult<Zval> {
     )
 }
 
+/// A read cache setting of a topic in bytes, null when the topic sets none.
+fn byte_size(size: Option<IggyByteSize>) -> PhpResult<Zval> {
+    size.map_or_else(
+        || Ok(Zval::new()),
+        |size| unsigned_scalar(size.as_bytes_u64()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,8 +453,9 @@ mod tests {
     type Getter<T> = fn(&T) -> PhpResult<Zval>;
 
     #[test]
-    fn given_topic_response_vectors_when_reading_durations_should_match_projections() {
-        let details_getters: [(&str, Getter<TopicDetails>); 6] = [
+    fn given_topic_response_vectors_when_reading_durations_and_read_cache_should_match_projections()
+    {
+        let details_getters: [(&str, Getter<TopicDetails>); 8] = [
             (
                 "fresh_upload_interval",
                 TopicDetails::fresh_upload_interval_micros,
@@ -435,14 +477,18 @@ mod tests {
                 "long_term_rewrite_max_interval",
                 TopicDetails::long_term_rewrite_max_interval_micros,
             ),
+            ("read_cache_size", TopicDetails::read_cache_size),
+            ("read_ahead", TopicDetails::read_ahead),
         ];
-        let topic_getters: [Getter<Topic>; 6] = [
+        let topic_getters: [Getter<Topic>; 8] = [
             Topic::fresh_upload_interval_micros,
             Topic::consumer_offset_upload_interval_micros,
             Topic::positions_publish_interval_micros,
             Topic::tombstone_grace_micros,
             Topic::positions_resume_timeout_micros,
             Topic::long_term_rewrite_max_interval_micros,
+            Topic::read_cache_size,
+            Topic::read_ahead,
         ];
         let fixture: Value = serde_json::from_str(FIXTURE).expect("fixture parses");
         for vector in fixture["topic_responses"].as_array().expect("vector list") {
@@ -464,16 +510,16 @@ mod tests {
             for ((key, details_getter), topic_getter) in
                 details_getters.into_iter().zip(topic_getters)
             {
-                // The projection lists only the durations the topic sets.
-                let micros = expected[key]
+                // The projection lists only the settings the topic sets, and 0 is one of them.
+                let number = expected[key]
                     .as_str()
-                    .map(|micros| micros.parse::<i64>().expect("micros fit a PHP int"));
+                    .map(|number| number.parse::<i64>().expect("value fits a PHP int"));
                 for value in [details_getter(&details), topic_getter(&topic)] {
                     let value = value.expect("getter reads");
-                    assert_eq!(value.long(), micros, "{}: {key}", vector["case"]);
+                    assert_eq!(value.long(), number, "{}: {key}", vector["case"]);
                     assert_eq!(
                         value.is_null(),
-                        micros.is_none(),
+                        number.is_none(),
                         "{}: {key}",
                         vector["case"]
                     );

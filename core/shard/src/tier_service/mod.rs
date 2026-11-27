@@ -36,13 +36,17 @@
 //! uploads.
 //!
 //! Jobs reach the store through [`TierStore`], which retries the calls that
-//! are safe to repeat and fails a put that stops making progress.
+//! are safe to repeat, puts whose body is held in memory included, fails a
+//! put that stops making progress, and gives a slow create-only put a second
+//! attempt.
 
 #![allow(
     clippy::future_not_send,
     reason = "every job and store call runs on the shard that owns it and never crosses threads"
 )]
 
+#[cfg(test)]
+mod put_tests;
 mod store;
 #[cfg(test)]
 pub(crate) mod test_store;
@@ -63,7 +67,9 @@ use iggy_object_store::{
 };
 use message_bus::MessageBus;
 
-pub use store::{StoreCallPolicy, TierStore};
+pub use store::{
+    PUT_ID_METADATA, PartsPolicy, SecondAttempts, StoreCallPolicy, StoreWriter, TierStore,
+};
 
 const MIB: u64 = 1024 * 1024;
 
@@ -168,10 +174,24 @@ where
     B: MessageBus + Clone + 'static,
 {
     /// A service whose jobs reach `provider` and run as tasks that `bus`
-    /// spawns, with the bus's clock for timeouts and backoff.
+    /// spawns, with the bus's clock for timeouts and backoff. Its store puts
+    /// as replica 0 and shard 0 and counts into counters of its own, which
+    /// suits a store that takes no put, such as the read-only store of a
+    /// peer, and tests.
     #[must_use]
     pub fn new(provider: S, bus: B, config: &TierServiceConfig) -> Self {
-        let store = Rc::new(TierStore::new(provider, bus.clone(), config.calls));
+        Self::with_writer(provider, bus, config, StoreWriter::default())
+    }
+
+    /// A service as [`Self::new`] makes it, whose store puts for `writer`.
+    #[must_use]
+    pub fn with_writer(
+        provider: S,
+        bus: B,
+        config: &TierServiceConfig,
+        writer: StoreWriter,
+    ) -> Self {
+        let store = Rc::new(TierStore::new(provider, bus.clone(), config.calls, writer));
         let classes = TierJobClass::ALL.map(|class| ClassState::new(config.limits(class)));
         Self {
             inner: Rc::new(Inner {

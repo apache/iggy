@@ -123,6 +123,12 @@ struct GeoTopicDurations {
     std::optional<std::chrono::microseconds> long_term_rewrite_max_interval;
 };
 
+/** @brief The read cache settings of a topic in bytes, each empty when the topic leaves it to the server setting. */
+struct TopicReadCache {
+    std::optional<std::uint64_t> read_cache_size;
+    std::optional<std::uint64_t> read_ahead;
+};
+
 /** @brief Returns a geo topic duration, which can be zero but never negative. */
 inline std::chrono::microseconds GeoTopicDuration(std::chrono::microseconds duration) {
     if (duration.count() < 0) {
@@ -1570,6 +1576,23 @@ class Topic final {
     }
 
     /**
+     * @brief Returns the memory each node keeps for what this topic's reads
+     *        fetch from the object store, divided between its partitions.
+     * @return Bytes the topic sets, zero when it keeps none, or `std::nullopt`
+     *         when every node applies its `[tiered_storage] read_cache_size`.
+     */
+    [[nodiscard]] std::optional<std::uint64_t> ReadCacheSize() const noexcept { return read_cache_.read_cache_size; }
+
+    /**
+     * @brief Returns the most bytes that readahead fetches in front of a
+     *        sequential reader of this topic.
+     * @return Bytes the topic sets, zero when readahead is off, or
+     *         `std::nullopt` when every node applies its `[tiered_storage]
+     *         read_ahead`.
+     */
+    [[nodiscard]] std::optional<std::uint64_t> ReadAhead() const noexcept { return read_cache_.read_ahead; }
+
+    /**
      * @brief Returns the aggregate number of retained messages.
      * @return Message count.
      */
@@ -1598,6 +1621,7 @@ class Topic final {
           ::iggy::TopicType topic_type,
           std::optional<::iggy::GeoMode> geo_mode,
           detail::GeoTopicDurations geo_durations,
+          detail::TopicReadCache read_cache,
           std::uint64_t messages_count,
           std::uint32_t partitions_count,
           ResourceOptions options)
@@ -1611,6 +1635,7 @@ class Topic final {
           topic_type_(topic_type),
           geo_mode_(geo_mode),
           geo_durations_(geo_durations),
+          read_cache_(read_cache),
           messages_count_(messages_count),
           partitions_count_(partitions_count),
           options_(std::move(options)) {}
@@ -1633,6 +1658,7 @@ class Topic final {
     ::iggy::TopicType topic_type_;
     std::optional<::iggy::GeoMode> geo_mode_;
     detail::GeoTopicDurations geo_durations_;
+    detail::TopicReadCache read_cache_;
     std::uint64_t messages_count_;
     std::uint32_t partitions_count_;
     ResourceOptions options_;
@@ -1937,6 +1963,23 @@ class TopicDetails final {
     }
 
     /**
+     * @brief Returns the memory each node keeps for what this topic's reads
+     *        fetch from the object store, divided between its partitions.
+     * @return Bytes the topic sets, zero when it keeps none, or `std::nullopt`
+     *         when every node applies its `[tiered_storage] read_cache_size`.
+     */
+    [[nodiscard]] std::optional<std::uint64_t> ReadCacheSize() const noexcept { return read_cache_.read_cache_size; }
+
+    /**
+     * @brief Returns the most bytes that readahead fetches in front of a
+     *        sequential reader of this topic.
+     * @return Bytes the topic sets, zero when readahead is off, or
+     *         `std::nullopt` when every node applies its `[tiered_storage]
+     *         read_ahead`.
+     */
+    [[nodiscard]] std::optional<std::uint64_t> ReadAhead() const noexcept { return read_cache_.read_ahead; }
+
+    /**
      * @brief Returns the aggregate number of retained messages.
      * @return Message count.
      */
@@ -1974,6 +2017,7 @@ class TopicDetails final {
                  ::iggy::TopicType topic_type,
                  std::optional<::iggy::GeoMode> geo_mode,
                  detail::GeoTopicDurations geo_durations,
+                 detail::TopicReadCache read_cache,
                  std::uint64_t messages_count,
                  std::uint32_t partitions_count,
                  std::vector<Partition> partitions,
@@ -1988,6 +2032,7 @@ class TopicDetails final {
           topic_type_(topic_type),
           geo_mode_(geo_mode),
           geo_durations_(geo_durations),
+          read_cache_(read_cache),
           messages_count_(messages_count),
           partitions_count_(partitions_count),
           partitions_(std::move(partitions)),
@@ -2009,6 +2054,7 @@ class TopicDetails final {
     ::iggy::TopicType topic_type_;
     std::optional<::iggy::GeoMode> geo_mode_;
     detail::GeoTopicDurations geo_durations_;
+    detail::TopicReadCache read_cache_;
     std::uint64_t messages_count_;
     std::uint32_t partitions_count_;
     std::vector<Partition> partitions_;
@@ -3316,8 +3362,9 @@ constexpr std::string_view to_string(const StreamOptionKey key) {
  * LocalRetentionSize are updatable, and all of them but Name are also
  * resettable. An update can turn TieredStorage on, never off. The durations
  * from FreshUploadInterval to LongTermRewriteMaxInterval are only on a geo
- * topic, where an update can set them but not reset them. Every other key is
- * create-only.
+ * topic, where an update can set them but not reset them. An update can set
+ * ReadCacheSize and ReadAhead on any topic but not reset them. Every other
+ * key is create-only.
  */
 enum class TopicOptionKey : std::uint8_t {
     Name,
@@ -3344,6 +3391,8 @@ enum class TopicOptionKey : std::uint8_t {
     TombstoneGrace,
     PositionsResumeTimeout,
     LongTermRewriteMaxInterval,
+    ReadCacheSize,
+    ReadAhead,
 };
 
 constexpr std::string_view to_string(const TopicOptionKey key) {
@@ -3396,6 +3445,10 @@ constexpr std::string_view to_string(const TopicOptionKey key) {
             return "positions_resume_timeout";
         case TopicOptionKey::LongTermRewriteMaxInterval:
             return "long_term_rewrite_max_interval";
+        case TopicOptionKey::ReadCacheSize:
+            return "read_cache_size";
+        case TopicOptionKey::ReadAhead:
+            return "read_ahead";
     }
     throw std::invalid_argument("Unknown topic option key");
 }
@@ -3433,6 +3486,11 @@ constexpr std::string_view to_string(const UserOptionKey key) {
  * name on every node. Only a geo topic takes them: the server refuses one on
  * a normal topic with InvalidOptionValue. Zero is a value, sent as zero, and
  * an unset duration leaves the node to its own setting.
+ *
+ * SetReadCacheSize() and SetReadAhead() override the `[tiered_storage]`
+ * server settings of the same name on every node, on any topic. Zero is a
+ * value that turns the setting off for the topic, and an unset one leaves the
+ * node to its own setting.
  */
 class TopicCreateOptions final {
   public:
@@ -3968,6 +4026,51 @@ class TopicCreateOptions final {
     }
 
     /**
+     * @brief Returns the memory each node keeps for what the topic's reads
+     *        fetch from the object store.
+     * @return Configured bytes, or `std::nullopt` to apply each node's
+     *         `[tiered_storage] read_cache_size`.
+     */
+    [[nodiscard]] std::optional<std::uint64_t> ReadCacheSize() const noexcept { return read_cache_.read_cache_size; }
+
+    /**
+     * @brief Sets the memory each node keeps for what the topic's reads fetch
+     *        from the object store.
+     *
+     * The bytes are divided between the topic's partitions. Each share is a
+     * limit within the read cache of its shard, not a reservation.
+     * @param read_cache_size Bytes, zero or at least 512 KiB. Zero keeps
+     *        nothing that the reads fetch.
+     * @return Reference to this options object.
+     */
+    TopicCreateOptions &SetReadCacheSize(std::uint64_t read_cache_size) noexcept {
+        read_cache_.read_cache_size = read_cache_size;
+        return *this;
+    }
+
+    /**
+     * @brief Returns the most bytes that readahead fetches in front of a
+     *        sequential reader of the topic.
+     * @return Configured bytes, or `std::nullopt` to apply each node's
+     *         `[tiered_storage] read_ahead`.
+     */
+    [[nodiscard]] std::optional<std::uint64_t> ReadAhead() const noexcept { return read_cache_.read_ahead; }
+
+    /**
+     * @brief Sets the most bytes that readahead fetches in front of a
+     *        sequential reader of the topic.
+     * @param read_ahead Bytes, zero or at least 128 KiB. Zero turns readahead
+     *        off.
+     * @return Reference to this options object.
+     * @note When the topic also sets a read cache size other than zero, the
+     *       server refuses a readahead above an eighth of it.
+     */
+    TopicCreateOptions &SetReadAhead(std::uint64_t read_ahead) noexcept {
+        read_cache_.read_ahead = read_ahead;
+        return *this;
+    }
+
+    /**
      * @brief Returns additional topic settings as key-value pairs.
      *
      * Use this for supported settings that do not have a dedicated setter.
@@ -4026,6 +4129,7 @@ class TopicCreateOptions final {
     std::optional<::iggy::TopicType> topic_type_;
     std::optional<::iggy::GeoMode> geo_mode_;
     detail::GeoTopicDurations geo_durations_;
+    detail::TopicReadCache read_cache_;
     std::map<std::string, std::string> raw_;
 
     friend class IggyBlockingClient;
@@ -4046,11 +4150,13 @@ class TopicCreateOptions final {
  * and must not both set and reset the same one.
  *
  * The durations from SetFreshUploadInterval() to
- * SetLongTermRewriteMaxInterval() are the only settings an update can change
- * on a geo topic. They have no default, so none of them can be reset: the
- * server refuses one on a normal topic with InvalidOptionValue, and
+ * SetLongTermRewriteMaxInterval() and the read cache settings
+ * SetReadCacheSize() and SetReadAhead() are the only settings an update can
+ * change on a geo topic. They have no default, so none of them can be reset:
  * UpdateTopic() refuses a Reset() of one before sending with
- * OptionNotResettable. Zero is a value, sent as zero.
+ * OptionNotResettable. The server refuses a duration on a normal topic with
+ * InvalidOptionValue, while the read cache settings apply to any topic. Zero
+ * is a value, sent as zero.
  */
 class TopicUpdateOptions final {
   public:
@@ -4327,6 +4433,46 @@ class TopicUpdateOptions final {
     }
 
     /**
+     * @brief Returns the requested read cache size of the topic.
+     * @return Bytes to apply, or `std::nullopt` when this update leaves it
+     *         unchanged.
+     */
+    [[nodiscard]] std::optional<std::uint64_t> ReadCacheSize() const noexcept { return read_cache_.read_cache_size; }
+
+    /**
+     * @brief Sets the memory each node keeps for what the topic's reads fetch
+     *        from the object store.
+     * @param read_cache_size Bytes, zero or at least 512 KiB. Zero keeps
+     *        nothing that the reads fetch.
+     * @return Reference to this options object.
+     */
+    TopicUpdateOptions &SetReadCacheSize(std::uint64_t read_cache_size) noexcept {
+        read_cache_.read_cache_size = read_cache_size;
+        return *this;
+    }
+
+    /**
+     * @brief Returns the requested readahead of the topic.
+     * @return Bytes to apply, or `std::nullopt` when this update leaves it
+     *         unchanged.
+     */
+    [[nodiscard]] std::optional<std::uint64_t> ReadAhead() const noexcept { return read_cache_.read_ahead; }
+
+    /**
+     * @brief Sets the most bytes that readahead fetches in front of a
+     *        sequential reader of the topic.
+     * @param read_ahead Bytes, zero or at least 128 KiB. Zero turns readahead
+     *        off.
+     * @return Reference to this options object.
+     * @note When the topic also sets a read cache size other than zero, the
+     *       server refuses a readahead above an eighth of it.
+     */
+    TopicUpdateOptions &SetReadAhead(std::uint64_t read_ahead) noexcept {
+        read_cache_.read_ahead = read_ahead;
+        return *this;
+    }
+
+    /**
      * @brief Returns additional mutable topic settings as key-value pairs.
      *
      * Use this for supported settings that do not have a dedicated setter.
@@ -4410,6 +4556,7 @@ class TopicUpdateOptions final {
     std::optional<::iggy::Expiry> local_retention_age_;
     std::optional<::iggy::MaxTopicSize> local_retention_size_;
     detail::GeoTopicDurations geo_durations_;
+    detail::TopicReadCache read_cache_;
     std::map<std::string, std::string> raw_;
     std::set<TopicOptionKey> reset_;
     std::set<std::string> raw_reset_;

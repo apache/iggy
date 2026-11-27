@@ -137,4 +137,18 @@ public record TopicDetails(
     public Optional<BigInteger> longTermRewriteMaxInterval() {
         return TopicSettings.uint64(options, derivedOptions, TopicOptionKey.LONG_TERM_REWRITE_MAX_INTERVAL);
     }
+
+    /**
+     * The memory in bytes that each node keeps for what the topic's reads fetch from the object store, zero
+     * keeping nothing. This and {@link #readAhead} are empty unless the topic sets them, and each node then
+     * applies its {@code [tiered_storage]} setting of the same name.
+     */
+    public Optional<BigInteger> readCacheSize() {
+        return TopicSettings.uint64(options, derivedOptions, TopicOptionKey.READ_CACHE_SIZE);
+    }
+
+    /** The most bytes that readahead fetches in front of a sequential reader, zero meaning readahead is off. */
+    public Optional<BigInteger> readAhead() {
+        return TopicSettings.uint64(options, derivedOptions, TopicOptionKey.READ_AHEAD);
+    }
 }

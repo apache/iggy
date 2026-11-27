@@ -229,7 +229,7 @@ fn given_a_committed_manifest_when_snapshotted_should_restore_the_same_manifest(
     machine.snapshot_into(&mut snapshot);
     assert_eq!(
         (iggy_binary_protocol::REPLICA_WIRE_REVISION, &snapshot[..8]),
-        (5, b"IGGYMAN1".as_slice())
+        (6, b"IGGYMAN1".as_slice())
     );
 
     let mut restored = PeerManifests::default();

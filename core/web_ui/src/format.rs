@@ -24,6 +24,8 @@ use chrono::DateTime;
 use crate::models::ResourceOptions;
 
 const MICROS_PER_SECOND: u64 = 1_000_000;
+const UNAVAILABLE: &str = "unavailable";
+const UNKNOWN: &str = "unknown";
 
 /// Formats a server timestamp (Unix microseconds) in UTC.
 pub fn timestamp(micros: u64) -> String {
@@ -46,6 +48,62 @@ pub fn message_expiry(options: &ResourceOptions) -> String {
         return "never".to_owned();
     }
     duration(micros / MICROS_PER_SECOND)
+}
+
+/// Renders how long the server has been running, given microseconds.
+pub fn elapsed(micros: u64) -> String {
+    duration(micros / MICROS_PER_SECOND)
+}
+
+/// Re-renders a server byte size such as `"8615888 KiB"` in the largest
+/// binary unit that keeps it at or above 1, falling back to the server's text
+/// when it does not parse.
+pub fn byte_size(server_text: &str) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let Some(mut amount) = parse_byte_size(server_text) else {
+        return server_text.to_owned();
+    };
+    let mut unit = 0;
+    while amount >= 1024.0 && unit < UNITS.len() - 1 {
+        amount /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        // A decimal unit can land a hair off a whole byte, so "1.001 KB"
+        // would otherwise show as 1000.9999999999999 B.
+        format!("{amount:.0} B")
+    } else {
+        format!("{amount:.2} {}", UNITS[unit])
+    }
+}
+
+/// Renders a server byte size out of its total. The server reports a total of
+/// zero when it cannot measure the resource, which is not the same as full.
+pub fn byte_size_of_total(part: &str, total: &str) -> String {
+    if parse_byte_size(total).is_some_and(|bytes| bytes <= 0.0) {
+        return UNAVAILABLE.to_owned();
+    }
+    format!("{} of {}", byte_size(part), byte_size(total))
+}
+
+/// The server reports zero for an open-file count or limit it cannot read.
+pub fn open_files(count: u64, limit: u64) -> String {
+    let known = |value: u64| match value {
+        0 => UNKNOWN.to_owned(),
+        value => value.to_string(),
+    };
+    match (count, limit) {
+        (0, 0) => UNKNOWN.to_owned(),
+        (count, limit) => format!("{} of {}", known(count), known(limit)),
+    }
+}
+
+/// The server reports zero threads where it cannot count them, as on macOS.
+pub fn thread_count(count: u32) -> String {
+    match count {
+        0 => UNAVAILABLE.to_owned(),
+        count => count.to_string(),
+    }
 }
 
 /// Shows the payload as text when it is UTF-8 and as hex otherwise.
@@ -120,6 +178,26 @@ pub fn truncate(text: &str, max_chars: usize) -> String {
     }
 }
 
+fn parse_byte_size(text: &str) -> Option<f64> {
+    let (amount, unit) = text.trim().split_once(' ')?;
+    let amount: f64 = amount.parse().ok()?;
+    let multiplier: f64 = match unit {
+        "B" => 1.0,
+        "KB" => 1e3,
+        "MB" => 1e6,
+        "GB" => 1e9,
+        "TB" => 1e12,
+        "PB" => 1e15,
+        "KiB" => 1024.0,
+        "MiB" => 1024.0_f64.powi(2),
+        "GiB" => 1024.0_f64.powi(3),
+        "TiB" => 1024.0_f64.powi(4),
+        "PiB" => 1024.0_f64.powi(5),
+        _ => return None,
+    };
+    Some(amount * multiplier)
+}
+
 fn format_micros(micros: u64, pattern: &str) -> String {
     i64::try_from(micros)
         .ok()
@@ -171,6 +249,52 @@ mod tests {
     fn given_expiry_in_micros_should_render_largest_units_first() {
         let micros = (86_400 + 3_600 + 5) * MICROS_PER_SECOND;
         assert_eq!(message_expiry(&expiry_options(micros)), "1d 1h 5s");
+    }
+
+    #[test]
+    fn given_exact_unit_sizes_should_render_largest_binary_unit() {
+        assert_eq!(byte_size("8615888 KiB"), "8.22 GiB");
+        assert_eq!(byte_size("16 GiB"), "16.00 GiB");
+        assert_eq!(byte_size("3.898 KB"), "3.81 KiB");
+        assert_eq!(byte_size("0 B"), "0 B");
+        assert_eq!(byte_size("512 B"), "512 B");
+        assert_eq!(byte_size("1.001 KB"), "1001 B");
+    }
+
+    #[test]
+    fn given_zero_total_should_render_unavailable() {
+        assert_eq!(byte_size_of_total("0 B", "0 B"), "unavailable");
+        assert_eq!(byte_size_of_total("0 B", "16 GiB"), "0 B of 16.00 GiB");
+        assert_eq!(
+            byte_size_of_total("8615888 KiB", "16 GiB"),
+            "8.22 GiB of 16.00 GiB"
+        );
+    }
+
+    #[test]
+    fn given_unknown_open_file_fields_should_render_unknown() {
+        assert_eq!(open_files(12, 1024), "12 of 1024");
+        assert_eq!(open_files(12, 0), "12 of unknown");
+        assert_eq!(open_files(0, 1024), "unknown of 1024");
+        assert_eq!(open_files(0, 0), "unknown");
+    }
+
+    #[test]
+    fn given_zero_threads_should_render_unavailable() {
+        assert_eq!(thread_count(0), "unavailable");
+        assert_eq!(thread_count(8), "8");
+    }
+
+    #[test]
+    fn given_unparsable_size_should_keep_server_text() {
+        assert_eq!(byte_size("lots"), "lots");
+        assert_eq!(byte_size("12 parsecs"), "12 parsecs");
+    }
+
+    #[test]
+    fn given_run_time_in_micros_should_render_duration() {
+        assert_eq!(elapsed(4_000_000), "4s");
+        assert_eq!(elapsed((3_600 + 120) * MICROS_PER_SECOND), "1h 2m");
     }
 
     #[test]

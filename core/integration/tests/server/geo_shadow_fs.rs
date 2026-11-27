@@ -31,6 +31,7 @@ use integration::harness::{TestBinary, TestHarness, TestServerConfig};
 use tokio::time::{Instant, sleep};
 
 use super::http_client::HttpClient;
+use super::tiered_storage_fs::{METRICS_DEADLINE, settled_read_cache_counts};
 
 const STREAM: &str = "orders";
 const SHADOW_STREAM: &str = "__shadow_dc-a_orders";
@@ -56,6 +57,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const FOLLOW_DEADLINE: Duration = Duration::from_secs(90);
 const FIRST_SENDS: u64 = 30;
 const SECOND_SENDS: u64 = 20;
+const MIB: u64 = 1024 * 1024;
 
 #[tokio::test]
 async fn given_a_geo_topic_in_a_peer_when_followed_should_adopt_it_refuse_writes_and_drop_it_after_its_delete()
@@ -93,11 +95,17 @@ async fn given_a_geo_topic_in_a_peer_when_followed_should_adopt_it_refuse_writes
     assert_eq!(resolved.topic_type, TopicType::Geo);
     assert_eq!(resolved.geo_mode, Some(GeoMode::Geo));
     assert_eq!(resolved.runtime.durability, Durability::Persisted);
-    let durability = topic
-        .options
-        .get(&HeaderKey::from(OptionKey::Durability))
-        .expect("the shadow reports a durability");
-    assert!(!durability.explicit, "the peer's geo mode set it");
+    assert_eq!(
+        resolved.runtime.consumer_offset_durability,
+        Durability::Persisted
+    );
+    for key in [OptionKey::Durability, OptionKey::ConsumerOffsetDurability] {
+        let durability = topic
+            .options
+            .get(&HeaderKey::from(key))
+            .expect("the shadow reports both durabilities");
+        assert!(!durability.explicit, "the peer's geo mode set {key}");
+    }
     assert_eq!(shadow.shadow_origin().as_deref(), Some("dc-a"));
     let origins: Vec<(String, Option<String>)> = follower
         .get_streams()
@@ -202,6 +210,184 @@ async fn given_a_three_node_follower_when_restarted_and_its_primary_stops_should
         .stop()
         .expect("stop the metadata primary of dc-b");
     assert_every_node_holds(&dc_b, &[1, 2], adopted.id, geo_topic_id).await;
+}
+
+/// The polls of a shadow topic keep what they read of the peer's segments,
+/// so a second pass over them asks the peer's bucket for nothing.
+#[tokio::test]
+async fn given_a_shadow_topic_read_once_when_read_again_should_not_ask_the_peer_s_bucket() {
+    let store = tempfile::tempdir().expect("a directory for the store of dc-a");
+    let mut dc_a = origin_cluster(store.path());
+    dc_a.start().await.expect("dc-a boots");
+    let origin = dc_a.tcp_root_client().await.expect("a client of dc-a");
+    let topic_id = create_geo_topic(&origin, 1).await;
+    send_to_origin(&origin, 0..FIRST_SENDS).await;
+    let mut dc_b = follower_cluster(store.path(), 1);
+    dc_b.start().await.expect("dc-b boots");
+    let follower = dc_b.tcp_root_client().await.expect("a client of dc-b");
+    wait_for_shadow_topic(&follower, topic_id).await;
+    let shadow_topic = Identifier::numeric(topic_id).expect("the topic id");
+    let expected: Vec<(u64, Vec<u8>)> = (0..FIRST_SENDS)
+        .map(|index| (index, payload(index)))
+        .collect();
+    let deadline = Instant::now() + FOLLOW_DEADLINE;
+    while read_from_start(&follower, &named(SHADOW_STREAM), &shadow_topic).await != expected {
+        assert!(Instant::now() < deadline, "dc-b never served every message");
+        sleep(POLL_INTERVAL).await;
+    }
+    let http = HttpClient::login_root(&dc_b).await;
+    let first =
+        settled_read_cache_counts(&http, METRICS_DEADLINE, |counts| counts.demand_bytes > 0).await;
+
+    let read = read_from_start(&follower, &named(SHADOW_STREAM), &shadow_topic).await;
+    let second =
+        settled_read_cache_counts(&http, METRICS_DEADLINE, |counts| *counts != first).await;
+
+    assert_eq!(read, expected);
+    assert!(second.block_hits > first.block_hits, "{second:?}");
+    assert_eq!(
+        second.demand_bytes, first.demand_bytes,
+        "the second pass read the peer's bucket: {first:?}, then {second:?}"
+    );
+}
+
+/// A shadow topic takes the read cache that its origin gives the geo topic,
+/// and follows an update of it with no restart on either side. Its polls
+/// read with what it took: with no cache, each pass asks the peer's bucket,
+/// and once the origin gives the topic a cache, a second pass reads memory.
+#[tokio::test]
+async fn given_a_geo_topic_with_its_own_read_cache_when_followed_and_updated_should_read_its_shadow_with_each_value()
+ {
+    let store = tempfile::tempdir().expect("a directory for the store of dc-a");
+    let mut dc_a = origin_cluster(store.path());
+    dc_a.start().await.expect("dc-a boots");
+    let origin = dc_a.tcp_root_client().await.expect("a client of dc-a");
+    let uncached = TopicReadCache {
+        size: Some(IggyByteSize::from(0)),
+        read_ahead: Some(IggyByteSize::from(MIB)),
+    };
+    let topic_id = create_geo_topic_with(
+        &origin,
+        TopicCreateOptions {
+            partitions_count: Some(1),
+            topic_type: Some(TopicType::Geo),
+            read_cache: uncached,
+            ..TopicCreateOptions::default()
+        },
+    )
+    .await;
+    send_to_origin(&origin, 0..FIRST_SENDS).await;
+    let mut dc_b = follower_cluster(store.path(), 1);
+    dc_b.start().await.expect("dc-b boots");
+    let follower = dc_b.tcp_root_client().await.expect("a client of dc-b");
+    wait_for_shadow_topic(&follower, topic_id).await;
+
+    assert_eq!(
+        read_cache_of(&origin, &named(STREAM), topic_id).await,
+        uncached
+    );
+    assert_eq!(
+        read_cache_of(&follower, &named(SHADOW_STREAM), topic_id).await,
+        uncached,
+        "the shadow topic took the read cache of the geo topic"
+    );
+    let shadow_topic = Identifier::numeric(topic_id).expect("the topic id");
+    let client_update = follower
+        .update_topic(
+            &named(SHADOW_STREAM),
+            &shadow_topic,
+            &TopicUpdateOptions {
+                read_cache: TopicReadCache {
+                    size: Some(IggyByteSize::from(64 * MIB)),
+                    read_ahead: None,
+                },
+                ..TopicUpdateOptions::default()
+            },
+        )
+        .await;
+    assert_eq!(
+        client_update.map_err(|error| error.as_code()),
+        Err(IggyError::ShadowStreamReadOnly.as_code())
+    );
+    let expected: Vec<(u64, Vec<u8>)> = (0..FIRST_SENDS)
+        .map(|index| (index, payload(index)))
+        .collect();
+    let deadline = Instant::now() + FOLLOW_DEADLINE;
+    while read_from_start(&follower, &named(SHADOW_STREAM), &shadow_topic).await != expected {
+        assert!(Instant::now() < deadline, "dc-b never served every message");
+        sleep(POLL_INTERVAL).await;
+    }
+    assert_eq!(
+        read_from_start(&follower, &named(SHADOW_STREAM), &shadow_topic).await,
+        expected
+    );
+    let http = HttpClient::login_root(&dc_b).await;
+    let without_cache = settled_read_cache_counts(&http, METRICS_DEADLINE, |_| true).await;
+    assert_eq!(
+        (
+            without_cache.block_hits,
+            without_cache.block_misses,
+            without_cache.demand_bytes,
+            without_cache.blocks_fetched_ahead
+        ),
+        (0, 0, 0, 0),
+        "a shadow topic that inherits no cache read through the cache: {without_cache:?}"
+    );
+
+    origin
+        .update_topic(
+            &named(STREAM),
+            &named(GEO_TOPIC),
+            &TopicUpdateOptions {
+                read_cache: TopicReadCache {
+                    size: Some(IggyByteSize::from(32 * MIB)),
+                    read_ahead: None,
+                },
+                ..TopicUpdateOptions::default()
+            },
+        )
+        .await
+        .expect("the geo topic takes a read cache");
+    let cached = TopicReadCache {
+        size: Some(IggyByteSize::from(32 * MIB)),
+        ..uncached
+    };
+    assert_eq!(
+        read_cache_of(&origin, &named(STREAM), topic_id).await,
+        cached
+    );
+    let updated = Instant::now();
+    let deadline = updated + FOLLOW_DEADLINE;
+    while read_cache_of(&follower, &named(SHADOW_STREAM), topic_id).await != cached {
+        assert!(
+            Instant::now() < deadline,
+            "the shadow topic never took the update of the geo topic"
+        );
+        sleep(POLL_INTERVAL).await;
+    }
+    eprintln!(
+        "the shadow topic took the read cache update {:?} after dc-a committed it",
+        updated.elapsed()
+    );
+
+    assert_eq!(
+        read_from_start(&follower, &named(SHADOW_STREAM), &shadow_topic).await,
+        expected
+    );
+    let first =
+        settled_read_cache_counts(&http, METRICS_DEADLINE, |counts| counts.demand_bytes > 0).await;
+    assert_eq!(
+        read_from_start(&follower, &named(SHADOW_STREAM), &shadow_topic).await,
+        expected
+    );
+    let second =
+        settled_read_cache_counts(&http, METRICS_DEADLINE, |counts| *counts != first).await;
+    assert!(second.block_hits > first.block_hits, "{second:?}");
+    assert_eq!(
+        second.demand_bytes, first.demand_bytes,
+        "the second pass with the inherited cache read the peer's bucket: {first:?}, then \
+         {second:?}"
+    );
 }
 
 #[tokio::test]
@@ -684,15 +870,24 @@ async fn serves_shadow_topic(client: &IggyClient, stream_id: u32, topic_id: u32)
 /// Creates the stream `orders` in `dc-a` with a geo topic of `partitions`
 /// partitions, and returns the topic's id.
 async fn create_geo_topic(origin: &IggyClient, partitions: u32) -> u32 {
+    create_geo_topic_with(
+        origin,
+        TopicCreateOptions {
+            partitions_count: Some(partitions),
+            topic_type: Some(TopicType::Geo),
+            ..TopicCreateOptions::default()
+        },
+    )
+    .await
+}
+
+/// Creates the stream `orders` in `dc-a` with the geo topic that `options`
+/// describe, and returns the topic's id.
+async fn create_geo_topic_with(origin: &IggyClient, options: TopicCreateOptions) -> u32 {
     origin
         .create_stream(STREAM, &StreamCreateOptions::default())
         .await
         .expect("create the stream of dc-a");
-    let options = TopicCreateOptions {
-        partitions_count: Some(partitions),
-        topic_type: Some(TopicType::Geo),
-        ..TopicCreateOptions::default()
-    };
     let deadline = Instant::now() + READY_DEADLINE;
     loop {
         match origin
@@ -708,6 +903,20 @@ async fn create_geo_topic(origin: &IggyClient, partitions: u32) -> u32 {
             Err(error) => panic!("dc-a never accepted the geo topic: {error}"),
         }
     }
+}
+
+/// The read cache settings that the topic `topic_id` of `stream` reads with.
+async fn read_cache_of(client: &IggyClient, stream: &Identifier, topic_id: u32) -> TopicReadCache {
+    client
+        .get_topic(
+            stream,
+            &Identifier::numeric(topic_id).expect("the topic id"),
+        )
+        .await
+        .expect("get the topic")
+        .expect("the topic exists")
+        .resolved_options()
+        .read_cache
 }
 
 fn payload(index: u64) -> Vec<u8> {

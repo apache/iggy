@@ -45,10 +45,12 @@ public sealed class TopicOptionsTests
             PositionsPublishInterval = TimeSpan.FromSeconds(2),
             TombstoneGrace = TimeSpan.FromHours(1),
             PositionsResumeTimeout = TimeSpan.FromSeconds(30),
-            LongTermRewriteMaxInterval = TimeSpan.FromSeconds(20)
+            LongTermRewriteMaxInterval = TimeSpan.FromSeconds(20),
+            ReadCacheSize = 16_777_216,
+            ReadAhead = 1_048_576
         }.ToDictionary();
 
-        Assert.Equal(19, options.Count);
+        Assert.Equal(21, options.Count);
 
         Assert.Equal(HeaderKind.Uint64, options["segment_size"].Kind);
         Assert.Equal(134217728UL, options["segment_size"].ToUInt64());
@@ -100,6 +102,24 @@ public sealed class TopicOptionsTests
             Assert.Equal(HeaderKind.Uint64, options[key].Kind);
             Assert.Equal(micros, options[key].ToUInt64());
         }
+
+        Assert.Equal(HeaderKind.Uint64, options["read_cache_size"].Kind);
+        Assert.Equal(16_777_216UL, options["read_cache_size"].ToUInt64());
+
+        Assert.Equal(HeaderKind.Uint64, options["read_ahead"].Kind);
+        Assert.Equal(1_048_576UL, options["read_ahead"].ToUInt64());
+    }
+
+    [Fact]
+    public void ToDictionary_SendsAZeroReadCacheAndLeavesAnUnsetReadAheadOut()
+    {
+        var options = new TopicOptions { ReadCacheSize = 0, MaxTopicSize = 0 }.ToDictionary();
+
+        // A zero size cap keeps the server default, while a zero read cache is a value.
+        Assert.Equal(["consumer_offset_durability", "durability", "read_cache_size"],
+            options.Keys.Order(StringComparer.Ordinal));
+        Assert.Equal(HeaderKind.Uint64, options["read_cache_size"].Kind);
+        Assert.Equal(0UL, options["read_cache_size"].ToUInt64());
     }
 
     [Fact]

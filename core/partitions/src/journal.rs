@@ -2220,6 +2220,11 @@ where
         self.commands.borrow().ops(ops).count()
     }
 
+    /// The ops of the commands this journal holds in `ops`, ascending.
+    pub(crate) fn command_ops_in(&self, ops: impl RangeBounds<u64>) -> Vec<u64> {
+        self.commands.borrow().ops(ops).collect()
+    }
+
     /// The ops of the commands this journal holds, ascending.
     #[cfg(test)]
     pub fn command_ops(&self) -> Vec<u64> {

@@ -238,6 +238,88 @@ iggy::ffi::GeoTopicDurations FfiGeoDurations(const nlohmann::json &expected) {
     return durations;
 }
 
+template <typename Holder>
+using BytesGetter = std::optional<std::uint64_t> (Holder::*)() const;
+
+template <typename Options>
+using BytesSetter = Options &(Options::*)(std::uint64_t);
+
+// The read cache settings of a topic by catalog key, on the options that set them.
+template <typename Options>
+const std::map<std::string, std::pair<BytesSetter<Options>, BytesGetter<Options>>> &ReadCacheAccessors() {
+    static const std::map<std::string, std::pair<BytesSetter<Options>, BytesGetter<Options>>> accessors = {
+        {"read_cache_size", {&Options::SetReadCacheSize, &Options::ReadCacheSize}},
+        {"read_ahead", {&Options::SetReadAhead, &Options::ReadAhead}},
+    };
+    return accessors;
+}
+
+// The read cache settings of a topic by catalog key, on the topics that read them.
+template <typename Topic>
+const std::map<std::string, BytesGetter<Topic>> &ReadCacheGetters() {
+    static const std::map<std::string, BytesGetter<Topic>> getters = {
+        {"read_cache_size", &Topic::ReadCacheSize},
+        {"read_ahead", &Topic::ReadAhead},
+    };
+    return getters;
+}
+
+using FfiReadCacheField = std::pair<bool iggy::ffi::TopicReadCache::*, std::uint64_t iggy::ffi::TopicReadCache::*>;
+
+// The bridge fields of each read cache setting, by catalog key.
+const std::map<std::string, FfiReadCacheField> &FfiReadCacheFields() {
+    using ReadCache                                              = iggy::ffi::TopicReadCache;
+    static const std::map<std::string, FfiReadCacheField> fields = {
+        {"read_cache_size", {&ReadCache::has_read_cache_size, &ReadCache::read_cache_size}},
+        {"read_ahead", {&ReadCache::has_read_ahead, &ReadCache::read_ahead}},
+    };
+    return fields;
+}
+
+// Zero turns a read cache setting off, so setting it must read back as set.
+template <typename Options>
+SurfaceCheck ReadCacheMember(const std::string &key) {
+    return [key] {
+        const auto &[set, get] = ReadCacheAccessors<Options>().at(key);
+        Options options;
+        (options.*set)(0);
+        return (options.*get)() == std::uint64_t{0};
+    };
+}
+
+// A projection or input lists a read cache setting as decimal bytes, and leaves out one that is unset.
+std::optional<std::uint64_t> FixtureBytes(const nlohmann::json &object, const std::string &key) {
+    if (!object.contains(key)) {
+        return std::nullopt;
+    }
+    return std::stoull(object.at(key).get<std::string>());
+}
+
+// Sets every read cache setting the input names through the typed setters, and checks each reads back.
+template <typename Options>
+void ExpectTypedReadCache(const nlohmann::json &input) {
+    Options options;
+    for (const auto &[key, accessors] : ReadCacheAccessors<Options>()) {
+        ASSERT_TRUE(input.contains(key)) << key;
+        (options.*accessors.first)(*FixtureBytes(input, key));
+    }
+    for (const auto &[key, accessors] : ReadCacheAccessors<Options>()) {
+        EXPECT_EQ((options.*accessors.second)(), FixtureBytes(input, key)) << key;
+    }
+}
+
+// The bridge read cache of a topic response projection.
+iggy::ffi::TopicReadCache FfiReadCache(const nlohmann::json &expected) {
+    iggy::ffi::TopicReadCache read_cache{};
+    for (const auto &[key, fields] : FfiReadCacheFields()) {
+        if (const auto bytes = FixtureBytes(expected, key)) {
+            read_cache.*fields.first  = true;
+            read_cache.*fields.second = *bytes;
+        }
+    }
+    return read_cache;
+}
+
 std::map<std::string, ScopeSurface> TypedSurface() {
     using iggy::StreamCreateOptions;
     using iggy::StreamUpdateOptions;
@@ -333,6 +415,8 @@ std::map<std::string, ScopeSurface> TypedSurface() {
               {"positions_resume_timeout", GeoDurationMember<TopicCreateOptions>("positions_resume_timeout")},
               {"long_term_rewrite_max_interval",
                GeoDurationMember<TopicCreateOptions>("long_term_rewrite_max_interval")},
+              {"read_cache_size", ReadCacheMember<TopicCreateOptions>("read_cache_size")},
+              {"read_ahead", ReadCacheMember<TopicCreateOptions>("read_ahead")},
           },
           {
               {"name", [] { return TopicUpdateOptions().SetName("renamed").Name().has_value(); }},
@@ -374,6 +458,8 @@ std::map<std::string, ScopeSurface> TypedSurface() {
               {"positions_resume_timeout", GeoDurationMember<TopicUpdateOptions>("positions_resume_timeout")},
               {"long_term_rewrite_max_interval",
                GeoDurationMember<TopicUpdateOptions>("long_term_rewrite_max_interval")},
+              {"read_cache_size", ReadCacheMember<TopicUpdateOptions>("read_cache_size")},
+              {"read_ahead", ReadCacheMember<TopicUpdateOptions>("read_ahead")},
           },
           {
               {"message_expiry", ResetMember<TopicUpdateOptions>(iggy::TopicOptionKey::MessageExpiry)},
@@ -575,6 +661,32 @@ TEST(ResourceOptionsFixtureTest, GivenTopicResponseProjectionsWhenReadingShouldE
         }
         for (const auto &[key, getter] : GeoDurationGetters<iggy::TopicDetails>()) {
             EXPECT_EQ((topic_details.*getter)(), FixtureMicros(expected, key)) << key;
+        }
+    }
+}
+
+TEST(ResourceOptionsFixtureTest, GivenReadCacheVectorsWhenSettingTypedOptionsShouldKeepEachValueAndZero) {
+    ExpectTypedReadCache<iggy::TopicCreateOptions>(FixtureCase("create_topic", "topic_with_read_cache").at("input"));
+    ExpectTypedReadCache<iggy::TopicUpdateOptions>(FixtureCase("update_resource", "topic_set_read_cache").at("input"));
+}
+
+TEST(ResourceOptionsFixtureTest, GivenTopicResponseProjectionsWhenReadingShouldExposeTheReadCache) {
+    for (const auto &vector : Fixture().at("topic_responses")) {
+        SCOPED_TRACE(vector.at("case").get<std::string>());
+        const auto &expected = vector.at("expected");
+        iggy::ffi::Topic summary{};
+        summary.read_cache = FfiReadCache(expected);
+        iggy::ffi::TopicDetails details{};
+        details.read_cache = FfiReadCache(expected);
+
+        const auto topic         = iggy::TopicTestPeer::FromBridge(std::move(summary));
+        const auto topic_details = iggy::TopicTestPeer::FromBridge(std::move(details));
+
+        for (const auto &[key, getter] : ReadCacheGetters<iggy::Topic>()) {
+            EXPECT_EQ((topic.*getter)(), FixtureBytes(expected, key)) << key;
+        }
+        for (const auto &[key, getter] : ReadCacheGetters<iggy::TopicDetails>()) {
+            EXPECT_EQ((topic_details.*getter)(), FixtureBytes(expected, key)) << key;
         }
     }
 }

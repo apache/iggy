@@ -38,6 +38,7 @@ bytemuck = { workspace = true }
 bytes = { workspace = true }
 compio = { workspace = true }
 consensus = { workspace = true }
+crc32c = { workspace = true }
 crossfire = { workspace = true }
 futures = { workspace = true }
 hash32 = { workspace = true }

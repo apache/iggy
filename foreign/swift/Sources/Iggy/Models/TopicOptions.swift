@@ -50,6 +50,10 @@ public enum TopicOptionKey: String, Sendable, Hashable, CaseIterable {
     case tombstoneGrace = "tombstone_grace"
     case positionsResumeTimeout = "positions_resume_timeout"
     case longTermRewriteMaxInterval = "long_term_rewrite_max_interval"
+    /// The two read cache settings, this and ``readAhead``, are updatable on
+    /// any topic and never resettable.
+    case readCacheSize = "read_cache_size"
+    case readAhead = "read_ahead"
 }
 
 /// How far a write has to get before the server completes it.
@@ -188,6 +192,22 @@ public struct TopicCreateOptions: Sendable, Hashable {
     /// The longest wait between two long-term rewrites of a partition, at
     /// least 1 second.
     public var longTermRewriteMaxInterval: Duration?
+    /// The memory each node keeps for what the topic's reads fetch from the
+    /// object store, divided between its partitions: each share is a limit
+    /// within the read cache of its shard, not a reservation. Zero keeps
+    /// nothing, and any other value is at least 512 KiB.
+    ///
+    /// This and ``readAheadBytes`` apply to any topic, geo included. Each
+    /// overrides the `[tiered_storage]` server setting of the same name on
+    /// every node, and nil leaves that setting. Zero is a value here, not a
+    /// server default, so it is sent. An update can change them but not
+    /// reset them.
+    public var readCacheSizeBytes: UInt64?
+    /// The most bytes that readahead fetches in front of a sequential reader
+    /// of the topic. Zero turns readahead off, and any other value is at
+    /// least 128 KiB. The server refuses more than an eighth of a
+    /// ``readCacheSizeBytes`` other than zero that the topic also sets.
+    public var readAheadBytes: UInt64?
     public var raw: [String: String]
 
     public init(
@@ -198,7 +218,7 @@ public struct TopicCreateOptions: Sendable, Hashable {
         segmentMaxAge: IggyExpiry? = nil, tieredStorage: Bool? = nil, localRetentionAge: IggyExpiry? = nil, localRetentionSize: MaxTopicSize? = nil,
         topicType: TopicType? = nil, geoMode: GeoMode? = nil, freshUploadInterval: Duration? = nil, consumerOffsetUploadInterval: Duration? = nil,
         positionsPublishInterval: Duration? = nil, tombstoneGrace: Duration? = nil, positionsResumeTimeout: Duration? = nil,
-        longTermRewriteMaxInterval: Duration? = nil, raw: [String: String] = [:]
+        longTermRewriteMaxInterval: Duration? = nil, readCacheSizeBytes: UInt64? = nil, readAheadBytes: UInt64? = nil, raw: [String: String] = [:]
     ) {
         self.partitionsCount = partitionsCount
         self.compressionAlgorithm = compressionAlgorithm
@@ -224,6 +244,8 @@ public struct TopicCreateOptions: Sendable, Hashable {
         self.tombstoneGrace = tombstoneGrace
         self.positionsResumeTimeout = positionsResumeTimeout
         self.longTermRewriteMaxInterval = longTermRewriteMaxInterval
+        self.readCacheSizeBytes = readCacheSizeBytes
+        self.readAheadBytes = readAheadBytes
         self.raw = raw
     }
 
@@ -294,6 +316,7 @@ public struct TopicCreateOptions: Sendable, Hashable {
             options[TopicOptionKey.geoMode.rawValue] = .explicit(try .string(geoMode.rawValue))
         }
         try insertGeoDurations(geoDurations, into: &options)
+        insertReadCache(readCache, into: &options)
         return options
     }
 
@@ -307,6 +330,11 @@ public struct TopicCreateOptions: Sendable, Hashable {
             (key: .positionsResumeTimeout, duration: positionsResumeTimeout),
             (key: .longTermRewriteMaxInterval, duration: longTermRewriteMaxInterval),
         ]
+    }
+
+    /// Each read cache setting with its key, in catalog order.
+    var readCache: [(key: TopicOptionKey, bytes: UInt64?)] {
+        [(key: .readCacheSize, bytes: readCacheSizeBytes), (key: .readAhead, bytes: readAheadBytes)]
     }
 
     func encode() throws -> [UInt8] {
@@ -341,16 +369,21 @@ public struct TopicUpdateOptions: Sendable, Hashable {
     /// ``MaxTopicSize/serverDefault`` changes nothing: reset
     /// ``TopicOptionKey/localRetentionSize`` to return to the default.
     public var localRetentionSize: MaxTopicSize?
-    /// The durations of a geo topic, see ``TopicCreateOptions``. They are the
-    /// only keys an update may change on a geo topic, and a normal topic
-    /// refuses them. Nil keeps the stored value and zero is sent as a value.
-    /// None of them can be reset.
+    /// The durations of a geo topic, see ``TopicCreateOptions``. They and
+    /// the read cache settings are the only keys an update may change on a
+    /// geo topic, and a normal topic refuses them. Nil keeps the stored value
+    /// and zero is sent as a value. None of them can be reset.
     public var freshUploadInterval: Duration?
     public var consumerOffsetUploadInterval: Duration?
     public var positionsPublishInterval: Duration?
     public var tombstoneGrace: Duration?
     public var positionsResumeTimeout: Duration?
     public var longTermRewriteMaxInterval: Duration?
+    /// The read cache settings, see ``TopicCreateOptions``, on any topic.
+    /// Nil keeps the stored value and zero is sent as a value. Neither can
+    /// be reset.
+    public var readCacheSizeBytes: UInt64?
+    public var readAheadBytes: UInt64?
     /// Keys to return to their defaults: ``TopicOptionKey/messageExpiry``,
     /// ``TopicOptionKey/maxTopicSize``, ``TopicOptionKey/localRetentionAge``
     /// or ``TopicOptionKey/localRetentionSize``. Any other key is refused
@@ -366,8 +399,8 @@ public struct TopicUpdateOptions: Sendable, Hashable {
         name: String? = nil, messageExpiry: IggyExpiry? = nil, maxTopicSize: MaxTopicSize? = nil, tieredStorage: Bool? = nil,
         localRetentionAge: IggyExpiry? = nil, localRetentionSize: MaxTopicSize? = nil, freshUploadInterval: Duration? = nil,
         consumerOffsetUploadInterval: Duration? = nil, positionsPublishInterval: Duration? = nil, tombstoneGrace: Duration? = nil,
-        positionsResumeTimeout: Duration? = nil, longTermRewriteMaxInterval: Duration? = nil, reset: Set<TopicOptionKey> = [],
-        raw: [String: String] = [:], rawReset: Set<String> = []
+        positionsResumeTimeout: Duration? = nil, longTermRewriteMaxInterval: Duration? = nil, readCacheSizeBytes: UInt64? = nil,
+        readAheadBytes: UInt64? = nil, reset: Set<TopicOptionKey> = [], raw: [String: String] = [:], rawReset: Set<String> = []
     ) {
         self.name = name
         self.messageExpiry = messageExpiry
@@ -381,6 +414,8 @@ public struct TopicUpdateOptions: Sendable, Hashable {
         self.tombstoneGrace = tombstoneGrace
         self.positionsResumeTimeout = positionsResumeTimeout
         self.longTermRewriteMaxInterval = longTermRewriteMaxInterval
+        self.readCacheSizeBytes = readCacheSizeBytes
+        self.readAheadBytes = readAheadBytes
         self.reset = reset
         self.raw = raw
         self.rawReset = rawReset
@@ -412,6 +447,7 @@ public struct TopicUpdateOptions: Sendable, Hashable {
             options[TopicOptionKey.localRetentionSize.rawValue] = .explicit(.uint64(localRetentionSize.wireValue))
         }
         try insertGeoDurations(geoDurations, into: &options)
+        insertReadCache(readCache, into: &options)
         return options
     }
 
@@ -427,9 +463,15 @@ public struct TopicUpdateOptions: Sendable, Hashable {
         ]
     }
 
+    /// Each read cache setting with its key, in catalog order.
+    var readCache: [(key: TopicOptionKey, bytes: UInt64?)] {
+        [(key: .readCacheSize, bytes: readCacheSizeBytes), (key: .readAhead, bytes: readAheadBytes)]
+    }
+
     func toPatch() throws -> OptionsPatch {
         // A server default sets nothing, so it is no set key either. A
-        // duration of a geo topic has no server default: zero sets it too.
+        // duration of a geo topic and a read cache setting have no server
+        // default: zero sets them too.
         var typed: [TopicOptionKey] = [
             name.map { _ in .name },
             messageExpiry.flatMap { $0 == .serverDefault ? nil : .messageExpiry },
@@ -439,6 +481,7 @@ public struct TopicUpdateOptions: Sendable, Hashable {
             localRetentionSize.flatMap { $0 == .serverDefault ? nil : .localRetentionSize },
         ].compactMap { $0 }
         typed += geoDurations.filter { $0.duration != nil }.map { $0.key }
+        typed += readCache.filter { $0.bytes != nil }.map { $0.key }
         return try OptionsPatch(typed: typed, raw: raw, reset: reset, rawReset: rawReset, values: toResourceOptions)
     }
 }
@@ -456,6 +499,14 @@ private func insertGeoDurations(_ durations: [(key: TopicOptionKey, duration: Du
     }
 }
 
+/// Writes the read cache settings that are set. Zero is a value of these
+/// keys, not a server default, so it is sent.
+private func insertReadCache(_ settings: [(key: TopicOptionKey, bytes: UInt64?)], into options: inout ResourceOptions) {
+    for case let (key, bytes?) in settings {
+        options[key.rawValue] = .explicit(.uint64(bytes))
+    }
+}
+
 extension TopicOptionKey: CatalogOptionKey {
     var flags: OptionFlags {
         switch self {
@@ -464,7 +515,7 @@ extension TopicOptionKey: CatalogOptionKey {
         case .segmentMaxAge, .topicType, .geoMode: .critical
         case .tieredStorage: [.updatable, .critical]
         case .freshUploadInterval, .consumerOffsetUploadInterval, .positionsPublishInterval, .tombstoneGrace, .positionsResumeTimeout,
-            .longTermRewriteMaxInterval:
+            .longTermRewriteMaxInterval, .readCacheSize, .readAhead:
             .updatable
         default: []
         }
@@ -562,6 +613,20 @@ extension Topic {
     public var longTermRewriteMaxInterval: Duration? {
         resolvedGeoDuration(options, .longTermRewriteMaxInterval)
     }
+
+    /// The memory each node keeps for what the topic's reads fetch from the
+    /// object store, from ``options``. This and ``readAheadBytes`` are nil
+    /// where the topic sets none, and each node then applies its own server
+    /// setting. Zero is a value: the setting is off for the topic.
+    public var readCacheSizeBytes: UInt64? {
+        options[TopicOptionKey.readCacheSize.rawValue]?.value.uint64Value
+    }
+
+    /// The most bytes that readahead fetches in front of a sequential reader,
+    /// from ``options``.
+    public var readAheadBytes: UInt64? {
+        options[TopicOptionKey.readAhead.rawValue]?.value.uint64Value
+    }
 }
 
 extension TopicDetails {
@@ -650,6 +715,20 @@ extension TopicDetails {
     /// ``options``.
     public var longTermRewriteMaxInterval: Duration? {
         resolvedGeoDuration(options, .longTermRewriteMaxInterval)
+    }
+
+    /// The memory each node keeps for what the topic's reads fetch from the
+    /// object store, from ``options``. This and ``readAheadBytes`` are nil
+    /// where the topic sets none, and each node then applies its own server
+    /// setting. Zero is a value: the setting is off for the topic.
+    public var readCacheSizeBytes: UInt64? {
+        options[TopicOptionKey.readCacheSize.rawValue]?.value.uint64Value
+    }
+
+    /// The most bytes that readahead fetches in front of a sequential reader,
+    /// from ``options``.
+    public var readAheadBytes: UInt64? {
+        options[TopicOptionKey.readAhead.rawValue]?.value.uint64Value
     }
 }
 

@@ -678,11 +678,15 @@ fn primary_transfer_grant<B: MessageBus, SB: SuperblockStore>(
 const COMMAND_KIND: u16 = 10;
 
 fn command_prepare(op: u64, parent: u128, kind: u16, value: u64) -> Message<PrepareHeader> {
+    command_prepare_of(op, parent, kind, &value.to_le_bytes())
+}
+
+/// A prepare of the command of `kind` with `payload`.
+fn command_prepare_of(op: u64, parent: u128, kind: u16, payload: &[u8]) -> Message<PrepareHeader> {
     let namespace = IggyNamespace::new(1, 1, 0);
-    let payload = value.to_le_bytes();
     let body = crate::state_machine::MachineCommand {
         kind: crate::state_machine::CommandKind(kind),
-        payload: &payload,
+        payload,
     }
     .encode()
     .unwrap();
@@ -1218,17 +1222,37 @@ pub(super) fn recording_partition_at(
     recording_partition_with_pipeline(replica, replica_count, LocalPipeline::new())
 }
 
-/// The offer `partition` serves once the I/O turn pinned its plan.
+/// The offer `partition` serves once the store answered its check and the I/O
+/// turn pinned its plan.
 async fn serve_offer(
     partition: &mut IggyPartition<IggyMessageBus>,
 ) -> Rc<crate::state_transfer::PartitionStateTransferOffer> {
     let config = repair_config();
-    assert!(matches!(
-        partition.state_transfer_offer(&config).await,
-        Err(PartitionTransferUnavailable::FlushPending)
-    ));
+    let first = after_store_check(partition, &config).await;
+    assert!(
+        matches!(first, Err(PartitionTransferUnavailable::FlushPending)),
+        "{first:?}"
+    );
     settle_partition_io(partition, &config).await;
     partition.state_transfer_offer(&config).await.unwrap()
+}
+
+/// The first offer round of `partition` that does not wait for the store.
+async fn after_store_check(
+    partition: &mut IggyPartition<IggyMessageBus>,
+    config: &PartitionsConfig,
+) -> Result<Rc<crate::state_transfer::PartitionStateTransferOffer>, PartitionTransferUnavailable> {
+    const ROUNDS_MAX: usize = 100;
+    for _ in 0..ROUNDS_MAX {
+        match partition.state_transfer_offer(config).await {
+            // The check runs in a detached task.
+            Err(PartitionTransferUnavailable::StoreCheckPending) => {
+                compio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            round => return round,
+        }
+    }
+    panic!("the store check did not answer in {ROUNDS_MAX} rounds");
 }
 
 /// `count` one-message records. Each call gives its messages new random
@@ -2002,16 +2026,35 @@ async fn backup_with_counter(
     directory: &std::path::Path,
     durability: iggy_common::Durability,
 ) -> Box<IggyPartition<RecordingBus>> {
+    Box::pin(backup_with_machines(
+        config,
+        directory,
+        durability,
+        |backup| {
+            backup
+                .register_state_machine(Box::new(
+                    crate::state_machine::registry::tests::CounterMachine::new(1, &[COMMAND_KIND]),
+                ))
+                .unwrap();
+        },
+    ))
+    .await
+}
+
+/// A backup on disk at `directory` with the machines `register` gives it,
+/// its sends and offsets under `durability`.
+async fn backup_with_machines(
+    config: &PartitionsConfig,
+    directory: &std::path::Path,
+    durability: iggy_common::Durability,
+    register: impl FnOnce(&mut IggyPartition<RecordingBus>),
+) -> Box<IggyPartition<RecordingBus>> {
     const BACKUP: u8 = 2;
     let (backup, _) = recording_partition_at(BACKUP, 3);
     let mut backup = Box::new(backup);
     backup.runtime_options.durability = durability;
     backup.runtime_options.consumer_offset_durability = durability;
-    backup
-        .register_state_machine(Box::new(
-            crate::state_machine::registry::tests::CounterMachine::new(1, &[COMMAND_KIND]),
-        ))
-        .unwrap();
+    register(&mut backup);
     backup.set_partition_dir(directory.to_string_lossy().into_owned());
     set_offset_dirs_under(&mut backup, directory);
     Box::pin(backup.open_persistence()).await.unwrap();
@@ -2073,6 +2116,7 @@ mod repair_protocol;
 mod retention;
 mod segment_chain;
 mod segment_upload;
+mod segment_verify;
 mod session_retirement;
 mod state_machines;
 mod state_transfer_offer;

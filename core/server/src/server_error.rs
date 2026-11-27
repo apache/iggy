@@ -19,7 +19,7 @@ use crate::shard_allocator::ShardingError;
 use consensus::VsrStateError;
 use iggy_binary_protocol::Operation;
 use metadata::impls::recovery::RecoveryError;
-use partitions::PartitionRecoveryError;
+use partitions::{PartitionRecoveryError, StoreViewRequest};
 use server_common::log::LogError;
 use shard::ShardCtorError;
 use std::error::Error as _;
@@ -323,6 +323,42 @@ pub enum ServerError {
         topic_id: usize,
         partition_id: usize,
         namespace_raw: u64,
+    },
+    /// The partition of a tiered topic found no chain file, and something
+    /// below its local front may have left the disk. Boot leaves it unbuilt,
+    /// and the reconciler loads it again with what `request` reads from the
+    /// store.
+    #[error(
+        "partition {stream_id}/{topic_id}/{partition_id} found no segment chain, and the offsets \
+         {} to {} below its local log wait for the object store",
+        request.from,
+        request.front.saturating_sub(1)
+    )]
+    PartitionChainMissing {
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        request: Box<StoreViewRequest>,
+    },
+    /// The loader wrote the chain it rebuilt from the store. Its caller loads
+    /// the partition once more over that chain, so recovery checks it by the
+    /// rules of any other chain.
+    #[error(
+        "partition {stream_id}/{topic_id}/{partition_id} rebuilt its segment chain from the \
+         object store"
+    )]
+    PartitionChainRebuilt {
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    },
+    #[error(
+        "the rebuild of the segment chain at {dir} could not read an anchor or write the chain"
+    )]
+    PartitionChainRebuildIo {
+        dir: PathBuf,
+        #[source]
+        source: std::io::Error,
     },
     #[error(
         "shard {shard_id} aborted while waiting for shard-0 to broadcast the metadata \

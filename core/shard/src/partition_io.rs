@@ -806,16 +806,21 @@ mod tests {
     use std::time::Duration;
 
     use consensus::{
-        ArtifactProgress, Consensus, DvcSuffix, HeartbeatSchedule, LocalPipeline, PartitionsHandle,
-        Pipeline, Plane, PlaneKind, REPLICATION_BATCH_BYTES_MAX, ReplicationSend, Sequencer,
-        StateArtifact, StateTransferStage, TimeoutManager, VsrAction, VsrConsensus, artifact_kind,
+        ArtifactProgress, Consensus, DvcSuffix, HeartbeatSchedule, LocalPipeline, MetadataHandle,
+        PartitionsHandle, Pipeline, Plane, PlaneKind, REPLICATION_BATCH_BYTES_MAX, ReplicationSend,
+        Sequencer, StateArtifact, StateTransferStage, TimeoutManager, VsrAction, VsrConsensus,
+        artifact_kind,
     };
     use futures::FutureExt;
     use futures::channel::oneshot;
     use iggy_binary_protocol::namespace::METADATA_GROUP;
     use iggy_binary_protocol::primitives::consumer::WireConsumer;
+    use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
+    use iggy_binary_protocol::requests::topics::{
+        CreateTopicRequest, CreateTopicWithAssignmentsRequest,
+    };
     use iggy_binary_protocol::requests::users::CreateUserRequest;
     use iggy_binary_protocol::requests::users::login_register::{CredentialProof, RegisterRequest};
     use iggy_binary_protocol::{
@@ -834,6 +839,10 @@ mod tests {
     use journal::prepare_journal::PrepareJournal;
     use journal::superblock::{SuperblockContents, SuperblockStore};
     use message_bus::{IggyMessageBus, MessageBus, SendError};
+    use metadata::stm::StateMachine;
+    use metadata::stm::shadow::{
+        ShadowReadCache, ShadowRetention, ShadowStream, ShadowTopicRequest, ShadowTopicTarget,
+    };
     use metadata::stm::stream::{Partition, Stream, Streams, StreamsInner, Topic};
     use metadata::stm::user::{Users, UsersInner};
     use metadata::{IggyMetadata, MuxStateMachine};
@@ -4766,6 +4775,115 @@ mod tests {
             ),
             (cap, LAGGING_GROUPS - cap, true),
             "(armed, deferred, deferred groups unchanged a round later) per group: {spent:?}"
+        );
+    }
+
+    /// A lagging replica of a tiered topic, its node's store state set as
+    /// given, armed for a transfer against the primary.
+    #[allow(clippy::future_not_send)]
+    async fn arm_transfer_with_store(
+        tiered: bool,
+        store_usable: bool,
+    ) -> (IoTestShard, TaggedSender, IggyNamespace) {
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, sender) = test_owner(&bus, None);
+        owner.set_repair_retry_ticks(1);
+        let frontier = owner.plane.metadata().applied_frontier();
+        frontier.set_tiered_storage_ready(true);
+        frontier.set_store_identity_verified(store_usable);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let mut partition = repairing_replica(
+            &bus,
+            namespace,
+            (PAIR_BACKUP, 2),
+            REPAIR_PRIMARY,
+            LAGGING_COMMIT_MIN,
+            LAGGING_COMMIT_MAX,
+        );
+        partition.set_runtime_options(TopicRuntimeOptions {
+            tiered_storage: tiered,
+            ..Default::default()
+        });
+        let partitions = owner.plane.partitions();
+        partitions.insert(namespace, partition);
+        let partition = partitions.get_mut_by_ns(&namespace).unwrap();
+        partition.consensus().begin_state_transfer_await();
+        owner
+            .arm_partition_transfer(partition, REPAIR_PRIMARY)
+            .await;
+        (owner, sender, namespace)
+    }
+
+    /// (transfer peer, re-arm pending, stage) of the partition at `namespace`.
+    fn transfer_arm_state(
+        owner: &IoTestShard,
+        namespace: IggyNamespace,
+    ) -> (Option<u8>, bool, StateTransferStage) {
+        let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
+        (
+            partition.transfer().map(|session| session.peer),
+            partition.transfer_rearm.is_some(),
+            partition.consensus().state_transfer_stage(),
+        )
+    }
+
+    #[compio::test]
+    async fn given_tiered_partition_when_store_is_not_usable_should_not_request_transfer() {
+        let (owner, _sender, namespace) = Box::pin(arm_transfer_with_store(true, false)).await;
+
+        assert_eq!(
+            transfer_arm_state(&owner, namespace),
+            (None, true, StateTransferStage::Idle)
+        );
+        assert_eq!(owner.plane.partitions().transfers_inflight(), 0);
+    }
+
+    #[compio::test]
+    async fn given_tiered_partition_waiting_for_store_when_store_becomes_usable_should_request_transfer()
+     {
+        let (owner, _sender, namespace) = Box::pin(arm_transfer_with_store(true, false)).await;
+        for _ in 0..4 {
+            assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
+        }
+        assert_eq!(
+            transfer_arm_state(&owner, namespace),
+            (None, true, StateTransferStage::Idle),
+            "the partition must keep waiting while the store is not usable"
+        );
+
+        owner
+            .plane
+            .metadata()
+            .applied_frontier()
+            .set_store_identity_verified(true);
+        for _ in 0..4 {
+            assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
+            if transfer_arm_state(&owner, namespace).0.is_some() {
+                break;
+            }
+        }
+
+        assert_eq!(
+            transfer_arm_state(&owner, namespace),
+            (
+                Some(REPAIR_PRIMARY),
+                false,
+                StateTransferStage::AwaitingTarget
+            )
+        );
+    }
+
+    #[compio::test]
+    async fn given_partition_not_tiered_when_store_is_not_usable_should_request_transfer() {
+        let (owner, _sender, namespace) = Box::pin(arm_transfer_with_store(false, false)).await;
+
+        assert_eq!(
+            transfer_arm_state(&owner, namespace),
+            (
+                Some(REPAIR_PRIMARY),
+                false,
+                StateTransferStage::AwaitingTarget
+            )
         );
     }
 
@@ -12764,6 +12882,186 @@ mod tests {
             .flat_map(|(_, entries)| entries.iter().map(|entry| entry.group))
             .collect();
         assert_eq!(sent_groups, groups);
+    }
+
+    /// The read cache that a topic sets reaches each of its partitions: its
+    /// size shared between them, its readahead as it is, and zero as a value
+    /// that keeps nothing. What the topic leaves unset is the shard's.
+    #[test]
+    fn given_a_topic_that_sets_its_read_cache_when_its_partitions_read_should_share_the_size_between_them()
+     {
+        const MIB: u64 = 1 << 20;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let settings_of = |read_cache: iggy_common::TopicReadCache| {
+            let (owner, _) = test_owner_shaped(&bus, None, (None, None), |topic| {
+                topic.resolved.read_cache = read_cache;
+            });
+            let settings: Vec<_> = (0..TEST_PARTITIONS)
+                .map(|partition_id| {
+                    owner.partition_read_settings(IggyNamespace::new(0, 0, partition_id))
+                })
+                .collect();
+            assert!(
+                settings.windows(2).all(|pair| pair[0] == pair[1]),
+                "every partition of the topic reads alike"
+            );
+            assert_eq!(
+                owner.partition_read_settings(IggyNamespace::new(0, 1, 0)),
+                partitions::PartitionReadSettings::SHARD,
+                "a topic that is gone leaves it to the shard"
+            );
+            settings[0].clone()
+        };
+        let bytes = |value: u64| Some(IggyByteSize::from(value));
+
+        assert_eq!(
+            settings_of(iggy_common::TopicReadCache::default()),
+            partitions::PartitionReadSettings::SHARD
+        );
+        assert_eq!(
+            settings_of(iggy_common::TopicReadCache {
+                size: bytes(3 * 4 * MIB),
+                read_ahead: bytes(MIB),
+            }),
+            partitions::PartitionReadSettings::new(
+                Some(usize::try_from(4 * MIB).unwrap()),
+                Some(MIB)
+            )
+        );
+        assert_eq!(
+            settings_of(iggy_common::TopicReadCache {
+                size: bytes(0),
+                read_ahead: bytes(0),
+            }),
+            partitions::PartitionReadSettings::new(Some(0), Some(0))
+        );
+        assert_eq!(
+            settings_of(iggy_common::TopicReadCache {
+                size: None,
+                read_ahead: bytes(MIB),
+            }),
+            partitions::PartitionReadSettings::new(None, Some(MIB)),
+            "an unset size sets no limit, whatever the shard's cache is"
+        );
+    }
+
+    /// Commit the shadow topic operation `request` at `op` on `owner`.
+    fn apply_shadow_topic<B: MessageBus + Clone + 'static>(
+        owner: &IoTestShard<B>,
+        op: u64,
+        request: &ShadowTopicRequest,
+    ) {
+        let body = request.to_bytes();
+        let size = size_of::<PrepareHeader>() + body.len();
+        let mut prepare = Message::<PrepareHeader>::new(size);
+        prepare.as_mut_slice()[size_of::<PrepareHeader>()..].copy_from_slice(&body);
+        let prepare = prepare.transmute_header(|_, header: &mut PrepareHeader| {
+            header.command = Command::Prepare;
+            header.operation = Operation::ShadowTopic;
+            header.op = op;
+            header.size = u32::try_from(size).unwrap();
+        });
+        let reply = owner.plane.metadata().mux_stm.update(prepare).unwrap();
+        assert_eq!(reply.code, 0, "{request:?}");
+    }
+
+    /// A shadow topic reads with the read cache that its peer's topic sets:
+    /// what its adoption carries, and then what each change carries, from
+    /// the next poll on. A value that this node's cache cannot keep is
+    /// passed on as the peer set it, for the cache to bound.
+    #[test]
+    fn given_a_shadow_topic_when_its_peer_changes_the_read_cache_should_read_with_it_from_the_next_poll()
+     {
+        const MIB: u64 = 1 << 20;
+        const PARTITIONS: u32 = 2;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _) = test_owner_shaped(&bus, None, (None, None), |_| {});
+        let target = ShadowTopicTarget {
+            stream_id: 1,
+            source: ShadowStream {
+                origin: "dc-b".to_owned(),
+                cluster_uid: 0x0b0b,
+                stream_id: 7,
+            },
+            topic_id: 3,
+            created_revision: 41,
+        };
+        apply_shadow_topic(
+            &owner,
+            1,
+            &ShadowTopicRequest::CreateStream {
+                source: target.source.clone(),
+                name: WireName::new("__shadow_dc-b_orders").unwrap(),
+            },
+        );
+        let options = iggy_common::TopicCreateOptions {
+            read_cache: iggy_common::TopicReadCache {
+                size: Some(IggyByteSize::from(16 * MIB)),
+                read_ahead: Some(IggyByteSize::from(MIB)),
+            },
+            ..iggy_common::TopicCreateOptions::default()
+        };
+        let create = CreateTopicWithAssignmentsRequest {
+            request: CreateTopicRequest {
+                stream_id: WireIdentifier::numeric(target.stream_id),
+                partitions_count: PARTITIONS,
+                name: WireName::new("payments").unwrap(),
+                options: options.to_wire().unwrap(),
+            },
+            derived_options: WireOptions::empty(),
+            partitions: (0..PARTITIONS)
+                .map(|partition_id| CreatedPartitionAssignment {
+                    partition_id,
+                    consensus_group_id: 100 + u64::from(partition_id),
+                    initial_view: 0,
+                    members: Vec::new(),
+                })
+                .collect(),
+        };
+        apply_shadow_topic(
+            &owner,
+            2,
+            &ShadowTopicRequest::AdoptTopic {
+                target: target.clone(),
+                create: Box::new(create),
+                retention: ShadowRetention::default(),
+                geo_mode: iggy_common::GeoMode::Geo,
+            },
+        );
+        let namespace = IggyNamespace::new(1, 3, 1);
+        let mib = |count: u64| usize::try_from(count * MIB).unwrap();
+
+        assert_eq!(
+            owner.partition_read_settings(namespace),
+            partitions::PartitionReadSettings::new(Some(mib(8)), Some(MIB)),
+            "what the adoption carried"
+        );
+
+        let changes = [
+            (Some(0), None, Some(0), None),
+            (
+                Some(512 * 1024),
+                Some(4 * MIB),
+                Some(256 * 1024),
+                Some(4 * MIB),
+            ),
+            (None, None, None, None),
+        ];
+        for (op, (size, read_ahead, limit, partition_read_ahead)) in (3..).zip(changes) {
+            apply_shadow_topic(
+                &owner,
+                op,
+                &ShadowTopicRequest::SetReadCache {
+                    target: target.clone(),
+                    read_cache: ShadowReadCache { size, read_ahead },
+                },
+            );
+            assert_eq!(
+                owner.partition_read_settings(namespace),
+                partitions::PartitionReadSettings::new(limit, partition_read_ahead),
+                "{size:?}, {read_ahead:?}"
+            );
+        }
     }
 
     mod fresh_proofs;

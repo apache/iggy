@@ -35,7 +35,7 @@ fn partition_transfer_formats_match_replica_wire_revision() {
             &snapshot[..8],
             geo_positions[0],
         ),
-        (5, *b"ICO1", 8, 9, b"IGGYSMS1".as_slice(), 2)
+        (6, *b"ICO1", 8, 9, b"IGGYSMS1".as_slice(), 2)
     );
 }
 

@@ -147,6 +147,8 @@ TEST(TopicCreateOptionsTest, DefaultHasNoValues) {
     EXPECT_FALSE(options.TombstoneGrace().has_value());
     EXPECT_FALSE(options.PositionsResumeTimeout().has_value());
     EXPECT_FALSE(options.LongTermRewriteMaxInterval().has_value());
+    EXPECT_FALSE(options.ReadCacheSize().has_value());
+    EXPECT_FALSE(options.ReadAhead().has_value());
     EXPECT_TRUE(options.RawEntries().empty());
 }
 
@@ -304,6 +306,17 @@ TEST(TopicCreateOptionsTest, GeoDurationsKeepZeroAndRefuseNegative) {
     EXPECT_EQ(options.TombstoneGrace(), std::chrono::microseconds(3600000000));
 }
 
+TEST(TopicCreateOptionsTest, ReadCacheKeepsZero) {
+    iggy::TopicCreateOptions options;
+    options.SetReadCacheSize(16777216).SetReadAhead(0);
+    EXPECT_EQ(options.ReadCacheSize(), std::optional<std::uint64_t>(16777216));
+    EXPECT_EQ(options.ReadAhead(), std::optional<std::uint64_t>(0));
+
+    options.SetReadCacheSize(0).SetReadAhead(1048576);
+    EXPECT_EQ(options.ReadCacheSize(), std::optional<std::uint64_t>(0));
+    EXPECT_EQ(options.ReadAhead(), std::optional<std::uint64_t>(1048576));
+}
+
 TEST(TopicCreateOptionsTest, TieredStorageKeepsAnExplicitFalse) {
     iggy::TopicCreateOptions options;
     options.SetTieredStorage(false);
@@ -356,6 +369,8 @@ TEST(TopicUpdateOptionsTest, DefaultHasNoValues) {
     EXPECT_FALSE(options.TombstoneGrace().has_value());
     EXPECT_FALSE(options.PositionsResumeTimeout().has_value());
     EXPECT_FALSE(options.LongTermRewriteMaxInterval().has_value());
+    EXPECT_FALSE(options.ReadCacheSize().has_value());
+    EXPECT_FALSE(options.ReadAhead().has_value());
     EXPECT_TRUE(options.RawEntries().empty());
     EXPECT_TRUE(options.ResetKeys().empty());
 }
@@ -378,6 +393,14 @@ TEST(TopicUpdateOptionsTest, GeoDurationsAreSetOnlyAndKeepZero) {
 
     EXPECT_THROW(options.SetPositionsResumeTimeout(std::chrono::seconds(-1)), std::invalid_argument);
     EXPECT_EQ(options.PositionsResumeTimeout(), std::chrono::microseconds(30000000));
+}
+
+TEST(TopicUpdateOptionsTest, ReadCacheIsSetOnlyAndKeepsZero) {
+    iggy::TopicUpdateOptions options;
+    options.SetReadCacheSize(0).SetReadAhead(1048576);
+    EXPECT_EQ(options.ReadCacheSize(), std::optional<std::uint64_t>(0));
+    EXPECT_EQ(options.ReadAhead(), std::optional<std::uint64_t>(1048576));
+    EXPECT_TRUE(options.ResetKeys().empty());
 }
 
 TEST(TopicUpdateOptionsTest, StoresUpdatableFields) {
@@ -471,6 +494,8 @@ TEST(OptionKeyTest, ReturnsCatalogNames) {
     EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::TombstoneGrace), "tombstone_grace");
     EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::PositionsResumeTimeout), "positions_resume_timeout");
     EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::LongTermRewriteMaxInterval), "long_term_rewrite_max_interval");
+    EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::ReadCacheSize), "read_cache_size");
+    EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::ReadAhead), "read_ahead");
     EXPECT_EQ(iggy::to_string(iggy::TopicType::Normal), "normal");
     EXPECT_EQ(iggy::to_string(iggy::TopicType::Geo), "geo");
     EXPECT_EQ(iggy::to_string(iggy::GeoMode::Geo), "geo");

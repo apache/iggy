@@ -43,9 +43,9 @@
 //! Every decision takes the time it is made at, so nothing here reads a
 //! clock.
 
-use partitions::{PlannedSegment, RewriteError};
+use partitions::{PlannedSegment, RewriteBudget, RewriteError};
 use server_common::sharding::IggyNamespace;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
@@ -108,6 +108,24 @@ pub fn backlog_delay(backlog: u64, limit: u64) -> Option<Duration> {
     Some(Duration::from_micros(
         u64::try_from(delay).unwrap_or(u64::MAX),
     ))
+}
+
+/// A send to a shard's partition that went straight to it, counted among
+/// the sends that wait on the shard until it is dropped.
+#[derive(Debug)]
+pub struct DirectSend(Rc<Cell<usize>>);
+
+impl DirectSend {
+    fn new(count: &Rc<Cell<usize>>) -> Self {
+        count.set(count.get().saturating_add(1));
+        Self(Rc::clone(count))
+    }
+}
+
+impl Drop for DirectSend {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
 }
 
 /// A partition incarnation: slab ids are reused after a delete, so the
@@ -194,6 +212,17 @@ pub struct RewritePacing {
     /// Whether the shard has yet to look over all its partitions for the
     /// ones to pace. A partition that sleeps is not looked at otherwise.
     sweep_wanted: bool,
+    /// Whether a partition the shard leads was past the backlog limit at
+    /// the last tick.
+    behind: Rc<Cell<bool>>,
+    /// Sends to the shard's partitions that went straight to them, not
+    /// through the object store, and are not answered yet.
+    direct_sends: Rc<Cell<usize>>,
+    /// Whether the store the rewrites use is on this node.
+    store_on_node: bool,
+    /// The share of the shard's time that its rewrites keep to, once the
+    /// first of them asked for it.
+    budget: Option<Rc<RewriteBudget>>,
 }
 
 impl Default for RewritePacing {
@@ -205,6 +234,10 @@ impl Default for RewritePacing {
             backlog_counts: Rc::default(),
             plans: Rc::default(),
             sweep_wanted: false,
+            behind: Rc::default(),
+            direct_sends: Rc::default(),
+            store_on_node: false,
+            budget: None,
         }
     }
 }
@@ -392,6 +425,57 @@ impl RewritePacing {
     #[must_use]
     pub const fn backlog_limit(&self) -> u64 {
         self.backlog_limit
+    }
+
+    /// Note whether a partition the shard leads is past the backlog limit.
+    ///
+    /// One such partition is enough for all the rewrites of the shard to
+    /// stop keeping to their share, those of the partitions within the
+    /// limit too: the rewrites share one budget, and the sends to the
+    /// partition behind wait for its rewrite, which waits behind the
+    /// others. With a limit of zero no partition is ever past it, and the
+    /// rewrites keep to their share whenever sends wait.
+    pub fn set_behind(&self, behind: bool) {
+        self.behind.set(behind);
+    }
+
+    /// Whether a partition the shard leads was past the backlog limit at
+    /// the last tick, for the rewrites the shard runs. See
+    /// [`Self::set_behind`].
+    #[must_use]
+    pub fn behind(&self) -> Rc<Cell<bool>> {
+        Rc::clone(&self.behind)
+    }
+
+    /// Count a send to one of the shard's partitions that goes straight to
+    /// it, until the returned guard is dropped with its reply.
+    #[must_use]
+    pub fn direct_send(&self) -> DirectSend {
+        DirectSend::new(&self.direct_sends)
+    }
+
+    /// The sends that [`Self::direct_send`] counts and that are not
+    /// answered yet.
+    #[must_use]
+    pub fn direct_sends(&self) -> Rc<Cell<usize>> {
+        Rc::clone(&self.direct_sends)
+    }
+
+    /// Note whether the store the rewrites use is on this node. A rewrite
+    /// started after this keeps to a budget that knows it.
+    pub fn set_store_on_node(&mut self, on_node: bool) {
+        self.store_on_node = on_node;
+        self.budget = None;
+    }
+
+    /// The budget of the shard's rewrites, which `start` makes the first
+    /// time, from whether the store is on this node.
+    pub fn budget(&mut self, start: impl FnOnce(bool) -> RewriteBudget) -> Rc<RewriteBudget> {
+        let store_on_node = self.store_on_node;
+        Rc::clone(
+            self.budget
+                .get_or_insert_with(|| Rc::new(start(store_on_node))),
+        )
     }
 
     /// Where a walk of a partition's log leaves its count, from a task

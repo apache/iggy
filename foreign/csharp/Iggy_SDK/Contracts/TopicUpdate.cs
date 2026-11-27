@@ -75,9 +75,10 @@ public sealed class TopicUpdate
     ///     changes nothing.
     /// </summary>
     /// <remarks>
-    ///     This and the five durations below are the only settings an update changes on a geo topic, and the server
-    ///     refuses them on a normal topic. Zero is a value for them and is sent, and a negative span is refused
-    ///     before anything is sent. They have no default, so the server refuses a reset of them.
+    ///     This and the five durations below are the only settings an update changes on a geo topic, besides
+    ///     <see cref="ReadCacheSize" /> and <see cref="ReadAhead" />, and the server refuses them on a normal topic.
+    ///     Zero is a value for them and is sent, and a negative span is refused before anything is sent. They have no
+    ///     default, so the server refuses a reset of them.
     /// </remarks>
     public TimeSpan? FreshUploadInterval { get; init; }
 
@@ -101,6 +102,23 @@ public sealed class TopicUpdate
 
     /// <summary>The longest wait between two long-term rewrites of a partition, at least one second.</summary>
     public TimeSpan? LongTermRewriteMaxInterval { get; init; }
+
+    /// <summary>
+    ///     The new memory in bytes that each node keeps for what the topic's reads fetch from the object store. Zero
+    ///     keeps nothing that they fetch, otherwise at least 512 KiB. Null changes nothing.
+    /// </summary>
+    /// <remarks>
+    ///     This and <see cref="ReadAhead" /> change on a normal or a geo topic. Zero is a value for them and is sent,
+    ///     unlike a zero <see cref="MaxTopicSize" />. They have no default, so the server refuses a reset of them.
+    /// </remarks>
+    public ulong? ReadCacheSize { get; init; }
+
+    /// <summary>
+    ///     The new most bytes that readahead fetches in front of a sequential reader of the topic. Zero turns
+    ///     readahead off, otherwise at least 128 KiB, and at most an eighth of a nonzero read cache size that the
+    ///     topic sets. Null changes nothing.
+    /// </summary>
+    public ulong? ReadAhead { get; init; }
 
     /// <summary>
     ///     Keys to reset to their defaults: <see cref="TopicOptionKey.MessageExpiry" />,
@@ -166,6 +184,16 @@ public sealed class TopicUpdate
             nameof(PositionsResumeTimeout));
         SetGeoDuration(set, TopicOptionKey.LongTermRewriteMaxInterval, LongTermRewriteMaxInterval,
             nameof(LongTermRewriteMaxInterval));
+
+        if (ReadCacheSize is { } readCacheSize)
+        {
+            set[OptionKeys.Describe(TopicOptionKey.ReadCacheSize).Name] = HeaderValue.FromUInt64(readCacheSize);
+        }
+
+        if (ReadAhead is { } readAhead)
+        {
+            set[OptionKeys.Describe(TopicOptionKey.ReadAhead).Name] = HeaderValue.FromUInt64(readAhead);
+        }
 
         return OptionKeys.Patch(OptionsScope.Topic, set, (Reset ?? NoReset).Select(OptionKeys.Describe),
             RawReset, hasRawSet);

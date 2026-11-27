@@ -540,16 +540,48 @@ pub fn decode_batch_slice_with(
 /// builds the blob and satisfies this.
 #[must_use]
 pub fn calculate_batch_checksum(header: &BatchHeader, blob: &[u8]) -> u64 {
-    let mut hasher = XxHash3_64::new();
-    write_batch_header_fields(&mut hasher, header);
-    let batch = BatchRef {
-        header: *header,
-        blob,
-    };
-    for framed in batch.iter_with_offsets() {
-        hasher.write(&blob[framed.start..framed.start + 8]);
+    let mut checksum = BatchChecksum::new(header, blob);
+    checksum.take_until(blob.len());
+    checksum.finish()
+}
+
+/// [`calculate_batch_checksum`] taken a stretch of the blob at a time, for a
+/// caller that lets other work run in between. Any split of the blob gives
+/// the one-shot checksum.
+pub struct BatchChecksum<'a> {
+    hasher: XxHash3_64,
+    frames: BatchIteratorWithOffsets<'a>,
+}
+
+impl<'a> BatchChecksum<'a> {
+    #[must_use]
+    pub fn new(header: &BatchHeader, blob: &'a [u8]) -> Self {
+        let mut hasher = XxHash3_64::new();
+        write_batch_header_fields(&mut hasher, header);
+        Self {
+            hasher,
+            frames: BatchIteratorWithOffsets { blob, position: 0 },
+        }
     }
-    hasher.finish()
+
+    /// Take the messages that start before `end` of the blob.
+    pub fn take_until(&mut self, end: usize) {
+        while self.frames.position < end {
+            let Some(framed) = self.frames.next() else {
+                // The frame walk of the one-shot checksum ends here too.
+                self.frames.position = self.frames.blob.len();
+                return;
+            };
+            self.hasher
+                .write(&self.frames.blob[framed.start..framed.start + 8]);
+        }
+    }
+
+    /// The checksum of the messages taken so far.
+    #[must_use]
+    pub fn finish(&self) -> u64 {
+        self.hasher.finish()
+    }
 }
 
 fn write_batch_header_fields(hasher: &mut XxHash3_64, header: &BatchHeader) {
@@ -903,6 +935,39 @@ mod tests {
             )
             .is_some()
         );
+    }
+
+    /// Stretches that end inside a frame, and a last frame cut short, give
+    /// the checksum of one pass, which the verifying decode recomputes by a
+    /// walk of its own.
+    #[test]
+    fn given_a_blob_taken_in_stretches_when_checksumming_should_give_the_one_pass_checksum() {
+        let frames: Vec<_> = (0..40_u8)
+            .map(|index| {
+                let payload = vec![index; 3 * usize::from(index)];
+                frame(u128::from(index), u32::from(index), 0, &payload)
+            })
+            .collect();
+        let bytes = batch_bytes(&frames);
+        let batch = decode_batch_slice(&bytes).unwrap();
+        let (header, blob) = (batch.header, batch.blob());
+        let cut = &blob[..blob.len() - 5];
+        let blobs = [
+            (blob, verify_and_recompute_batch_checksum(&batch).unwrap()),
+            (cut, calculate_batch_checksum(&header, cut)),
+        ];
+        for stretch in [1, 7, BATCH_MESSAGE_HEADER_SIZE, 100, blob.len()] {
+            for (blob, one_pass) in blobs {
+                let mut checksum = BatchChecksum::new(&header, blob);
+                let mut end = 0;
+                while end < blob.len() {
+                    end = (end + stretch).min(blob.len());
+                    checksum.take_until(end);
+                }
+
+                assert_eq!(checksum.finish(), one_pass, "stretches of {stretch}");
+            }
+        }
     }
 
     #[test]

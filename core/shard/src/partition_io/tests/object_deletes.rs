@@ -17,6 +17,8 @@
 
 //! Delete passes on a shard that hosts a tiered primary on disk.
 
+use std::time::SystemTime;
+
 use super::segment_uploads::{
     SEALED_SEGMENTS, floor, namespace, pumped, staged_revision, tiered_owner, until,
 };
@@ -28,8 +30,9 @@ use iggy_object_store::{
     TierJobHandle, TierJobRequest, TierScopeToken,
 };
 use partitions::{
-    ExecutorDeleter, ExecutorUploader, ObjectDeleteDone, ObjectDeleteJob, ObjectDeleteOutcome,
-    ObjectDeleteWork, ObjectDeleter, RETIRED_OBJECT_GRACE, SweptObjects,
+    ClaimReadOutcome, ExecutorDeleter, ExecutorUploader, ObjectDeleteDone, ObjectDeleteJob,
+    ObjectDeleteOutcome, ObjectDeleteWork, ObjectDeleter, RETIRED_OBJECT_GRACE, RootListOutcome,
+    SweptObjects,
 };
 
 /// The last offset the fixture's truncation removes. Every segment holds one
@@ -95,6 +98,19 @@ impl ObjectDeleter for RecordingDeleter {
         } else {
             self.deleter.run(job, scope)
         }
+    }
+
+    fn read_claim(&self, scope: TierScopeToken) -> LocalBoxFuture<'static, ClaimReadOutcome> {
+        self.deleter.read_claim(scope)
+    }
+
+    fn list_root(
+        &self,
+        after: Option<String>,
+        claimed_at: SystemTime,
+        scope: TierScopeToken,
+    ) -> LocalBoxFuture<'static, RootListOutcome> {
+        self.deleter.list_root(after, claimed_at, scope)
     }
 }
 

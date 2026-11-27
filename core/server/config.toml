@@ -1082,7 +1082,7 @@ change_log_activity_capacity = 16384
 # Topic durability and flush scheduling are set at creation and returned by GetTopic.
 # durability controls message completion. consumer_offset_durability controls explicit offset stores and deletes.
 # Both independently default to "replicated". Neither inherits the other.
-# A geo topic in the geo mode is always "persisted": its create's durability is ignored.
+# A geo topic in the geo mode is always "persisted" for both: its create's values for them are ignored.
 # Every disk-backed partition uses a WAL for recovery and retries.
 # WAL references retain segment bodies by hard link until reclamation.
 # Full message payloads count against wal_bytes_max under both durability policies.
@@ -1561,16 +1561,117 @@ handshake_grace = "10 s"
 # The longest wait for one attempt at a store call other than a put, from
 # 1 s to 1 h.
 #request_timeout = "30 s"
-# If the store takes no piece of a put's body for this long, or gives no
-# answer for this long after the last piece, the put fails. A put has no
-# total deadline. From 1 s to 1 h.
+# If the store takes no piece of the body of a put that streams from a file,
+# a sealed segment, for this long, or gives no answer for this long after the
+# last piece, the put fails. Such a put has no total deadline and is sent
+# once. Each attempt at an overwrite whose body the node holds in memory, such
+# as a manifest or a positions object, waits the same. From 1 s to 1 h.
 #progress_timeout = "30 s"
-# The most attempts at a store call other than a put that keeps failing for
-# a transient reason, the first one included, and the backoff between them,
-# each wait from 1 ms to 1 h.
+# The most attempts at a store call that keeps failing for a transient
+# reason, the first one included, and the backoff between them, each wait
+# from 1 ms to 1 h. They cover heads, reads, listings, deletes, and the
+# create-only puts whose body the node holds in memory: fresh objects and
+# long-term segments. Each attempt of such a put carries the same "put-id" in
+# the object's metadata, so a create-only put that the store refuses because
+# an earlier attempt stored the object counts as stored. An overwrite, such as
+# a manifest, a positions object or a topic object, is sent again only when
+# its request never left the node, for example when the connection was
+# refused: an attempt that may have reached the store can land after a later
+# overwrite of the same key and roll it back, so any other failure goes to
+# the caller. Every request of a put counts, a second attempt too.
 #max_attempts = 3
 #retry_delay = "200 ms"
 #max_retry_delay = "5 s"
+# An attempt at a create-only put whose body the node holds in memory, a fresh
+# object or a long-term segment, is given up and sent again when the store
+# takes no piece of its body (64 KiB) for 'put_attempt_stall_timeout', or gives
+# no answer for 'put_attempt_answer_timeout' after the last piece. A late
+# create finds the object and stores nothing. An overwrite cut early could land
+# after a later put of other bytes, so it waits 'progress_timeout' instead,
+# and so does every put on the "fs" backend. Each from 100 ms to 1 h.
+#put_attempt_stall_timeout = "1 s"
+#put_attempt_answer_timeout = "5 s"
+# A create-only put whose body the node holds in memory, such as the upload of
+# a fresh object that producers wait for, gets a second attempt on another
+# connection once it has run for 'second_attempt_after' plus
+# 'second_attempt_after_per_mib' for each MiB of its body. The first attempt
+# to store the object wins, and the other is dropped. The defaults are about
+# the 99th percentile of a put of each size measured on GCS, so about one put
+# in a hundred costs a second request. 'jobs.second_attempts' bounds how many
+# run at once. The "fs" backend sends none, since a slow put there means a busy
+# volume. "disabled" sends no second attempt. Otherwise from 1 ms to 1 h, and
+# up to 1 h per MiB.
+#second_attempt_after = "300 ms"
+#second_attempt_after_per_mib = "60 ms"
+# A long-term segment of at least twice 'part_size' goes up in parts on "s3"
+# and "gcs": up to 'jobs.parts_in_flight' parts side by side, each sent again
+# after a failure as a put is but without a second attempt, and then one
+# request creates the object whole and create-only, with a CRC32C of all of it that the store
+# checks. Every other put goes whole, such as a fresh object that producers
+# wait for. On s3 it is a multipart upload with a full object CRC32C. On gcs
+# each part is a temporary object under "<prefix>/meta/uploads/", which a
+# compose joins into a composite whose CRC32C the node checks before a second
+# compose creates the object, and the node then deletes them. Only an https
+# endpoint of Google takes uploads in parts. gcs composes at most 32 parts, so a
+# part takes at least a 32nd of its object there. On gcs, a bucket with soft
+# delete on keeps deleted objects billable for its retention, 7 days by
+# default, so each long-term segment stored in parts is billed about twice for
+# that time. Turning soft delete off on the bucket, or part_size = "0", avoids
+# it. A store that refuses multipart uploads or the full object checksum makes
+# the node put every object whole from then on. "0" puts every object whole.
+# Otherwise from 5 MiB, S3's least part, to 5 GiB.
+#part_size = "8 MiB"
+# How old an upload in parts that never completed must be before shard 0 of
+# the metadata primary removes it: what a crash or a cancelled put leaves, the
+# parts of an S3 multipart upload or the temporary objects of a GCS upload.
+# The sweep runs every hour, or every 'abandoned_upload_grace' when that is
+# shorter, while the node passes the store identity check, and only when the
+# identity object names this cluster. An upload in parts gives up at half the
+# grace, so the sweep never meets a live one, and the other half covers the
+# skew between the clocks of the node and of the store. "disabled" turns the
+# sweep off and leaves an upload in parts without a deadline: on S3, a bucket
+# lifecycle rule that aborts incomplete multipart uploads does the same work.
+# Otherwise at least 30 min, so that the half that covers the skew of the
+# clocks takes the 15 minutes that S3 accepts. On s3 the sweep needs
+# s3:ListBucketMultipartUploads on the bucket (arn:aws:s3:::<bucket>) and
+# s3:AbortMultipartUpload on its objects (arn:aws:s3:::<bucket>/*).
+# Without them it removes nothing, and S3 keeps charging for the parts of
+# every abandoned upload unless such a lifecycle rule aborts them.
+#abandoned_upload_grace = "1 h"
+# The bytes of what one shard reads from object stores that it keeps in
+# memory, so that a poll of bytes another poll read a moment ago does not ask
+# the store again: tiered and long-term segments, the indexes of long-term
+# segments, fresh objects, and the segments of geo peers. The index of a
+# tiered segment is fetched once into a local index file on disk instead. The
+# same budget holds the fresh objects that the shard uploads for geo topics,
+# in up to seven eighths of it, until the long-term rewrite takes their
+# messages, so that a consumer at the tail reads them from memory. A shard
+# with a high upload rate wants 64 MiB or more. Each shard keeps its own, so a
+# node spends this times its shards. "0" keeps nothing that reads fetch and
+# turns readahead off: those reads go to the store each time. It never stops
+# the shard from holding what it uploads, which then takes a fixed 64 MiB of
+# its own. Otherwise at least 8 blocks of 'read_cache_block_size'. Every
+# partition of the shard reads within it. A topic can override it with its own
+# 'read_cache_size' option, which is shared evenly between the topic's
+# partitions. Each share is a limit on what that partition keeps, not a
+# reservation: what a quiet partition leaves unused is there for the others. A
+# topic that sets none is bounded by this budget alone.
+#read_cache_size = "64 MiB"
+# The piece of a segment that the cache fetches and keeps. A smaller block
+# wastes less on a small or random read. A larger block means fewer entries
+# and suits consumers that read forward. Adjacent missing blocks are fetched
+# in one request either way. From 64 KiB to 1 MiB.
+#read_cache_block_size = "256 KiB"
+# When polls read a segment in order, the shard fetches up to this many bytes
+# past the last poll before a poll asks for them, in whole blocks. These
+# fetches take the speculative fetch caps of [tiered_storage.jobs]: at most
+# 'speculative_fetches' of them at once, each at most
+# 'speculative_fetch_bytes'. One starts only while no fetch that a poll waits
+# for is queued, and it can run beside the ones that already run. "0" turns
+# readahead off. Otherwise at least 2 blocks, and at most an eighth of
+# 'read_cache_size', the part of the cache where the fetched bytes wait for
+# their poll. A topic can override it with its own 'read_ahead' option.
+#read_ahead = "2 MiB"
 # The shortest time between the starts of two uploads of fresh objects on one
 # shard, so a shard creates at most one object per interval, plus the objects
 # that fill to 4 MiB before it passes. A send that finds a free upload slot
@@ -1614,13 +1715,33 @@ handshake_grace = "10 s"
 # fresh_sends_denied_partition_share and fresh_sends_denied_shard_cap count the
 # refusals. At least 4 MiB, and at most 'fresh_pending_bytes'.
 #fresh_partition_pending_bytes = "8 MiB"
+# How long the sweeps of the root must find the same objects of a partition
+# incarnation that committed metadata no longer holds before they delete the
+# incarnation. A committed delete of a partition deletes its objects from a
+# queue in memory, so a restart, a change of the metadata primary or a full
+# queue can leave them in the store. Shard 0 of the metadata primary lists the
+# whole root every hour, or every 'orphan_grace' when that is shorter, and
+# counts the grace by its own clock from the second sweep that found the same
+# objects, so a new object of the incarnation starts it again. It never deletes
+# the objects of a live partition, of one created after the sweep read
+# metadata, of a geo topic, objects under 'meta/' other than the manifest of
+# an incarnation it deletes, objects of another cluster, or objects no newer
+# than this cluster's claim of the root. "disabled" turns the sweep off.
+# Otherwise at least 1 s.
+#orphan_grace = "6 h"
 # Per shard: how many jobs of each class run at once, and the bytes that
 # fetches and uploads hold. A segment larger than 'upload_bytes' uploads
-# alone. Polls that read from the store are demand fetches. Nothing uses the
-# speculative fetch caps yet. 'fresh_uploads' are the uploads that producers
-# of geo topics wait for. They have slots of their own and never wait behind
-# 'uploads'. Housekeeping jobs, such as sweeps and the merges of long-term
-# segments, start only while no fetch or upload waits.
+# alone. Polls that read from the store are demand fetches, and readahead
+# ('read_ahead') takes the speculative fetch caps. 'fresh_uploads' are the
+# uploads that producers of geo topics wait for. They have slots of their own
+# and never wait behind 'uploads'. Housekeeping jobs, such as sweeps and the
+# merges of long-term segments, start only while no fetch or upload waits.
+# 'second_attempts' are the second attempts at slow create-only puts that run
+# at once (see 'second_attempt_after'). They take no slot of 'fresh_uploads',
+# and a slow put that finds none free waits for its first attempt.
+# 'parts_in_flight' are the parts of uploads in parts that run at once (see
+# 'part_size'), over every upload of the shard. An upload with no part in flight
+# sends one even when they are all taken.
 #[tiered_storage.jobs]
 #demand_fetches = 16
 #demand_fetch_bytes = "64 MiB"
@@ -1631,6 +1752,8 @@ handshake_grace = "10 s"
 #speculative_fetch_bytes = "32 MiB"
 #deletes = 2
 #housekeeping = 1
+#second_attempts = 4
+#parts_in_flight = 8
 # The gcs backend: Google Cloud Storage, over its JSON API. A put is a
 # create-only upload where it must be (ifGenerationMatch=0), and GCS checks
 # the CRC32C of each body. GCS takes one write per second to one object name,
@@ -1656,8 +1779,10 @@ handshake_grace = "10 s"
 # latency after its body arrived and before it commits, and calls in flight
 # wait at the same time, as on a remote store. 'bytes_per_second' adds the
 # time to move the body of a put or the bytes of a read, "0" for no limit.
-# Each latency must be shorter than the timeout of its call:
-# 'progress_timeout' for a put, 'request_timeout' for the others.
+# Each latency must be shorter than the timeout of its call: both
+# 'progress_timeout' and 'put_attempt_answer_timeout' for a put,
+# 'request_timeout' for the others. A 'put_latency' past the threshold of
+# 'second_attempt_after' gives every create-only put a second attempt.
 #[tiered_storage.mock_s3]
 #put_latency = "0"
 #get_latency = "0"
@@ -1751,11 +1876,14 @@ handshake_grace = "10 s"
 # Shard 0 reads each peer's store identity object, "<prefix>/meta/identity",
 # at boot and every minute after that. While the node reads nothing from the
 # peer, or the peer's store does not answer, it reads the object every 5
-# seconds. The node remembers the first cluster that the object names, until
-# the node restarts. If the object names another cluster later, the node reads
-# nothing from the peer until it restarts. A peer that does not answer never
-# stops the boot. The gauges geo_peer_identity_verified and
-# geo_peer_unreachable show each peer by its origin.
+# seconds. The node reads the peer when the object names a cluster that its
+# shadow streams of the peer came from, or a successor of one that the
+# recovery records under the peer's root prove. While it holds no shadow
+# stream of the peer, the first cluster that the object names counts. If the
+# object names another cluster later, the node reads nothing from the peer
+# until it restarts. A peer that does not answer never stops the boot. The
+# gauges geo_peer_identity_verified and geo_peer_unreachable show each peer by
+# its origin.
 #[[geo.peers]]
 # The peer's own geo.origin.
 #origin = "dc-b"

@@ -15,10 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Reads of segments whose `.log` left the disk.
+//! Reads of segments whose `.log` left the disk, and of fresh objects.
 //!
 //! A poll plan names a remote segment by an object and a byte range in it,
-//! and the walk reads that range with ranged GETs straight from the store.
+//! and the walk reads that range with ranged GETs from the store, through
+//! the shard's read cache when it has one (see [`ReadCache`]). The cache
+//! also holds the fresh objects the shard uploaded, until the long-term
+//! floors of their partitions pass them.
 //! The segment's sparse index is the local `.index` while one is usable, and
 //! otherwise the `.index` object, fetched once and kept on disk. The fetch
 //! runs in a task of its own (see [`IndexFetch`]), apart from the polls that
@@ -28,7 +31,6 @@
 //! service, see [`ExecutorObjects`].
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
 use std::ops::{Range, RangeInclusive};
 use std::rc::Rc;
 use std::time::Duration;
@@ -38,18 +40,28 @@ use compio::io::AsyncWriteAtExt;
 use futures::FutureExt;
 use futures::channel::oneshot;
 use futures::future::{self, Either, LocalBoxFuture, Shared};
+use futures::{StreamExt, stream};
 use iggy_object_store::{
-    ErrorClass, KeyLayout, LongTermKey, ObjectRange, ObjectStore, ObjectStoreError, SegmentKey,
-    SegmentObject, TierExecutor, TierJobClass, TierJobRequest, TierScope,
+    ErrorClass, KeyLayout, LongTermKey, ObjectMeta, ObjectPrefix, ObjectRange, ObjectStore,
+    ObjectStoreError, SegmentKey, SegmentObject, TierExecutor, TierJobClass, TierJobRequest,
+    TierScope,
 };
 use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::iobuf::{Frozen, Owned};
 use server_common::poll::PollHistoryId;
+use server_common::sharding::IggyNamespace;
 use tracing::{error, warn};
 
+use crate::PartitionLeft;
 use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::io::PartitionIoQuiescence;
 use crate::poll_plan::DiskFault;
+use crate::remote_blocks::{
+    PartitionReadSettings, ReadCache, ReadGate, Reading, RemoteBlocks, RemoteReadMetrics, StoreSlot,
+};
+use crate::rewrite_share::RewriteShare;
+use crate::segment_chain::SegmentRecord;
+use crate::segment_upload::{is_recorded_log, is_whole_index};
 use crate::state_transfer::{STAGING_SUFFIX, fsync_dir};
 
 /// Bytes of an index object that one GET asks for: a whole number of entries,
@@ -63,8 +75,16 @@ const INDEX_FETCH_CHUNK: u64 = (IGGY_INDEX_SIZE as u64) * 32 * 1024;
 /// joins it, for good.
 const INDEX_GET_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The ranged read of an [`ObjectStore`], behind a pointer, so a partition
-/// does not carry the provider's type.
+/// How long the store may take to answer for one segment that a state
+/// transfer would send without its bytes.
+const STORED_SEGMENT_HEAD_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many segments one check of a stored front asks the store about at a
+/// time.
+const STORED_SEGMENT_CHECKS: usize = 4;
+
+/// The reads of an [`ObjectStore`], behind a pointer, so a partition does not
+/// carry the provider's type.
 pub trait RemoteObjects {
     /// See [`ObjectStore::get_range`].
     fn get_range<'a>(
@@ -72,6 +92,32 @@ pub trait RemoteObjects {
         key: &'a str,
         range: Range<u64>,
     ) -> LocalBoxFuture<'a, Result<ObjectRange, ObjectStoreError>>;
+
+    /// As [`Self::get_range`], if `wanted` still says so when the read
+    /// starts. `None` when it does not, and the store is not asked.
+    fn get_range_if<'a>(
+        &'a self,
+        key: &'a str,
+        range: Range<u64>,
+        wanted: Box<dyn FnOnce() -> bool>,
+    ) -> LocalBoxFuture<'a, Result<Option<ObjectRange>, ObjectStoreError>> {
+        async move {
+            if !wanted() {
+                return Ok(None);
+            }
+            self.get_range(key, range).await.map(Some)
+        }
+        .boxed_local()
+    }
+
+    /// See [`ObjectStore::head`]. A source that does not implement it answers
+    /// [`ObjectStoreError::Unsupported`].
+    fn head<'a>(
+        &'a self,
+        _key: &'a str,
+    ) -> LocalBoxFuture<'a, Result<ObjectMeta, ObjectStoreError>> {
+        future::ready(Err(ObjectStoreError::Unsupported("head".to_owned()))).boxed_local()
+    }
 }
 
 impl<S: ObjectStore> RemoteObjects for S {
@@ -81,6 +127,13 @@ impl<S: ObjectStore> RemoteObjects for S {
         range: Range<u64>,
     ) -> LocalBoxFuture<'a, Result<ObjectRange, ObjectStoreError>> {
         ObjectStore::get_range(self, key, range).boxed_local()
+    }
+
+    fn head<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> LocalBoxFuture<'a, Result<ObjectMeta, ObjectStoreError>> {
+        ObjectStore::head(self, key).boxed_local()
     }
 }
 
@@ -119,8 +172,7 @@ impl<E: TierExecutor> RemoteObjects for ExecutorObjects<E> {
         key: &'a str,
         range: Range<u64>,
     ) -> LocalBoxFuture<'a, Result<ObjectRange, ObjectStoreError>> {
-        let request = TierJobRequest::new(self.class, self.scope.token())
-            .with_bytes(range.end.saturating_sub(range.start));
+        let request = self.request(&range);
         let key = key.to_owned();
         let job = self.executor.submit(request, move |store| async move {
             ObjectStore::get_range(&*store, &key, range).await
@@ -130,6 +182,52 @@ impl<E: TierExecutor> RemoteObjects for ExecutorObjects<E> {
                 .unwrap_or_else(|cancelled| Err(ObjectStoreError::Transport(cancelled.to_string())))
         }
         .boxed_local()
+    }
+
+    /// `wanted` is asked when the job starts, which can be long after it
+    /// queued.
+    fn get_range_if<'a>(
+        &'a self,
+        key: &'a str,
+        range: Range<u64>,
+        wanted: Box<dyn FnOnce() -> bool>,
+    ) -> LocalBoxFuture<'a, Result<Option<ObjectRange>, ObjectStoreError>> {
+        let request = self.request(&range);
+        let key = key.to_owned();
+        let job = self.executor.submit(request, move |store| async move {
+            if !wanted() {
+                return Ok(None);
+            }
+            ObjectStore::get_range(&*store, &key, range).await.map(Some)
+        });
+        async move {
+            job.await
+                .unwrap_or_else(|cancelled| Err(ObjectStoreError::Transport(cancelled.to_string())))
+        }
+        .boxed_local()
+    }
+
+    fn head<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> LocalBoxFuture<'a, Result<ObjectMeta, ObjectStoreError>> {
+        let request = TierJobRequest::new(self.class, self.scope.token());
+        let key = key.to_owned();
+        let job = self.executor.submit(request, move |store| async move {
+            ObjectStore::head(&*store, &key).await
+        });
+        async move {
+            job.await
+                .unwrap_or_else(|cancelled| Err(ObjectStoreError::Transport(cancelled.to_string())))
+        }
+        .boxed_local()
+    }
+}
+
+impl<E> ExecutorObjects<E> {
+    fn request(&self, range: &Range<u64>) -> TierJobRequest {
+        TierJobRequest::new(self.class, self.scope.token())
+            .with_bytes(range.end.saturating_sub(range.start))
     }
 }
 
@@ -180,13 +278,6 @@ pub fn index_file_name(start_offset: u64, keyed_end_offset: Option<u64>) -> Stri
     )
 }
 
-/// Bytes of fresh objects a shard keeps in memory for its polls.
-///
-/// A consumer at the tail reads what a producer sent a moment ago. Without
-/// the cache, each such poll would fetch from the store the bytes this node
-/// has just put there.
-pub const FRESH_CACHE_BYTES: usize = 64 * 1024 * 1024;
-
 /// Bytes between two blobs of one fresh object that a read fetches along
 /// with them. A request to the store costs more than these bytes do.
 pub const FRESH_READ_GAP_BYTES: u64 = 256 * 1024;
@@ -195,216 +286,6 @@ pub const FRESH_READ_GAP_BYTES: u64 = 256 * 1024;
 /// blobs of several batches. A single blob is read whatever its size.
 pub const FRESH_READ_BYTES_MAX: u64 = 8 * 1024 * 1024;
 
-/// The part of the cache's budget, one in this many, that the objects this
-/// shard stored never take, so what polls fetched from the store can serve
-/// the next poll of the same bytes while the uploads fill the rest. One read
-/// of [`FRESH_READ_BYTES_MAX`] fits in it.
-const FRESH_CACHE_FETCHED_SHARE: usize = 8;
-
-const _: () =
-    assert!((FRESH_CACHE_BYTES / FRESH_CACHE_FETCHED_SHARE) as u64 >= FRESH_READ_BYTES_MAX);
-
-/// One buffer the cache keeps.
-struct CachedBytes {
-    bytes: Bytes,
-    /// Bytes of memory the buffer holds, which can be more than its length.
-    held: usize,
-    used_at: u64,
-}
-
-/// Buffers by key, with the order they were last used in.
-struct RecentBytes<K> {
-    entries: BTreeMap<K, CachedBytes>,
-    /// The key used at each turn, the least recent first.
-    order: BTreeMap<u64, K>,
-    turn: u64,
-    held: usize,
-}
-
-impl<K: Ord + Copy> RecentBytes<K> {
-    const fn new() -> Self {
-        Self {
-            entries: BTreeMap::new(),
-            order: BTreeMap::new(),
-            turn: 0,
-            held: 0,
-        }
-    }
-
-    fn insert(&mut self, key: K, bytes: Bytes, held: usize) {
-        self.remove(&key);
-        self.turn += 1;
-        self.held += held;
-        self.order.insert(self.turn, key);
-        self.entries.insert(
-            key,
-            CachedBytes {
-                bytes,
-                held,
-                used_at: self.turn,
-            },
-        );
-    }
-
-    fn mark_used(&mut self, key: K) {
-        let Some(entry) = self.entries.get_mut(&key) else {
-            return;
-        };
-        self.order.remove(&entry.used_at);
-        self.turn += 1;
-        entry.used_at = self.turn;
-        self.order.insert(self.turn, key);
-    }
-
-    fn remove(&mut self, key: &K) {
-        if let Some(entry) = self.entries.remove(key) {
-            self.order.remove(&entry.used_at);
-            self.held -= entry.held;
-        }
-    }
-
-    /// Drop the entry used the longest ago. `false` when none is left.
-    fn drop_least_recent(&mut self) -> bool {
-        let Some((_, key)) = self.order.pop_first() else {
-            return false;
-        };
-        if let Some(entry) = self.entries.remove(&key) {
-            self.held -= entry.held;
-        }
-        true
-    }
-}
-
-/// The bytes of fresh objects that this shard stored or fetched. Losing any
-/// of it loses nothing: a read that misses goes to the store.
-///
-/// The two kinds are kept apart. A consumer far behind fetches old objects
-/// faster than anything reads them twice, and in one order with the stored
-/// objects it would push out the ones the consumers at the tail read next.
-/// So a fetched range only ever takes the place of another fetched range,
-/// and a stored object takes the place of fetched ranges first.
-struct FreshCache<Id = u128> {
-    /// Whole objects this shard stored, by object id.
-    stored: RecentBytes<Id>,
-    /// Ranges read from the store, by object id and the position each starts
-    /// at. No range of an object lies inside another, so the one that starts
-    /// last at or before a position is the only one that can hold it.
-    fetched: RecentBytes<(Id, u64)>,
-    /// The most memory both kinds hold together.
-    budget: usize,
-}
-
-impl<Id: Ord + Copy> FreshCache<Id> {
-    const fn new(budget: usize) -> Self {
-        Self {
-            stored: RecentBytes::new(),
-            fetched: RecentBytes::new(),
-            budget,
-        }
-    }
-
-    /// The most memory the stored objects hold.
-    const fn stored_budget(&self) -> usize {
-        self.budget - self.budget / FRESH_CACHE_FETCHED_SHARE
-    }
-
-    const fn held(&self) -> usize {
-        self.stored.held + self.fetched.held
-    }
-
-    /// Keep the whole object `object_id`, which this shard stored. It takes
-    /// the place of fetched ranges, and of the stored objects used the
-    /// longest ago. An object larger than the room of its kind is not kept.
-    fn insert_stored(&mut self, object_id: Id, bytes: Bytes) {
-        let limit = self.stored_budget();
-        if bytes.len() > limit {
-            return;
-        }
-        let (bytes, held) = held_within(bytes, limit);
-        self.stored.insert(object_id, bytes, held);
-        while self.stored.held > limit && self.stored.drop_least_recent() {}
-        while self.held() > self.budget && self.fetched.drop_least_recent() {}
-    }
-
-    /// Keep `bytes`, which were read from `position` of the object
-    /// `object_id`, in the place of the fetched ranges used the longest ago.
-    /// Bytes larger than the room the stored objects leave are not kept.
-    /// Returns the bytes as the caller should hold them.
-    ///
-    /// What the store returns can be a view into a larger buffer of its
-    /// transport, which no owner of the view can measure. So the cache keeps
-    /// a copy of exactly the range.
-    fn insert(&mut self, object_id: Id, position: u64, bytes: Bytes) -> Bytes {
-        let room = self.budget.saturating_sub(self.stored.held);
-        let end = position.saturating_add(bytes.len() as u64);
-        if bytes.is_empty() || bytes.len() > room || self.get(object_id, &(position..end)).is_some()
-        {
-            return bytes;
-        }
-        let bytes = Bytes::copy_from_slice(&bytes);
-        let held = bytes.len();
-        let inside: Vec<_> = self
-            .fetched
-            .entries
-            .range((object_id, position)..(object_id, end))
-            .filter(|((_, start), entry)| start + entry.bytes.len() as u64 <= end)
-            .map(|(key, _)| *key)
-            .collect();
-        for key in inside {
-            self.fetched.remove(&key);
-        }
-        self.fetched
-            .insert((object_id, position), bytes.clone(), held);
-        while self.held() > self.budget && self.fetched.drop_least_recent() {}
-        bytes
-    }
-
-    /// `range` of the object `object_id`, when one entry holds all of it.
-    /// That entry becomes the one used last.
-    fn get(&mut self, object_id: Id, range: &Range<u64>) -> Option<Bytes> {
-        let (entry, bytes) = self.find(object_id, range)?;
-        match entry {
-            CacheEntry::Stored => self.stored.mark_used(object_id),
-            CacheEntry::Fetched(position) => self.fetched.mark_used((object_id, position)),
-        }
-        Some(bytes)
-    }
-
-    /// As [`Self::get`], but the entry keeps its place in the order the
-    /// cache drops them in.
-    fn peek(&self, object_id: Id, range: &Range<u64>) -> Option<Bytes> {
-        self.find(object_id, range).map(|(_, bytes)| bytes)
-    }
-
-    fn find(&self, object_id: Id, range: &Range<u64>) -> Option<(CacheEntry, Bytes)> {
-        let stored = self
-            .stored
-            .entries
-            .get(&object_id)
-            .and_then(|entry| slice_at(&entry.bytes, 0, range));
-        if let Some(bytes) = stored {
-            return Some((CacheEntry::Stored, bytes));
-        }
-        self.fetched
-            .entries
-            .range((object_id, 0)..=(object_id, range.start))
-            .next_back()
-            .and_then(|((_, position), entry)| {
-                Some((
-                    CacheEntry::Fetched(*position),
-                    slice_at(&entry.bytes, *position, range)?,
-                ))
-            })
-    }
-}
-
-/// The entry of a [`FreshCache`] that holds a range.
-enum CacheEntry {
-    Stored,
-    /// The fetched range that starts at this position.
-    Fetched(u64),
-}
-
 /// `range` of an object out of `bytes`, which start at `position` of it.
 fn slice_at(bytes: &Bytes, position: u64, range: &Range<u64>) -> Option<Bytes> {
     let start = usize::try_from(range.start.checked_sub(position)?).ok()?;
@@ -412,22 +293,25 @@ fn slice_at(bytes: &Bytes, position: u64, range: &Range<u64>) -> Option<Bytes> {
     (end <= bytes.len()).then(|| bytes.slice(start..end))
 }
 
-/// `bytes` as the cache keeps them, and the memory they hold.
-///
-/// A buffer that grew by doubling holds up to twice its length. One with no
-/// other owner is kept as it is while its capacity is within `limit`, so
-/// keeping it copies nothing. Any other buffer is copied to its length: one
-/// that is shared can hold more memory than this owner can measure.
-fn held_within(bytes: Bytes, limit: usize) -> (Bytes, usize) {
-    let exact = |bytes: &[u8]| (Bytes::copy_from_slice(bytes), bytes.len());
-    match bytes.try_into_mut() {
-        Ok(unique) if unique.capacity() <= limit => {
-            let held = unique.capacity();
-            (unique.freeze(), held)
+/// The reads that fetch `ranges` of one object, in the order of their
+/// positions: ranges within [`FRESH_READ_GAP_BYTES`] of each other in one
+/// read of at most [`FRESH_READ_BYTES_MAX`], and a single range whatever its
+/// size.
+fn coalesced(mut ranges: Vec<Range<u64>>) -> Vec<Range<u64>> {
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut reads: Vec<Range<u64>> = Vec::new();
+    for range in ranges {
+        match reads.last_mut() {
+            Some(read)
+                if range.start <= read.end.saturating_add(FRESH_READ_GAP_BYTES)
+                    && range.end.max(read.end) - read.start <= FRESH_READ_BYTES_MAX =>
+            {
+                read.end = read.end.max(range.end);
+            }
+            _ => reads.push(range),
         }
-        Ok(unique) => exact(&unique),
-        Err(shared) => exact(&shared),
     }
+    reads
 }
 
 /// What one fetch read of a fresh object.
@@ -453,13 +337,53 @@ impl FreshReads {
     }
 }
 
+/// The read settings of one incarnation of a partition, which every poll
+/// plan of it shares and reads at each read of the store.
+///
+/// A plan runs off the pump, after plans built later may have run. Reading
+/// the shared value keeps an older plan from putting back a limit that the
+/// partition's topic changed since, and the flag set at the end of the
+/// incarnation keeps a plan that outlived it from reading for a partition
+/// that is gone.
+#[derive(Debug, Clone, Default)]
+pub struct ReadPolicy {
+    topic: Rc<Cell<(Option<usize>, Option<u64>)>>,
+    left: PartitionLeft,
+}
+
+impl ReadPolicy {
+    /// The incarnation reads with the limit and readahead of `settings`
+    /// from now on.
+    pub(crate) fn set(&self, settings: &PartitionReadSettings) {
+        self.topic.set((settings.limit, settings.read_ahead));
+    }
+
+    /// The incarnation left the shard, so its reads start no GET and keep
+    /// nothing.
+    pub(crate) fn end(&self) {
+        self.left.set();
+    }
+
+    /// What a read reads with now.
+    pub(crate) fn current(&self) -> PartitionReadSettings {
+        let (limit, read_ahead) = self.topic.get();
+        PartitionReadSettings {
+            limit,
+            read_ahead,
+            left: Some(self.left.clone()),
+        }
+    }
+}
+
 /// Where the shard reads remote segments from.
 pub struct RemoteSegments {
     objects: Rc<dyn RemoteObjects>,
     layout: KeyLayout,
     /// See [`INDEX_GET_TIMEOUT`].
     pub(crate) index_get_timeout: Duration,
-    fresh: RefCell<FreshCache>,
+    /// The reads through the shard's cache, `None` for reads that go to the
+    /// store for exactly their range.
+    pub(crate) blocks: Option<RemoteBlocks>,
 }
 
 impl RemoteSegments {
@@ -469,27 +393,225 @@ impl RemoteSegments {
             objects,
             layout,
             index_get_timeout: INDEX_GET_TIMEOUT,
-            fresh: RefCell::new(FreshCache::new(FRESH_CACHE_BYTES)),
+            blocks: None,
         }
     }
 
-    /// Keep at most `budget` bytes of fresh objects in memory.
-    #[cfg(test)]
-    pub(crate) fn set_fresh_cache_bytes(&mut self, budget: usize) {
-        self.fresh = RefCell::new(FreshCache::new(budget));
+    /// Reads of the node's own store through the tier service `executor`,
+    /// which keep the fresh objects the shard uploads in `cache`, and what
+    /// they fetch when the cache keeps that, fetching ahead of a poll that
+    /// reads a segment in order.
+    #[must_use]
+    pub fn cached<E>(executor: E, layout: KeyLayout, cache: &Rc<ReadCache>) -> Self
+    where
+        E: TierExecutor + Clone + 'static,
+    {
+        let ahead = Rc::new(ExecutorObjects::with_class(
+            executor.clone(),
+            TierJobClass::SpeculativeFetch,
+        ));
+        Self::new(Rc::new(ExecutorObjects::new(executor)), layout).with_cache(ahead, cache)
     }
 
-    /// Keep the bytes of the fresh object `object_id`, which this shard has
-    /// just stored, so that polls of its batches need no fetch. Bytes that
-    /// the shard built and no longer shares are kept without a copy, and
-    /// count as the capacity of their buffer.
-    pub fn cache_fresh_object(&self, object_id: u128, bytes: Bytes) {
-        self.fresh.borrow_mut().insert_stored(object_id, bytes);
+    /// Reads of the store of the geo peer in `store` through the shard's
+    /// `cache`, once `gate` admits them: through `demand` for what a read
+    /// waits for, and through `ahead` for readahead.
+    #[must_use]
+    pub fn through_cache(
+        demand: Rc<dyn RemoteObjects>,
+        ahead: Rc<dyn RemoteObjects>,
+        layout: KeyLayout,
+        cache: &Rc<ReadCache>,
+        store: StoreSlot,
+        gate: Rc<dyn ReadGate>,
+    ) -> Self {
+        let mut remote = Self::new(Rc::clone(&demand), layout);
+        remote.blocks = Some(RemoteBlocks::new(
+            Rc::clone(cache),
+            store,
+            gate,
+            demand,
+            ahead,
+        ));
+        remote
+    }
+
+    /// Read the node's own store through `cache`, and fetch ahead through
+    /// `ahead`.
+    #[must_use]
+    pub fn with_cache(mut self, ahead: Rc<dyn RemoteObjects>, cache: &Rc<ReadCache>) -> Self {
+        self.blocks = Some(RemoteBlocks::own(
+            Rc::clone(cache),
+            Rc::clone(&self.objects),
+            ahead,
+        ));
+        self
+    }
+
+    /// The reads through the shard's cache when it keeps what they fetch.
+    fn fetched_into_cache(&self) -> Option<&RemoteBlocks> {
+        self.blocks
+            .as_ref()
+            .filter(|blocks| blocks.cache().keeps_fetched())
+    }
+
+    /// Whether the cache holds all `len` bytes of the segment in `source`
+    /// from byte `position`, for the partition that reads them with
+    /// `settings`, so that a read of them asks the store nothing.
+    pub(crate) fn holds(
+        &self,
+        source: &RemoteRange,
+        position: u64,
+        len: usize,
+        settings: &PartitionReadSettings,
+    ) -> bool {
+        let start = source.range.start + position;
+        let end = start + len as u64;
+        end <= source.range.end
+            && self
+                .reading(source.key.prefix, settings)
+                .ok()
+                .flatten()
+                .is_some_and(|(blocks, _)| blocks.holds_segment(source, &(start..end)))
+    }
+
+    /// Drop what the cache holds of the `len` bytes of the segment in
+    /// `source` from byte `position`, which are not the batches that the
+    /// store holds there, so that the next read fetches them again.
+    pub(crate) fn forget_cached(&self, source: &RemoteRange, position: u64, len: usize) {
+        if let Some(blocks) = self.fetched_into_cache() {
+            let start = source.range.start + position;
+            blocks.forget_segment(source, &(start..start + len as u64));
+        }
+    }
+
+    /// What the cache that these reads go through did since the last take,
+    /// `None` without one.
+    #[must_use]
+    pub fn take_read_metrics(&self) -> Option<RemoteReadMetrics> {
+        self.blocks
+            .as_ref()
+            .map(|blocks| blocks.cache().take_metrics())
+    }
+
+    /// Hold the whole fresh object `object_id`, which this shard has just
+    /// stored, so that polls of its batches need no fetch until the
+    /// long-term floors of `partitions`, the partitions with a batch in it,
+    /// pass it. Bytes that the shard built and no longer shares are held
+    /// without a copy, and count as the capacity of their buffer. Reads
+    /// without a cache hold nothing.
+    pub fn cache_fresh_object(
+        &self,
+        object_id: u128,
+        bytes: Bytes,
+        partitions: impl IntoIterator<Item = IggyNamespace>,
+    ) {
+        if let Some(blocks) = &self.blocks {
+            blocks.hold_fresh(object_id, bytes, partitions);
+        }
+    }
+
+    /// Every send of the fresh object `object_id` was answered.
+    pub fn settle_fresh_object(&self, object_id: u128) {
+        if let Some(blocks) = &self.blocks {
+            blocks.cache().settle_fresh(object_id);
+        }
+    }
+
+    /// A batch of `namespace` in the fresh object `object_id` committed, its
+    /// last message at `end_offset`.
+    pub(crate) fn note_fresh_commit(
+        &self,
+        namespace: IggyNamespace,
+        object_id: u128,
+        end_offset: u64,
+    ) {
+        if let Some(blocks) = &self.blocks {
+            blocks
+                .cache()
+                .note_fresh_commit(namespace, object_id, end_offset);
+        }
+    }
+
+    /// The long-term floor of `namespace` moved to `floor`.
+    pub(crate) fn note_long_term_floor(&self, namespace: IggyNamespace, floor: u64) {
+        if let Some(blocks) = &self.blocks {
+            blocks.cache().passed_fresh(namespace, floor);
+        }
+    }
+
+    /// Keep the end of the long-term segment that a rewrite just stored, its
+    /// `.log` bytes `log` read by `segment`, and its `index`, when the cache
+    /// keeps what reads fetch, for the partition that reads with `settings`.
+    /// The copies count against the rewrite's `share`.
+    pub(crate) async fn carry_long_term(
+        &self,
+        segment: &RemoteRange,
+        log: &[u8],
+        index: &[u8],
+        settings: &PartitionReadSettings,
+        share: &mut RewriteShare,
+    ) {
+        if let Some(blocks) = self.fetched_into_cache() {
+            blocks
+                .carry_segment(segment, log, index, settings, share)
+                .await;
+        }
+    }
+
+    /// Whether the fresh object `object_id` is still held for the polls of
+    /// its partitions.
+    #[cfg(test)]
+    pub(crate) fn holds_fresh_object(&self, object_id: u128) -> bool {
+        self.blocks
+            .as_ref()
+            .is_some_and(|blocks| blocks.cache().holds_fresh(object_id))
+    }
+
+    /// `namespace` left the shard.
+    pub(crate) fn forget_partition(&self, namespace: IggyNamespace) {
+        if let Some(blocks) = &self.blocks {
+            blocks.cache().forget_fresh(namespace);
+        }
+    }
+
+    /// The partition whose incarnation `prefix` names in this store left the
+    /// shard: what its reads keep goes. What its GETs in flight fetch is not
+    /// kept once its [`PartitionReadSettings::left`] is set.
+    pub(crate) fn forget_reader(&self, prefix: ObjectPrefix) {
+        if let Some(blocks) = &self.blocks {
+            blocks.forget_reader(prefix);
+        }
+    }
+
+    /// How the partition `prefix` names reads through the cache with
+    /// `settings`, `None` without a cache that keeps what it fetches for it.
+    /// Without `settings`, those of an incarnation that left the shard, it
+    /// reads past the cache, so the cache records nothing for it again.
+    fn reading(
+        &self,
+        prefix: ObjectPrefix,
+        settings: &PartitionReadSettings,
+    ) -> Result<Option<(&RemoteBlocks, Reading)>, DiskFault> {
+        // A poll or a rewrite that outlives its partition starts no GET for
+        // it, through the cache or past it.
+        if settings.left_shard() {
+            return Err(DiskFault::Retryable);
+        }
+        let Some(blocks) = self.fetched_into_cache() else {
+            return Ok(None);
+        };
+        Ok(blocks
+            .reading(prefix, settings)
+            .map(|reading| (blocks, reading)))
     }
 
     /// The bytes at `range` of the fresh object `object_id`: the blob of one
     /// batch, from memory when this shard holds them and from the store
     /// otherwise.
+    ///
+    /// The reader is the partition whose incarnation `prefix` names, reading
+    /// with `settings`.
     ///
     /// An error the store may not repeat is retryable. Anything else is not:
     /// a missing object, a refusal, or fewer bytes than the range.
@@ -497,24 +619,32 @@ impl RemoteSegments {
         &self,
         object_id: u128,
         range: Range<u64>,
+        prefix: ObjectPrefix,
+        settings: &PartitionReadSettings,
     ) -> Result<Bytes, DiskFault> {
-        let cached = self.fresh.borrow_mut().get(object_id, &range);
-        if let Some(bytes) = cached {
-            return Ok(bytes);
+        if let Some(blob) = self
+            .blocks
+            .as_ref()
+            .and_then(|blocks| blocks.held_fresh(object_id))
+            .and_then(|object| slice_at(&object, 0, &range))
+        {
+            return Ok(blob);
         }
-        let bytes = self.read_fresh_from_store(object_id, range.clone()).await?;
-        Ok(self
-            .fresh
-            .borrow_mut()
-            .insert(object_id, range.start, bytes))
+        if let Some((blocks, reading)) = self.reading(prefix, settings)? {
+            let key_of = || self.layout.fresh_key(object_id);
+            return blocks.read_fresh(reading, object_id, &key_of, range).await;
+        }
+        self.read_fresh_from_store(object_id, range).await
     }
 
     /// `range` of the fresh object `object_id` when this shard holds it in
-    /// memory. The entry keeps its place in the order the cache drops them
-    /// in: a rewrite reads each blob once, and what it read is held by its
-    /// long-term segment from then on.
-    pub(crate) fn cached_fresh(&self, object_id: u128, range: &Range<u64>) -> Option<Bytes> {
-        self.fresh.borrow().peek(object_id, range)
+    /// memory, not counted as a read of it: a rewrite reads each blob once,
+    /// and what it read is in its long-term segment from then on.
+    ///
+    /// The bytes come in the pieces the cache keeps them in, back to back,
+    /// so that nothing is copied here.
+    pub(crate) fn cached_fresh(&self, object_id: u128, range: &Range<u64>) -> Option<Vec<Bytes>> {
+        self.blocks.as_ref()?.peek_fresh(object_id, range)
     }
 
     /// The bytes at `range` of the fresh object `object_id` from the store,
@@ -551,66 +681,80 @@ impl RemoteSegments {
         Ok(object.bytes)
     }
 
-    /// The bytes at `range` of the long-term segment object `key`, cut at
-    /// the end of the object.
+    /// The `.index` object of the long-term segment whose `.log` `log`
+    /// reads, whole and at most `cap` bytes. The index of a long-term
+    /// segment never changes once stored, so a cache may keep it.
     ///
     /// An error the store may not repeat is retryable. Anything else is not:
     /// a missing object or a refusal.
-    pub(crate) async fn read_long_term_object(
+    pub(crate) async fn read_long_term_index(
         &self,
-        key: &LongTermKey,
-        range: Range<u64>,
+        log: &RemoteRange,
+        cap: u64,
+        settings: &PartitionReadSettings,
     ) -> Result<Bytes, DiskFault> {
-        let key = self.layout.long_term_key(key);
+        if let Some((blocks, reading)) = self.reading(log.key.prefix, settings)? {
+            let key_of = || self.object_key(log, SegmentObject::Index);
+            return blocks.read_segment_index(reading, log, &key_of, cap).await;
+        }
+        let key = self.object_key(log, SegmentObject::Index);
         self.objects
-            .get_range(&key, range)
+            .get_range(&key, 0..cap)
             .await
             .map(|object| object.bytes)
             .map_err(|error| fault(&key, &error))
     }
 
-    /// Fetch the blobs at `ranges` of the fresh object `object_id` that this
-    /// shard does not hold, and return what was read. Blobs that sit within
+    /// Fetch the blobs at `ranges` of the fresh object `object_id`, and
+    /// return what was read, so a poll of many batches of one object asks
+    /// the store once and not once a batch. An object this shard holds is
+    /// read from memory. Otherwise blobs that sit within
     /// [`FRESH_READ_GAP_BYTES`] of each other come in one read of at most
-    /// [`FRESH_READ_BYTES_MAX`], so a poll of many batches of one object asks
-    /// the store once and not once a batch. The poll takes its blobs from the
-    /// returned reads, which the cache may have had no room to keep.
+    /// [`FRESH_READ_BYTES_MAX`], in the blocks of a cache that keeps what it
+    /// fetches. The poll takes its blobs from the returned reads, which the
+    /// cache may have had no room to keep. The reader is as in
+    /// [`Self::read_fresh`].
     ///
     /// # Errors
     /// As [`Self::read_fresh`].
     pub(crate) async fn fetch_fresh(
         &self,
         object_id: u128,
-        ranges: &[Range<u64>],
+        ranges: impl IntoIterator<Item = Range<u64>>,
+        prefix: ObjectPrefix,
+        settings: &PartitionReadSettings,
     ) -> Result<FreshReads, DiskFault> {
-        let mut missing: Vec<Range<u64>> = {
-            let mut cache = self.fresh.borrow_mut();
-            ranges
-                .iter()
-                .filter(|range| range.start < range.end && cache.get(object_id, range).is_none())
-                .cloned()
-                .collect()
-        };
-        missing.sort_unstable_by_key(|range| range.start);
-        let mut reads: Vec<Range<u64>> = Vec::new();
-        for range in missing {
-            match reads.last_mut() {
-                Some(read)
-                    if range.start <= read.end.saturating_add(FRESH_READ_GAP_BYTES)
-                        && range.end.max(read.end) - read.start <= FRESH_READ_BYTES_MAX =>
-                {
-                    read.end = read.end.max(range.end);
-                }
-                _ => reads.push(range),
-            }
+        if let Some(object) = self
+            .blocks
+            .as_ref()
+            .and_then(|blocks| blocks.held_fresh(object_id))
+        {
+            return Ok(FreshReads {
+                object_id,
+                reads: vec![(0, object)],
+            });
         }
+        let missing = ranges
+            .into_iter()
+            .filter(|range| range.start < range.end)
+            .collect();
+        let reads = coalesced(missing);
+        let through_cache = self.reading(prefix, settings)?;
+        let key_of = || self.layout.fresh_key(object_id);
         let mut fetched = FreshReads {
             object_id,
             reads: Vec::with_capacity(reads.len()),
         };
         for read in reads {
             let position = read.start;
-            let bytes = self.read_fresh(object_id, read).await?;
+            let bytes = match &through_cache {
+                Some((blocks, reading)) => {
+                    blocks
+                        .read_fresh(reading.clone(), object_id, &key_of, read)
+                        .await?
+                }
+                None => self.read_fresh_from_store(object_id, read).await?,
+            };
             fetched.reads.push((position, bytes));
         }
         Ok(fetched)
@@ -644,7 +788,10 @@ impl RemoteSegments {
     }
 
     /// Exactly `len` bytes of the segment in `source`, from byte `position`
-    /// of the segment.
+    /// of the segment, for the partition that reads it with `settings` and a
+    /// poll that reads `poll_offset` next when it knows that offset. `next`
+    /// is the segment the reader goes on to, if it is in the same store,
+    /// which readahead may run on into.
     ///
     /// An error the store may not repeat is retryable. Anything else is not:
     /// a missing object, a refusal, or fewer bytes than the segment holds.
@@ -653,13 +800,22 @@ impl RemoteSegments {
         source: &RemoteRange,
         position: u64,
         len: usize,
+        next: Option<&RemoteRange>,
+        poll_offset: Option<u64>,
+        settings: &PartitionReadSettings,
     ) -> Result<Frozen<4096>, DiskFault> {
-        let key = self.object_key(source, source.key.object);
         let start = source.range.start + position;
         let end = start + len as u64;
         if end > source.range.end {
             return Err(DiskFault::Tiered);
         }
+        if let Some((blocks, reading)) = self.reading(source.key.prefix, settings)? {
+            let key_of = |source: &RemoteRange| self.object_key(source, source.key.object);
+            return blocks
+                .read_segment(reading, source, &key_of, start..end, next, poll_offset)
+                .await;
+        }
+        let key = self.object_key(source, source.key.object);
         let object = self
             .objects
             .get_range(&key, start..end)
@@ -678,6 +834,56 @@ impl RemoteSegments {
             return Err(DiskFault::Tiered);
         }
         Ok(Frozen::from(Owned::<4096>::copy_from_slice(&object.bytes)))
+    }
+
+    /// The leading run of `segments` whose `.log` and `.index` the store holds
+    /// under `prefix` as their records describe. The run ends at the first
+    /// segment the store lacks, holds otherwise, or does not answer for in
+    /// [`STORED_SEGMENT_HEAD_TIMEOUT`].
+    pub(crate) async fn stored_front(
+        &self,
+        prefix: ObjectPrefix,
+        segments: Vec<SegmentRecord>,
+    ) -> Vec<SegmentRecord> {
+        stream::iter(segments)
+            .map(
+                |record| async move { self.holds_segment(prefix, &record).await.then_some(record) },
+            )
+            .buffered(STORED_SEGMENT_CHECKS)
+            .take_while(|held| future::ready(held.is_some()))
+            .filter_map(future::ready)
+            .collect()
+            .await
+    }
+
+    async fn holds_segment(&self, prefix: ObjectPrefix, record: &SegmentRecord) -> bool {
+        let key = |object| {
+            self.layout.segment_key(&SegmentKey {
+                prefix,
+                start_offset: record.start_offset,
+                object,
+            })
+        };
+        let (log_key, index_key) = (key(SegmentObject::Log), key(SegmentObject::Index));
+        let heads = future::join(self.objects.head(&log_key), self.objects.head(&index_key));
+        let reason = match compio::time::timeout(STORED_SEGMENT_HEAD_TIMEOUT, heads).await {
+            Ok((Ok(log), Ok(index))) => {
+                if is_recorded_log(&log, record) && is_whole_index(&index) {
+                    return true;
+                }
+                "the store holds other objects than the record describes".to_owned()
+            }
+            Ok((Err(error), _) | (_, Err(error))) => error.to_string(),
+            Err(_) => "the store did not answer in time".to_owned(),
+        };
+        warn!(
+            target: "iggy.partitions.diag",
+            plane = "partitions",
+            key = log_key,
+            reason,
+            "state transfer: a stored segment is not confirmed in the store, so its bytes travel"
+        );
+        false
     }
 
     /// Fetch the `.index` object next to the `.log` in `log` and put it at
@@ -838,7 +1044,9 @@ fn field(entry: &[u8; IGGY_INDEX_SIZE], slot: usize) -> u64 {
     u64::from_le_bytes(bytes)
 }
 
-fn fault(key: &str, error: &ObjectStoreError) -> DiskFault {
+/// What a store that failed a read of `key` with `error` means for the poll,
+/// logged: retryable for a transient error, tiered for any other.
+pub fn fault(key: &str, error: &ObjectStoreError) -> DiskFault {
     warn!(
         target: "iggy.partitions.diag",
         plane = "partitions",
@@ -1446,332 +1654,6 @@ mod tests {
         assert!(matches!(missing, Err(ObjectStoreError::NotFound { .. })));
     }
 
-    #[test]
-    fn given_a_cached_object_when_asking_for_ranges_should_answer_only_what_one_entry_holds() {
-        let mut cache = FreshCache::new(64);
-        cache.insert(7, 0, Bytes::from_static(b"0123456789"));
-        cache.insert(7, 100, Bytes::from_static(b"abcde"));
-
-        assert_eq!(cache.get(7, &(2..6)).unwrap(), "2345");
-        assert_eq!(cache.get(7, &(0..10)).unwrap(), "0123456789");
-        assert_eq!(cache.get(7, &(101..104)).unwrap(), "bcd");
-        // Past the entry, before it, between two, and of another object.
-        assert_eq!(cache.get(7, &(8..11)), None);
-        assert_eq!(cache.get(7, &(99..102)), None);
-        assert_eq!(cache.get(7, &(10..100)), None);
-        assert_eq!(cache.get(8, &(2..6)), None);
-    }
-
-    #[test]
-    fn given_more_bytes_than_the_budget_when_inserting_should_drop_the_oldest_entries() {
-        let mut cache = FreshCache::new(10);
-        cache.insert(1, 0, Bytes::from_static(b"aaaa"));
-        cache.insert(2, 0, Bytes::from_static(b"bbbb"));
-        cache.insert(3, 0, Bytes::from_static(b"cccc"));
-
-        assert_eq!(cache.get(1, &(0..4)), None);
-        assert_eq!(cache.get(2, &(0..4)).unwrap(), "bbbb");
-        assert_eq!(cache.get(3, &(0..4)).unwrap(), "cccc");
-        assert_eq!(cache.held(), 8);
-
-        // Larger than the whole budget: not kept, and nothing is dropped for it.
-        cache.insert(4, 0, Bytes::from_static(b"dddddddddddd"));
-        assert_eq!(cache.get(4, &(0..12)), None);
-        assert_eq!(cache.held(), 8);
-    }
-
-    /// A buffer of `len` bytes that holds `capacity` and has no other owner,
-    /// as an object that grew by doubling does.
-    fn grown(len: usize, capacity: usize) -> Bytes {
-        let mut bytes = bytes::BytesMut::with_capacity(capacity);
-        bytes.resize(len, b'x');
-        bytes.freeze()
-    }
-
-    std::thread_local! {
-        static ID_COMPARISONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    }
-
-    /// An object id that counts how often the cache compares it.
-    #[derive(Clone, Copy, Debug)]
-    struct CountedId(u64);
-
-    impl Ord for CountedId {
-        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-            ID_COMPARISONS.with(|comparisons| comparisons.set(comparisons.get() + 1));
-            self.0.cmp(&other.0)
-        }
-    }
-
-    impl PartialOrd for CountedId {
-        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-            Some(self.cmp(other))
-        }
-    }
-
-    impl PartialEq for CountedId {
-        fn eq(&self, other: &Self) -> bool {
-            self.cmp(other).is_eq()
-        }
-    }
-
-    impl Eq for CountedId {}
-
-    /// The ids `step` compared.
-    fn comparisons_of<T>(step: impl FnOnce() -> T) -> (T, u64) {
-        ID_COMPARISONS.with(|comparisons| comparisons.set(0));
-        let result = step();
-        (result, ID_COMPARISONS.with(std::cell::Cell::get))
-    }
-
-    #[test]
-    fn given_many_cached_entries_when_looking_one_up_should_not_walk_the_others() {
-        const ENTRIES: u64 = 1 << 16;
-        // A walk of the entries compares an id per entry. The searches of one
-        // lookup or insert compare a few hundred at most.
-        const MOST_COMPARISONS: u64 = ENTRIES / 64;
-        let mut cache = FreshCache::new(usize::MAX);
-        let fetched = |entry: u64| CountedId(ENTRIES + entry);
-        for entry in 0..ENTRIES {
-            let ((), stored) = comparisons_of(|| {
-                cache.insert_stored(CountedId(entry), Bytes::from_static(b"s"));
-            });
-            let (_, range) =
-                comparisons_of(|| cache.insert(fetched(entry), 0, Bytes::from_static(b"f")));
-            assert!(stored.max(range) <= MOST_COMPARISONS, "entry {entry}");
-        }
-
-        for entry in [0, ENTRIES / 2, ENTRIES - 1] {
-            let (stored, compared) = comparisons_of(|| cache.get(CountedId(entry), &(0..1)));
-            assert_eq!(stored.unwrap(), "s");
-            assert!(
-                compared <= MOST_COMPARISONS,
-                "{compared} for a stored object"
-            );
-            let (range, compared) = comparisons_of(|| cache.get(fetched(entry), &(0..1)));
-            assert_eq!(range.unwrap(), "f");
-            assert!(
-                compared <= MOST_COMPARISONS,
-                "{compared} for a fetched range"
-            );
-            let (missing, compared) =
-                comparisons_of(|| cache.get(CountedId(3 * ENTRIES + entry), &(0..1)));
-            assert_eq!(missing, None);
-            assert!(compared <= MOST_COMPARISONS, "{compared} for a miss");
-        }
-    }
-
-    #[test]
-    fn given_a_stored_object_when_old_ranges_are_fetched_past_the_budget_should_keep_it() {
-        let mut cache = FreshCache::new(64);
-        cache.insert_stored(1, Bytes::from_static(b"just stored by this shard"));
-
-        // A consumer far behind reads one old object after another.
-        for old in 100..200 {
-            cache.insert(old, 0, Bytes::from_static(b"0123456789"));
-            assert_eq!(cache.get(old, &(0..10)).unwrap(), "0123456789");
-        }
-
-        assert_eq!(cache.get(1, &(5..11)).unwrap(), "stored");
-        assert_eq!(cache.get(100, &(0..10)), None);
-        assert!(cache.held() <= 64);
-    }
-
-    #[test]
-    fn given_fetched_ranges_in_the_whole_budget_when_storing_objects_should_drop_the_ranges_first()
-    {
-        let mut cache = FreshCache::new(64);
-        for old in 100..106 {
-            cache.insert(old, 0, Bytes::from_static(b"0123456789"));
-        }
-        assert_eq!(cache.held(), 60);
-
-        for stored in 1..=7 {
-            cache.insert_stored(stored, Bytes::from_static(b"abcdefgh"));
-        }
-
-        // The stored objects took all but the part they never take.
-        for stored in 1..=7 {
-            assert_eq!(cache.get(stored, &(0..8)).unwrap(), "abcdefgh");
-        }
-        assert_eq!(cache.stored.held, 56);
-        assert_eq!(cache.fetched.held, 0);
-        // An eighth object takes the place of a stored one, and a read as
-        // large as the part for fetched ranges is still kept.
-        cache.insert_stored(8, Bytes::from_static(b"abcdefgh"));
-        assert_eq!(cache.get(1, &(0..8)), None);
-        cache.insert(200, 0, Bytes::from_static(b"01234567"));
-        assert_eq!(cache.get(200, &(0..8)).unwrap(), "01234567");
-        assert_eq!(cache.held(), 64);
-        // No room is left for a longer one, which is not kept.
-        cache.insert(201, 0, Bytes::from_static(b"012345678"));
-        assert_eq!(cache.get(201, &(0..9)), None);
-        assert_eq!(cache.stored.held, 56);
-    }
-
-    #[test]
-    fn given_an_entry_read_again_when_the_budget_runs_out_should_keep_it_over_one_that_was_not() {
-        let mut cache = FreshCache::new(16);
-        cache.insert(1, 0, Bytes::from_static(b"aaaa"));
-        cache.insert(2, 0, Bytes::from_static(b"bbbb"));
-        cache.insert(3, 0, Bytes::from_static(b"cccc"));
-        cache.insert(4, 0, Bytes::from_static(b"dddd"));
-        assert_eq!(cache.get(1, &(1..3)).unwrap(), "aa");
-        cache.insert(5, 0, Bytes::from_static(b"eeee"));
-
-        assert_eq!(cache.get(1, &(0..4)).unwrap(), "aaaa");
-        assert_eq!(cache.get(2, &(0..4)), None);
-
-        let mut cache = FreshCache::new(16);
-        cache.insert_stored(1, Bytes::from_static(b"aaaaaaa"));
-        cache.insert_stored(2, Bytes::from_static(b"bbbbbbb"));
-        assert_eq!(cache.get(1, &(0..1)).unwrap(), "a");
-        cache.insert_stored(3, Bytes::from_static(b"ccccccc"));
-
-        assert_eq!(cache.get(1, &(0..7)).unwrap(), "aaaaaaa");
-        assert_eq!(cache.get(2, &(0..7)), None);
-        assert_eq!(cache.get(3, &(0..7)).unwrap(), "ccccccc");
-    }
-
-    #[test]
-    fn given_an_entry_a_rewrite_read_when_the_budget_runs_out_should_drop_it_in_its_turn() {
-        let mut cache = FreshCache::new(16);
-        cache.insert(1, 0, Bytes::from_static(b"aaaa"));
-        cache.insert(2, 0, Bytes::from_static(b"bbbb"));
-        cache.insert(3, 0, Bytes::from_static(b"cccc"));
-        cache.insert(4, 0, Bytes::from_static(b"dddd"));
-        assert_eq!(cache.peek(1, &(1..3)).unwrap(), "aa");
-        cache.insert(5, 0, Bytes::from_static(b"eeee"));
-
-        assert_eq!(cache.get(1, &(0..4)), None);
-        assert_eq!(cache.get(2, &(0..4)).unwrap(), "bbbb");
-
-        let mut cache = FreshCache::new(16);
-        cache.insert_stored(1, Bytes::from_static(b"aaaaaaa"));
-        cache.insert_stored(2, Bytes::from_static(b"bbbbbbb"));
-        assert_eq!(cache.peek(1, &(0..1)).unwrap(), "a");
-        cache.insert_stored(3, Bytes::from_static(b"ccccccc"));
-
-        assert_eq!(cache.get(1, &(0..7)), None);
-        assert_eq!(cache.get(2, &(0..7)).unwrap(), "bbbbbbb");
-    }
-
-    #[test]
-    fn given_buffers_with_spare_capacity_when_caching_them_should_count_what_they_hold() {
-        let mut cache = FreshCache::new(4800);
-        cache.insert_stored(1, grown(600, 1200));
-        assert_eq!(cache.held(), 1200);
-        cache.insert_stored(2, grown(600, 1200));
-        cache.insert_stored(3, grown(600, 1200));
-        assert_eq!(cache.held(), 3600);
-
-        // By their lengths all four fit. They hold twice that.
-        cache.insert_stored(4, grown(600, 1200));
-        assert_eq!(cache.held(), 3600);
-        assert_eq!(cache.get(1, &(0..600)), None);
-        assert_eq!(cache.get(4, &(0..600)).unwrap().len(), 600);
-
-        // A range read from the store is kept as a copy of its length.
-        cache.insert(9, 0, grown(100, 300));
-        assert_eq!(cache.fetched.held, 100);
-        assert_eq!(cache.held(), 3700);
-    }
-
-    #[test]
-    fn given_a_range_that_views_a_larger_buffer_when_caching_it_should_keep_a_copy_of_only_the_range()
-     {
-        let buffer = Bytes::from(vec![7_u8; 4096]);
-        let spans = buffer.as_ptr_range();
-        let view = buffer.slice(1000..1100);
-        drop(buffer);
-        let mut cache = FreshCache::new(4096);
-
-        let kept = cache.insert(1, 1000, view);
-
-        assert_eq!(kept, vec![7_u8; 100]);
-        assert_eq!(cache.held(), 100);
-        let cached = cache.get(1, &(1000..1100)).unwrap();
-        assert!(
-            !spans.contains(&cached.as_ptr()),
-            "it holds the whole buffer"
-        );
-    }
-
-    #[test]
-    fn given_a_buffer_that_is_shared_or_holds_too_much_when_caching_it_should_keep_a_copy_of_its_length()
-     {
-        let mut cache = FreshCache::new(4096);
-        let shared = grown(600, 1200);
-        cache.insert_stored(1, shared.clone());
-        assert_eq!(cache.held(), 600);
-        assert_eq!(cache.get(1, &(0..600)).unwrap(), shared);
-
-        // Its capacity is past what stored objects may hold, its length is not.
-        let mut cache = FreshCache::new(4096);
-        cache.insert_stored(2, grown(3000, 6000));
-        assert_eq!(cache.held(), 3000);
-        assert_eq!(cache.get(2, &(0..3000)).unwrap().len(), 3000);
-    }
-
-    #[test]
-    fn given_a_range_fetched_around_a_kept_one_when_asking_should_answer_from_the_wider_one() {
-        let mut cache = FreshCache::new(1024);
-        let object: Vec<u8> = (0..=255).collect();
-        cache.insert(7, 100, Bytes::copy_from_slice(&object[100..200]));
-        cache.insert(7, 0, Bytes::copy_from_slice(&object[..250]));
-
-        assert_eq!(cache.get(7, &(200..250)).unwrap(), object[200..250]);
-        assert_eq!(cache.get(7, &(120..180)).unwrap(), object[120..180]);
-        assert_eq!(cache.held(), 250, "the range inside the wider one is gone");
-
-        // A range that an entry already holds is not kept a second time.
-        cache.insert(7, 50, Bytes::copy_from_slice(&object[50..60]));
-        assert_eq!(cache.held(), 250);
-    }
-
-    #[compio::test]
-    async fn given_an_object_this_shard_stored_when_a_consumer_catches_up_should_serve_it_from_memory()
-     {
-        let store = Asked::holding(4096);
-        let mut remote = RemoteSegments::new(store.clone(), KeyLayout::new("iggy").unwrap());
-        remote.fresh = RefCell::new(FreshCache::new(1024));
-        remote.cache_fresh_object(1, store.object.slice(..512));
-
-        for old in 100..120 {
-            remote.read_fresh(old, 0..128).await.unwrap();
-        }
-        let asked = store.ranges.borrow().len();
-        assert_eq!(asked, 20);
-
-        assert_eq!(
-            remote.read_fresh(1, 10..500).await.unwrap(),
-            store.object.slice(10..500)
-        );
-        assert_eq!(store.ranges.borrow().len(), asked);
-    }
-
-    #[compio::test]
-    async fn given_a_fresh_range_read_once_when_reading_it_again_should_not_ask_the_store() {
-        let store = Rc::new(MemoryStore::new());
-        let layout = KeyLayout::new("iggy").unwrap();
-        store
-            .put(
-                &layout.fresh_key(7),
-                PutBody::from_bytes(Bytes::from_static(b"0123456789")),
-                &PutOptions::default(),
-            )
-            .await
-            .unwrap();
-        let remote = RemoteSegments::new(store.clone(), layout.clone());
-
-        assert_eq!(remote.read_fresh(7, 2..6).await.unwrap(), "2345");
-        let deleted = store.delete(&[layout.fresh_key(7)]).await.unwrap();
-        assert!(deleted.failed.is_empty());
-
-        assert_eq!(remote.read_fresh(7, 2..6).await.unwrap(), "2345");
-        assert_eq!(remote.read_fresh(7, 0..2).await, Err(DiskFault::Tiered));
-    }
-
     /// One object, and the ranges it was asked for.
     struct Asked {
         object: Bytes,
@@ -1809,41 +1691,28 @@ mod tests {
         }
     }
 
+    /// Without a cache, a poll's blobs of one object still cost one read
+    /// when they are close together, and the poll takes them from what it
+    /// read.
     #[compio::test]
-    async fn given_blobs_close_together_when_fetching_them_should_ask_the_store_once() {
+    async fn given_blobs_close_together_and_no_cache_when_fetching_them_should_ask_the_store_once_and_hand_back_what_it_read()
+     {
         let store = Asked::holding(4096);
         let remote = RemoteSegments::new(store.clone(), KeyLayout::new("iggy").unwrap());
         let blobs = [100..200, 200..300, 1000..1100];
 
-        remote.fetch_fresh(7, &blobs).await.unwrap();
+        let fetched = remote
+            .fetch_fresh(
+                7,
+                blobs.clone(),
+                log().key.prefix,
+                &PartitionReadSettings::SHARD,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(store.ranges.borrow().len(), 1);
         assert_eq!(store.ranges.borrow()[0], 100..1100);
-        for blob in blobs {
-            let expected = store
-                .object
-                .slice(usize::try_from(blob.start).unwrap()..usize::try_from(blob.end).unwrap());
-            assert_eq!(remote.read_fresh(7, blob).await.unwrap(), expected);
-        }
-        assert_eq!(
-            store.ranges.borrow().len(),
-            1,
-            "every blob came from memory"
-        );
-    }
-
-    #[compio::test]
-    async fn given_a_cache_without_room_when_fetching_blobs_should_hand_back_what_it_read() {
-        let store = Asked::holding(4096);
-        let mut remote = RemoteSegments::new(store.clone(), KeyLayout::new("iggy").unwrap());
-        remote.set_fresh_cache_bytes(0);
-        let blobs = [100..200, 200..300, 1000..1100];
-
-        let fetched = remote.fetch_fresh(7, &blobs).await.unwrap();
-
-        assert_eq!(store.ranges.borrow().len(), 1);
-        assert_eq!(store.ranges.borrow()[0], 100..1100);
-        assert_eq!(remote.fresh.borrow().held(), 0);
         for blob in blobs {
             let expected = store
                 .object
@@ -1865,7 +1734,15 @@ mod tests {
         let third = far + FRESH_READ_BYTES_MAX;
         let blobs = [third..third + 100, 0..100, far..far + 100];
 
-        remote.fetch_fresh(7, &blobs).await.unwrap();
+        remote
+            .fetch_fresh(
+                7,
+                blobs.clone(),
+                log().key.prefix,
+                &PartitionReadSettings::SHARD,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(
             *store.ranges.borrow(),
@@ -1874,27 +1751,20 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_blobs_this_shard_holds_when_fetching_should_ask_only_for_the_others() {
-        let store = Asked::holding(4096);
-        let remote = RemoteSegments::new(store.clone(), KeyLayout::new("iggy").unwrap());
-        remote.read_fresh(7, 100..200).await.unwrap();
-
-        remote
-            .fetch_fresh(7, &[100..200, 200..300, 150..150])
-            .await
-            .unwrap();
-        remote.fetch_fresh(7, &[100..200, 200..300]).await.unwrap();
-
-        assert_eq!(*store.ranges.borrow(), [100..200, 200..300]);
-    }
-
-    #[compio::test]
     async fn given_an_object_shorter_than_its_blobs_when_fetching_should_fail_the_read() {
         let store = Asked::holding(250);
         let remote = RemoteSegments::new(store, KeyLayout::new("iggy").unwrap());
 
         assert_eq!(
-            remote.fetch_fresh(7, &[100..200, 200..300]).await.err(),
+            remote
+                .fetch_fresh(
+                    7,
+                    [100..200, 200..300],
+                    log().key.prefix,
+                    &PartitionReadSettings::SHARD
+                )
+                .await
+                .err(),
             Some(DiskFault::Tiered)
         );
     }

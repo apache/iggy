@@ -24,7 +24,7 @@
 //! [`partitions::TopicObjects`]. So the metadata primary stores the object of
 //! a new geo topic on its next pass after the topic commits. It stores the
 //! object again whenever what the object holds changes, as when the stream
-//! is renamed.
+//! is renamed or an update changes the topic's read cache settings.
 //!
 //! Once a minute, a sweep lists every topic object under the root:
 //!
@@ -466,6 +466,16 @@ fn topic_object(
             .geo_durations
             .tombstone_grace
             .map_or(0, |grace| grace.as_micros()),
+        read_cache_size: topic
+            .resolved
+            .read_cache
+            .size
+            .map(|size| size.as_bytes_u64()),
+        read_ahead: topic
+            .resolved
+            .read_cache
+            .read_ahead
+            .map(|bytes| bytes.as_bytes_u64()),
     })
 }
 

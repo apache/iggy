@@ -88,7 +88,7 @@ use iggy_common::{
     TopicCreateOptions, TopicResolvedOptions, UserId, UserStatus, admit, admit_geo_topic,
     admit_tiered_storage, critical_keys_marker, derived_defaults, drop_options_fixed_by_type,
     stream_wrap_set, topic_option_keys, validate_geo_topic, validate_local_retention,
-    validate_segment_max_age, validate_topic_segment_size,
+    validate_read_cache, validate_segment_max_age, validate_topic_segment_size,
 };
 use journal::local_gate::{LocalGate, LocalGateAcquire, OwnedLocalGateGuard};
 use journal::superblock::{
@@ -6222,6 +6222,7 @@ where
                 admit_geo_topic(&admitted.explicit, self.tiered_storage_cluster_ready())?;
                 admit_tiered_storage(&admitted.explicit, self.tiered_storage_cluster_ready())?;
                 validate_local_retention(&stored)?;
+                validate_read_cache(&stored)?;
                 let derived_options = resource_options_to_wire(&derived, OptionsProvenance::All)?;
                 let mut counts = self.placement_counts()?;
                 let partitions = self
@@ -8971,8 +8972,8 @@ mod tests {
             derived_options: WireOptions::empty(),
             partitions: Vec::new(),
         };
-        let durability = HeaderKey::from(OptionKey::Durability);
         let replicated = OptionValue::explicit(Durability::Replicated.encode().unwrap());
+        let persisted = OptionValue::derived(Durability::Persisted.encode().unwrap());
 
         let mut restored = create(&TopicCreateOptions {
             topic_type: Some(TopicType::Geo),
@@ -8982,19 +8983,20 @@ mod tests {
         metadata.assign_shadow_partitions(&mut restored).unwrap();
         let explicit = resource_options_from_wire(&restored.request.options, true).unwrap();
         let derived = resource_options_from_wire(&restored.derived_options, false).unwrap();
-        assert!(!explicit.contains_key(&durability));
-        assert_eq!(
-            derived.get(&durability),
-            Some(&OptionValue::derived(
-                Durability::Persisted.encode().unwrap()
-            ))
-        );
+        for key in Durability::KEYS {
+            let key = HeaderKey::from(key);
+            assert!(!explicit.contains_key(&key), "{key:?}");
+            assert_eq!(derived.get(&key), Some(&persisted), "{key:?}");
+        }
 
         // A shadow adoption is stored as a normal topic and keeps its block.
         let mut adopted = create(&TopicCreateOptions::default());
         metadata.assign_shadow_partitions(&mut adopted).unwrap();
         let explicit = resource_options_from_wire(&adopted.request.options, true).unwrap();
-        assert_eq!(explicit.get(&durability), Some(&replicated));
+        for key in Durability::KEYS {
+            let key = HeaderKey::from(key);
+            assert_eq!(explicit.get(&key), Some(&replicated), "{key:?}");
+        }
     }
 
     #[test]
@@ -9746,7 +9748,6 @@ mod tests {
     #[test]
     fn given_a_geo_topic_naming_a_durability_when_preparing_should_ignore_it_and_derive_persisted()
     {
-        let durability = HeaderKey::from(OptionKey::Durability);
         for named in [Durability::Replicated, Durability::Persisted] {
             let plane = metadata_plane();
             plane.observe_tiered_storage_readiness(true);
@@ -9755,6 +9756,7 @@ mod tests {
                 &iggy_common::TopicCreateOptions {
                     topic_type: Some(TopicType::Geo),
                     durability: named,
+                    consumer_offset_durability: named,
                     ..Default::default()
                 },
             )
@@ -9763,27 +9765,33 @@ mod tests {
                 .expect("explicit block decodes");
             let derived = resource_options_from_wire(&persisted.derived_options, false)
                 .expect("derived block decodes");
-            assert!(!explicit.contains_key(&durability), "{named} is ignored");
-            assert_eq!(
-                derived.get(&durability),
-                Some(&OptionValue::derived(
-                    Durability::Persisted.encode().unwrap()
-                )),
-                "{named}"
-            );
+            for key in Durability::KEYS {
+                let key = HeaderKey::from(key);
+                assert!(!explicit.contains_key(&key), "{named} {key:?} is ignored");
+                assert_eq!(
+                    derived.get(&key),
+                    Some(&OptionValue::derived(
+                        Durability::Persisted.encode().unwrap()
+                    )),
+                    "{named} {key:?}"
+                );
+            }
         }
 
         let normal = prepare_topic_with(&iggy_common::TopicCreateOptions::default())
             .expect("a normal topic is admitted");
         let explicit = resource_options_from_wire(&normal.request.options, true)
             .expect("explicit block decodes");
-        assert_eq!(
-            explicit.get(&durability),
-            Some(&OptionValue::explicit(
-                Durability::Replicated.encode().unwrap()
-            )),
-            "a normal topic keeps the durability it names"
-        );
+        for key in Durability::KEYS {
+            let key = HeaderKey::from(key);
+            assert_eq!(
+                explicit.get(&key),
+                Some(&OptionValue::explicit(
+                    Durability::Replicated.encode().unwrap()
+                )),
+                "a normal topic keeps the {key:?} it names"
+            );
+        }
     }
 
     #[test]
@@ -9842,6 +9850,38 @@ mod tests {
             })
             .is_ok()
         );
+    }
+
+    #[test]
+    fn given_a_read_ahead_above_an_eighth_of_the_read_cache_when_preparing_create_topic_should_refuse_it()
+     {
+        const MIB: u64 = 1 << 20;
+        let read_cache = |size: u64, read_ahead: u64| iggy_common::TopicCreateOptions {
+            read_cache: iggy_common::TopicReadCache {
+                size: Some(iggy_common::IggyByteSize::from(size)),
+                read_ahead: Some(iggy_common::IggyByteSize::from(read_ahead)),
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            prepare_topic_with(&read_cache(8 * MIB, 2 * MIB)).err(),
+            Some(IggyError::InvalidOptionValue("read_ahead".to_owned()))
+        );
+
+        let persisted = prepare_topic_with(&read_cache(0, 2 * MIB))
+            .expect("a topic that caches nothing has no readahead to bound");
+        let stored = TopicResolvedOptions::from(
+            &resource_options_from_wire(&persisted.request.options, true)
+                .expect("explicit block decodes"),
+        );
+        assert_eq!(
+            stored.read_cache,
+            iggy_common::TopicReadCache {
+                size: Some(iggy_common::IggyByteSize::from(0u64)),
+                read_ahead: Some(iggy_common::IggyByteSize::from(2 * MIB)),
+            }
+        );
+        assert!(prepare_topic_with(&read_cache(8 * MIB, MIB)).is_ok());
     }
 
     #[test]

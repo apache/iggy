@@ -65,7 +65,9 @@ public class OptionsTests
         "positions_publish_interval",
         "tombstone_grace",
         "positions_resume_timeout",
-        "long_term_rewrite_max_interval"
+        "long_term_rewrite_max_interval",
+        "read_cache_size",
+        "read_ahead"
     ];
 
     private static readonly string[] NeverReturnedKeys = ["encryption_key", "encryption_key_wrapped", "critical_keys"];
@@ -211,7 +213,9 @@ public class OptionsTests
             PositionsPublishInterval = TimeSpan.FromSeconds(1),
             TombstoneGrace = TimeSpan.FromHours(1),
             PositionsResumeTimeout = TimeSpan.Zero,
-            LongTermRewriteMaxInterval = TimeSpan.FromSeconds(10)
+            LongTermRewriteMaxInterval = TimeSpan.FromSeconds(10),
+            ReadCacheSize = 16_777_216,
+            ReadAhead = 0
         }.ToDictionary().Keys;
 
         typedKeys.ShouldAllBe(key => catalogKeys.Contains(key));

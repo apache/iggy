@@ -85,7 +85,9 @@ internal static class OptionKeys
         new("positions_publish_interval", HeaderKind.Uint64, OptionFlags.Updatable),
         new("tombstone_grace", HeaderKind.Uint64, OptionFlags.Updatable),
         new("positions_resume_timeout", HeaderKind.Uint64, OptionFlags.Updatable),
-        new("long_term_rewrite_max_interval", HeaderKind.Uint64, OptionFlags.Updatable)
+        new("long_term_rewrite_max_interval", HeaderKind.Uint64, OptionFlags.Updatable),
+        new("read_cache_size", HeaderKind.Uint64, OptionFlags.Updatable),
+        new("read_ahead", HeaderKind.Uint64, OptionFlags.Updatable)
     ];
 
     private static readonly OptionDescriptor[] UserKeys =
@@ -147,6 +149,8 @@ internal static class OptionKeys
             TopicOptionKey.TombstoneGrace => "tombstone_grace",
             TopicOptionKey.PositionsResumeTimeout => "positions_resume_timeout",
             TopicOptionKey.LongTermRewriteMaxInterval => "long_term_rewrite_max_interval",
+            TopicOptionKey.ReadCacheSize => "read_cache_size",
+            TopicOptionKey.ReadAhead => "read_ahead",
             _ => throw new ArgumentOutOfRangeException(nameof(key), key, "Unknown topic option key")
         });
     }

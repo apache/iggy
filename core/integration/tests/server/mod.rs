@@ -66,12 +66,18 @@ mod geo_shadow_follow_fs;
 // A consumer group that moves between two clusters on fs resumes from about
 // where it stopped, exactly after a drain, and keeps a move backwards.
 mod geo_positions_fs;
+// One group reads a geo topic with its shadow topics through the SDK's geo
+// consumer: every message once with its origin, a shadow topic that appears
+// later, and a move to the other cluster that resumes each log.
+mod geo_consumer_fs;
 // A geo topic whose object store goes down: its sends are refused as
 // retryable, a normal topic keeps serving, and nothing refused is stored.
 mod geo_mode_faults_fs;
 // The geo topic scenarios on the `s3` backend, against Floci.
 mod geo_mode_faults_s3;
 pub(crate) mod tiered_storage_fs;
+// The sweep of the store root for the objects of deleted partitions.
+mod tiered_storage_orphans_fs;
 // A server on the `gcs` backend, against fake-gcs-server: the claim, a geo
 // topic read back from its long-term segments, and both token sources.
 mod tiered_storage_gcs;

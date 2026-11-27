@@ -251,7 +251,7 @@ async fn scrape(http: &HttpClient) -> String {
 
 /// The value of the `name` series of the peer `origin`. Every shard exports
 /// the same node gauges, so any shard's series holds it.
-fn gauge(exposition: &str, name: &str, origin: &str) -> Option<u64> {
+pub(crate) fn gauge(exposition: &str, name: &str, origin: &str) -> Option<u64> {
     let series_prefix = format!("{name}{{");
     let origin_label = format!("origin=\"{origin}\"");
     exposition

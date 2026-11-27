@@ -21,11 +21,13 @@ use std::time::SystemTime;
 
 use chrono::DateTime;
 use percent_encoding::percent_decode_str;
+use quick_xml::Reader;
 use quick_xml::escape::escape;
+use quick_xml::events::Event;
 use serde::Deserialize;
 
 use crate::error::ObjectStoreError;
-use crate::store::{ListPage, ListedObject};
+use crate::store::{ListPage, ListedObject, StoredPart};
 
 /// The code and the message of an S3 error body.
 #[derive(Debug, Default, Deserialize)]
@@ -73,6 +75,55 @@ struct Contents {
 struct DeleteResult {
     #[serde(default, rename = "Error")]
     errors: Vec<DeleteError>,
+}
+
+#[derive(Deserialize)]
+struct InitiateMultipartUploadResult {
+    #[serde(rename = "UploadId")]
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct CompleteMultipartUploadResult {
+    #[serde(rename = "ETag", default)]
+    etag: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ListMultipartUploadsResult {
+    #[serde(default, rename = "Upload")]
+    uploads: Vec<ListedUpload>,
+    #[serde(default)]
+    is_truncated: bool,
+    next_key_marker: Option<String>,
+    next_upload_id_marker: Option<String>,
+    encoding_type: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ListedUpload {
+    key: String,
+    upload_id: String,
+    initiated: String,
+}
+
+/// One multipart upload in progress, as a listing of them reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingUpload {
+    pub key: String,
+    pub upload_id: String,
+    pub initiated: SystemTime,
+}
+
+/// One page of a `ListMultipartUploads` answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadsPage {
+    pub uploads: Vec<PendingUpload>,
+    /// The key marker and the upload id marker of the next page, `None` on
+    /// the last one.
+    pub next: Option<(String, String)>,
 }
 
 /// The error in `body`. A HEAD answer has no body, and a proxy can send one
@@ -143,10 +194,146 @@ pub fn delete_request<'a>(keys: impl IntoIterator<Item = &'a str>) -> String {
     body
 }
 
+/// The upload id of a `CreateMultipartUpload` answer.
+///
+/// # Errors
+/// [`ObjectStoreError::Malformed`] for a body that is not such an answer.
+pub fn parse_initiate(body: &[u8]) -> Result<String, ObjectStoreError> {
+    let result: InitiateMultipartUploadResult = parse(body)?;
+    if result.id.is_empty() {
+        return Err(ObjectStoreError::Malformed(
+            "a multipart upload without an upload id".to_owned(),
+        ));
+    }
+    Ok(result.id)
+}
+
+/// The body of a `CompleteMultipartUpload` request: each part with its
+/// number, its etag and its CRC32C, in order.
+pub fn complete_request(parts: &[StoredPart], encode_crc32c: impl Fn(u32) -> String) -> String {
+    let mut body = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8"?><CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
+    );
+    for part in parts {
+        body.push_str("<Part><PartNumber>");
+        body.push_str(&part.number.to_string());
+        body.push_str("</PartNumber><ETag>\"");
+        body.push_str(&escape(unquote_etag(&part.tag)));
+        body.push_str("\"</ETag><ChecksumCRC32C>");
+        body.push_str(&encode_crc32c(part.crc32c));
+        body.push_str("</ChecksumCRC32C></Part>");
+    }
+    body.push_str("</CompleteMultipartUpload>");
+    body
+}
+
+/// What a `CompleteMultipartUpload` answer of 200 holds. The store sends its
+/// status before it finishes the work, so a failure comes in the body of a
+/// 200.
+#[derive(Debug)]
+pub enum Completion {
+    /// The store created the object.
+    Created,
+    /// The store failed after it sent the status.
+    Failed(ErrorBody),
+}
+
+/// What a `CompleteMultipartUpload` answer of 200 holds, by its root element:
+/// a result with the object's etag, or an error.
+///
+/// # Errors
+/// [`ObjectStoreError::Malformed`] for a body that is neither, an empty one
+/// included.
+pub fn parse_complete(body: &[u8]) -> Result<Completion, ObjectStoreError> {
+    match root_name(body)?.as_str() {
+        "CompleteMultipartUploadResult" => {
+            let result: CompleteMultipartUploadResult = parse(body)?;
+            if result.etag.is_empty() {
+                return Err(ObjectStoreError::Malformed(
+                    "a completed multipart upload without an etag".to_owned(),
+                ));
+            }
+            Ok(Completion::Created)
+        }
+        "Error" => Ok(Completion::Failed(parse_error(body))),
+        root => Err(ObjectStoreError::Malformed(format!(
+            "a completion answered with a {root:?} root"
+        ))),
+    }
+}
+
+/// One page of a `ListMultipartUploads` answer.
+///
+/// # Errors
+/// [`ObjectStoreError::Malformed`] for a body that is not such an answer.
+pub fn parse_uploads(body: &[u8]) -> Result<UploadsPage, ObjectStoreError> {
+    let result: ListMultipartUploadsResult = parse(body)?;
+    let url_encoded = result.encoding_type.as_deref() == Some("url");
+    let decode = |key: String| {
+        if url_encoded {
+            decode_url_key(&key)
+        } else {
+            Ok(key)
+        }
+    };
+    let next = match (
+        result.is_truncated,
+        result.next_key_marker,
+        result.next_upload_id_marker,
+    ) {
+        (false, _, _) => None,
+        (true, Some(key), Some(upload_id)) => Some((decode(key)?, upload_id)),
+        (true, _, _) => {
+            return Err(ObjectStoreError::Malformed(
+                "a truncated listing of uploads without its markers".to_owned(),
+            ));
+        }
+    };
+    let uploads = result
+        .uploads
+        .into_iter()
+        .map(|upload| {
+            Ok(PendingUpload {
+                key: decode(upload.key)?,
+                upload_id: upload.upload_id,
+                initiated: parse_timestamp(&upload.initiated)?,
+            })
+        })
+        .collect::<Result<_, ObjectStoreError>>()?;
+    Ok(UploadsPage { uploads, next })
+}
+
 /// An etag as the store quotes it in headers and listings, without the
 /// quotes, so that every call reports the same value.
 pub fn unquote_etag(etag: &str) -> &str {
     etag.trim_matches('"')
+}
+
+/// The local name of the root element of `body`.
+fn root_name(body: &[u8]) -> Result<String, ObjectStoreError> {
+    let text = std::str::from_utf8(body)
+        .map_err(|error| ObjectStoreError::Malformed(error.to_string()))?;
+    let mut reader = Reader::from_str(text);
+    reader.config_mut().trim_text(true);
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(root) | Event::Empty(root)) => {
+                return Ok(root.local_name().as_ref().to_owned());
+            }
+            Ok(Event::Decl(_) | Event::Comment(_) | Event::PI(_) | Event::DocType(_)) => {}
+            Ok(Event::Eof) => {
+                return Err(ObjectStoreError::Malformed(
+                    "an answer without a root element".to_owned(),
+                ));
+            }
+            Ok(_) => {
+                return Err(ObjectStoreError::Malformed(
+                    "an answer with text before its root element".to_owned(),
+                ));
+            }
+            Err(error) => return Err(ObjectStoreError::Malformed(error.to_string())),
+        }
+    }
 }
 
 fn parse<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T, ObjectStoreError> {
@@ -304,5 +491,54 @@ mod tests {
         );
         assert_eq!(parse_error(b"").code, "");
         assert_eq!(parse_error(b"<html>bad gateway</html>").code, "");
+    }
+
+    #[test]
+    fn given_a_completion_result_with_an_etag_when_parsing_should_say_created() {
+        let body = br#"<?xml version="1.0" encoding="UTF-8"?>
+
+<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Location>https://segments.s3.amazonaws.com/a/b</Location><Bucket>segments</Bucket>
+  <Key>a/b</Key><ETag>"3858f62230ac3c915f300c664312c11f-9"</ETag>
+</CompleteMultipartUploadResult>"#;
+
+        assert!(matches!(parse_complete(body), Ok(Completion::Created)));
+    }
+
+    #[test]
+    fn given_an_error_root_with_attributes_when_parsing_a_completion_should_return_its_code() {
+        let body = br#"<?xml version="1.0" encoding="UTF-8"?>
+<Error xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Code>InternalError</Code>
+<Message>We encountered an internal error.</Message></Error>"#;
+
+        let completion = parse_complete(body).unwrap();
+
+        assert!(
+            matches!(&completion, Completion::Failed(error) if error.code == "InternalError"),
+            "{completion:?}"
+        );
+    }
+
+    #[test]
+    fn given_a_completion_answer_without_a_result_or_an_error_when_parsing_should_fail_as_malformed()
+     {
+        for body in [
+            &b""[..],
+            b"   \n",
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+            b"<CompleteMultipartUploadResult/>",
+            b"<CompleteMultipartUploadResult><Key>a/b</Key><ETag></ETag>\
+              </CompleteMultipartUploadResult>",
+            b"<html>bad gateway</html>",
+            b"bad gateway",
+            b"<CompleteMultipartUploadResult><ETag>x</ETag>",
+            b"\xff\xfe",
+        ] {
+            assert!(
+                matches!(parse_complete(body), Err(ObjectStoreError::Malformed(_))),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
     }
 }

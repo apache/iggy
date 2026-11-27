@@ -58,7 +58,7 @@ use crate::producer::{IggyProducer, ProducerMode, u32_param as producer_u32_para
 use crate::reader::PartitionReader;
 use crate::receive_message::{Checkpoint, PolledBatch, PollingStrategy};
 use crate::resource_options::{
-    OptionKey, StreamOptions, TopicOptions, UserOptions, geo_topic_durations,
+    OptionKey, StreamOptions, TopicOptions, UserOptions, geo_topic_durations, topic_read_cache,
 };
 use crate::send_message::{SendMessage, SendMessagesResponse as PySendMessagesResponse};
 use crate::snapshot::{
@@ -1481,13 +1481,19 @@ impl IggyClient {
     ///         `datetime.timedelta | None`, unchanged when `None`. This and
     ///         the five durations below have the meaning and bounds
     ///         `TopicOptions` gives them, zero is a value, and none of them
-    ///         can be reset. They are the only options an update changes on a
-    ///         geo topic, and the server refuses them on a normal topic.
+    ///         can be reset. With `read_cache_size` and `read_ahead` they are
+    ///         the only options an update changes on a geo topic, and the
+    ///         server refuses them on a normal topic.
     ///     consumer_offset_upload_interval: As `fresh_upload_interval`.
     ///     positions_publish_interval: As `fresh_upload_interval`.
     ///     tombstone_grace: As `fresh_upload_interval`.
     ///     positions_resume_timeout: As `fresh_upload_interval`.
     ///     long_term_rewrite_max_interval: As `fresh_upload_interval`.
+    ///     read_cache_size: Read cache bytes of the topic as `int | None`,
+    ///         unchanged when `None`. This and `read_ahead` have the meaning
+    ///         and bounds `TopicOptions` gives them, zero is a value, and
+    ///         neither can be reset. An update can change them on any topic.
+    ///     read_ahead: As `read_cache_size`.
     ///
     /// Returns:
     ///     An awaitable that resolves to `None` when the topic is updated.
@@ -1503,7 +1509,7 @@ impl IggyClient {
     ///         nothing, names a key both set and reset, the name does not fit,
     ///         or a reset key cannot be reset. Otherwise if the request fails.
     #[pyo3(
-        signature = (stream_id, topic_id, name = None, message_expiry = None, max_topic_size = None, reset = None, options = None, raw_reset = None, tiered_storage = None, local_retention_age = None, local_retention_size = None, fresh_upload_interval = None, consumer_offset_upload_interval = None, positions_publish_interval = None, tombstone_grace = None, positions_resume_timeout = None, long_term_rewrite_max_interval = None)
+        signature = (stream_id, topic_id, name = None, message_expiry = None, max_topic_size = None, reset = None, options = None, raw_reset = None, tiered_storage = None, local_retention_age = None, local_retention_size = None, fresh_upload_interval = None, consumer_offset_upload_interval = None, positions_publish_interval = None, tombstone_grace = None, positions_resume_timeout = None, long_term_rewrite_max_interval = None, read_cache_size = None, read_ahead = None)
     )]
     #[allow(clippy::too_many_arguments)]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
@@ -1545,6 +1551,8 @@ impl IggyClient {
         positions_resume_timeout: Option<Py<PyDelta>>,
         #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
         long_term_rewrite_max_interval: Option<Py<PyDelta>>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] read_cache_size: Option<u64>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] read_ahead: Option<u64>,
     ) -> PyResult<Bound<'a, PyAny>> {
         let update_options = TopicUpdateOptions {
             name,
@@ -1565,6 +1573,7 @@ impl IggyClient {
                 positions_resume_timeout,
                 long_term_rewrite_max_interval,
             ])?,
+            read_cache: topic_read_cache(read_cache_size, read_ahead),
             reset: reset_keys(reset),
             raw_reset: raw_reset.into_iter().flatten().collect(),
             raw: options.unwrap_or_default(),

@@ -50,6 +50,43 @@ pub struct UserInfoDetails {
     pub username: String,
 }
 
+/// `GET /stats`. Byte sizes arrive as exact-unit strings such as
+/// `"8615888 KiB"`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Stats {
+    pub process_id: u32,
+    pub cpu_usage: f32,
+    pub total_cpu_usage: f32,
+    pub memory_usage: String,
+    pub total_memory: String,
+    pub available_memory: String,
+    /// Microseconds.
+    pub run_time: u64,
+    pub start_time: u64,
+    pub read_bytes: String,
+    pub written_bytes: String,
+    pub messages_size_bytes: String,
+    pub streams_count: u32,
+    pub topics_count: u32,
+    pub partitions_count: u32,
+    pub segments_count: u32,
+    pub messages_count: u64,
+    pub clients_count: u32,
+    pub consumer_groups_count: u32,
+    pub hostname: String,
+    pub os_name: String,
+    pub os_version: String,
+    pub kernel_version: String,
+    pub iggy_server_version: String,
+    pub threads_count: u32,
+    pub free_disk_space: String,
+    pub total_disk_space: String,
+    #[serde(default)]
+    pub open_files_count: u64,
+    #[serde(default)]
+    pub open_files_limit: u64,
+}
+
 /// One entry of a resource's `options` map, as written by
 /// `iggy_common::resource_options_json`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -144,8 +181,8 @@ mod tests {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
     use iggy_common::{
-        HeaderKey, HeaderValue, IggyByteSize, IggyTimestamp, OptionKey, PartitionContext,
-        UserStatus,
+        HeaderKey, HeaderValue, IggyByteSize, IggyDuration, IggyTimestamp, OptionKey,
+        PartitionContext, UserStatus,
     };
     use serde::de::DeserializeOwned;
 
@@ -309,6 +346,36 @@ mod tests {
                 },
                 payload: STANDARD.encode("hello"),
             }]
+        );
+    }
+
+    #[test]
+    fn given_server_stats_should_decode_overview_fields() {
+        let server = iggy_common::Stats {
+            process_id: 42,
+            cpu_usage: 1.5,
+            memory_usage: IggyByteSize::from(2_048),
+            run_time: IggyDuration::from(90_000_000),
+            start_time: IggyTimestamp::from(CREATED_AT),
+            messages_count: 10,
+            hostname: "node-1".to_owned(),
+            iggy_server_version: "0.11.1".to_owned(),
+            open_files_count: 3,
+            open_files_limit: 1_024,
+            ..Default::default()
+        };
+        let mirror: Stats = decode(&server);
+        assert_eq!(mirror.process_id, 42);
+        assert_eq!(mirror.cpu_usage, 1.5);
+        assert_eq!(mirror.memory_usage, "2 KiB");
+        assert_eq!(mirror.run_time, 90_000_000);
+        assert_eq!(mirror.start_time, CREATED_AT);
+        assert_eq!(mirror.messages_count, 10);
+        assert_eq!(mirror.hostname, "node-1");
+        assert_eq!(mirror.iggy_server_version, "0.11.1");
+        assert_eq!(
+            (mirror.open_files_count, mirror.open_files_limit),
+            (3, 1_024)
         );
     }
 

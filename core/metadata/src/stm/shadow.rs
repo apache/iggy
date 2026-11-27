@@ -35,7 +35,9 @@
 //! `detached` once the origin deleted it. The primary removes a detached
 //! topic after a grace period, and a shadow stream once it holds no topic.
 //! Whether a peer's store answers is the primary's own view, which it does
-//! not replicate.
+//! not replicate. A following topic takes the `read_cache_size` and
+//! `read_ahead` that the peer's topic sets, at its adoption and after each
+//! change in the peer.
 //!
 //! The same operation takes back the geo topics of a cluster that lost every
 //! disk, from its store, into the cluster rebuilt in its place: a restored
@@ -58,12 +60,14 @@ use iggy_binary_protocol::requests::topics::{
     CreateTopicWithAssignmentsRequest, DeleteTopicRequest,
 };
 use iggy_binary_protocol::{WireError, WireIdentifier, WireName};
-use iggy_common::{GeoMode, IggyTimestamp};
+use iggy_common::{
+    GeoMode, HeaderKey, HeaderValue, IggyTimestamp, OptionKey, OptionValue, ResourceOptions,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use crate::change_log::{AppliedChange, change_actor, stream_body};
+use crate::change_log::{AppliedChange, change_actor, stream_body, topic_body};
 use crate::stm::StateHandler;
 use crate::stm::result::{ApplyReply, ShadowTopicResult};
 use crate::stm::stream::{FixedTopic, Stream, StreamsInner, admits_slab_key, create_topic};
@@ -169,6 +173,71 @@ impl ShadowTopic {
     }
 }
 
+/// The `read_cache_size` and `read_ahead` of a peer's geo topic in bytes.
+///
+/// The topic's object publishes them. `None` for one that the topic does not
+/// set, which the shadow topic does not set either: the nodes of this cluster
+/// apply their own settings then.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShadowReadCache {
+    pub size: Option<u64>,
+    pub read_ahead: Option<u64>,
+}
+
+/// The option keys of a [`ShadowReadCache`], built once for a walk over
+/// many shadow topics.
+#[derive(Debug, Clone)]
+pub struct ShadowReadCacheKeys {
+    size: HeaderKey,
+    read_ahead: HeaderKey,
+}
+
+impl Default for ShadowReadCacheKeys {
+    fn default() -> Self {
+        Self {
+            size: HeaderKey::from(OptionKey::ReadCacheSize),
+            read_ahead: HeaderKey::from(OptionKey::ReadAhead),
+        }
+    }
+}
+
+impl ShadowReadCacheKeys {
+    /// What the options of a shadow topic store of the read cache.
+    #[must_use]
+    pub fn stored(&self, options: &ResourceOptions) -> ShadowReadCache {
+        let stored = |key: &HeaderKey| {
+            options
+                .get(key)
+                .and_then(|option| option.value.as_uint64().ok())
+        };
+        ShadowReadCache {
+            size: stored(&self.size),
+            read_ahead: stored(&self.read_ahead),
+        }
+    }
+}
+
+impl ShadowReadCache {
+    /// Store each size in `options`, and remove the entry of each one that is
+    /// unset.
+    fn store_in(self, options: &mut ResourceOptions) {
+        for (key, size) in [
+            (OptionKey::ReadCacheSize, self.size),
+            (OptionKey::ReadAhead, self.read_ahead),
+        ] {
+            let key = HeaderKey::from(key);
+            match size {
+                Some(bytes) => {
+                    options.insert(key, OptionValue::explicit(HeaderValue::from(bytes)));
+                }
+                None => {
+                    options.remove(&key);
+                }
+            }
+        }
+    }
+}
+
 /// One shadow topic, by its shadow stream and the peer's incarnation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShadowTopicTarget {
@@ -228,6 +297,12 @@ pub enum ShadowTopicRequest {
         target: ShadowTopicTarget,
         create: Box<CreateTopicWithAssignmentsRequest>,
     },
+    /// Give the shadow topic the `read_cache_size` and `read_ahead` that the
+    /// peer's topic sets now, and take away each one that it does not set.
+    SetReadCache {
+        target: ShadowTopicTarget,
+        read_cache: ShadowReadCache,
+    },
 }
 
 const CREATE_STREAM: u8 = 1;
@@ -238,6 +313,11 @@ const DETACH_TOPIC: u8 = 5;
 const REMOVE_TOPIC: u8 = 6;
 const RESTORE_STREAM: u8 = 7;
 const RESTORE_TOPIC: u8 = 8;
+const SET_READ_CACHE: u8 = 9;
+
+/// The bits of the keys byte of a read cache.
+const READ_CACHE_SIZE_KEY: u8 = 1;
+const READ_AHEAD_KEY: u8 = 2;
 
 impl ShadowTopicRequest {
     const fn kind(&self) -> u8 {
@@ -250,6 +330,7 @@ impl ShadowTopicRequest {
             Self::RemoveTopic { .. } => REMOVE_TOPIC,
             Self::RestoreStream { .. } => RESTORE_STREAM,
             Self::RestoreTopic { .. } => RESTORE_TOPIC,
+            Self::SetReadCache { .. } => SET_READ_CACHE,
         }
     }
 
@@ -262,7 +343,8 @@ impl ShadowTopicRequest {
             Self::AdoptTopic { target, .. }
             | Self::DetachTopic { target, .. }
             | Self::RemoveTopic { target }
-            | Self::RestoreTopic { target, .. } => &target.source,
+            | Self::RestoreTopic { target, .. }
+            | Self::SetReadCache { target, .. } => &target.source,
         }
     }
 }
@@ -282,14 +364,21 @@ impl ShadowTopicRequest {
 //   restore stream: name
 //   restore topic: stream_id u32 | topic_id u32 | created_revision u64
 //                  | create length u32 | create
+//   set read cache: stream_id u32 | topic_id u32 | created_revision u64
+//                  | read cache
 //
 // A retention is message_expiry u64 | max_topic_size u64.
+//
+// A read cache is keys u8 | read_cache_size u64 | read_ahead u64. The keys
+// have bit 1 when read_cache_size is set and bit 2 when read_ahead is. A size
+// that is not set is zero.
 //
 // A restore carries this cluster's origin, the retired cluster's
 // cluster_uid and the stream's id there.
 
 const TARGET_LEN: usize = 4 + 4 + 8;
 const RETENTION_LEN: usize = 8 + 8;
+const READ_CACHE_LEN: usize = 1 + 8 + 8;
 
 impl WireEncode for ShadowTopicRequest {
     fn encoded_size(&self) -> usize {
@@ -307,6 +396,7 @@ impl WireEncode for ShadowTopicRequest {
             Self::RestoreTopic { create, .. } => TARGET_LEN + 4 + create.encoded_size(),
             Self::DetachTopic { .. } => TARGET_LEN + 8,
             Self::RemoveTopic { .. } => TARGET_LEN,
+            Self::SetReadCache { .. } => TARGET_LEN + READ_CACHE_LEN,
         }
     }
 
@@ -343,6 +433,10 @@ impl WireEncode for ShadowTopicRequest {
                 buf.put_u64_le(*deleted_at);
             }
             Self::RemoveTopic { target } => encode_target(target, buf),
+            Self::SetReadCache { target, read_cache } => {
+                encode_target(target, buf);
+                encode_read_cache(*read_cache, buf);
+            }
         }
     }
 }
@@ -393,6 +487,41 @@ fn decode_retention(buf: &[u8], position: usize) -> Result<ShadowRetention, Wire
     })
 }
 
+fn encode_read_cache(read_cache: ShadowReadCache, buf: &mut BytesMut) {
+    let mut keys = 0;
+    if read_cache.size.is_some() {
+        keys |= READ_CACHE_SIZE_KEY;
+    }
+    if read_cache.read_ahead.is_some() {
+        keys |= READ_AHEAD_KEY;
+    }
+    buf.put_u8(keys);
+    buf.put_u64_le(read_cache.size.unwrap_or(0));
+    buf.put_u64_le(read_cache.read_ahead.unwrap_or(0));
+}
+
+fn decode_read_cache(buf: &[u8], position: usize) -> Result<ShadowReadCache, WireError> {
+    let keys = read_u8(buf, position)?;
+    if keys & !(READ_CACHE_SIZE_KEY | READ_AHEAD_KEY) != 0 {
+        return Err(WireError::Validation(
+            format!("unknown read cache keys {keys:#04x} of a shadow topic").into(),
+        ));
+    }
+    let size = |key: u8, offset: usize| -> Result<Option<u64>, WireError> {
+        match (keys & key != 0, read_u64_le(buf, position + offset)?) {
+            (true, bytes) => Ok(Some(bytes)),
+            (false, 0) => Ok(None),
+            (false, _) => Err(WireError::Validation(
+                "a read cache size without its key of a shadow topic".into(),
+            )),
+        }
+    };
+    Ok(ShadowReadCache {
+        size: size(READ_CACHE_SIZE_KEY, 1)?,
+        read_ahead: size(READ_AHEAD_KEY, 1 + 8)?,
+    })
+}
+
 impl WireDecode for ShadowTopicRequest {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
         let kind = read_u8(buf, 0)?;
@@ -432,7 +561,7 @@ impl WireDecode for ShadowTopicRequest {
                 position += 4;
                 Self::RemoveStream { stream_id, source }
             }
-            ADOPT_TOPIC | DETACH_TOPIC | REMOVE_TOPIC | RESTORE_TOPIC => {
+            ADOPT_TOPIC | DETACH_TOPIC | REMOVE_TOPIC | RESTORE_TOPIC | SET_READ_CACHE => {
                 let target = ShadowTopicTarget {
                     stream_id: read_u32_le(buf, position)?,
                     source,
@@ -466,6 +595,11 @@ impl WireDecode for ShadowTopicRequest {
                         position += 8;
                         Self::DetachTopic { target, deleted_at }
                     }
+                    SET_READ_CACHE => {
+                        let read_cache = decode_read_cache(buf, position)?;
+                        position += READ_CACHE_LEN;
+                        Self::SetReadCache { target, read_cache }
+                    }
                     _ => Self::RemoveTopic { target },
                 }
             }
@@ -495,6 +629,52 @@ pub struct RetiredOrigin {
     pub cluster_uids: Vec<u128>,
     /// When the retirement committed, in microseconds since the Unix epoch.
     pub retired_at: u64,
+}
+
+impl StreamsInner {
+    /// The cluster lifetimes that committed metadata knows for the peer
+    /// `origin`: the ones its shadow streams came from, and for a retired
+    /// origin the ones its retirement recorded. Empty before this cluster
+    /// adopted a stream of the origin.
+    #[must_use]
+    pub fn recorded_cluster_uids(&self, origin: &str) -> BTreeSet<u128> {
+        self.recorded_clusters()
+            .filter(|(of, _)| *of == origin)
+            .map(|(_, cluster_uid)| cluster_uid)
+            .collect()
+    }
+
+    /// [`Self::recorded_cluster_uids`] of every origin that it is not empty
+    /// for, from one pass over the streams.
+    #[must_use]
+    pub fn recorded_cluster_uids_by_origin(&self) -> BTreeMap<String, BTreeSet<u128>> {
+        let mut recorded: BTreeMap<String, BTreeSet<u128>> = BTreeMap::new();
+        for (origin, cluster_uid) in self.recorded_clusters() {
+            if let Some(clusters) = recorded.get_mut(origin) {
+                clusters.insert(cluster_uid);
+            } else {
+                recorded.insert(origin.to_owned(), BTreeSet::from([cluster_uid]));
+            }
+        }
+        recorded
+    }
+
+    /// Each origin with a cluster lifetime that a shadow stream or a
+    /// retirement recorded of it.
+    fn recorded_clusters(&self) -> impl Iterator<Item = (&str, u128)> {
+        let streams = self
+            .items
+            .iter()
+            .filter_map(|(_, stream)| stream.shadow.as_ref())
+            .map(|source| (source.origin.as_str(), source.cluster_uid));
+        let retired = self.retired_origins.iter().flat_map(|(origin, retired)| {
+            retired
+                .cluster_uids
+                .iter()
+                .map(move |&cluster_uid| (origin.as_str(), cluster_uid))
+        });
+        streams.chain(retired)
+    }
 }
 
 impl StateHandler for RetireGeoOriginRequest {
@@ -551,6 +731,7 @@ impl StateHandler for ShadowTopicRequest {
             Self::RestoreTopic { target, create } => {
                 restore_topic(state, target, create, timestamp)
             }
+            Self::SetReadCache { target, read_cache } => set_read_cache(state, target, *read_cache),
         };
         state.shadow_write = false;
         reply
@@ -771,6 +952,58 @@ fn remove_topic(
     .apply(state, timestamp)
 }
 
+/// Write `read_cache` into the stored options of the shadow topic `target`
+/// names. A client's update can set these keys and not remove them, so the
+/// entry of a size that the peer no longer sets is removed here, and the
+/// nodes apply their own setting again.
+///
+/// A retired origin is followed no more, so an update that its retirement
+/// overtook in the log changes nothing.
+fn set_read_cache(
+    state: &mut StreamsInner,
+    target: &ShadowTopicTarget,
+    read_cache: ShadowReadCache,
+) -> ApplyReply {
+    if state.retired_origins.contains_key(&target.source.origin) {
+        return ApplyReply::err(ShadowTopicResult::TopicNotFound);
+    }
+    let Some((stream_id, topic_id)) = shadow_topic_ids(state, target) else {
+        return ApplyReply::err(ShadowTopicResult::TopicNotFound);
+    };
+    // Read first: `make_mut` copies a stream that a checkpoint capture shares.
+    let stream = &state.items[stream_id];
+    let Some(topic) = stream.topics.get(topic_id) else {
+        return ApplyReply::err(ShadowTopicResult::TopicNotFound);
+    };
+    let before = topic_body(stream, topic);
+    let mut options = topic.options.clone();
+    read_cache.store_in(&mut options);
+    let Some(stream) = state.items.make_mut(stream_id) else {
+        return ApplyReply::err(ShadowTopicResult::TopicNotFound);
+    };
+    let Some(topic) = stream.topics.get_mut(topic_id) else {
+        return ApplyReply::err(ShadowTopicResult::TopicNotFound);
+    };
+    topic.set_options(options);
+    let changes = stream
+        .topics
+        .get(topic_id)
+        .and_then(|topic| topic_body(stream, topic))
+        .filter(|after| before.as_ref() != Some(after))
+        .map(|body| {
+            AppliedChange::new(
+                &WireMetadataChange::TopicUpdated(body),
+                change_actor(&state.apply_context),
+            )
+        })
+        .into_iter()
+        .collect();
+    ApplyReply {
+        changes,
+        ..ApplyReply::ok(Bytes::new())
+    }
+}
+
 /// Create the stream `name` of this cluster at the id the retired cluster
 /// gave it. A stream that holds the id already with that name and no peer
 /// is the one an earlier attempt restored.
@@ -879,6 +1112,7 @@ mod tests {
         UpdateTopicResult,
     };
     use crate::stm::snapshot::Snapshotable;
+    use crate::stm::stream::tests::{running_and_reported_durability, store_replicated_durability};
     use crate::stm::stream::{Streams, TruncatePartitionRequest};
     use iggy_binary_protocol::WireOptions;
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
@@ -890,7 +1124,7 @@ mod tests {
         CreateStreamRequest, UpdateStreamResolvedRequest,
     };
     use iggy_binary_protocol::requests::topics::{CreateTopicRequest, UpdateTopicResolvedRequest};
-    use iggy_common::IggyError;
+    use iggy_common::{Durability, IggyByteSize, IggyError, TopicCreateOptions, TopicReadCache};
 
     const PEER: &str = "dc-b";
     const PEER_CLUSTER: u128 = 0x0b0b_0b0b_0b0b_0b0b_0b0b_0b0b_0b0b_0b0b;
@@ -955,6 +1189,22 @@ mod tests {
             }),
             retention: RETENTION,
             geo_mode: GeoMode::Geo,
+        }
+    }
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// The operation that gives the shadow topic `PEER_TOPIC` in the stream
+    /// `stream_id` a `read_cache_size` of `size` and a `read_ahead` of
+    /// `read_ahead`.
+    fn read_cache_of(
+        stream_id: u32,
+        size: Option<u64>,
+        read_ahead: Option<u64>,
+    ) -> ShadowTopicRequest {
+        ShadowTopicRequest::SetReadCache {
+            target: target(stream_id),
+            read_cache: ShadowReadCache { size, read_ahead },
         }
     }
 
@@ -1200,6 +1450,10 @@ mod tests {
                 name: name("orders"),
             },
             restoration(RETIRED_REVISION, 2),
+            read_cache_of(4, None, None),
+            read_cache_of(4, Some(0), None),
+            read_cache_of(4, None, Some(MIB)),
+            read_cache_of(4, Some(64 * MIB), Some(0)),
         ];
         for request in requests {
             let bytes = request.to_bytes();
@@ -1210,7 +1464,29 @@ mod tests {
                 "a cut body is refused: {request:?}"
             );
         }
-        assert!(ShadowTopicRequest::decode_from(&[9, 1, b'x']).is_err());
+        assert!(ShadowTopicRequest::decode_from(&[10, 1, b'x']).is_err());
+    }
+
+    #[test]
+    fn given_an_unknown_read_cache_key_or_a_size_without_its_key_when_decoding_should_refuse_it() {
+        let bytes = read_cache_of(4, None, None).to_bytes().to_vec();
+        let keys = bytes.len() - READ_CACHE_LEN;
+        let read_ahead = keys + 1 + 8;
+
+        for (offset, value) in [(keys, 4), (keys, READ_AHEAD_KEY | 8), (read_ahead, 1)] {
+            let mut damaged = bytes.clone();
+            damaged[offset] = value;
+            assert!(
+                ShadowTopicRequest::decode_from(&damaged).is_err(),
+                "byte {offset} set to {value}"
+            );
+        }
+        let mut size_key = bytes;
+        size_key[keys] = READ_CACHE_SIZE_KEY;
+        assert_eq!(
+            ShadowTopicRequest::decode_from(&size_key).unwrap(),
+            read_cache_of(4, Some(0), None)
+        );
     }
 
     #[test]
@@ -1253,6 +1529,64 @@ mod tests {
 
         assert_eq!(inner.revision, revision);
         assert_eq!(inner.items[stream_id as usize].topics.len(), 1);
+    }
+
+    /// An adoption that a build proposed before the peer's mode fixed the
+    /// durability names `replicated`, as every create does unless told
+    /// otherwise, and a snapshot taken then stores it.
+    #[test]
+    fn given_a_shadow_topic_stored_with_replicated_offsets_when_replayed_or_restored_should_run_and_report_its_modes_durability()
+     {
+        for (geo_mode, durability) in [
+            (GeoMode::Geo, Durability::Persisted),
+            (GeoMode::GeoTiered, Durability::Replicated),
+        ] {
+            let expected = ([durability; 2], [durability; 2]);
+            let mut inner = StreamsInner::new();
+            let create = ShadowTopicRequest::CreateStream {
+                source: source(),
+                name: name(SHADOW_NAME),
+            };
+            assert_eq!(apply(&mut inner, 1, &create).code, 0);
+            let stream_id = u32::try_from(inner.index[SHADOW_NAME]).unwrap();
+            let adopt = ShadowTopicRequest::AdoptTopic {
+                target: target(stream_id),
+                create: Box::new(CreateTopicWithAssignmentsRequest {
+                    request: CreateTopicRequest {
+                        stream_id: WireIdentifier::numeric(stream_id),
+                        partitions_count: 1,
+                        name: name("payments"),
+                        options: TopicCreateOptions::default().to_wire().unwrap(),
+                    },
+                    derived_options: WireOptions::empty(),
+                    partitions: assignments(1),
+                }),
+                retention: RETENTION,
+                geo_mode,
+            };
+            assert_eq!(apply(&mut inner, 2, &adopt).code, 0);
+
+            let replayed = &inner.items[stream_id as usize].topics[PEER_TOPIC as usize];
+            assert_eq!(
+                running_and_reported_durability(replayed),
+                expected,
+                "replayed {geo_mode:?}"
+            );
+
+            let mut snapshot = Streams::from(inner).to_snapshot();
+            for (_, stream) in &mut snapshot.items {
+                for (_, topic) in &mut stream.topics {
+                    store_replicated_durability(&mut topic.options);
+                }
+            }
+            let restored = StreamsInner::inner_from_snapshot(snapshot, Arc::default());
+            let restored = &restored.items[stream_id as usize].topics[PEER_TOPIC as usize];
+            assert_eq!(
+                running_and_reported_durability(restored),
+                expected,
+                "restored {geo_mode:?}"
+            );
+        }
     }
 
     #[test]
@@ -1510,6 +1844,60 @@ mod tests {
     }
 
     #[test]
+    fn given_shadow_streams_and_a_retirement_when_asking_for_an_origins_clusters_should_give_both()
+    {
+        let (mut inner, _) = shadowed();
+        assert_eq!(
+            inner.recorded_cluster_uids(PEER),
+            BTreeSet::from([PEER_CLUSTER])
+        );
+        assert_eq!(inner.recorded_cluster_uids("dc-c"), BTreeSet::new());
+
+        assert_eq!(apply(&mut inner, 4, &retirement(PEER)).code, 0);
+        inner
+            .retired_origins
+            .get_mut(PEER)
+            .unwrap()
+            .cluster_uids
+            .push(RETIRED_CLUSTER);
+        let removed = inner.items.iter().map(|(id, _)| id).collect::<Vec<_>>();
+        for id in removed {
+            inner.items.make_mut(id).unwrap().shadow = None;
+        }
+
+        assert_eq!(
+            inner.recorded_cluster_uids(PEER),
+            BTreeSet::from([PEER_CLUSTER, RETIRED_CLUSTER]),
+            "a retired origin keeps the clusters of the shadow streams it had"
+        );
+    }
+
+    #[test]
+    fn given_shadow_streams_and_a_retirement_of_two_origins_when_asking_for_every_origins_clusters_should_give_what_each_origin_gets()
+     {
+        let (mut inner, _) = shadowed();
+        assert_eq!(apply(&mut inner, 4, &retirement("dc-c")).code, 0);
+        inner
+            .retired_origins
+            .get_mut("dc-c")
+            .unwrap()
+            .cluster_uids
+            .push(RETIRED_CLUSTER);
+
+        let recorded = inner.recorded_cluster_uids_by_origin();
+
+        assert_eq!(
+            recorded,
+            BTreeMap::from([
+                (PEER.to_owned(), inner.recorded_cluster_uids(PEER)),
+                ("dc-c".to_owned(), inner.recorded_cluster_uids("dc-c")),
+            ])
+        );
+        assert_eq!(recorded[PEER], BTreeSet::from([PEER_CLUSTER]));
+        assert_eq!(recorded["dc-c"], BTreeSet::from([RETIRED_CLUSTER]));
+    }
+
+    #[test]
     fn given_an_origin_without_shadow_streams_when_retired_should_record_no_cluster() {
         let mut inner = StreamsInner::new();
         assert_eq!(apply(&mut inner, 1, &retirement("dc-c")).code, 0);
@@ -1725,6 +2113,172 @@ mod tests {
         });
         assert_eq!(shadow, Some(source()));
         assert_eq!(revision, Some(PEER_REVISION));
+    }
+
+    /// What the shadow topic `PEER_TOPIC` stores and resolves of its read
+    /// cache settings.
+    fn read_cache_in(inner: &StreamsInner, stream_id: u32) -> (ShadowReadCache, TopicReadCache) {
+        let topic = &inner.items[stream_id as usize].topics[PEER_TOPIC as usize];
+        (
+            ShadowReadCacheKeys::default().stored(&topic.options),
+            topic.resolved.read_cache,
+        )
+    }
+
+    #[test]
+    fn given_a_shadow_topic_when_its_peer_sets_changes_and_unsets_the_read_cache_should_follow_each_step()
+     {
+        let (mut inner, stream_id) = shadowed();
+        let topic_updated = |inner: &StreamsInner| {
+            let stream = &inner.items[stream_id as usize];
+            let body = topic_body(stream, &stream.topics[PEER_TOPIC as usize]).unwrap();
+            vec![AppliedChange::new(
+                &WireMetadataChange::TopicUpdated(body),
+                None,
+            )]
+        };
+
+        let set = apply(&mut inner, 4, &read_cache_of(stream_id, Some(0), Some(MIB)));
+        assert_eq!(set.code, 0);
+        assert_eq!(set.changes, topic_updated(&inner));
+        assert_eq!(
+            read_cache_in(&inner, stream_id),
+            (
+                ShadowReadCache {
+                    size: Some(0),
+                    read_ahead: Some(MIB),
+                },
+                TopicReadCache {
+                    size: Some(IggyByteSize::from(0)),
+                    read_ahead: Some(IggyByteSize::from(MIB)),
+                }
+            )
+        );
+        let topic = &inner.items[stream_id as usize].topics[PEER_TOPIC as usize];
+        assert!(
+            topic.options[&HeaderKey::from(OptionKey::ReadCacheSize)].explicit,
+            "set as the peer's client set it"
+        );
+
+        let again = apply(&mut inner, 5, &read_cache_of(stream_id, Some(0), Some(MIB)));
+        assert_eq!((again.code, again.changes), (0, Vec::new()));
+
+        let changed = apply(
+            &mut inner,
+            6,
+            &read_cache_of(stream_id, Some(32 * MIB), None),
+        );
+        assert_eq!(changed.changes, topic_updated(&inner));
+        assert_eq!(
+            read_cache_in(&inner, stream_id).1,
+            TopicReadCache {
+                size: Some(IggyByteSize::from(32 * MIB)),
+                read_ahead: None,
+            }
+        );
+        let topic = &inner.items[stream_id as usize].topics[PEER_TOPIC as usize];
+        assert!(
+            !topic
+                .options
+                .contains_key(&HeaderKey::from(OptionKey::ReadAhead))
+        );
+
+        let unset = apply(&mut inner, 7, &read_cache_of(stream_id, None, None));
+        assert_eq!(unset.changes, topic_updated(&inner));
+        assert_eq!(
+            read_cache_in(&inner, stream_id),
+            (ShadowReadCache::default(), TopicReadCache::default())
+        );
+    }
+
+    #[test]
+    fn given_a_stale_target_when_setting_the_read_cache_should_change_nothing() {
+        let (mut inner, stream_id) = shadowed();
+        let set = read_cache_of(stream_id, Some(16 * MIB), Some(MIB));
+        assert_eq!(apply(&mut inner, 4, &set).code, 0);
+        let ShadowTopicRequest::SetReadCache { target, .. } = set else {
+            unreachable!()
+        };
+        let read_cache = ShadowReadCache::default();
+        let stale = [
+            ShadowTopicTarget {
+                created_revision: PEER_REVISION + 1,
+                ..target.clone()
+            },
+            ShadowTopicTarget {
+                source: ShadowStream {
+                    cluster_uid: PEER_CLUSTER + 1,
+                    ..source()
+                },
+                ..target.clone()
+            },
+            ShadowTopicTarget {
+                topic_id: PEER_TOPIC + 1,
+                ..target
+            },
+        ];
+
+        for (op, target) in (5..).zip(stale) {
+            let reply = apply(
+                &mut inner,
+                op,
+                &ShadowTopicRequest::SetReadCache { target, read_cache },
+            );
+            assert_eq!(reply.code, u32::from(ShadowTopicResult::TopicNotFound));
+            assert_eq!(reply.changes, Vec::new());
+        }
+
+        assert_eq!(
+            read_cache_in(&inner, stream_id).0,
+            ShadowReadCache {
+                size: Some(16 * MIB),
+                read_ahead: Some(MIB),
+            }
+        );
+    }
+
+    #[test]
+    fn given_a_retired_origin_when_a_queued_read_cache_update_applies_should_change_nothing() {
+        let (mut inner, stream_id) = shadowed();
+        let set = read_cache_of(stream_id, Some(16 * MIB), Some(MIB));
+        assert_eq!(apply(&mut inner, 4, &set).code, 0);
+        assert_eq!(apply(&mut inner, 5, &retirement(PEER)).code, 0);
+
+        let queued = apply(&mut inner, 6, &read_cache_of(stream_id, Some(0), None));
+
+        assert_eq!(queued.code, u32::from(ShadowTopicResult::TopicNotFound));
+        assert_eq!(queued.changes, Vec::new());
+        assert_eq!(
+            read_cache_in(&inner, stream_id).0,
+            ShadowReadCache {
+                size: Some(16 * MIB),
+                read_ahead: Some(MIB),
+            }
+        );
+    }
+
+    #[test]
+    fn given_a_shadow_topic_with_a_read_cache_when_restored_from_a_snapshot_should_keep_it() {
+        let (mut inner, stream_id) = shadowed();
+        let set = read_cache_of(stream_id, Some(16 * MIB), Some(0));
+        assert_eq!(apply(&mut inner, 4, &set).code, 0);
+        let streams = Streams::from(inner);
+
+        let restored = Streams::from_snapshot(streams.to_snapshot()).unwrap();
+
+        assert_eq!(
+            restored.read(|inner| read_cache_in(inner, stream_id)),
+            (
+                ShadowReadCache {
+                    size: Some(16 * MIB),
+                    read_ahead: Some(0),
+                },
+                TopicReadCache {
+                    size: Some(IggyByteSize::from(16 * MIB)),
+                    read_ahead: Some(IggyByteSize::from(0)),
+                }
+            )
+        );
     }
 
     #[test]

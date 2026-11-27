@@ -37,7 +37,7 @@ use std::time::Duration;
 
 /// Sealed segments of a partition with [`RECEIVER_OPS`] one-message ops, as
 /// `(first offset, last offset)`.
-const SEALED: [(u64, u64); 2] = [(0, 1), (2, 3)];
+pub(super) const SEALED: [(u64, u64); 2] = [(0, 1), (2, 3)];
 
 const STORED: ManifestPublishOutcome = Ok(Ok(()));
 
@@ -49,7 +49,7 @@ fn publisher() -> Publisher {
 
 /// A tiered partition whose store holds the first `stored` sealed segments,
 /// as committed floor advances say.
-async fn partition_with_stored(
+pub(super) async fn partition_with_stored(
     stored: usize,
 ) -> (tempfile::TempDir, IggyPartition<IggyMessageBus>) {
     let (directory, mut partition) =

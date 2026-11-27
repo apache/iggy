@@ -17,6 +17,13 @@
 
 #![allow(clippy::future_not_send)]
 
+mod chain_rebuild;
+pub use chain_rebuild::{
+    ChainLoss, ChainLost, ChainLostReason, ExecutorStoreViewReader, LocalFront,
+    MANIFEST_CROSS_CHECK_BYTES_MAX, ManifestRead, RebuildFailure, RebuildInput, RebuiltFront,
+    StoreView, StoreViewOutcome, StoreViewReader, StoreViewRequest, StoredLog, chain_loss,
+    rebuild_front,
+};
 mod consumer_offset_capacity;
 mod free_space;
 pub mod geo_positions;
@@ -49,23 +56,34 @@ pub use persistence::{
     PartitionPersistence, PersistenceCompletion, PersistenceMetrics, PersistenceNotifier,
 };
 pub use repair_memory::{RepairMemoryBudget, RepairRingBudget, RepairRingShed, RepairRingUsage};
-mod remote_segments;
-pub use remote_segments::{
-    ExecutorObjects, FRESH_CACHE_BYTES, RemoteObjects, RemoteRange, RemoteSegments,
+mod remote_blocks;
+pub(crate) use remote_blocks::PartitionLeft;
+pub use remote_blocks::{
+    FRESH_CACHE_BYTES, LIMIT_BLOCKS_MIN, OWN_STORE, PartitionReadSettings, READ_AHEAD_START_BLOCKS,
+    ReadCache, ReadCacheSettings, ReadGate, RemoteReadMetrics, StoreSlot,
 };
+mod remote_segments;
+pub use remote_segments::{ExecutorObjects, RemoteObjects, RemoteRange, RemoteSegments};
 mod object_delete;
 mod segment;
 pub mod segment_anchor;
 pub mod segment_chain;
 mod segment_upload;
 pub use object_delete::{
-    DeletedIncarnations, ExecutorDeleter, INCARNATION_DELETE_RETRY, MAX_QUEUED_INCARNATIONS,
+    ClaimReadOutcome, DeletedIncarnations, ExecutorDeleter, INCARNATION_DELETE_RETRY,
+    IncarnationSettled, ListedSegment, MAX_QUEUED_INCARNATIONS, MAX_QUEUED_ORPHANS,
     ObjectDeleteDone, ObjectDeleteJob, ObjectDeleteOutcome, ObjectDeleteStart, ObjectDeleteWork,
-    ObjectDeleter, RETIRED_OBJECT_GRACE, SweptObjects, delete_incarnation,
-    delete_long_term_segments, delete_objects, delete_segments, list_segment_starts,
-    sweep_long_term, sweep_segments, sweepable,
+    ObjectDeleter, RETIRED_OBJECT_GRACE, RootListOutcome, SweptObjects, UploadSweepOutcome,
+    delete_incarnation, delete_long_term_segments, delete_objects, delete_segments,
+    list_segment_starts, sweep_long_term, sweep_segments, sweepable,
+};
+mod orphan_sweep;
+pub use orphan_sweep::{
+    ClaimStamp, OrphanCandidates, OrphanDelete, OrphanGuard, OrphanProgress, OrphanRefusal,
+    RootListing, RootPages, SweepFindings, SweepStamp, sweep_interval,
 };
 mod fresh_proofs;
+mod orphan_sweep_job;
 pub use fresh_proofs::{FreshProofs, ProofWalk, RebuiltProofs};
 mod fresh_upload;
 pub use fresh_upload::{ExecutorFreshUploader, FreshObjectUploader, FreshUploadOutcome};
@@ -93,9 +111,16 @@ pub use proven_batch::{ProvenBatch, ProvenBatchError};
 mod topic_object;
 pub use segment_chain::object_prefix;
 pub use segment_upload::{
-    ExecutorUploader, SegmentUpload, SegmentUploadAttempt, SegmentUploader, StartedSegmentUpload,
-    UploadError, UploadOutcome, upload_segment,
+    ExecutorUploader, MEMORY_PIECE_LEN, SegmentUpload, SegmentUploadAttempt, SegmentUploader,
+    StartedSegmentUpload, UploadError, UploadOutcome, memory_body, upload_segment,
 };
+mod segment_verify;
+pub use segment_verify::{
+    ObjectHead, SegmentHeads, SegmentVerifyJob, SegmentVerifyOutcome, SegmentVerifyReport,
+    Unanswered, VerifyBegin, VerifyTally,
+};
+mod segment_verify_job;
+pub use segment_verify_job::{ExecutorSegmentVerifier, SegmentVerifier, head_segments};
 pub mod long_term;
 mod long_term_delete;
 pub use long_term_delete::{
@@ -110,9 +135,12 @@ pub use long_term_merge::{
 };
 mod long_term_rewrite;
 pub use long_term_rewrite::{
-    BacklogWalk, ExecutorLongTermWriter, LONG_TERM_SEGMENT_BYTES, LongTermWriter, PlannedSegment,
-    RewriteError, RewriteOutcome, RewriteStart, SegmentPlan, SegmentRewrite,
+    BacklogWalk, CacheCarry, ExecutorLongTermWriter, LONG_TERM_SEGMENT_BYTES, LaterCarry,
+    LongTermWriter, PlannedSegment, RewriteError, RewriteOutcome, RewriteStart, SegmentPlan,
+    SegmentRewrite,
 };
+mod rewrite_share;
+pub use rewrite_share::{RewriteBudget, RewriteClock};
 pub use topic_object::{
     ExecutorTopicObjects, TOPIC_OBJECT_RETRY, TopicObjectOutcome, TopicObjects, delete_topic,
     list_topic_keys,
@@ -187,11 +215,12 @@ pub use partition_storage::{
     hydrate_partition_log, read_created_revision, read_revision_record, recover_consumer_offsets,
     recover_consumer_offsets_with_storage, write_created_revision, write_revision_record,
 };
-pub use poll_plan::{DISK_POLL_CHUNK_MAX, PollPlan, PollReadResult};
+pub use poll_plan::{DISK_POLL_CHUNK_MAX, DISK_POLL_CHUNK_MIN, PollPlan, PollReadResult};
 pub use segment::{Segment, SegmentLocation};
 pub use segment_recovery::{
     PartitionRecoveryError, PartitionRecoveryRefusal, RecoveredLog, RecoveredSegment,
-    load_persisted_segments, load_persisted_segments_with_checkpoint, load_placed_segments,
+    holds_neither_chain_nor_log, load_persisted_segments, load_persisted_segments_with_checkpoint,
+    load_placed_segments, load_tiered_segments,
 };
 use server_common::Message;
 pub use server_common::send_messages::{IggyMessage, IggyMessageHeader, IggyMessages};

@@ -30,10 +30,11 @@ namespace Apache.Iggy.Contracts;
 /// <remarks>
 ///     <see cref="MessageExpiry" />, <see cref="MaxTopicSize" />, <see cref="LocalRetentionAge" /> and
 ///     <see cref="LocalRetentionSize" /> can change later through a <see cref="TopicUpdate" />, which can also turn
-///     <see cref="TieredStorage" /> on and set the six durations of a geo topic again. Every other setting is fixed
-///     at creation. A property left null emits no key, which leaves the server default in place, or for a duration
-///     of a geo topic the server setting of each node. <see cref="IIggySystem.DescribeOptionsAsync" /> enumerates
-///     the keys a given server accepts, with the kind, default and mutability of each.
+///     <see cref="TieredStorage" /> on and set <see cref="ReadCacheSize" />, <see cref="ReadAhead" /> and the six
+///     durations of a geo topic again. Every other setting is fixed at creation. A property left null emits no key,
+///     which leaves the server default in place, or for the read cache and a duration of a geo topic the server
+///     setting of each node. <see cref="IIggySystem.DescribeOptionsAsync" /> enumerates the keys a given server
+///     accepts, with the kind, default and mutability of each.
 /// </remarks>
 public sealed class TopicOptions
 {
@@ -205,6 +206,25 @@ public sealed class TopicOptions
     public TimeSpan? LongTermRewriteMaxInterval { get; init; }
 
     /// <summary>
+    ///     The memory in bytes that each node keeps for what the topic's reads fetch from the object store, divided
+    ///     between its partitions. Zero keeps nothing that they fetch, otherwise at least 512 KiB. Overrides the
+    ///     server's <c>[tiered_storage] read_cache_size</c>.
+    /// </summary>
+    /// <remarks>
+    ///     This and <see cref="ReadAhead" /> apply to a normal or a geo topic. Zero is a value for them and is sent,
+    ///     unlike a zero <see cref="MaxTopicSize" />. Null leaves each node to apply its own server setting of the
+    ///     same name. The share of a partition is a limit within the read cache of its shard, not a reservation.
+    /// </remarks>
+    public ulong? ReadCacheSize { get; init; }
+
+    /// <summary>
+    ///     The most bytes that readahead fetches from the object store in front of a sequential reader of the topic.
+    ///     Zero turns readahead off, otherwise at least 128 KiB, and at most an eighth of a nonzero
+    ///     <see cref="ReadCacheSize" />. Overrides the server's <c>[tiered_storage] read_ahead</c>.
+    /// </summary>
+    public ulong? ReadAhead { get; init; }
+
+    /// <summary>
     ///     Option keys with no property of their own, keyed by option name, for keys newer than this build. A
     ///     property above wins on collision, and the server refuses a key outside its catalog by name. A raw
     ///     durability is kept unless the matching property asks for persisted durability.
@@ -335,6 +355,16 @@ public sealed class TopicOptions
             nameof(PositionsResumeTimeout));
         AddGeoDuration(options, TopicOptionKey.LongTermRewriteMaxInterval, LongTermRewriteMaxInterval,
             nameof(LongTermRewriteMaxInterval));
+
+        if (ReadCacheSize is { } readCacheSize)
+        {
+            options[Name(TopicOptionKey.ReadCacheSize)] = HeaderValue.FromUInt64(readCacheSize);
+        }
+
+        if (ReadAhead is { } readAhead)
+        {
+            options[Name(TopicOptionKey.ReadAhead)] = HeaderValue.FromUInt64(readAhead);
+        }
 
         return options;
     }

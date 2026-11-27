@@ -37,6 +37,9 @@ use integration::harness::{TestHarness, TestServerConfig, wait_for_consumer_grou
 use server_common::sharding::IggyNamespace;
 use tokio::time::{Instant, sleep};
 
+use super::http_client::HttpClient;
+use super::tiered_storage_fs::{METRICS_DEADLINE, settled_read_cache_counts};
+
 const STREAM: &str = "geo-stream";
 const TOPIC: &str = "geo-topic";
 const PARTITION_ID: u32 = 0;
@@ -49,6 +52,52 @@ const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// How long the bucket may take to prove the last committed batch: one
 /// object of proof rows alone after a wait and an upload.
 const PROVEN_DEADLINE: Duration = Duration::from_secs(30);
+/// How long the rewrite of a partition may take to take every message into
+/// long-term segments: its interval grows up to 10 s, and its segment then
+/// has to commit.
+const REWRITE_DEADLINE: Duration = Duration::from_secs(90);
+
+/// A consumer at the tail reads what the shard uploaded from memory, and one
+/// behind the rewrite reads the long-term segments that the rewrite handed
+/// to the cache, so neither asks the bucket.
+#[tokio::test]
+async fn given_a_geo_topic_when_consumers_read_before_and_after_its_rewrite_should_not_ask_the_bucket()
+ {
+    let store = tempfile::tempdir().expect("a directory for the object store");
+    let mut harness = server_with_fs_store(store.path());
+    harness.start().await.expect("the server boots");
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+    let http = HttpClient::login_root(&harness).await;
+    let stream = Identifier::named(STREAM).expect("stream identifier");
+    let topic = Identifier::named(TOPIC).expect("topic identifier");
+    client
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .expect("create stream");
+    create_geo_topic(&client, &stream, TOPIC, None)
+        .await
+        .expect("create the geo topic");
+    send(&client, &stream, &topic, 0..MESSAGES).await;
+
+    assert_reads_every_message(&client, &stream, &topic, MESSAGES).await;
+    let tail =
+        settled_read_cache_counts(&http, METRICS_DEADLINE, |counts| counts.block_hits > 0).await;
+    assert_eq!(tail.demand_bytes, 0, "the tail read the bucket: {tail:?}");
+    let rewritten = settled_read_cache_counts(&http, REWRITE_DEADLINE, |counts| {
+        counts.fresh_releases > 0 && counts.held_bytes == 0
+    })
+    .await;
+    assert!(rewritten.carried_bytes > 0, "{rewritten:?}");
+    assert_reads_every_message(&client, &stream, &topic, MESSAGES).await;
+    let behind =
+        settled_read_cache_counts(&http, METRICS_DEADLINE, |counts| *counts != rewritten).await;
+
+    assert!(behind.block_hits > rewritten.block_hits, "{behind:?}");
+    assert_eq!(
+        behind.demand_bytes, 0,
+        "a read behind the rewrite read the bucket: {rewritten:?}, then {behind:?}"
+    );
+}
 
 #[tokio::test]
 async fn given_a_geo_topic_when_producing_should_store_the_sends_and_read_them_back() {
@@ -104,9 +153,10 @@ async fn given_a_geo_topic_when_producing_should_store_the_sends_and_read_them_b
     assert_reads_every_message(&client, &stream, &topic, MESSAGES).await;
 }
 
-/// A geo topic in the `geo` mode has no durability choice: whatever a create
-/// names, or with no `durability` at all, every transport reports `persisted`
-/// as derived. A normal topic keeps the durability it names.
+/// A geo topic in the `geo` mode has no durability choice, for its messages
+/// or its consumer offsets: whatever a create names, or with neither key at
+/// all, every transport reports both `persisted` as derived. A normal topic
+/// keeps the durabilities it names.
 #[tokio::test]
 async fn given_a_geo_topic_when_created_naming_any_durability_or_none_should_report_persisted() {
     let store = tempfile::tempdir().expect("a directory for the object store");
@@ -133,6 +183,7 @@ async fn given_a_geo_topic_when_created_naming_any_durability_or_none_should_rep
         "http-replicated",
         &TopicCreateOptions {
             durability: Durability::Replicated,
+            consumer_offset_durability: Durability::Replicated,
             ..geo.clone()
         },
     )
@@ -178,16 +229,24 @@ async fn given_a_geo_topic_when_created_naming_any_durability_or_none_should_rep
                 .await
                 .expect("get topic")
                 .expect("the topic exists");
-            let durability = details
-                .options
-                .get(&HeaderKey::from(OptionKey::Durability))
-                .expect("the durability is stored");
-            assert_eq!(
-                details.resolved_options().runtime.durability,
-                expected,
-                "{name} over {transport}"
-            );
-            assert_eq!(durability.explicit, explicit, "{name} over {transport}");
+            let runtime = details.resolved_options().runtime;
+            for (key, resolved) in [
+                (OptionKey::Durability, runtime.durability),
+                (
+                    OptionKey::ConsumerOffsetDurability,
+                    runtime.consumer_offset_durability,
+                ),
+            ] {
+                let stored = details
+                    .options
+                    .get(&HeaderKey::from(key))
+                    .expect("the durability is stored");
+                assert_eq!(resolved, expected, "{key} of {name} over {transport}");
+                assert_eq!(
+                    stored.explicit, explicit,
+                    "{key} of {name} over {transport}"
+                );
+            }
         }
     }
 }
@@ -488,6 +547,98 @@ async fn given_a_geo_topic_with_its_own_durations_when_reading_and_changing_them
         refused.as_code(),
         IggyError::InvalidOptionValue(String::new()).as_code()
     );
+}
+
+/// A geo topic takes a change of its read cache, which a read of it reports
+/// once the topic sets it and as it was set, a zero included.
+#[tokio::test]
+async fn given_a_geo_topic_when_changing_its_read_cache_should_report_each_change() {
+    let store = tempfile::tempdir().expect("a directory for the object store");
+    let mut harness = server_with_fs_store(store.path());
+    harness.start().await.expect("the server boots");
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+    let stream = Identifier::named(STREAM).expect("stream identifier");
+    let topic = Identifier::named(TOPIC).expect("topic identifier");
+    client
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .expect("create stream");
+    create_geo_topic(&client, &stream, TOPIC, None)
+        .await
+        .expect("create the geo topic");
+    let read_cache = || async {
+        client
+            .get_topic(&stream, &topic)
+            .await
+            .expect("get topic")
+            .expect("the topic exists")
+            .resolved_options()
+            .read_cache
+    };
+    let bytes = |text: &str| Some(text.parse::<IggyByteSize>().expect("a byte size"));
+    let update = |read_cache: TopicReadCache| TopicUpdateOptions {
+        read_cache,
+        ..TopicUpdateOptions::default()
+    };
+    assert_eq!(
+        read_cache().await,
+        TopicReadCache::default(),
+        "unset, each node applies its own settings"
+    );
+
+    client
+        .update_topic(
+            &stream,
+            &topic,
+            &update(TopicReadCache {
+                read_ahead: bytes("1 MiB"),
+                ..TopicReadCache::default()
+            }),
+        )
+        .await
+        .expect("a geo topic takes a change of its readahead");
+    assert_eq!(
+        read_cache().await,
+        TopicReadCache {
+            size: None,
+            read_ahead: bytes("1 MiB"),
+        }
+    );
+    client
+        .update_topic(
+            &stream,
+            &topic,
+            &update(TopicReadCache {
+                size: bytes("0"),
+                ..TopicReadCache::default()
+            }),
+        )
+        .await
+        .expect("a geo topic takes a change of its read cache size");
+    assert_eq!(
+        read_cache().await,
+        TopicReadCache {
+            size: bytes("0"),
+            read_ahead: bytes("1 MiB"),
+        }
+    );
+
+    let error = client
+        .update_topic(
+            &stream,
+            &topic,
+            &TopicUpdateOptions {
+                raw_reset: ["read_cache_size".to_owned()].into(),
+                ..TopicUpdateOptions::default()
+            },
+        )
+        .await
+        .expect_err("a geo topic refuses a reset of its read cache size");
+    assert_eq!(
+        error.as_code(),
+        IggyError::OptionNotResettable(String::new()).as_code()
+    );
+    assert_eq!(read_cache().await.size, bytes("0"));
 }
 
 /// The offsets that a group stores itself are answered once the bucket holds

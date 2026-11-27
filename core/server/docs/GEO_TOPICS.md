@@ -120,6 +120,7 @@ shadow topic. A message becomes readable in another datacenter once its origin p
 | Recover the geo topics of a cluster that lost every disk, from its bucket     | Yes             |
 | Consumer positions that move between datacenters                              | Yes             |
 | Positions of plain consumers, and of Kafka groups through the Kafka gateway   | Yes             |
+| One consumer group over a topic and its shadow topics, in the Rust SDK        | Yes             |
 | The `geo_tiered` mode, and a switch between modes                             | No              |
 | Geo topics in encrypted streams                                               | No              |
 | Create, produce to or read geo topics through the Kafka gateway               | No              |
@@ -141,7 +142,12 @@ shadow topic. A message becomes readable in another datacenter once its origin p
    batch header and where its messages sit in the fresh object, 320 bytes in all. The replicas
    store this record on their disks. The messages themselves are only in the bucket.
 4. The producer is acknowledged when the placed batch commits. The message is **committed**.
-   Polls in this cluster read it at once, from the bucket, through a cache of 64 MiB per shard.
+   Polls in this cluster read it at once. The shard that stored the object holds it in memory
+   until the long-term segment below takes its messages, even with `read_cache_size` at 0, and
+   other polls read the bucket through the shard's read cache, `[tiered_storage] read_cache_size`,
+   within the topic's own `read_cache_size` when it sets one. When the cache needs the room for
+   newer objects first, it lets an object go before that, and polls of its messages read them from
+   the bucket.
 5. In the background, the partition's primary rewrites committed messages into **long-term
    segments** in the bucket, at most 64 MiB each, and commits each one to the partition's
    long-term log. It then stores the partition's **manifest**,
@@ -179,9 +185,17 @@ about an hour later.
   cannot check this rule.
 - **Credentials.** Each cluster needs read and write access to its own bucket: get, put, list
   and delete. On S3 that is `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` and
-  `s3:ListBucket`. Each cluster needs only read access to the bucket of each peer: `s3:GetObject`
-  and `s3:ListBucket`. On GCS, the role Storage Object User on the own bucket and Storage Object
-  Viewer on each peer's bucket. The server never writes to a peer's bucket.
+  `s3:ListBucket`, and for the multipart uploads of long-term segments
+  `s3:ListBucketMultipartUploads` on the bucket (`arn:aws:s3:::<bucket>`) and
+  `s3:AbortMultipartUpload` on its objects (`arn:aws:s3:::<bucket>/*`). A node aborts a
+  multipart upload that fails, and the sweep of abandoned uploads lists and aborts the ones
+  that a crash or a cancelled put left.
+  Without these two actions the sweep removes nothing and logs why, and S3 keeps charging for
+  the parts of every abandoned upload. A bucket lifecycle rule that aborts incomplete multipart
+  uploads is the alternative: it deletes no object. Each cluster needs only read access to the
+  bucket of each peer: `s3:GetObject` and `s3:ListBucket`. On GCS, the role Storage Object User
+  on the own bucket and Storage Object Viewer on each peer's bucket. The server never writes to
+  a peer's bucket.
 - **On GCS, one write per second per object.** GCS throttles a second write to one object name
   within a second. A partition stores its manifest at most once a second, within that limit. Each
   node rewrites one positions object per log, so set `[geo] consumer_offset_upload_interval` to
@@ -448,15 +462,27 @@ every topic option the server takes.
 `geo_mode` defaults to `geo` on a geo topic, the only mode clients can pick in this version. The
 server stores `partition_resize_policy` as `fixed` on a geo topic.
 
-A geo topic in the `geo` mode has no durability choice: it is always `persisted`. The server
-ignores the `durability` option on create, which the CLI and every SDK send as `replicated`
-unless told otherwise, and `GetTopic` reports `persisted` as derived. A send to a geo topic
-already waits for its upload to the bucket. With `persisted` it also waits until the record that
-places its batch is on disk on a quorum of the cluster's nodes. Without that record no
-datacenter can read the batch. On GCP, a power loss of every node of a cluster lost 70 of 10,500
-acknowledged messages with `replicated` and none with `persisted`. The flush cost about 4 ms on
-a 65 ms send. The `geo_tiered` mode, not available in this version, is the one meant for a
-faster path.
+A geo topic in the `geo` mode has no durability choice: its messages and its consumer offsets
+are always `persisted`. The server ignores the `durability` and `consumer_offset_durability`
+options on create, which the CLI and every SDK send as `replicated` unless told otherwise, and
+`GetTopic` reports both as `persisted`, derived. The server still checks a value it ignores, so
+a create that names one that is not `replicated` or `persisted` fails with `InvalidOptionValue`
+(4042). A send to a geo topic already waits for its
+upload to the bucket. With `persisted` it also waits until the record that places its batch is
+on disk on a quorum of the cluster's nodes. Without that record no datacenter can read the
+batch. On GCP, a power loss of every node of a cluster lost 70 of 10,500 acknowledged messages
+with `replicated` and none with `persisted`. The flush cost about 4 ms on a 65 ms send.
+
+An offset store waits in the same way. A node that answers a store before it is on disk can
+come back without it, and after every node of a cluster stops at once the partition then
+trusts no node's log: it elects a primary only once all of its nodes are back. With both
+`persisted`, any quorum of them elects. The `geo_tiered` mode, not available in this version,
+is the one meant for a faster path.
+
+A geo topic in the `geo` mode that an earlier build of the server stored with `replicated`, and
+a shadow topic of one, take `persisted` for both when a node loads its metadata, from a snapshot
+or from its log. `GetTopic` then reports what the partitions run with. What such a topic
+acknowledged before that load has the guarantee of `replicated` only.
 
 ### What a create refuses
 
@@ -469,15 +495,17 @@ faster path.
 | A duration of a geo topic on a normal topic                          | `InvalidOptionValue` (4042)   |
 | `tiered_storage=true` on a geo topic                                 | `InvalidOptionValue` (4042)   |
 | `partition_resize_policy` other than `fixed` on a geo topic          | `InvalidOptionValue` (4042)   |
+| A `durability` or `consumer_offset_durability` that is not valid     | `InvalidOptionValue` (4042)   |
 | Any topic create in a shadow stream                                  | `ShadowStreamReadOnly` (1021) |
 
-After the create, the topic refuses changes, all but a change of its durations:
+After the create, the topic refuses changes, all but a change of its durations and of its
+`read_cache_size` and `read_ahead`:
 
-| Request on a geo topic                                | Answer                           |
-| ----------------------------------------------------- | -------------------------------- |
-| An update of its name or of any option but a duration | `OptionNotUpdatable` (4103)      |
-| A reset of a duration                                 | `OptionNotResettable` (4104)     |
-| Adding or deleting partitions                         | `PartitionResizeDisabled` (2023) |
+| Request on a geo topic                                                      | Answer                           |
+| --------------------------------------------------------------------------- | -------------------------------- |
+| An update of its name or of any option but a duration or a read cache key   | `OptionNotUpdatable` (4103)      |
+| A reset of a duration or of a read cache key                                | `OptionNotResettable` (4104)     |
+| Adding or deleting partitions                                               | `PartitionResizeDisabled` (2023) |
 
 A `FeatureUnavailable` from a cluster that is not ready is worth retrying while its nodes pass
 their store identity checks. `object_store_identity_verified` shows when each node does.
@@ -508,7 +536,7 @@ A value is a number of microseconds or a duration like `50 ms`. The meaning of e
 - An update cannot reset a duration to the node's setting. To follow the node again, set the
   node's value.
 - A normal topic refuses them. A shadow topic has none: its cluster applies its own settings,
-  because the options of a topic do not go to other datacenters.
+  because the durations of a topic do not go to other datacenters.
 - The topic's object records its `tombstone_grace`, so the grace still applies after the delete,
   when the topic is gone from metadata.
 
@@ -530,6 +558,27 @@ iggy topic update orders payments --set consumer_offset_upload_interval=200ms
 `iggy topic get` shows the durations that the topic sets. Every SDK has typed fields for them in
 its topic create options, its topic update and its topic read model.
 
+A geo topic can also set `read_cache_size` and `read_ahead`, as any topic can. They override the
+`[tiered_storage]` settings of the same name for the reads of the topic that go to the bucket:
+long-term segments, and fresh objects that the shard does not hold. `read_cache_size` is shared
+evenly between the topic's partitions, and each share is a limit within the read cache of the
+shard, not a reservation. `0` keeps nothing that those reads fetch, and turns readahead off. The
+fresh objects that a shard uploaded stay in memory for the polls at the tail whatever the topic
+sets. An update can change both and cannot reset them. See [tiered
+storage](../README.md#tiered-storage) in the server README.
+
+The topic's object carries both keys, so each shadow topic of the topic in another datacenter
+reads with the same values: it takes them at its adoption, and follows each update. A key that
+the geo topic does not set is unset on the shadow topic too, and the nodes that hold the shadow
+apply their own settings. The values are kept as the origin set them, also when they do not fit
+the nodes of the other cluster: a share of `read_cache_size` below 8 blocks of a node's
+`read_cache_block_size` keeps nothing on that node, which logs it once for each such partition,
+and a partition reads ahead at most an eighth of its share. A client cannot set them on a shadow
+topic. An update typically reaches the shadow topics within about 35 seconds, and later while
+earlier shadow operations are queued, see [Delays](#delays). After a recovery of the origin, a
+shadow topic follows the successor's updates. While the origin's bucket does not answer, and after
+its origin retired, a shadow topic keeps the last values it took.
+
 ### What happens after a create
 
 1. The metadata primary stores the topic's object,
@@ -539,7 +588,8 @@ its topic create options, its topic update and its topic read model.
    warning.
 3. The metadata primary of each peer lists the topic objects of this cluster every 5 seconds. It
    adopts the new topic into the shadow stream `__shadow_<origin>_<stream>`, with the same topic
-   id, topic name and partition ids.
+   id, topic name and partition ids, and the `read_cache_size` and `read_ahead` that the topic
+   sets.
 
 ## Produce and consume
 
@@ -571,9 +621,10 @@ A consumer connects to the cluster of its own datacenter, and reads:
 A client recognizes a shadow stream by the read-only key `shadow_origin`, which names the origin.
 A stream read reports it, alone or in a listing, and no other stream carries it. Every SDK has a
 typed getter for it, and for the `topic_type` and `geo_mode` of a topic. A shadow topic reads as a
-geo topic with the `geo_mode` of its origin, and in the `geo` mode as `persisted`, although this
-cluster stores it as a normal topic and runs none of a geo topic's write path for it. The CLI
-shows the origin in `iggy stream list`, and the type, the mode and the origin in `iggy topic get`.
+geo topic with the `geo_mode` of its origin, although this cluster stores it as a normal topic and
+runs none of a geo topic's write path for it. In the `geo` mode it reads as `persisted` for its
+messages and its consumer offsets, and its partitions run with both. The CLI shows the origin in
+`iggy stream list`, and the type, the mode and the origin in `iggy topic get`.
 
 A shadow topic is read like any other topic, by stream name and topic name or id. It has the
 topic id and the partition ids of its origin's topic, and it is built to serve the origin's
@@ -584,6 +635,53 @@ their bytes from the origin's bucket. A message that the origin committed and di
 is not in the shadow topic: see [Delays](#delays). Every node of the cluster serves the same
 messages of a shadow partition, also after a restart. A consumer whose stored position is ahead
 of what the shadow partition serves waits until it gets there; its position is never moved back.
+
+The Rust SDK reads the topic and its shadow topics as one consumer. Add `with_shadows()` to the
+builder of a consumer group:
+
+```rust
+let mut consumer = client
+    .consumer_group("billing", "orders", "payments")?
+    .with_shadows()
+    .build();
+consumer.init().await?;
+let mut outcome = Ok(());
+while let Some(received) = consumer.next().await {
+    // The consumer reads on after an error of one topic.
+    let Ok(received) = received else { continue };
+    // received.origin tells where the message was written.
+    if let Err(error) = consumer.commit(received.checkpoint()).await {
+        outcome = Err(error);
+        break;
+    }
+}
+consumer.shutdown().await?;
+outcome?;
+```
+
+- The consumer reads `orders/payments` and the topic `payments` of each shadow stream of
+  `orders`, such as `__shadow_dc-b_orders`. It finds them by `shadow_origin` and by name. It lists
+  the streams again every `discovery_interval`, 5 seconds by default, so it starts to read a
+  shadow topic that appears later without a restart, and stops reading one that is gone, such as
+  the shadow of a retired origin.
+- Each message tells where it was written: in the origin that the `shadow_origin` of its shadow
+  stream names, or in this datacenter. A client cannot read the origin of the cluster it is
+  connected to, so a message of the topic in this cluster is marked local, with no origin name.
+- Order holds within one origin and partition only. Nothing orders the messages of two origins.
+- Messages of a shadow topic arrive seconds after those of the topic in this cluster, see
+  [Delays](#delays). A topic that is slow or has no messages does not hold back the others.
+  The joins of the shadow topics share the requests of the client, so a slow join can delay
+  the other joins, but not the topics already read.
+- `sources` chooses the topics: `GeoSources::Both`, the default, `GeoSources::LocalOnly` or
+  `GeoSources::ShadowsOnly`.
+- The consumer finds only the shadow streams that the user may read, because a list of the streams
+  holds no other stream. A shadow topic that the consumer cannot open is reported once, and the
+  other topics are read on. The geo consumers of one client share a listing of the streams that
+  is younger than half their `discovery_interval`.
+- `init()` refuses HTTP, which cannot join a consumer group, and, when the consumer reads the
+  topic in this cluster, a topic that is not a geo topic or a stream that is a shadow stream.
+
+The other SDKs read the topic and each shadow topic with a consumer of their own.
 
 ### Consumer groups and positions
 
@@ -629,6 +727,12 @@ of what the shadow partition serves waits until it gets there; its position is n
   from coming back from the other clusters. The other clusters keep their groups of that name.
 - Membership, generations and partition assignments do not move. Consumers join and rebalance in
   the cluster they connect to.
+- A consumer that reads the topic with its shadow topics joins an ordinary group of its name on
+  each topic. Each topic keeps its own positions, which move between the datacenters as above,
+  and the consumer commits each message to the topic it came from. A group that moves to another
+  datacenter resumes each log from its own position there.
+- Each topic balances its partitions among the members of its group on its own. A member can hold
+  partitions of the topic and of shadow topics at once, and two members can hold different totals.
 - Grant read permissions on each shadow stream as on any other stream.
 
 ### Plain consumers and Kafka groups
@@ -675,6 +779,7 @@ deduplicate on an id of their own, such as the message id that the producer sets
 | Published               | Readable in another datacenter       | Up to `[geo] manifest_poll_interval`, 5 s by default, until the peer lists the manifest, then one read of the manifest and one commit in the peer.                                                                                                                   |
 | Committed               | Readable in another datacenter       | The two rows above added up, seconds: the next rewrite and manifest, then the peer's next listing. Nothing else brings a message there.                                                                                                                              |
 | Geo topic created       | Shadow topic in each peer            | About a second to store the topic object, then up to 5 s until a peer lists it.                                                                                                                                                                                      |
+| Read cache updated      | Shadow topic reads with it           | Typically about a second to store the topic object again, then up to 30 s until a peer reads it again and up to 5 s until its next pass, then one commit in the peer. Earlier shadow operations queued in the peer can delay it by more passes.                      |
 | Group offset store      | Acknowledged, position in the bucket | One commit of the store, one commit of the fold and one put of the node's object of the log. A put that runs, or one that started less than `[geo] consumer_offset_upload_interval` (50 ms by default) before, delays it to the next put.                            |
 | Poll with `auto_commit` | Position stored in the bucket        | Up to `[geo] positions_publish_interval`, 1 s by default, then a commit of the fold and the upload of the object.                                                                                                                                                    |
 | Position stored         | Taken by another datacenter          | Up to `[geo] positions_poll_interval`, 1 s by default, then one read of the object and one commit in that cluster.                                                                                                                                                   |
@@ -722,7 +827,7 @@ acknowledged it. At that load each partition rewrites every 10 s, the default lo
 | ------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | One node of a cluster fails                             | The partitions elect another primary as for any topic. Nothing is lost.                                                                                                                                                                                                                                                          |
 | A cluster's bucket does not answer                      | Its geo topics refuse sends with 58. Polls that need bytes from the bucket get 58, which the SDKs retry. A group's own offset store on a geo or shadow topic commits, and is answered with `TransientNotCommitted` (57) after 10 s, which the SDKs send again. Rewrites wait. Peers mark the shadow topics of that origin stale. |
-| A cluster fails and returns, its bucket stays           | On restart the cluster replays its consensus log, and the rewrite publishes the committed messages it had not published. A geo topic in the `geo` mode is always `persisted`, so it keeps every acknowledged message: see [above](#create-a-geo-topic).                                                                          |
+| A cluster fails and returns, its bucket stays           | On restart the cluster replays its consensus log, and the rewrite publishes the committed messages it had not published. A geo topic in the `geo` mode is always `persisted`, so it keeps every acknowledged message and offset, and a quorum of its nodes serves it: see [above](#create-a-geo-topic).                          |
 | A cluster is destroyed with its disks, its bucket stays | A cluster rebuilt on empty disks takes back its geo topics when an operator asks for it: see [Recover an origin that lost its disks](#recover-an-origin-that-lost-its-disks). The published messages come back, and so do the committed ones that self-describing fresh objects prove. The other committed messages are lost.    |
 | A cluster is destroyed and never returns                | Its shadow topics in the other clusters stop growing. Retire its origin in each of them: see [Retire an origin](#retire-an-origin). Its shadow topics then expire by their own retention.                                                                                                                                        |
 | A bucket is lost                                        | Every message of the geo topics of that cluster is lost, committed or published. This is the reason for the deployment rule.                                                                                                                                                                                                     |
@@ -810,8 +915,10 @@ node keeps it across restarts. A retirement of an origin that is retired already
 
 After the command:
 
-- The nodes send the origin's bucket no request but the reads of polls. They check its identity
-  no more, and list none of its topic objects, manifests or consumer group positions.
+- The nodes send the origin's bucket no request but the reads of polls, and after each start
+  one read of its identity object, which the polls wait for. A node serves the polls only when
+  that object names a cluster that the retirement recorded, or a successor that recovery records
+  prove. They list none of its topic objects, manifests or consumer group positions.
   `geo_peer_retired` is 1 for that origin.
 - After a node starts, its group polls wait for the positions of the other peers only.
 - The shadow topics of the origin stop growing. A poll reads the messages that the last
@@ -870,9 +977,9 @@ Fresh objects of the format before (`IGGYFRS1`) say neither whose batches they h
 where those committed, so their messages come back only when they were published. The
 recovery reports each such object.
 
-A restored topic takes its partitions, compression, retention and its own `tombstone_grace` from
-its topic object, the only one of its durations that the object records. It is in the `geo` mode,
-so it is `persisted`.
+A restored topic takes its partitions, compression, retention, its own `tombstone_grace`, the
+only one of its durations that the object records, and its `read_cache_size` and `read_ahead`
+from its topic object. It is in the `geo` mode, so it is `persisted`.
 
 Nothing else comes back from the bucket: consumer offsets, consumer groups, users and
 permissions, normal topics, and the idempotent producer state of the published messages are
@@ -917,7 +1024,9 @@ one starts from the position its peers hold.
 A recovery that fails logs the reason and runs again at the next check, 5 seconds later.
 Each attempt finds what an earlier one stored and goes on. It refuses a topic of another
 `[geo] origin`, a cluster that already holds streams, and a bucket that another cluster
-recovered already.
+recovered already. It also refuses a bucket with a topic object that this build cannot read,
+damaged or in a format it does not know, so that it never recovers only some of the topics.
+The log names the object and its format marker, the first 8 bytes, such as `IGGYTOP3`.
 
 ### What it writes
 
@@ -933,7 +1042,13 @@ Then it replaces `<prefix>/meta/identity` with the rebuilt cluster's own. A node
 cluster that comes back finds another cluster there at its next check, within a minute, and
 stops writing. A peer that follows the lost cluster's fresh objects takes its batches only
 below each partition's cutover in the record: from there on the partition's log is the
-rebuilt cluster's.
+rebuilt cluster's. A peer whose shadow streams came from the lost cluster follows the record
+from it to the rebuilt cluster, and reads the bucket as that cluster's. It reads no record of a
+bucket whose identity object names a cluster that its shadow streams came from. When the lost
+cluster is the only one that the peer's metadata records of the origin, those shadow streams
+also follow the rebuilt cluster's topic objects: a tombstone detaches its topic, and a new topic
+of a shadowed stream gets a shadow topic. A stream that has no shadow stream gets none, and the
+peer logs it.
 
 The report lists, per partition:
 
@@ -962,7 +1077,12 @@ when a poll of a shadow topic reads them from the peer's bucket. The cross-datac
 per peer:
 
 - each node reads the peer's store identity object once a minute, and every 5 seconds while the
-  check does not pass;
+  check does not pass, and a recovery record under the peer's root only when the object names a
+  cluster that the shadow streams did not come from;
+- each manifest or positions pass that reads an object of the peer reads the identity object
+  before and after it: two more gets at most every `[geo] manifest_poll_interval` per shard for
+  each 16 changed manifests that it reads, and every `[geo] positions_poll_interval` per node
+  while the peer's positions change;
 - the metadata primary lists the peer's topic objects every 5 seconds, reads each new object,
   and reads each known object again every 30 seconds;
 - every `[geo] positions_poll_interval`, shard 0 of each node that leads a partition of a geo or
@@ -990,8 +1110,8 @@ Requests to a cluster's own bucket:
   for each object that fills to 4 MiB first;
 - up to four puts a second on a shard whose sends are more than 250 ms apart, for the proof rows
   that no object with messages carried in that time;
-- a get for each poll that misses the shard's 64 MiB cache, and gets for the rewrites and merges,
-  which read the messages back;
+- a get for each run of blocks a poll misses in the shard's read cache, and gets for the rewrites
+  and merges, which read the messages back;
 - a put for each long-term segment and its index, and a put of the partition's manifest at most
   once a second, only when its long-term log changed. The manifest is one object, about 88 bytes
   per segment it lists, that each put rewrites whole;
@@ -1006,7 +1126,9 @@ Requests to a cluster's own bucket:
 
 Storage: a message stays in its fresh object until at least 10 minutes after every message of
 that object is published, and in a long-term segment until retention removes it. Each replica
-keeps 320 bytes per batch on its disk.
+keeps 320 bytes per batch on its disk. On GCS, a bucket with soft delete on keeps each deleted
+fresh object billable for its retention, 7 days by default, so turn soft delete off on the bucket
+to avoid it.
 
 ## Metrics
 
@@ -1019,12 +1141,12 @@ the `_total` suffix, and histograms the `_bucket`, `_sum` and `_count` suffixes.
 | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `object_store_identity_verified`        | 1 while the node passes the store identity check of its own bucket.                                                                                                            |
 | `object_store_unreachable`              | 1 while its own bucket does not answer the check.                                                                                                                              |
-| `geo_peer_identity_verified`            | Per `origin`: 1 while the node reads the peer's bucket.                                                                                                                        |
+| `geo_peer_identity_verified`            | Per `origin`: 1 while the node reads the peer's bucket, whose identity object names a cluster that the shadow streams came from or a proven successor.                         |
 | `geo_peer_unreachable`                  | Per `origin`: 1 while the peer's bucket does not answer the check.                                                                                                             |
-| `geo_peer_retired`                      | Per `origin`: 1 once this cluster retired the origin. The node then sends its bucket only the reads of polls.                                                                  |
+| `geo_peer_retired`                      | Per `origin`: 1 once this cluster retired the origin. The node then sends its bucket only the reads of polls, and one identity read after a start.                             |
 | `geo_shadow_topics_stale`               | Per `origin`: stale shadow topics, counted on the metadata primary.                                                                                                            |
 | `geo_peer_manifest_requests_total`      | Per `origin` and `request`, `list` or `get`: requests for the peer's manifests.                                                                                                |
-| `geo_peer_manifest_failures_total`      | The same requests that failed.                                                                                                                                                 |
+| `geo_peer_manifest_failures_total`      | The same requests that failed, and the manifest reads of a pass that found another claim on the bucket.                                                                        |
 | `geo_peer_manifests_refused_total`      | Per `origin`: manifests that this cluster refused.                                                                                                                             |
 | `geo_peer_manifest_commands_total`      | Per `origin`: commands that committed a manifest to a shadow partition.                                                                                                        |
 | `geo_peer_manifest_listed_seconds`      | Per `origin`: Unix time of the last listing that succeeded, on shard 0.                                                                                                        |
@@ -1137,7 +1259,7 @@ Alert on these first:
 | `[geo] tombstone_grace`                          | `24 h`   | How long a deleted geo topic keeps its tombstone and its objects in this cluster's bucket, and how long this cluster keeps a detached shadow topic. Make it longer than any peer outage. A geo topic can set its own.                                                                                                                                                                                                                     |
 
 The keys that a geo topic can set for itself are in
-[Durations of a geo topic](#durations-of-a-geo-topic).
+[Durations of a geo topic](#durations-of-a-geo-topic), with `read_cache_size` and `read_ahead`.
 
 The two bounds of waiting sends protect the memory of a node when the bucket or a partition stops
 answering. A node holds at most `fresh_pending_bytes` times its shards for them. The share of one
@@ -1205,5 +1327,8 @@ object is deleted, and 1 hour before an unlisted long-term object is deleted.
   remove long-term segments. Only retention and a delete of the topic do.
 - **65,536 long-term segments per partition.** Merges keep the count down. A full log takes no new
   segment until merges or retention free room.
-- **No consumer that reads a topic with its shadow topics.** A consumer reads the topic and each
-  shadow topic separately. Stream reads mark a shadow stream with `shadow_origin`.
+- **Only the Rust SDK reads a topic with its shadow topics as one consumer.** In the other SDKs a
+  consumer reads the topic and each shadow topic separately. Stream reads mark a shadow stream
+  with `shadow_origin`.
+- **No origin name for the topic in this cluster.** A client cannot read the origin of the
+  cluster it is connected to, so the Rust consumer labels those messages as local only.

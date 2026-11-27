@@ -133,13 +133,14 @@ struct ModelVectorTests {
             preallocateSegments: false, replicationFactor: 2, segmentMaxAge: .after(.seconds(3_600)), tieredStorage: false,
             localRetentionAge: .after(.seconds(1_800)), localRetentionSize: .bytes(536_870_912), topicType: .geo, geoMode: .geoTiered,
             freshUploadInterval: .milliseconds(50), consumerOffsetUploadInterval: .zero, positionsPublishInterval: .seconds(2),
-            tombstoneGrace: .seconds(3_600), positionsResumeTimeout: .seconds(30), longTermRewriteMaxInterval: .seconds(20))
+            tombstoneGrace: .seconds(3_600), positionsResumeTimeout: .seconds(30), longTermRewriteMaxInterval: .seconds(20),
+            readCacheSizeBytes: 16_777_216, readAheadBytes: 0)
         #expect(try create.encode() == golden.bytes("options.topic_create.full"))
         let update = TopicUpdateOptions(
             messageExpiry: .never, maxTopicSize: .unlimited, tieredStorage: true, localRetentionAge: .after(.seconds(1_800)),
             localRetentionSize: .bytes(536_870_912), freshUploadInterval: .milliseconds(50), consumerOffsetUploadInterval: .zero,
             positionsPublishInterval: .seconds(2), tombstoneGrace: .seconds(3_600), positionsResumeTimeout: .seconds(30),
-            longTermRewriteMaxInterval: .seconds(20))
+            longTermRewriteMaxInterval: .seconds(20), readCacheSizeBytes: 16_777_216, readAheadBytes: 0)
         #expect(try OptionsBlock.encode(update.toPatch().set) == golden.bytes("options.topic_update.full"))
         let raw = TopicCreateOptions(raw: ["durability": "persisted"])
         #expect(try raw.encode() == golden.bytes("options.topic_create.raw"))
