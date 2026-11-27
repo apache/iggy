@@ -143,11 +143,11 @@ pub enum ObjectDeleteDone {
 pub type ObjectDeleteOutcome = Result<ObjectDeleteDone, TierJobCancelled>;
 
 /// What a read of the claim of the root found, see
-/// [`crate::orphan_sweep_job::read_claim`].
+/// `orphan_sweep_job::read_claim`.
 pub type ClaimReadOutcome = Result<Result<Option<ClaimStamp>, ObjectStoreError>, TierJobCancelled>;
 
 /// What one listing job of the root read, see
-/// [`crate::orphan_sweep_job::list_root`].
+/// `orphan_sweep_job::list_root`.
 pub type RootListOutcome = Result<Result<RootPages, ObjectStoreError>, TierJobCancelled>;
 
 /// What one page of a sweep of abandoned uploads in parts did, or that its
