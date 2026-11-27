@@ -4443,6 +4443,33 @@ describe('consumer', () => {
     assert.equal(outcome, 'closed');
   });
 
+  for (const streamError of [undefined, new Error('stream failed')]) {
+    it(streamError ? 'keeps the stream error when shutdown also fails' : 'emits the shutdown error when destroyed',
+      async () => {
+        const topic = new FakeTopic(2n);
+        const commit = CommitPolicy.Auto({ interval: 3_600_000, after: CommitAfter.Processing });
+        const consumer = new IggyConsumer(await open(topic, [1], { commit }), CommitAfter.Processing);
+        const readable = consumer.toReadable();
+        const events: (Error | 'close')[] = [];
+        readable.on('error', (error: Error) => events.push(error));
+        const closed = new Promise<void>((resolve) => readable.once('close', () => {
+          events.push('close');
+          resolve();
+        }));
+
+        await once(readable, 'readable');
+        const { message } = readable.read();
+        const failure = new Error('offset store refused');
+        topic.storeFailure = failure;
+        readable.destroy(streamError);
+        await closed;
+
+        assert.equal(message.headers.offset, 0n);
+        assert.equal(topic.stored.get(1), undefined);
+        assert.deepEqual(events, [streamError ?? failure, 'close']);
+      });
+  }
+
   for (const [action, end, leaves] of [
     ['commit', (consumer, checkpoint, signal) => consumer.commit(checkpoint, { signal }), 0],
     ['shutdown', (consumer, _, signal) => consumer.shutdown({ signal }), 1]
