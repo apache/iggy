@@ -30,7 +30,7 @@ use tracing::{debug, info, warn};
 
 use super::{IggyBridge, REQUEST_TIMEOUT, metadata_write_on, with_request_timeout};
 use crate::bridge::error::BridgeError;
-use crate::bridge::topic_map::validate_kafka_topic_name;
+use crate::bridge::topic_map::{IggyNames, split_shadow_stream, validate_kafka_topic_name};
 use crate::bridge::topic_settings::{
     KafkaTopicSettings, TopicConfigSnapshot, TopicConfigUpdate, replication_factor_of,
 };
@@ -145,9 +145,12 @@ impl IggyBridge {
                 kafka_topic: kafka_topic.to_string(),
             });
         }
-        let (stream_name, topic_name) = self.config.topic_mapping.resolve(kafka_topic);
-        let stream_id = ensure_stream(&self.client, stream_name).await?;
-        self.ensure_topic(&stream_id, topic_name, kafka_topic, partition_count)
+        let names = self.iggy_names_read(&self.client, kafka_topic).await;
+        if let Some(origin) = names.origin {
+            return Err(shadow_topic(kafka_topic, origin));
+        }
+        let stream_id = ensure_stream(&self.client, &names.stream).await?;
+        self.ensure_topic(&stream_id, names.topic, kafka_topic, partition_count)
             .await?;
         Ok(())
     }
@@ -266,9 +269,9 @@ impl IggyBridge {
     /// connectivity/auth failures.
     pub async fn delete_kafka_topic(&self, kafka_topic: &str) -> Result<(), BridgeError> {
         validate_kafka_topic_name("kafka_topic", kafka_topic)?;
-        let (stream_name, topic_name) = self.config.topic_mapping.resolve(kafka_topic);
-        let stream_id = Identifier::named(stream_name).map_err(BridgeError::Iggy)?;
-        let topic_id = Identifier::named(topic_name).map_err(BridgeError::Iggy)?;
+        let names = self.iggy_names_read(&self.client, kafka_topic).await;
+        let stream_id = Identifier::named(&names.stream).map_err(BridgeError::Iggy)?;
+        let topic_id = Identifier::named(names.topic).map_err(BridgeError::Iggy)?;
         self.metadata_write(|| self.client.delete_topic(&stream_id, &topic_id))
             .await
     }
@@ -304,15 +307,18 @@ impl IggyBridge {
                 kafka_topic: kafka_topic.to_string(),
             });
         }
-        let (stream_name, topic_name) = self.config.topic_mapping.resolve(kafka_topic);
-        let stream_id = Identifier::named(stream_name).map_err(BridgeError::Iggy)?;
-        let topic_id = Identifier::named(topic_name).map_err(BridgeError::Iggy)?;
+        let names = self.iggy_names_read(&self.client, kafka_topic).await;
+        let stream_id = Identifier::named(&names.stream).map_err(BridgeError::Iggy)?;
+        let topic_id = Identifier::named(names.topic).map_err(BridgeError::Iggy)?;
         self.metadata_write(|| {
             self.client
                 .create_partitions(&stream_id, &topic_id, partitions_count)
         })
         .await?;
-        info!("added {partitions_count} partitions to Iggy topic '{topic_name}'");
+        info!(
+            "added {partitions_count} partitions to Iggy topic '{}'",
+            names.topic
+        );
         Ok(())
     }
 
@@ -342,9 +348,9 @@ impl IggyBridge {
         kafka_topic: &str,
     ) -> Result<Option<TopicDetails>, BridgeError> {
         validate_kafka_topic_name("kafka_topic", kafka_topic)?;
-        let (stream_name, topic_name) = self.config.topic_mapping.resolve(kafka_topic);
-        let stream_id = Identifier::named(stream_name).map_err(BridgeError::Iggy)?;
-        let topic_id = Identifier::named(topic_name).map_err(BridgeError::Iggy)?;
+        let names = self.iggy_names_read(client, kafka_topic).await;
+        let stream_id = Identifier::named(&names.stream).map_err(BridgeError::Iggy)?;
+        let topic_id = Identifier::named(names.topic).map_err(BridgeError::Iggy)?;
         // No separate get_stream probe: get_topic already answers Ok(None) when the stream
         // itself is missing (see high_watermarks' own doc on this same fact), so a probe first
         // would just pay a second round trip to learn something this one call already tells us.
@@ -371,9 +377,9 @@ impl IggyBridge {
         if update.is_empty() {
             return Ok(());
         }
-        let (stream_name, topic_name) = self.config.topic_mapping.resolve(kafka_topic);
-        let stream_id = Identifier::named(stream_name).map_err(BridgeError::Iggy)?;
-        let topic_id = Identifier::named(topic_name).map_err(BridgeError::Iggy)?;
+        let names = self.iggy_names_read(&self.client, kafka_topic).await;
+        let stream_id = Identifier::named(&names.stream).map_err(BridgeError::Iggy)?;
+        let topic_id = Identifier::named(names.topic).map_err(BridgeError::Iggy)?;
         let options = update.options();
         self.metadata_write(|| self.client.update_topic(&stream_id, &topic_id, &options))
             .await
@@ -405,15 +411,16 @@ impl IggyBridge {
         &self,
         kafka_topics: &[StrBytes],
     ) -> Result<Vec<(StrBytes, Option<KafkaTopicMetadata>)>, BridgeError> {
+        self.read_unseen_shadows(&self.client, kafka_topics.iter().map(StrBytes::as_str))
+            .await;
         let resolved: Vec<(StrBytes, String, String)> = kafka_topics
             .iter()
             .map(|kafka_topic| {
-                let (stream_name, topic_name) =
-                    self.config.topic_mapping.resolve(kafka_topic.as_str());
+                let names = self.iggy_names(kafka_topic.as_str());
                 (
                     kafka_topic.clone(),
-                    stream_name.to_string(),
-                    topic_name.to_string(),
+                    names.stream.into_owned(),
+                    names.topic.to_string(),
                 )
             })
             .collect();
@@ -545,8 +552,17 @@ impl IggyBridge {
                 kafka_topic: kafka_topic.to_string(),
             });
         }
-        let (stream_name, topic_name) = self.config.topic_mapping.resolve(kafka_topic);
+        let names = self.iggy_names_read(client, kafka_topic).await;
+        let (stream_name, topic_name) = (names.stream.as_ref(), names.topic);
         let stream_id = Identifier::named(stream_name).map_err(BridgeError::Iggy)?;
+        if let Some(origin) = names.origin {
+            // Tools that make sure a topic exists take this answer for a shadow that Iggy holds.
+            let topic_id = Identifier::named(topic_name).map_err(BridgeError::Iggy)?;
+            return match with_request_timeout(client.get_topic(&stream_id, &topic_id)).await? {
+                Some(_) => Ok(TopicCreationOutcome::AlreadyExists),
+                None => Err(shadow_topic(kafka_topic, origin)),
+            };
+        }
 
         let options = settings.create_options(partition_count, &self.config.topic_defaults);
         let create_topic = || {
@@ -662,6 +678,8 @@ impl IggyBridge {
             }
         }
 
+        let shadow_streams = self.read_shadow_streams(client).await?;
+        let is_shadow_stream = |stream: &str| shadow_streams.contains(stream);
         let default_stream_id = Identifier::named(default_stream).map_err(BridgeError::Iggy)?;
         // No separate get_stream probe: get_topics already answers an empty list when the stream
         // itself is missing (server-side "legacy parity: a missing stream lists as empty, not
@@ -687,6 +705,20 @@ impl IggyBridge {
                 );
                 continue;
             }
+            if self
+                .config
+                .topic_mapping
+                .resolve_name(&topic.name, is_shadow_stream)
+                .origin
+                .is_some()
+            {
+                debug!(
+                    "skipping Iggy topic '{}' in Metadata: a shadow of another datacenter's geo \
+                     topic takes its name",
+                    topic.name
+                );
+                continue;
+            }
             let replication_factor = replication_factor_of(&topic.options);
             results.push(KafkaTopicMetadata {
                 kafka_topic: topic.name,
@@ -694,11 +726,131 @@ impl IggyBridge {
                 replication_factor,
             });
         }
+        self.list_shadow_topics(client, &shadow_streams, &mut results)
+            .await?;
 
         Ok(KafkaTopicListing {
             topics: results,
             unreadable,
         })
+    }
+
+    /// Adds to `results` each topic of `shadow_streams` that a Kafka name lists: the shadows of the
+    /// geo topics that other datacenters write, for the streams that the mapping names.
+    async fn list_shadow_topics(
+        &self,
+        client: &IggyClient,
+        shadow_streams: &HashSet<String>,
+        results: &mut Vec<KafkaTopicMetadata>,
+    ) -> Result<(), BridgeError> {
+        let mapping = &self.config.topic_mapping;
+        let mapped: HashSet<&str> = mapping
+            .overrides()
+            .map(|(_, over)| over.stream.as_str())
+            .chain([mapping.default_stream()])
+            .collect();
+        let mut listed: Vec<&String> = shadow_streams
+            .iter()
+            .filter(|name| {
+                split_shadow_stream(name).is_some_and(|(_, stream)| mapped.contains(stream))
+            })
+            .collect();
+        listed.sort();
+        for shadow_stream in listed {
+            let stream_id = Identifier::named(shadow_stream).map_err(BridgeError::Iggy)?;
+            let topics = match with_request_timeout(client.get_topics(&stream_id)).await {
+                Ok(topics) => topics,
+                Err(BridgeError::Iggy(IggyError::Unauthorized)) => {
+                    debug!(
+                        "skipping shadow stream '{shadow_stream}' in Metadata: caller is unauthorized to read it"
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            for topic in topics {
+                let Some(kafka_topic) = mapping.shadow_kafka_topic(shadow_stream, &topic.name)
+                else {
+                    continue;
+                };
+                results.push(KafkaTopicMetadata {
+                    kafka_topic,
+                    partitions_count: topic.partitions_count,
+                    replication_factor: replication_factor_of(&topic.options),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The Iggy names of `kafka_topic`, with the shadow streams that the bridge last saw.
+    pub(crate) fn iggy_names<'a>(&'a self, kafka_topic: &'a str) -> IggyNames<'a> {
+        self.config
+            .topic_mapping
+            .resolve_name(kafka_topic, |stream| self.shadows.contains(stream))
+    }
+
+    /// [`Self::iggy_names`], after [`Self::read_unseen_shadows`].
+    async fn iggy_names_read<'a>(
+        &'a self,
+        client: &IggyClient,
+        kafka_topic: &'a str,
+    ) -> IggyNames<'a> {
+        self.read_unseen_shadows(client, [kafka_topic]).await;
+        self.iggy_names(kafka_topic)
+    }
+
+    /// Reads Iggy's shadow streams again when one of `kafka_topics` may name a shadow that the
+    /// bridge has not seen, so a shadow that Iggy adopted since the last read resolves at once.
+    /// One read runs each `SHADOW_READ_INTERVAL` at most, and a read that fails leaves the names
+    /// as they were.
+    async fn read_unseen_shadows<'a>(
+        &self,
+        client: &IggyClient,
+        kafka_topics: impl IntoIterator<Item = &'a str>,
+    ) {
+        let unseen = kafka_topics.into_iter().find(|kafka_topic| {
+            self.config.topic_mapping.may_name_a_shadow(kafka_topic)
+                && self.iggy_names(kafka_topic).origin.is_none()
+        });
+        let Some(kafka_topic) = unseen else {
+            return;
+        };
+        if !self.shadows.take_read(Instant::now()) {
+            return;
+        }
+        if let Err(error) = self.read_shadow_streams(client).await {
+            debug!(%error, "could not read Iggy's shadow streams for '{kafka_topic}'");
+        }
+    }
+
+    /// The names of Iggy's shadow streams, which name resolution reads from then on. A bridge user
+    /// that may not list streams keeps the names that the bridge saw.
+    async fn read_shadow_streams(
+        &self,
+        client: &IggyClient,
+    ) -> Result<HashSet<String>, BridgeError> {
+        match with_request_timeout(client.get_streams()).await {
+            Ok(streams) => {
+                let names: HashSet<String> = streams
+                    .into_iter()
+                    .map(|stream| stream.name)
+                    .filter(|name| split_shadow_stream(name).is_some())
+                    .collect();
+                self.shadows.replace(names.clone());
+                Ok(names)
+            }
+            Err(BridgeError::Iggy(IggyError::Unauthorized)) => Ok(self.shadows.names()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// The refusal of a write that creates a topic under the name of a shadow.
+fn shadow_topic(kafka_topic: &str, origin: &str) -> BridgeError {
+    BridgeError::ShadowTopic {
+        kafka_topic: kafka_topic.to_string(),
+        origin: origin.to_string(),
     }
 }
 

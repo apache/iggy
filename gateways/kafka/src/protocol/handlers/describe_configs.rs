@@ -18,8 +18,9 @@
 //! `DescribeConfigs` (API key 32).
 //!
 //! A topic reports every key of Kafka 4.4 except `cleanup.policy`: the three keys Iggy stores,
-//! what the gateway applies for some others, and Kafka's default for the rest. A broker reports a
-//! fixed set for this gateway. See `topic_config::keys` and `docs/CONFIGS.md`.
+//! what the gateway applies for some others, and Kafka's default for the rest. It also reports
+//! `iggy.topic.type`, which Kafka does not have. A broker reports a fixed set for this gateway. See
+//! `topic_config::keys` and `docs/CONFIGS.md`.
 
 use std::collections::HashSet;
 

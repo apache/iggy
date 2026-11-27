@@ -19,6 +19,7 @@
 //! hold offsets, when a topic changes and what its users can do, without listing any of them.
 //! `docs/OFFSET_STORAGE.md` has the reasoning.
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::mem;
@@ -40,11 +41,12 @@ use tracing::{debug, info, warn};
 
 use super::group_index::GroupFeed;
 use super::group_offsets::kafka_group_of;
+use super::shadows::ShadowStreams;
 use super::{LazyClient, REQUEST_TIMEOUT};
 use crate::auth::{Grants, UserKey};
 use crate::bridge::config::IggyBridgeConfig;
 use crate::bridge::error::BridgeError;
-use crate::bridge::topic_map::TopicMapping;
+use crate::bridge::topic_map::{TopicMapping, split_shadow_stream};
 
 /// The record groups the follower reads. Members and sessions change with every consumer, and
 /// nothing here needs them.
@@ -102,6 +104,8 @@ pub(super) struct Follower {
     /// Replaced after each read that showed a stream, topic or partition change, before the groups
     /// and `topics` move.
     pub(super) shapes: Arc<watch::Sender<Arc<TopicShapes>>>,
+    /// Replaced with the shadow streams of each read that showed a stream or topic change.
+    pub(super) shadows: Arc<ShadowStreams>,
     pub(super) permissions: Arc<PermissionBoard>,
     /// Gets each topic that the change log shows deleted.
     pub(super) deletions: broadcast::Sender<DeletedTopic>,
@@ -542,6 +546,13 @@ impl Follower {
     /// The topics go first, so a caller that saw the groups move sees the topics of that read.
     fn publish(&self, mirror: &Mirror, changed: Changed) {
         if changed.topics {
+            self.shadows.replace(
+                mirror
+                    .shadow_streams()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            );
             self.shapes
                 .send_replace(Arc::new(mirror.kafka_topic_shapes(&self.mapping)));
         }
@@ -706,7 +717,7 @@ impl Mirror {
                 deleted.extend(
                     self.kafka_topics(mapping)
                         .filter(|(key, _)| key.in_stream(stream_id, created_op))
-                        .map(|(key, kafka_topic)| deleted_topic(key, kafka_topic)),
+                        .map(|(key, kafka_topic)| deleted_topic(key, &kafka_topic)),
                 );
                 self.drop_stream(stream_id, created_op);
                 Changed::ALL
@@ -722,9 +733,10 @@ impl Mirror {
             }
             MetadataChange::TopicDeleted(topic) => {
                 let key = topic_key!(topic);
+                let shadows = self.shadow_streams();
                 deleted.extend(
-                    self.kafka_topic_of(key, mapping)
-                        .map(|kafka_topic| deleted_topic(key, kafka_topic)),
+                    self.kafka_topic_of(key, mapping, &shadows)
+                        .map(|kafka_topic| deleted_topic(key, &kafka_topic)),
                 );
                 self.drop_topic(key);
                 Changed::ALL
@@ -791,9 +803,10 @@ impl Mirror {
 
     /// The Kafka groups with offsets on a topic that a Kafka name lists under `mapping`.
     fn kafka_groups(&self, mapping: &TopicMapping) -> BTreeSet<String> {
+        let shadows = self.shadow_streams();
         self.groups
             .iter()
-            .filter(|(key, _)| self.kafka_topic_of(key.topic, mapping).is_some())
+            .filter(|(key, _)| self.kafka_topic_of(key.topic, mapping, &shadows).is_some())
             .map(|(_, group)| group.clone())
             .collect()
     }
@@ -802,26 +815,31 @@ impl Mirror {
     fn kafka_topics<'a>(
         &'a self,
         mapping: &'a TopicMapping,
-    ) -> impl Iterator<Item = (TopicKey, &'a str)> {
-        self.topics
-            .values()
-            .filter_map(move |topic| Some((topic.key, self.kafka_topic_of(topic.key, mapping)?)))
+    ) -> impl Iterator<Item = (TopicKey, Cow<'a, str>)> {
+        let shadows = self.shadow_streams();
+        self.topics.values().filter_map(move |topic| {
+            Some((
+                topic.key,
+                self.kafka_topic_of(topic.key, mapping, &shadows)?,
+            ))
+        })
     }
 
     /// Each Kafka topic that `mapping` names, by name.
     fn kafka_topic_shapes(&self, mapping: &TopicMapping) -> TopicShapes {
+        let shadows = self.shadow_streams();
         self.topics
             .values()
             .filter_map(|topic| {
-                let kafka_topic = self.kafka_topic_of(topic.key, mapping)?;
+                let kafka_topic = self.kafka_topic_of(topic.key, mapping, &shadows)?;
                 let shape = TopicShape {
                     incarnation: topic.key.topic_created_op,
                     partitions: topic.partitions,
                     stream_id: topic.key.stream_id,
                     topic_id: topic.key.topic_id,
-                    geo: topic.geo,
+                    geo: topic.geo || self.in_shadow_stream(topic.key),
                 };
-                Some((kafka_topic.to_owned(), shape))
+                Some((kafka_topic.into_owned(), shape))
             })
             .collect()
     }
@@ -829,19 +847,27 @@ impl Mirror {
     /// The topics that this mirror lists under `mapping` and `newer` does not, also those that
     /// `newer` lists under the same name in another incarnation.
     fn kafka_topics_left_out(&self, newer: &Self, mapping: &TopicMapping) -> Vec<DeletedTopic> {
-        let kept: HashSet<(&str, u64)> = newer
+        let kept: HashSet<(Cow<'_, str>, u64)> = newer
             .kafka_topics(mapping)
             .map(|(key, kafka_topic)| (kafka_topic, key.topic_created_op))
             .collect();
         self.kafka_topics(mapping)
-            .filter(|(key, kafka_topic)| !kept.contains(&(*kafka_topic, key.topic_created_op)))
-            .map(|(key, kafka_topic)| deleted_topic(key, kafka_topic))
+            .filter(|(key, kafka_topic)| {
+                !kept.contains(&(kafka_topic.clone(), key.topic_created_op))
+            })
+            .map(|(key, kafka_topic)| deleted_topic(key, &kafka_topic))
             .collect()
     }
 
     /// The Kafka name of topic `key`, when the mirror holds that incarnation and `mapping` lists
-    /// it.
-    fn kafka_topic_of<'a>(&'a self, key: TopicKey, mapping: &'a TopicMapping) -> Option<&'a str> {
+    /// it. A topic of a shadow stream goes by `<origin>.<kafka name>`, and a topic whose name a
+    /// shadow of `shadows` takes is not listed.
+    fn kafka_topic_of<'a>(
+        &'a self,
+        key: TopicKey,
+        mapping: &'a TopicMapping,
+        shadows: &HashSet<&str>,
+    ) -> Option<Cow<'a, str>> {
         let stream = self
             .streams
             .get(&key.stream_id)
@@ -850,7 +876,34 @@ impl Mirror {
             .topics
             .get(&(key.stream_id, key.topic_id))
             .filter(|topic| topic.key == key)?;
-        mapping.kafka_topic_of(&stream.name, &topic.name)
+        if split_shadow_stream(&stream.name).is_some() {
+            return mapping
+                .shadow_kafka_topic(&stream.name, &topic.name)
+                .map(Cow::Owned);
+        }
+        let kafka_topic = mapping.kafka_topic_of(&stream.name, &topic.name)?;
+        let shadowed = mapping
+            .resolve_name(kafka_topic, |name| shadows.contains(name))
+            .origin
+            .is_some();
+        (!shadowed).then_some(Cow::Borrowed(kafka_topic))
+    }
+
+    /// The names of the shadow streams that the mirror holds.
+    fn shadow_streams(&self) -> HashSet<&str> {
+        self.streams
+            .values()
+            .map(|stream| stream.name.as_str())
+            .filter(|name| split_shadow_stream(name).is_some())
+            .collect()
+    }
+
+    /// Whether topic `key` is in a shadow stream, which holds the shadows of another datacenter's
+    /// geo topics.
+    fn in_shadow_stream(&self, key: TopicKey) -> bool {
+        self.streams
+            .get(&key.stream_id)
+            .is_some_and(|stream| split_shadow_stream(&stream.name).is_some())
     }
 
     /// Ops only grow, so a stream of the same id created by a later op is newer, and the record of
@@ -1452,6 +1505,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn given_a_shadow_stream_should_show_its_topics_as_geo_under_the_origin_and_hide_a_local_name()
+    {
+        const SHADOW: u32 = 3;
+        let (mut mirror, _) = seeded();
+        apply_all(
+            &mut mirror,
+            &[
+                MetadataChange::StreamCreated(stream(
+                    SHADOW,
+                    u64::from(SHADOW),
+                    "__shadow_dc-a_kafka",
+                )),
+                MetadataChange::TopicCreated(topic(SHADOW, 1, 20, "orders")),
+                MetadataChange::TopicCreated(topic(KAFKA, 2, 21, "dc-a.orders")),
+                MetadataChange::TopicCreated(topic(KAFKA, 3, 22, "dc-b.orders")),
+            ],
+        );
+
+        let shapes = mirror.kafka_topic_shapes(&mapping());
+        let shadow = shapes["dc-a.orders"];
+        assert_eq!(
+            (shadow.stream_id, shadow.topic_id),
+            (SHADOW, 1),
+            "the shadow takes the name from the local topic"
+        );
+        assert!(shadow.geo, "a shadow reads as geo");
+        assert!(!shapes["orders"].geo);
+        assert!(
+            shapes.contains_key("dc-b.orders"),
+            "no stream here shadows dc-b"
+        );
+        assert_eq!(
+            mirror.shadow_streams(),
+            HashSet::from(["__shadow_dc-a_kafka"])
+        );
+        assert_eq!(
+            deleted_by(&mut mirror, &[topic_deleted(SHADOW, 1, 20)]),
+            ["dc-a.orders"]
+        );
+    }
+
     /// A gap in the log can hide a delete and the create of a topic of the same name.
     #[test]
     fn given_a_topic_created_again_in_a_newer_state_should_report_the_older_deleted() {
@@ -2005,6 +2100,7 @@ mod tests {
             groups: index.feed(),
             topics: Arc::clone(&topics),
             shapes: Arc::new(watch::Sender::new(Arc::default())),
+            shadows: Arc::default(),
             permissions: Arc::clone(&permissions),
             deletions,
         };

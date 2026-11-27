@@ -68,8 +68,8 @@ const INCREMENTAL_V0: i16 = 0;
 const TOPIC: i8 = 2;
 const BROKER: i8 = 4;
 const BROKER_LOGGER: i8 = 8;
-/// Every topic key of Kafka 4.4 but `cleanup.policy`.
-const TOPIC_KEYS_REPORTED: usize = 36;
+/// Every topic key of Kafka 4.4 but `cleanup.policy`, and `iggy.topic.type`.
+const TOPIC_KEYS_REPORTED: usize = 37;
 const SOURCE_TOPIC: i8 = 1;
 const SOURCE_STATIC_BROKER: i8 = 4;
 const SOURCE_DEFAULT: i8 = 5;

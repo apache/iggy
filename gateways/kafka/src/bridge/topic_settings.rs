@@ -30,13 +30,15 @@
 //!   `persisted` durability.
 //! - The Kafka replication factor is Iggy's `replication_factor` (#4692). -1 takes the server
 //!   default.
+//! - `iggy.topic.type`, which Kafka does not have, is Iggy's `topic_type`: `geo` makes a geo
+//!   topic. Iggy sets it only when it creates a topic.
 
 use std::fmt;
 use std::str::FromStr;
 
 use iggy::prelude::{
     Durability, HeaderKey, IggyByteSize, IggyDuration, IggyExpiry, MaxTopicSize, OptionKey,
-    ResourceOptions, TopicCreateOptions, TopicResolvedOptions, TopicUpdateOptions,
+    ResourceOptions, TopicCreateOptions, TopicResolvedOptions, TopicType, TopicUpdateOptions,
 };
 use iggy_common::{DEFAULT_SEGMENT_SIZE, MAX_TOPIC_SEGMENT_SIZE};
 
@@ -286,6 +288,8 @@ pub struct KafkaTopicSettings {
     /// The durability of the messages: `Persisted` when `flush.messages=1` or `flush.ms=0` asks
     /// for a flush of every write.
     pub durability: Option<Durability>,
+    /// The type that `iggy.topic.type` names. `None` makes a normal topic.
+    pub topic_type: Option<TopicType>,
 }
 
 impl KafkaTopicSettings {
@@ -316,6 +320,7 @@ impl KafkaTopicSettings {
             durability: self.durability.unwrap_or(defaults.durability),
             consumer_offset_durability: defaults.durability,
             replication_factor: self.replication_factor,
+            topic_type: self.topic_type,
             ..TopicCreateOptions::default()
         }
     }
@@ -353,6 +358,8 @@ pub struct TopicConfigSnapshot {
     pub replication_factor: Option<u32>,
     /// The durability of the messages.
     pub durability: Durability,
+    /// Whether the topic is geo. A shadow of another datacenter's geo topic reads as geo too.
+    pub topic_type: TopicType,
 }
 
 impl TopicConfigSnapshot {
@@ -370,6 +377,7 @@ impl TopicConfigSnapshot {
             segment_size_explicit: is_explicit(options, OptionKey::SegmentSize),
             replication_factor: replication_factor_of(options),
             durability: resolved.runtime.durability,
+            topic_type: resolved.topic_type,
         }
     }
 
@@ -388,7 +396,8 @@ impl TopicConfigSnapshot {
                 .map_or(DEFAULT_SEGMENT_SIZE, |size| size.as_bytes_u64()),
             segment_size_explicit: options.segment_size.is_some(),
             replication_factor: options.replication_factor,
-            durability: options.durability,
+            durability: options.fixed_durability().unwrap_or(options.durability),
+            topic_type: options.topic_type.unwrap_or_default(),
         }
     }
 

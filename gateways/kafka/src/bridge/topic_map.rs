@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -139,6 +140,56 @@ fn kafka_topic_name_violation(value: &str) -> Option<KafkaTopicNameViolation> {
         .bytes()
         .find(|b| !(b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')))
         .map(KafkaTopicNameViolation::IllegalByte)
+}
+
+/// The prefix of a shadow stream's name. Iggy names the stream that shadows stream `<stream>` of
+/// datacenter `<origin>` `__shadow_<origin>_<stream>` (`core/metadata/src/stm/shadow.rs`).
+const SHADOW_STREAM_PREFIX: &str = "__shadow_";
+
+/// The longest datacenter name that Iggy takes as `[geo] origin`.
+const MAX_ORIGIN_LEN: usize = 32;
+
+/// Whether `origin` is a datacenter name that Iggy takes as `[geo] origin`: a lowercase letter,
+/// then lowercase letters, digits and `-`, at most 32 bytes, not ending with `-`. Such a name holds
+/// no `.` and no `_`, so a shadow's Kafka name and its stream's name both split at the first one.
+fn is_origin_name(origin: &str) -> bool {
+    origin.len() <= MAX_ORIGIN_LEN
+        && origin.starts_with(|c: char| c.is_ascii_lowercase())
+        && !origin.ends_with('-')
+        && origin
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// The name of the stream that shadows stream `stream` of datacenter `origin`.
+#[must_use]
+pub fn shadow_stream_name(origin: &str, stream: &str) -> String {
+    format!("{SHADOW_STREAM_PREFIX}{origin}_{stream}")
+}
+
+/// The datacenter and the stream that the stream named `name` shadows, or `None` for a stream
+/// that shadows nothing.
+#[must_use]
+pub fn split_shadow_stream(name: &str) -> Option<(&str, &str)> {
+    let (origin, stream) = name.strip_prefix(SHADOW_STREAM_PREFIX)?.split_once('_')?;
+    (is_origin_name(origin) && !stream.is_empty()).then_some((origin, stream))
+}
+
+/// The datacenter and the Kafka name in `<origin>.<kafka topic>`, or `None` for a name of
+/// another form.
+fn split_shadow_kafka_topic(kafka_topic: &str) -> Option<(&str, &str)> {
+    let (origin, topic) = kafka_topic.split_once('.')?;
+    (is_origin_name(origin) && is_valid_kafka_topic_name(topic)).then_some((origin, topic))
+}
+
+/// The Iggy stream and topic of one Kafka topic name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IggyNames<'a> {
+    pub stream: Cow<'a, str>,
+    pub topic: &'a str,
+    /// The datacenter whose geo topic the name shadows. A shadow is the read-only copy of
+    /// another datacenter's geo topic.
+    pub origin: Option<&'a str>,
 }
 
 /// Explicit Kafka-topic → Iggy stream/topic override. Absent entries fall back to
@@ -333,6 +384,56 @@ impl TopicMapping {
         self.topics
             .values()
             .any(|over| (over.stream.as_str(), over.topic.as_str()) == target)
+    }
+
+    /// Resolves `kafka_topic` as [`Self::resolve`] does, except for the name of a shadow. A name
+    /// `<origin>.<kafka topic>` that no override claims resolves to the shadow of that Kafka
+    /// topic in datacenter `origin`, once `is_shadow_stream` holds the shadow's stream.
+    /// `MirrorMaker 2` names the topics that it copies from another cluster the same way.
+    #[must_use]
+    pub fn resolve_name<'a>(
+        &'a self,
+        kafka_topic: &'a str,
+        is_shadow_stream: impl Fn(&str) -> bool,
+    ) -> IggyNames<'a> {
+        if !self.topics.contains_key(kafka_topic)
+            && let Some((origin, origin_topic)) = split_shadow_kafka_topic(kafka_topic)
+        {
+            let (stream, topic) = self.resolve(origin_topic);
+            let shadow = shadow_stream_name(origin, stream);
+            if is_shadow_stream(&shadow) {
+                return IggyNames {
+                    stream: Cow::Owned(shadow),
+                    topic,
+                    origin: Some(origin),
+                };
+            }
+        }
+        let (stream, topic) = self.resolve(kafka_topic);
+        IggyNames {
+            stream: Cow::Borrowed(stream),
+            topic,
+            origin: None,
+        }
+    }
+
+    /// Whether `kafka_topic` has the form of a shadow's name that no override claims. It names a
+    /// shadow once the shadow's stream exists.
+    #[must_use]
+    pub fn may_name_a_shadow(&self, kafka_topic: &str) -> bool {
+        !self.topics.contains_key(kafka_topic) && split_shadow_kafka_topic(kafka_topic).is_some()
+    }
+
+    /// The Kafka name of topic `topic` of the shadow stream `stream`: the datacenter, a dot, and
+    /// the Kafka name of the geo topic that it shadows. `None` when `stream` shadows nothing, when
+    /// no Kafka name lists the geo topic, when an override claims the name, or when the name breaks
+    /// Kafka's rules.
+    #[must_use]
+    pub fn shadow_kafka_topic(&self, stream: &str, topic: &str) -> Option<String> {
+        let (origin, origin_stream) = split_shadow_stream(stream)?;
+        let kafka_topic = self.kafka_topic_of(origin_stream, topic)?;
+        let name = format!("{origin}.{kafka_topic}");
+        (is_valid_kafka_topic_name(&name) && !self.topics.contains_key(&name)).then_some(name)
     }
 
     /// Parses a `TopicMapping` from a TOML document.
@@ -776,5 +877,169 @@ mod tests {
         );
         assert_eq!(mapping.kafka_topic_of("billing", "payments"), None);
         assert_eq!(mapping.kafka_topic_of("kafka", "not kafka"), None);
+    }
+
+    /// `orders` of the default stream `kafka`, and `payments` mapped to `billing/payments_v2`.
+    fn geo_mapping() -> TopicMapping {
+        let mut topics = HashMap::new();
+        topics.insert(
+            "payments".to_string(),
+            TopicOverride {
+                stream: "billing".to_string(),
+                topic: "payments_v2".to_string(),
+            },
+        );
+        mapping_with("kafka", topics)
+    }
+
+    #[test]
+    fn given_shadow_stream_names_should_split_them_into_the_origin_and_its_stream() {
+        assert_eq!(
+            split_shadow_stream("__shadow_dc-a_kafka"),
+            Some(("dc-a", "kafka"))
+        );
+        assert_eq!(
+            split_shadow_stream("__shadow_dc-a_my_stream"),
+            Some(("dc-a", "my_stream")),
+            "an origin holds no `_`, so the stream keeps every later one"
+        );
+        assert_eq!(
+            split_shadow_stream(&shadow_stream_name("eu-west-2", "kafka")),
+            Some(("eu-west-2", "kafka"))
+        );
+        for name in [
+            "kafka",
+            "__shadow_",
+            "__shadow_dc-a",
+            "__shadow_dc-a_",
+            "__shadow_DC_kafka",
+            "__shadow_1dc_kafka",
+            "__shadow_dc-_kafka",
+        ] {
+            assert_eq!(split_shadow_stream(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn given_the_name_of_a_shadow_when_its_stream_exists_should_resolve_to_the_shadow() {
+        let mapping = geo_mapping();
+        let shadows = ["__shadow_dc-a_kafka", "__shadow_dc-a_billing"];
+        let exists = |stream: &str| shadows.contains(&stream);
+
+        assert_eq!(
+            mapping.resolve_name("dc-a.orders", exists),
+            IggyNames {
+                stream: Cow::Borrowed("__shadow_dc-a_kafka"),
+                topic: "orders",
+                origin: Some("dc-a"),
+            }
+        );
+        assert_eq!(
+            mapping.resolve_name("dc-a.payments", exists),
+            IggyNames {
+                stream: Cow::Borrowed("__shadow_dc-a_billing"),
+                topic: "payments_v2",
+                origin: Some("dc-a"),
+            },
+            "the shadow of an override's topic resolves through the override"
+        );
+        assert_eq!(
+            mapping.resolve_name("orders", exists),
+            IggyNames {
+                stream: Cow::Borrowed("kafka"),
+                topic: "orders",
+                origin: None,
+            }
+        );
+    }
+
+    #[test]
+    fn given_the_name_of_a_shadow_when_its_stream_is_missing_should_resolve_to_a_local_topic() {
+        let mapping = geo_mapping();
+        let names = mapping.resolve_name("dc-b.orders", |stream| stream == "__shadow_dc-a_kafka");
+
+        assert_eq!(names.stream, "kafka");
+        assert_eq!(names.topic, "dc-b.orders");
+        assert_eq!(names.origin, None);
+        assert!(mapping.may_name_a_shadow("dc-b.orders"));
+        assert!(!mapping.may_name_a_shadow("orders"));
+        assert!(
+            !mapping.may_name_a_shadow("Dc.orders"),
+            "no datacenter has an upper case name"
+        );
+    }
+
+    #[test]
+    fn given_an_override_whose_key_has_the_form_of_a_shadow_should_resolve_through_it() {
+        let mut topics = HashMap::new();
+        topics.insert(
+            "dc-a.orders".to_string(),
+            TopicOverride {
+                stream: "imports".to_string(),
+                topic: "orders".to_string(),
+            },
+        );
+        let mapping = mapping_with("kafka", topics);
+        let names = mapping.resolve_name("dc-a.orders", |_| true);
+
+        assert_eq!(names.stream, "imports");
+        assert_eq!(names.origin, None);
+        assert!(!mapping.may_name_a_shadow("dc-a.orders"));
+        assert_eq!(
+            mapping.shadow_kafka_topic("__shadow_dc-a_kafka", "orders"),
+            None,
+            "the override claims the name, so the shadow is not listed under it"
+        );
+    }
+
+    #[test]
+    fn given_a_shadow_topic_should_list_it_as_its_origin_and_the_kafka_name_of_its_geo_topic() {
+        let mapping = geo_mapping();
+
+        assert_eq!(
+            mapping
+                .shadow_kafka_topic("__shadow_dc-a_kafka", "orders")
+                .as_deref(),
+            Some("dc-a.orders")
+        );
+        assert_eq!(
+            mapping
+                .shadow_kafka_topic("__shadow_dc-a_billing", "payments_v2")
+                .as_deref(),
+            Some("dc-a.payments")
+        );
+        assert_eq!(
+            mapping.shadow_kafka_topic("kafka", "orders"),
+            None,
+            "a stream that shadows nothing"
+        );
+        assert_eq!(
+            mapping.shadow_kafka_topic("__shadow_dc-a_other", "orders"),
+            None,
+            "no Kafka name lists `other/orders`"
+        );
+        let long = "t".repeat(MAX_KAFKA_TOPIC_NAME_LEN);
+        assert_eq!(
+            mapping.shadow_kafka_topic("__shadow_dc-a_kafka", &long),
+            None,
+            "a name past Kafka's limit"
+        );
+    }
+
+    #[test]
+    fn given_a_listed_shadow_name_should_resolve_back_to_its_stream_and_topic() {
+        let mapping = geo_mapping();
+        for (stream, topic) in [
+            ("__shadow_dc-a_kafka", "orders"),
+            ("__shadow_dc-a_kafka", "dc-b.orders"),
+            ("__shadow_eu-1_billing", "payments_v2"),
+        ] {
+            let kafka_topic = mapping
+                .shadow_kafka_topic(stream, topic)
+                .expect("a listed shadow");
+            let names = mapping.resolve_name(&kafka_topic, |shadow| shadow == stream);
+
+            assert_eq!((names.stream.as_ref(), names.topic), (stream, topic));
+        }
     }
 }
