@@ -5,6 +5,10 @@ description: "Run the Iggy Docker image from your own test suite, with examples 
 
 Iggy has no embedded, in-process test server. The server ships as a binary, not a library, so a test suite can't start it in-process. To test against a real server, start the published Docker image when your tests start and stop it when they finish. The examples below use each language's `testcontainers` library to do that.
 
+## Local development
+
+For local development, run the server from the Docker image, as in [Docker & Helm](/docs/server/docker), or build it from source with `cargo run --bin iggy-server`, as in [Starting the Iggy server](/docs/introduction/getting-started#starting-the-iggy-server).
+
 ## What the container needs
 
 These settings apply whichever language your tests are in:
