@@ -101,7 +101,7 @@ fn seed_geo_topic_with(
 
 /// Make the change log name `cluster_uid`, as the first committed operation
 /// of a cluster does.
-fn seed_cluster_uid(shard: &TestShard, cluster_uid: u128) {
+pub(super) fn seed_cluster_uid(shard: &TestShard, cluster_uid: u128) {
     let header = PrepareHeader {
         op: 1,
         checksum: cluster_uid,

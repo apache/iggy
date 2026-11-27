@@ -1648,6 +1648,20 @@ handshake_grace = "10 s"
 # fresh_sends_denied_partition_share and fresh_sends_denied_shard_cap count the
 # refusals. At least 4 MiB, and at most 'fresh_pending_bytes'.
 #fresh_partition_pending_bytes = "8 MiB"
+# How long the sweeps of the root must find the same objects of a partition
+# incarnation that committed metadata no longer holds before they delete the
+# incarnation. A committed delete of a partition deletes its objects from a
+# queue in memory, so a restart, a change of the metadata primary or a full
+# queue can leave them in the store. Shard 0 of the metadata primary lists the
+# whole root every hour, or every 'orphan_grace' when that is shorter, and
+# counts the grace by its own clock from the second sweep that found the same
+# objects, so a new object of the incarnation starts it again. It never deletes
+# the objects of a live partition, of one created after the sweep read
+# metadata, of a geo topic, objects under 'meta/' other than the manifest of
+# an incarnation it deletes, objects of another cluster, or objects no newer
+# than this cluster's claim of the root. "disabled" turns the sweep off.
+# Otherwise at least 1 s.
+#orphan_grace = "6 h"
 # Per shard: how many jobs of each class run at once, and the bytes that
 # fetches and uploads hold. A segment larger than 'upload_bytes' uploads
 # alone. Polls that read from the store are demand fetches, and readahead

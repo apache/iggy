@@ -284,6 +284,17 @@ impl KeyLayout {
         (parts.next()? == MANIFEST && parts.next().is_none()).then_some(prefix)
     }
 
+    /// Whether `key` is a key of the root that is not an object of a
+    /// segment: a manifest, the identity object, a fresh object, a geo topic
+    /// object, positions or a recovery record.
+    #[must_use]
+    pub fn is_meta_key(&self, key: &str) -> bool {
+        key.strip_prefix(self.root.as_str())
+            .and_then(|rest| rest.strip_prefix('/'))
+            .and_then(|rest| rest.strip_prefix(META))
+            .is_some_and(|rest| rest.starts_with('/'))
+    }
+
     /// The key of the store identity object, which names the cluster that
     /// owns the root. No other root can continue with `meta`, and no id is
     /// `identity`, so no other key of any root is this key.
@@ -825,6 +836,43 @@ mod tests {
             "tenant/iggy/meta/fresh/00/0001/0000000000000000000000000000001f".to_owned(),
         ] {
             assert_eq!(layout.parse_fresh_key(&key), None, "{key}");
+        }
+    }
+
+    #[test]
+    fn given_keys_of_the_root_when_matching_meta_keys_should_take_only_those_outside_segments() {
+        let layout = layout();
+        let segment = layout.segment_key(&SegmentKey {
+            prefix: PREFIX,
+            start_offset: 1_000,
+            object: SegmentObject::Log,
+        });
+        let long_term = layout.long_term_key(&LongTermKey {
+            prefix: PREFIX,
+            start_offset: 1_000,
+            end_offset: 1_999,
+            object: SegmentObject::Index,
+        });
+
+        for key in [
+            layout.manifest_key(&PREFIX),
+            layout.identity_key(),
+            layout.fresh_key(7),
+            layout.topic_key(&TOPIC),
+            layout.recovery_key(7),
+            "tenant/iggy/meta/notes".to_owned(),
+        ] {
+            assert!(layout.is_meta_key(&key), "{key}");
+        }
+        for key in [
+            segment,
+            long_term,
+            "tenant/iggy/meta".to_owned(),
+            "tenant/iggy/metadata/1".to_owned(),
+            "tenant/iggymeta/1".to_owned(),
+            "tenant/other/meta/1".to_owned(),
+        ] {
+            assert!(!layout.is_meta_key(&key), "{key}");
         }
     }
 

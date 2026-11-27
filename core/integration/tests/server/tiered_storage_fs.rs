@@ -731,7 +731,7 @@ pub(crate) async fn wait_for_eviction(store: &Path, data_path: &Path) -> usize {
 }
 
 /// Waits until the store holds a segment.
-async fn wait_for_upload(store: &Path) {
+pub(crate) async fn wait_for_upload(store: &Path) {
     let deadline = Instant::now() + TIERING_DEADLINE;
     while segment_logs(store).is_empty() {
         assert!(
@@ -846,7 +846,7 @@ async fn settled_metric(http: &HttpClient, series: &str, ready: impl Fn(u64) -> 
     }
 }
 
-async fn metric(http: &HttpClient, series: &str) -> u64 {
+pub(crate) async fn metric(http: &HttpClient, series: &str) -> u64 {
     let exposition = http
         .get("/metrics")
         .await

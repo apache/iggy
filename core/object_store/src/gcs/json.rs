@@ -52,7 +52,10 @@ pub struct ObjectResource {
     pub size: u64,
     #[serde(deserialize_with = "number")]
     pub generation: u64,
-    pub updated: String,
+    /// When this generation of the object was written. `updated` moves on
+    /// a change of metadata or of storage class, so an old object could read
+    /// as a new one.
+    pub time_created: String,
     #[serde(default)]
     pub crc32c: Option<String>,
     #[serde(default)]
@@ -103,7 +106,7 @@ impl ObjectResource {
         Ok(ObjectMeta {
             size: self.size,
             etag: self.generation.to_string(),
-            last_modified: parse_time(&self.updated)?,
+            last_modified: parse_time(&self.time_created)?,
             crc32c: self.crc32c.as_deref().map(parse_crc32c).transpose()?,
             metadata: self.metadata.unwrap_or_default(),
         })
@@ -111,7 +114,7 @@ impl ObjectResource {
 
     pub fn listed(self) -> Result<ListedObject, ObjectStoreError> {
         Ok(ListedObject {
-            last_modified: parse_time(&self.updated)?,
+            last_modified: parse_time(&self.time_created)?,
             etag: self.generation.to_string(),
             size: self.size,
             key: self.name,
@@ -213,7 +216,8 @@ mod tests {
     fn given_object_resource_when_reading_should_report_generation_crc32c_and_metadata() {
         let resource = parse_object(
             br#"{"kind":"storage#object","name":"a/b","size":"11","generation":"1795094486939773",
-               "updated":"2026-10-28T00:00:00.500Z","crc32c":"yZRlqg==","etag":"CP2Q",
+               "timeCreated":"2026-10-28T00:00:00.500Z",
+               "updated":"2026-11-02T00:00:00Z","crc32c":"yZRlqg==","etag":"CP2Q",
                "metadata":{"start-offset":"7"}}"#,
         )
         .unwrap();
@@ -234,10 +238,30 @@ mod tests {
     }
 
     #[test]
+    fn given_an_object_whose_storage_class_changed_when_reading_should_report_when_it_was_created()
+    {
+        let resource = br#"{"name":"a","size":"1","generation":"2","storageClass":"COLDLINE",
+            "timeCreated":"2026-10-28T00:00:00Z","updated":"2026-11-28T00:00:00Z",
+            "timeStorageClassUpdated":"2026-11-28T00:00:00Z"}"#;
+        let created = SystemTime::UNIX_EPOCH + Duration::from_hours(498_096);
+
+        let meta = parse_object(resource).unwrap().meta().unwrap();
+        let listed = parse_list(&[br#"{"items":["#.as_slice(), resource, b"]}"].concat())
+            .unwrap()
+            .items
+            .remove(0)
+            .listed()
+            .unwrap();
+
+        assert_eq!(meta.last_modified, created);
+        assert_eq!(listed.last_modified, created);
+    }
+
+    #[test]
     fn given_listing_when_reading_should_take_numbers_as_strings_or_numbers() {
         let list = parse_list(
-            br#"{"items":[{"name":"a","size":1,"generation":2,"updated":"2026-10-28T00:00:00Z"},
-                          {"name":"b","size":"3","generation":"4","updated":"2026-10-28T00:00:01Z"}],
+            br#"{"items":[{"name":"a","size":1,"generation":2,"timeCreated":"2026-10-28T00:00:00Z"},
+                          {"name":"b","size":"3","generation":"4","timeCreated":"2026-10-28T00:00:01Z"}],
                  "nextPageToken":"token"}"#,
         )
         .unwrap();

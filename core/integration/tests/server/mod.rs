@@ -72,6 +72,8 @@ mod geo_mode_faults_fs;
 // The geo topic scenarios on the `s3` backend, against Floci.
 mod geo_mode_faults_s3;
 pub(crate) mod tiered_storage_fs;
+// The sweep of the store root for the objects of deleted partitions.
+mod tiered_storage_orphans_fs;
 // A server on the `gcs` backend, against fake-gcs-server: the claim, a geo
 // topic read back from its long-term segments, and both token sources.
 mod tiered_storage_gcs;

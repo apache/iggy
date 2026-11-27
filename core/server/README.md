@@ -683,6 +683,94 @@ from the same request that starts its object deletes. A node with
 and its `partition_stored_segments_missing` and
 `partition_stored_segments_diverged` stay at 0 whatever the store lost.
 
+A committed delete of a partition, or of the topic or stream that holds it,
+queues the delete of the partition's objects in the memory of the metadata
+primary. A restart, a change of the metadata primary, a full queue, or a change
+feed that overflowed each leave those objects in the store, and nothing else
+deletes them. So shard 0 of the caught-up metadata primary sweeps
+the root of the store, while its node passes the store identity check
+described below:
+
+- It reads the revision that committed metadata reached and the partition
+  incarnations it holds, then the store identity object, then lists every key
+  under the prefix, in housekeeping jobs of at most 16 pages of 1,000 keys.
+- It sorts the keys by partition incarnation: stream, topic, partition and
+  the revision the partition was created at. An incarnation is an orphan when
+  committed metadata holds no partition of it and its revision is not above
+  the one the sweep read before the listing.
+- It deletes an orphan only once full sweeps in a row of the same primary
+  process found the same objects of it, by their number and the time the
+  store gives the newest, for `[tiered_storage] orphan_grace`, 6 hours by
+  default. The grace runs on the monotonic clock of the primary, from the
+  start of the second of those sweeps, so neither a clock of the primary that
+  is ahead of the store's nor a step of its wall clock shortens it, and a new
+  object of the orphan starts it again.
+- The delete goes through the same queue as a committed delete, in turns
+  that each list at most 4 pages of the incarnation and give the delete slot
+  back between them. Orphans take at most a quarter of the queue, so the rest
+  stays free for committed deletes. Every turn checks committed metadata and
+  the view of the primary, and reads the claim of the store identity object
+  again: a turn whose claim names another cluster, sits in another object, or
+  was committed at another moment deletes nothing. The first turns list the
+  whole incarnation and delete nothing. The turns after them list it again
+  and delete what each of them listed, in this order within the turn: every
+  `.index` it listed, then every `.log` it listed. The manifest goes after the
+  last of those turns, once its listing ended and every segment object it
+  listed is gone, so the manifest is the last object of the incarnation to go.
+  That turn deletes the manifest by its key even when the listing found none,
+  so an unlink of the filesystem backend whose directory sync failed is made
+  durable. A turn that finds a long-term segment, a geo topic object, or an
+  object newer than the sweeps found or no newer than the claim ends the
+  delete.
+- The primary sweeps every hour, or every `orphan_grace` when that is shorter.
+  `orphan_grace = "disabled"` turns the sweep off. A sweep that does not list
+  the whole root, a store identity object that names another cluster, and a
+  change of the metadata primary or of its view each drop what the sweeps
+  found, so the count starts again with the next sweeps.
+
+The sweep never deletes:
+
+- A partition incarnation that committed metadata holds, or one created after
+  the sweep read the revision of metadata.
+- The data of geo topics: an incarnation with a long-term segment, or whose
+  topic incarnation has a geo topic object, live or a tombstone, and any fresh
+  object. The sweep of geo topics owns those.
+- Anything under `<prefix>/meta/`, except the manifest of an incarnation it
+  deletes, which goes last.
+- The data of another cluster. The sweep runs only while the node passes the
+  store identity check, and stops when the identity object it reads names
+  another cluster.
+- An incarnation with an object that is no newer than this cluster's claim of
+  the prefix, the time the store gives the identity object, compared in whole
+  seconds, as what a retired cluster left before a recovery. An object from
+  the second of the claim counts as older than it, as a store can give a
+  listing a finer time than a HEAD. A repair or a recovery that puts the
+  identity object again moves the claim later, so objects that this cluster
+  wrote before then count as older than the claim as well. The node logs such
+  incarnations as a warning and leaves them to an operator.
+- A key that is not the key of a segment object or a manifest.
+
+Each shard exports `orphan_sweeps_total`, the sweeps that listed the whole
+root, the gauge `orphan_incarnations`, the orphans the last sweep found,
+`orphan_incarnations_deleted_total`, the gauge `orphan_objects_before_claim`,
+the objects no newer than the claim of the incarnations the last sweep left to
+an operator, and `orphan_identity_skips_total`, the sweeps and deletes that
+stopped at a store identity object other than the one they expected. Only
+shard 0 of the metadata primary moves them. A sweep costs a HEAD and a read of
+the identity object and one listing request per 1,000 keys under the prefix,
+fresh objects and the keys of other prefixes nested in it included. The delete
+of an orphan lists the incarnation twice, and costs a HEAD and a read of the
+identity object per turn, a listing of the key of its geo topic object per
+turn that deletes and at the end of the first listing, a listing of the key
+of its manifest at the end of each listing, and the deletes. It lists those
+keys rather than asking for a HEAD, as a policy scoped to a prefix can refuse
+the HEAD of an absent key.
+
+Restoring metadata while tiered storage is in use is not supported. If
+metadata is rolled back or restored under the same cluster id, the
+incarnations of the history that was lost become orphans once the revision of
+metadata passes theirs, and the sweep deletes them.
+
 The `fs` backend keeps the objects in a directory. The `s3` backend keeps them
 in a bucket on AWS S3 or on a store with its API, such as Ceph RGW or R2. With
 an empty `endpoint`, it uses AWS in `region`. `url_style` picks whether the

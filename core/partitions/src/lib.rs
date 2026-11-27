@@ -70,13 +70,20 @@ pub mod segment_anchor;
 pub mod segment_chain;
 mod segment_upload;
 pub use object_delete::{
-    DeletedIncarnations, ExecutorDeleter, INCARNATION_DELETE_RETRY, ListedSegment,
-    MAX_QUEUED_INCARNATIONS, ObjectDeleteDone, ObjectDeleteJob, ObjectDeleteOutcome,
-    ObjectDeleteStart, ObjectDeleteWork, ObjectDeleter, RETIRED_OBJECT_GRACE, SweptObjects,
-    delete_incarnation, delete_long_term_segments, delete_objects, delete_segments,
-    list_segment_starts, sweep_long_term, sweep_segments, sweepable,
+    ClaimReadOutcome, DeletedIncarnations, ExecutorDeleter, INCARNATION_DELETE_RETRY,
+    IncarnationSettled, ListedSegment, MAX_QUEUED_INCARNATIONS, MAX_QUEUED_ORPHANS,
+    ObjectDeleteDone, ObjectDeleteJob, ObjectDeleteOutcome, ObjectDeleteStart, ObjectDeleteWork,
+    ObjectDeleter, RETIRED_OBJECT_GRACE, RootListOutcome, SweptObjects, delete_incarnation,
+    delete_long_term_segments, delete_objects, delete_segments, list_segment_starts,
+    sweep_long_term, sweep_segments, sweepable,
+};
+mod orphan_sweep;
+pub use orphan_sweep::{
+    ClaimStamp, OrphanCandidates, OrphanDelete, OrphanGuard, OrphanProgress, OrphanRefusal,
+    RootListing, RootPages, SweepFindings, SweepStamp, sweep_interval,
 };
 mod fresh_proofs;
+mod orphan_sweep_job;
 pub use fresh_proofs::{FreshProofs, ProofWalk, RebuiltProofs};
 mod fresh_upload;
 pub use fresh_upload::{ExecutorFreshUploader, FreshObjectUploader, FreshUploadOutcome};

@@ -31,14 +31,17 @@
 //! A partition that a committed delete removed has no primary left, so
 //! [`DeletedIncarnations`] holds its incarnation for the node that saw the
 //! delete commit, and [`delete_incarnation`] removes everything the
-//! incarnation stored.
+//! incarnation stored. The same queue takes the orphans that the sweep of
+//! [`crate::orphan_sweep`] found, and deletes each in turns of
+//! [`crate::orphan_sweep_job::delete_orphan`], each of which checks the store
+//! first.
 //!
 //! A partition that places its batches deletes the objects of long-term
 //! segments instead, by the rules of [`crate::long_term_delete`], through
 //! the same jobs.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use futures::FutureExt;
 use futures::future::LocalBoxFuture;
@@ -51,6 +54,10 @@ use iggy_object_store::{
 use tracing::warn;
 
 use crate::long_term_delete::{LongTermNames, SweptLongTerm};
+use crate::orphan_sweep::{
+    ClaimStamp, OrphanDelete, OrphanGuard, OrphanProgress, OrphanRefusal, RootPages,
+};
+use crate::orphan_sweep_job::{delete_orphan, list_root, read_claim};
 
 /// How long the objects of a removed segment stay in the store after the
 /// primary learned the segment is gone.
@@ -64,6 +71,11 @@ pub const INCARNATION_DELETE_RETRY: Duration = Duration::from_mins(1);
 /// only, so a delete of more partitions than this leaves the objects of the
 /// rest in the store.
 pub const MAX_QUEUED_INCARNATIONS: usize = 65_536;
+
+/// The most orphans of the sweep that wait at once, so the rest of
+/// [`MAX_QUEUED_INCARNATIONS`] stays free for the incarnations of committed
+/// deletes.
+pub const MAX_QUEUED_ORPHANS: usize = MAX_QUEUED_INCARNATIONS / 4;
 
 /// The most segments whose objects of one kind fit one delete call to the
 /// store.
@@ -93,6 +105,10 @@ pub enum ObjectDeleteWork {
     /// Delete the `.index` and then the `.log` of the long-term segments
     /// with these first and last offsets.
     DeleteLongTerm { segments: Vec<(u64, u64)> },
+    /// Run one turn of the delete of an incarnation that the orphan sweep
+    /// found, from where the turns before it stopped, once the store still
+    /// holds what the guard records.
+    DeleteOrphan(OrphanGuard, OrphanProgress),
 }
 
 /// A job the partition's owner captured, to run under the scope it came with.
@@ -119,10 +135,20 @@ pub enum ObjectDeleteDone {
     /// The first and the last offset of the long-term segments that still
     /// have an object.
     LongTermDeleted { failed: Vec<(u64, u64)> },
+    /// What a turn of the delete of an orphan did, or why it stopped.
+    OrphanDeleted(Result<OrphanDelete, ObjectStoreError>),
 }
 
 /// What a job ended as: its own result, or a cancellation before it finished.
 pub type ObjectDeleteOutcome = Result<ObjectDeleteDone, TierJobCancelled>;
+
+/// What a read of the claim of the root found, see
+/// `orphan_sweep_job::read_claim`.
+pub type ClaimReadOutcome = Result<Result<Option<ClaimStamp>, ObjectStoreError>, TierJobCancelled>;
+
+/// What one listing job of the root read, see
+/// `orphan_sweep_job::list_root`.
+pub type RootListOutcome = Result<Result<RootPages, ObjectStoreError>, TierJobCancelled>;
 
 /// A job to run, with the token of the scope its owner keeps.
 pub type ObjectDeleteStart = (ObjectDeleteJob, TierScopeToken);
@@ -137,6 +163,19 @@ pub trait ObjectDeleter {
         job: ObjectDeleteJob,
         scope: TierScopeToken,
     ) -> LocalBoxFuture<'static, ObjectDeleteOutcome>;
+
+    /// Read the claim of the root for a sweep of orphans, under `scope`.
+    fn read_claim(&self, scope: TierScopeToken) -> LocalBoxFuture<'static, ClaimReadOutcome>;
+
+    /// List the next pages of the root for a sweep of orphans, after `after`
+    /// or from the first key, under `scope`, for a claim of the root the
+    /// store committed at `claimed_at`.
+    fn list_root(
+        &self,
+        after: Option<String>,
+        claimed_at: SystemTime,
+        scope: TierScopeToken,
+    ) -> LocalBoxFuture<'static, RootListOutcome>;
 }
 
 /// Deletes through a tier executor. Deletes go in its delete class and a
@@ -144,7 +183,9 @@ pub trait ObjectDeleter {
 /// a read.
 ///
 /// The delete of an incarnation is one job of the delete class, its listing
-/// included.
+/// included, and so is each turn of the delete of an orphan. The read of the
+/// claim of the root and each listing job of an orphan sweep are
+/// housekeeping.
 pub struct ExecutorDeleter<E> {
     executor: E,
     layout: KeyLayout,
@@ -232,7 +273,43 @@ impl<E: TierExecutor> ObjectDeleter for ExecutorDeleter<E> {
                     },
                 )
                 .boxed_local(),
+            ObjectDeleteWork::DeleteOrphan(guard, progress) => self
+                .executor
+                .submit(
+                    TierJobRequest::new(TierJobClass::Delete, scope),
+                    move |store| async move {
+                        ObjectDeleteDone::OrphanDeleted(
+                            delete_orphan(&*store, &layout, &prefix, &guard, progress).await,
+                        )
+                    },
+                )
+                .boxed_local(),
         }
+    }
+
+    fn read_claim(&self, scope: TierScopeToken) -> LocalBoxFuture<'static, ClaimReadOutcome> {
+        let layout = self.layout.clone();
+        self.executor
+            .submit(
+                TierJobRequest::new(TierJobClass::Housekeeping, scope),
+                move |store| async move { read_claim(&*store, &layout).await },
+            )
+            .boxed_local()
+    }
+
+    fn list_root(
+        &self,
+        after: Option<String>,
+        claimed_at: SystemTime,
+        scope: TierScopeToken,
+    ) -> LocalBoxFuture<'static, RootListOutcome> {
+        let layout = self.layout.clone();
+        self.executor
+            .submit(
+                TierJobRequest::new(TierJobClass::Housekeeping, scope),
+                move |store| async move { list_root(&*store, &layout, after, claimed_at).await },
+            )
+            .boxed_local()
     }
 }
 
@@ -714,7 +791,8 @@ impl RetiredSegments {
 }
 
 /// The incarnations a committed delete removed, whose objects wait for their
-/// delete on the node that saw the delete commit.
+/// delete on the node that saw the delete commit, and the orphans that the
+/// sweep of the store found.
 ///
 /// Kept in memory only. What is queued here and lost, on a restart or when
 /// the node stops being the one that deletes, stays in the store.
@@ -725,9 +803,29 @@ pub struct DeletedIncarnations {
     /// The same entries by that moment, so a pass finds the next one without
     /// walking the queue.
     by_due: BTreeSet<(u64, ObjectPrefix)>,
+    /// The entries the orphan sweep queued, with what their delete checks
+    /// the store against first and where it stands.
+    orphans: BTreeMap<ObjectPrefix, (OrphanGuard, OrphanProgress)>,
     /// The job in flight. Dropping its scope cancels it.
     running: Option<(u64, ObjectPrefix, TierScope)>,
     jobs: u64,
+}
+
+/// What the result of a delete job did to the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncarnationSettled {
+    /// Every object of the incarnation is gone, and it left the queue.
+    /// `orphan` when the orphan sweep had queued it.
+    Deleted { orphan: bool },
+    /// The delete did not finish, and runs again after
+    /// [`INCARNATION_DELETE_RETRY`].
+    Retried,
+    /// A turn of the delete of an orphan did its share, and the next turn
+    /// waits behind every entry that was due.
+    Continues,
+    /// A turn of the delete of an orphan deleted nothing, and the orphan
+    /// left the queue for the next sweeps to judge again.
+    Refused(OrphanRefusal),
 }
 
 impl DeletedIncarnations {
@@ -748,15 +846,45 @@ impl DeletedIncarnations {
         true
     }
 
+    /// Queue an orphan that the sweep of the store found, due at `now`: the
+    /// sweep waited out its own grace period already. Its delete checks the
+    /// store against `guard` first. An incarnation that waits already keeps
+    /// its entry. `false` when the queue is full, or holds
+    /// [`MAX_QUEUED_ORPHANS`] orphans already, and the orphan was left out.
+    pub fn queue_orphan(
+        &mut self,
+        prefix: ObjectPrefix,
+        guard: OrphanGuard,
+        now: IggyTimestamp,
+    ) -> bool {
+        if self.due_at.contains_key(&prefix) {
+            return true;
+        }
+        if self.due_at.len() >= MAX_QUEUED_INCARNATIONS || self.orphans.len() >= MAX_QUEUED_ORPHANS
+        {
+            return false;
+        }
+        let due_at = now.as_micros();
+        self.due_at.insert(prefix, due_at);
+        self.by_due.insert((due_at, prefix));
+        self.orphans
+            .insert(prefix, (guard, OrphanProgress::default()));
+        true
+    }
+
     /// Start the delete of the next incarnation that waited long enough by
     /// `now`. `None` while a job is in flight and when nothing is due.
     ///
     /// `is_live` says whether committed metadata holds a partition of exactly
     /// that incarnation. Such an incarnation is dropped from the queue and
-    /// never deleted: its queueing was wrong, whatever caused it.
+    /// never deleted: its queueing was wrong, whatever caused it. An orphan
+    /// whose sweeps ran in a view other than `view`, the metadata view of
+    /// this node now, is dropped as well: a node that became the primary
+    /// again in a later view sweeps again first.
     pub fn begin(
         &mut self,
         now: IggyTimestamp,
+        view: Option<u32>,
         mut is_live: impl FnMut(&ObjectPrefix) -> bool,
     ) -> Option<ObjectDeleteStart> {
         if self.running.is_some() {
@@ -775,50 +903,97 @@ impl DeletedIncarnations {
                 self.forget(&prefix);
                 continue;
             }
+            if self
+                .orphans
+                .get(&prefix)
+                .is_some_and(|(guard, _)| Some(guard.view) != view)
+            {
+                warn!(
+                    ?prefix,
+                    ?view,
+                    "an orphan incarnation that the sweeps of another view found is dropped from the queue"
+                );
+                self.forget(&prefix);
+                continue;
+            }
+            let work = self
+                .orphans
+                .get(&prefix)
+                .map_or(ObjectDeleteWork::DeleteIncarnation, |(guard, progress)| {
+                    ObjectDeleteWork::DeleteOrphan(guard.clone(), progress.clone())
+                });
             let scope = TierScope::new();
             let token = scope.token();
             self.jobs += 1;
             let id = self.jobs;
             self.running = Some((id, prefix, scope));
-            return Some((
-                ObjectDeleteJob {
-                    id,
-                    prefix,
-                    work: ObjectDeleteWork::DeleteIncarnation,
-                },
-                token,
-            ));
+            return Some((ObjectDeleteJob { id, prefix, work }, token));
         }
     }
 
     /// Settle the job `id`. An incarnation with nothing left to delete
-    /// leaves the queue. Any other end keeps it, to be tried again
-    /// [`INCARNATION_DELETE_RETRY`] after `now`. A result of a job that is
-    /// not the one in flight settles nothing.
-    pub fn finish(&mut self, id: u64, outcome: ObjectDeleteOutcome, now: IggyTimestamp) {
+    /// leaves the queue, and so does an orphan whose delete found the store
+    /// other than its sweep judged it. An orphan whose turn goes on waits
+    /// just past `now` for its next turn. Any other end keeps the entry, to
+    /// be tried again from the start [`INCARNATION_DELETE_RETRY`] after
+    /// `now`. A result of a job that is not the one in flight settles
+    /// nothing and gives `None`.
+    pub fn finish(
+        &mut self,
+        id: u64,
+        outcome: ObjectDeleteOutcome,
+        now: IggyTimestamp,
+    ) -> Option<IncarnationSettled> {
         if self
             .running
             .as_ref()
             .is_none_or(|(running, ..)| *running != id)
         {
-            return;
+            return None;
         }
-        let Some((_, prefix, _scope)) = self.running.take() else {
-            return;
-        };
+        let (_, prefix, _scope) = self.running.take()?;
+        let orphan = self.orphans.contains_key(&prefix);
         match outcome {
-            Ok(ObjectDeleteDone::IncarnationDeleted(Ok(0))) => {
+            Ok(
+                ObjectDeleteDone::IncarnationDeleted(Ok(0))
+                | ObjectDeleteDone::OrphanDeleted(Ok(OrphanDelete::Deleted)),
+            ) => {
                 self.forget(&prefix);
-                return;
+                return Some(IncarnationSettled::Deleted { orphan });
+            }
+            Ok(ObjectDeleteDone::OrphanDeleted(Ok(OrphanDelete::Refused(refusal)))) => {
+                warn!(
+                    ?prefix,
+                    ?refusal,
+                    "the store no longer holds an orphan incarnation as its sweep found it, so \
+                     its delete stopped before the turn deleted anything"
+                );
+                self.forget(&prefix);
+                return Some(IncarnationSettled::Refused(refusal));
+            }
+            Ok(ObjectDeleteDone::OrphanDeleted(Ok(OrphanDelete::Continues(progress)))) => {
+                // Strictly after `now`: every entry due by then takes the
+                // slot before the next turn of this one.
+                self.requeue(prefix, now.as_micros().saturating_add(1), progress);
+                return Some(IncarnationSettled::Continues);
             }
             Ok(ObjectDeleteDone::IncarnationDeleted(Ok(left))) => warn!(
                 ?prefix,
                 left, "some objects of a deleted incarnation were not deleted and are tried again"
             ),
-            Ok(ObjectDeleteDone::IncarnationDeleted(Err(error))) => warn!(
+            Ok(ObjectDeleteDone::OrphanDeleted(Ok(OrphanDelete::Unfinished))) => warn!(
+                ?prefix,
+                "the store kept an object of an orphan incarnation that its delete asked it to \
+                 delete; the delete starts over later"
+            ),
+            Ok(
+                ObjectDeleteDone::IncarnationDeleted(Err(error))
+                | ObjectDeleteDone::OrphanDeleted(Err(error)),
+            ) => warn!(
                 ?prefix,
                 %error,
-                "listing the objects of a deleted incarnation failed and is tried again"
+                orphan,
+                "reading the objects of a deleted incarnation failed and is tried again"
             ),
             // A cancelled job, or a result of another kind of work, proves
             // nothing about what the store still holds.
@@ -830,12 +1005,11 @@ impl DeletedIncarnations {
             )
             | Err(_) => {}
         }
-        self.forget(&prefix);
         let due_at = now
             .as_micros()
             .saturating_add(micros(INCARNATION_DELETE_RETRY));
-        self.due_at.insert(prefix, due_at);
-        self.by_due.insert((due_at, prefix));
+        self.requeue(prefix, due_at, OrphanProgress::default());
+        Some(IncarnationSettled::Retried)
     }
 
     /// Forget every incarnation and cancel the job in flight.
@@ -844,6 +1018,12 @@ impl DeletedIncarnations {
             jobs: self.jobs,
             ..Self::default()
         };
+    }
+
+    /// Whether the orphan sweep queued the incarnation.
+    #[must_use]
+    pub fn is_orphan(&self, prefix: &ObjectPrefix) -> bool {
+        self.orphans.contains_key(prefix)
     }
 
     #[must_use]
@@ -865,6 +1045,21 @@ impl DeletedIncarnations {
     fn forget(&mut self, prefix: &ObjectPrefix) {
         if let Some(due_at) = self.due_at.remove(prefix) {
             self.by_due.remove(&(due_at, *prefix));
+        }
+        self.orphans.remove(prefix);
+    }
+
+    /// Move the entry of `prefix` to `due_at`. An orphan keeps its guard and
+    /// goes on from `progress`. An entry no longer queued stays out.
+    fn requeue(&mut self, prefix: ObjectPrefix, due_at: u64, progress: OrphanProgress) {
+        let Some(queued_at) = self.due_at.get_mut(&prefix) else {
+            return;
+        };
+        self.by_due.remove(&(*queued_at, prefix));
+        *queued_at = due_at;
+        self.by_due.insert((due_at, prefix));
+        if let Some((_, held)) = self.orphans.get_mut(&prefix) {
+            *held = progress;
         }
     }
 }

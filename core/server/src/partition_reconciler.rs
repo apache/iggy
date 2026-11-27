@@ -193,6 +193,7 @@
 
 use crate::geo_topics::GeoTopics;
 use crate::incarnation_deletes::IncarnationDeletes;
+use crate::orphan_sweep::OrphanSweep;
 use crate::partition_helpers::{
     ChainRecovery, LoadedPartition, build_partition_fresh, load_partition_or_fence,
     record_partition_retirement_fence,
@@ -458,6 +459,10 @@ pub struct ReconcilerCtx {
     /// The incarnations whose delete this node saw commit as the metadata
     /// primary, and whose objects wait for their delete.
     incarnation_deletes: IncarnationDeletes,
+    /// The sweep of the store root for the objects of incarnations that
+    /// committed metadata no longer holds. Shard 0 of the metadata primary
+    /// only.
+    orphan_sweep: OrphanSweep,
     /// The objects of this cluster's geo topics in its store, which the
     /// metadata primary keeps in step with committed metadata.
     geo_topics: GeoTopics,
@@ -524,6 +529,7 @@ impl ReconcilerCtx {
             .streams()
             .read(|inner| Arc::clone(&inner.stats_registry));
         let geo_topics = GeoTopics::new(&config.geo);
+        let orphan_sweep = OrphanSweep::new(&config.tiered_storage);
         let shadow_topics = ShadowTopics::new(&config.geo);
         let peer_manifests = PeerManifestLister::new(&config.geo);
         let peer_positions = PeerPositionLister::new(&config.geo);
@@ -549,6 +555,7 @@ impl ReconcilerCtx {
             group_offset_cleanup: GroupOffsetCleanup::default(),
             lifecycle_reports: LifecycleReports::default(),
             incarnation_deletes: IncarnationDeletes::default(),
+            orphan_sweep,
             geo_topics,
             shadow_topics,
             peer_manifests,
@@ -867,6 +874,7 @@ pub async fn run_reconciler(
     }
 
     ctx.incarnation_deletes.stop();
+    ctx.orphan_sweep.stop();
     ctx.geo_topics.stop();
     ctx.shadow_topics.stop(&ctx.shard);
     ctx.peer_manifests.stop();
@@ -959,6 +967,10 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     }
     report_lifecycles(ctx).await;
     let now = IggyTimestamp::now();
+    // Before the delete pass, so it starts the orphans the last sweep found
+    // due.
+    ctx.orphan_sweep
+        .pass(&ctx.shard, &ctx.incarnation_deletes, now, Instant::now());
     ctx.incarnation_deletes.pass(&ctx.shard, now);
     ctx.geo_topics.pass(&ctx.shard, now);
     ctx.shadow_topics.pass(&ctx.shard, now);
@@ -3276,6 +3288,7 @@ pub fn install_tick_handler(shard: &Rc<ServerShard>, wake_tx: WakeTx) {
 mod tests {
     mod chain_waits;
     mod geo_topics;
+    mod orphan_sweep;
 
     use super::{
         CommittedTarget, Convergence, DISK_VISITS_PER_PASS, FailureCause, FailureRecord,
