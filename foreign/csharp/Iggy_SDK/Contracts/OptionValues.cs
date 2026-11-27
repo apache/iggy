@@ -71,6 +71,15 @@ internal static class OptionValues
             : null;
     }
 
+    /// <summary>A size in bytes that has no default, null when absent.</summary>
+    internal static ulong? Size(Dictionary<HeaderKey, HeaderValue>? explicitOptions,
+        Dictionary<HeaderKey, HeaderValue>? derivedOptions, TopicOptionKey key)
+    {
+        return Find(explicitOptions, derivedOptions, key) is { Kind: HeaderKind.Uint64 } value
+            ? value.ToUInt64()
+            : null;
+    }
+
     private static HeaderValue? Find(Dictionary<HeaderKey, HeaderValue>? explicitOptions,
         Dictionary<HeaderKey, HeaderValue>? derivedOptions, string name)
     {

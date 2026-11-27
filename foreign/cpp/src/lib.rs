@@ -79,6 +79,7 @@ mod ffi {
         geo_mode: GeoMode,
         /// Each one unset on a normal topic.
         geo_durations: GeoTopicDurations,
+        read_cache: TopicReadCache,
         messages_count: u64,
         partitions_count: u32,
         /// Options the creating client set explicitly. Carried as
@@ -131,6 +132,7 @@ mod ffi {
         geo_mode: GeoMode,
         /// See [`Topic::geo_durations`].
         geo_durations: GeoTopicDurations,
+        read_cache: TopicReadCache,
         messages_count: u64,
         partitions_count: u32,
         partitions: Vec<Partition>,
@@ -205,6 +207,18 @@ mod ffi {
         positions_resume_timeout_micros: u64,
         has_long_term_rewrite_max_interval: bool,
         long_term_rewrite_max_interval_micros: u64,
+    }
+
+    /// The read cache settings of a topic in bytes, each overriding the
+    /// `[tiered_storage]` server setting of the same name on every node. A
+    /// `has_` flag is false when the topic leaves its setting to that node
+    /// setting. Zero is a value that turns the setting off.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct TopicReadCache {
+        has_read_cache_size: bool,
+        read_cache_size: u64,
+        has_read_ahead: bool,
+        read_ahead: u64,
     }
 
     #[repr(u8)]
@@ -782,6 +796,7 @@ mod ffi {
         has_geo_mode: bool,
         geo_mode: String,
         geo_durations: GeoTopicDurations,
+        read_cache: TopicReadCache,
         raw_options: Vec<HeaderEntry>,
     }
 
@@ -806,6 +821,8 @@ mod ffi {
         local_retention_size: String,
         /// Set-only: none of the durations can be reset.
         geo_durations: GeoTopicDurations,
+        /// Set-only, as the durations are.
+        read_cache: TopicReadCache,
         reset: Vec<String>,
         raw_reset: Vec<String>,
         raw_options: Vec<HeaderEntry>,

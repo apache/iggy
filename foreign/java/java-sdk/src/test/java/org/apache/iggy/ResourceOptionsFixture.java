@@ -161,6 +161,8 @@ public final class ResourceOptionsFixture {
         text(input, "long_term_rewrite_max_interval")
                 .map(BigInteger::new)
                 .ifPresent(builder::longTermRewriteMaxInterval);
+        text(input, "read_cache_size").map(BigInteger::new).ifPresent(builder::readCacheSize);
+        text(input, "read_ahead").map(BigInteger::new).ifPresent(builder::readAhead);
         resetKeys(input, TopicOptionKey.class, builder::rawReset).forEach(builder::reset);
         return builder.build();
     }
@@ -191,6 +193,8 @@ public final class ResourceOptionsFixture {
                 case "tombstone_grace" -> builder.tombstoneGrace(new BigInteger(text));
                 case "positions_resume_timeout" -> builder.positionsResumeTimeout(new BigInteger(text));
                 case "long_term_rewrite_max_interval" -> builder.longTermRewriteMaxInterval(new BigInteger(text));
+                case "read_cache_size" -> builder.readCacheSize(new BigInteger(text));
+                case "read_ahead" -> builder.readAhead(new BigInteger(text));
                 default -> throw new IllegalArgumentException("create_topic input field " + field.getKey());
             }
         }

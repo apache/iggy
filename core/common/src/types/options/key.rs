@@ -70,6 +70,8 @@ pub enum OptionKey {
     TombstoneGrace,
     PositionsResumeTimeout,
     LongTermRewriteMaxInterval,
+    ReadCacheSize,
+    ReadAhead,
     ShadowOrigin,
     CriticalKeys,
 }

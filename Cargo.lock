@@ -10100,6 +10100,7 @@ dependencies = [
  "bytes",
  "compio",
  "consensus",
+ "crc32c",
  "crossfire",
  "futures",
  "hash32",

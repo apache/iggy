@@ -222,7 +222,8 @@ struct ResourceOptionsTests {
                 consumerOffsetUploadInterval: try duration(input.consumerOffsetUploadInterval),
                 positionsPublishInterval: try duration(input.positionsPublishInterval), tombstoneGrace: try duration(input.tombstoneGrace),
                 positionsResumeTimeout: try duration(input.positionsResumeTimeout),
-                longTermRewriteMaxInterval: try duration(input.longTermRewriteMaxInterval))
+                longTermRewriteMaxInterval: try duration(input.longTermRewriteMaxInterval), readCacheSizeBytes: try bytes(input.readCacheSize),
+                readAheadBytes: try bytes(input.readAhead))
             let body = try Requests.createTopic(
                 streamID: identifier(input.streamID), partitionsCount: input.partitionsCount, name: input.name, options: options.encode())
             #expect(body == [UInt8](hex: vector.bodyHex), "\(vector.name)")
@@ -286,9 +287,12 @@ struct ResourceOptionsTests {
             #expect(microseconds(topic.tombstoneGrace) == expected.tombstoneGrace, "\(vector.name)")
             #expect(microseconds(topic.positionsResumeTimeout) == expected.positionsResumeTimeout, "\(vector.name)")
             #expect(microseconds(topic.longTermRewriteMaxInterval) == expected.longTermRewriteMaxInterval, "\(vector.name)")
+            #expect(topic.readCacheSizeBytes.map(String.init) == expected.readCacheSize, "\(vector.name)")
+            #expect(topic.readAheadBytes.map(String.init) == expected.readAhead, "\(vector.name)")
             #expect(neverReturned.isDisjoint(with: topic.options.keys))
         }
         #expect(fixture.topicResponses.contains { $0.expected.consumerOffsetUploadInterval == "0" }, "no topic vector sets a zero duration")
+        #expect(fixture.topicResponses.contains { $0.expected.readCacheSize == "0" }, "no topic vector sets a zero read cache size")
         for vector in fixture.userResponses {
             let user = try Responses.userDetails([UInt8](hex: vector.responseHex)[...])
             let expected = vector.expected
@@ -329,7 +333,8 @@ struct ResourceOptionsTests {
             sizeOfMessagesRequiredToSaveBytes: 1 << 10, preallocateSegments: true, replicationFactor: 3, segmentMaxAge: .after(.seconds(3_600)),
             tieredStorage: false, localRetentionAge: .after(.seconds(1_800)), localRetentionSize: .bytes(1 << 29), topicType: .geo, geoMode: .geoTiered,
             freshUploadInterval: .milliseconds(50), consumerOffsetUploadInterval: .zero, positionsPublishInterval: .seconds(2),
-            tombstoneGrace: .seconds(3_600), positionsResumeTimeout: .zero, longTermRewriteMaxInterval: .seconds(20))
+            tombstoneGrace: .seconds(3_600), positionsResumeTimeout: .zero, longTermRewriteMaxInterval: .seconds(20), readCacheSizeBytes: 1 << 24,
+            readAheadBytes: 0)
         #expect(unsetFields(streamCreate, except: ["raw"]).isEmpty)
         #expect(unsetFields(topicCreate, except: ["raw"]).isEmpty)
         #expect(Set(try streamCreate.toResourceOptions().keys) == creatable("stream"))
@@ -340,7 +345,8 @@ struct ResourceOptionsTests {
         let topicUpdate = TopicUpdateOptions(
             name: "renamed", messageExpiry: .never, maxTopicSize: .bytes(1 << 30), tieredStorage: true, localRetentionAge: .after(.seconds(1_800)),
             localRetentionSize: .bytes(1 << 29), freshUploadInterval: .milliseconds(50), consumerOffsetUploadInterval: .zero,
-            positionsPublishInterval: .seconds(2), tombstoneGrace: .seconds(3_600), positionsResumeTimeout: .zero, longTermRewriteMaxInterval: .seconds(20))
+            positionsPublishInterval: .seconds(2), tombstoneGrace: .seconds(3_600), positionsResumeTimeout: .zero, longTermRewriteMaxInterval: .seconds(20),
+            readCacheSizeBytes: 0, readAheadBytes: 1 << 20)
         let userUpdate = UserUpdateOptions(username: "renamed", status: .inactive)
         let untyped: Set<String> = ["reset", "raw", "rawReset"]
         #expect(unsetFields(streamUpdate, except: untyped).isEmpty)
@@ -551,6 +557,19 @@ struct ResourceOptionsTests {
         #expect(normal.tombstoneGrace == nil)
     }
 
+    /// A topic of any type reports the read cache settings it sets, zero
+    /// included, and nil for one it leaves to each node.
+    @Test func givenTopicWhenDecodingShouldProjectItsReadCache() throws {
+        let readCache = optionEntry("read_cache_size", kind: HeaderKind.uint64.rawValue, value: UInt64(0).littleEndianBytes)
+        let details = try Responses.topicDetails(topicResponse(explicit: readCache, derived: [])[...])
+        #expect(details.readCacheSizeBytes == 0)
+        #expect(details.readAheadBytes == nil)
+        var listReader = ByteReader(try topicResponse(explicit: readCache, derived: []))
+        let listed = try Responses.topic(from: &listReader)
+        #expect(listed.readCacheSizeBytes == 0)
+        #expect(listed.readAheadBytes == nil)
+    }
+
     // MARK: Helpers
 
     func fakeServerClient(_ server: FakeVSRServer) -> IggyClient {
@@ -587,6 +606,7 @@ struct ResourceOptionsTests {
             freshUploadInterval: try duration(input.freshUploadInterval), consumerOffsetUploadInterval: try duration(input.consumerOffsetUploadInterval),
             positionsPublishInterval: try duration(input.positionsPublishInterval), tombstoneGrace: try duration(input.tombstoneGrace),
             positionsResumeTimeout: try duration(input.positionsResumeTimeout), longTermRewriteMaxInterval: try duration(input.longTermRewriteMaxInterval),
+            readCacheSizeBytes: try bytes(input.readCacheSize), readAheadBytes: try bytes(input.readAhead),
             reset: Set((input.reset ?? []).compactMap(TopicOptionKey.init(rawValue:))), rawReset: rawResetNames(TopicOptionKey.self, input))
     }
 
@@ -598,6 +618,11 @@ struct ResourceOptionsTests {
     /// A duration in the fixture's form: decimal microseconds, nil when unset.
     func microseconds(_ duration: Duration?) -> String? {
         duration.flatMap { $0.wholeMicroseconds }.map(String.init)
+    }
+
+    /// A read cache setting from the fixture's decimal bytes.
+    func bytes(_ text: String?) throws -> UInt64? {
+        try text.map { try #require(UInt64($0)) }
     }
 
     func streamUpdate(_ input: ResourceOptionsFixture.UpdateInput) throws -> StreamUpdateOptions {

@@ -154,3 +154,60 @@ async fn given_replicated_durability_when_two_commands_replicate_in_one_view_sho
         Some(14)
     );
 }
+
+/// A replica evicts once an advance applies, which can be before any WAL
+/// checkpoint covers it. Until the restarted partition commits again, only
+/// the WAL holds that advance, so the floor a load decides by counts it.
+#[compio::test]
+async fn given_a_committed_advance_the_commit_path_has_not_applied_when_reading_the_recovered_floor_should_count_it()
+ {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = repair_config();
+    config.path_layout.streams_root = root.path().to_string_lossy().into_owned();
+    let directory = std::path::PathBuf::from(config.get_partition_path(1, 1, 0));
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut backup = backup_with_machines(
+        &config,
+        &directory,
+        iggy_common::Durability::Persisted,
+        |backup| backup.register_builtin_state_machines().unwrap(),
+    )
+    .await;
+    let persistence = Rc::clone(backup.persistence.as_ref().unwrap());
+    let advance = crate::tiered_floor::AdvanceTieredFloor {
+        start: 0,
+        up_to: 5,
+        hash: [7; 32],
+    };
+
+    let first = checksummed_segment_prepare(1, 0, 0, b"before");
+    let command = command_prepare_of(
+        2,
+        first.header().checksum,
+        crate::tiered_floor::ADVANCE_TIERED_FLOOR.0,
+        &advance.encode(),
+    );
+    let third = checksummed_segment_prepare(3, command.header().checksum, 1, b"after");
+    for prepare in [first, command, third] {
+        Box::pin(backup.on_replicate(prepare)).await;
+    }
+    persistence.drain().await.unwrap();
+    assert_eq!(backup.recovered_tiered_floor(), None, "nothing committed");
+
+    let heartbeat = CommitEntry::new(
+        backup.namespace().inner(),
+        0,
+        0,
+        3,
+        0,
+        HeartbeatState::Busy,
+        0,
+    );
+    assert!(matches!(
+        backup.consensus().handle_commit(&heartbeat),
+        consensus::CommitOutcome::Advanced
+    ));
+
+    assert_eq!(backup.tiered_floor(), None, "the commit path has not run");
+    assert_eq!(backup.recovered_tiered_floor(), Some(5));
+}

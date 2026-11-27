@@ -36,8 +36,13 @@
 //! compression u8 | max_message_size u64
 //! message_expiry u64 | max_topic_size u64 | geo_mode u8
 //! created_at u64 | published_at u64 | deleted_at u64 | tombstone_grace u64
+//! read_cache_keys u8 | read_cache_size u64 | read_ahead u64
 //! crc32c of every byte before it u32
 //! ```
+//!
+//! `read_cache_keys` has a bit for each size that the topic sets: 1 for
+//! `read_cache_size` and 2 for `read_ahead`. Zero is a value of a size that the
+//! topic sets, so a size that it does not set is zero with its bit clear.
 //!
 //! The magic names the version. A reader refuses a magic it does not know.
 
@@ -45,11 +50,11 @@ use crate::error::ObjectStoreError;
 use crate::layout::{KeyLayout, TopicKey};
 use crate::store::{ObjectStore, PutBody, PutOptions};
 
-const MAGIC: u64 = u64::from_le_bytes(*b"IGGYTOP2");
+const MAGIC: u64 = u64::from_le_bytes(*b"IGGYTOP3");
 /// The longest name, in bytes: the most that its one-byte length says.
 pub const MAX_TOPIC_NAME_LEN: usize = u8::MAX as usize;
 /// The bytes of every field but the bytes of the three names.
-const FIXED_LEN: usize = 118;
+const FIXED_LEN: usize = 135;
 const CHECKSUM_LEN: usize = size_of::<u32>();
 /// The most bytes that a topic object takes: three names of the longest
 /// length.
@@ -57,6 +62,10 @@ pub const MAX_TOPIC_OBJECT_LEN: usize = FIXED_LEN + 3 * MAX_TOPIC_NAME_LEN;
 
 const LIVE: u8 = 1;
 const TOMBSTONE: u8 = 2;
+
+/// The bits of `read_cache_keys`.
+const READ_CACHE_SIZE_KEY: u8 = 1;
+const READ_AHEAD_KEY: u8 = 2;
 
 /// Whether the topic still exists in its origin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +168,13 @@ pub struct TopicObject {
     /// sets none: the `[geo] tombstone_grace` of the sweeping node applies.
     /// Readers in other datacenters do not use it.
     pub tombstone_grace: u64,
+    /// The topic's `read_cache_size` in bytes, `None` when the topic sets
+    /// none and each node that reads it applies its own setting. The shadow
+    /// topics of the topic in other datacenters take it.
+    pub read_cache_size: Option<u64>,
+    /// The topic's `read_ahead` in bytes, `None` when it sets none. The
+    /// shadow topics take it too.
+    pub read_ahead: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -238,6 +254,19 @@ impl TopicObject {
             bytes.extend_from_slice(&timestamp.to_le_bytes());
         }
         bytes.extend_from_slice(&self.tombstone_grace.to_le_bytes());
+        let mut read_cache_keys = 0;
+        for (size, key) in [
+            (self.read_cache_size, READ_CACHE_SIZE_KEY),
+            (self.read_ahead, READ_AHEAD_KEY),
+        ] {
+            if size.is_some() {
+                read_cache_keys |= key;
+            }
+        }
+        bytes.push(read_cache_keys);
+        for size in [self.read_cache_size, self.read_ahead] {
+            bytes.extend_from_slice(&size.unwrap_or(0).to_le_bytes());
+        }
         let checksum = crc32c::crc32c(&bytes);
         bytes.extend_from_slice(&checksum.to_le_bytes());
         Ok(bytes)
@@ -270,6 +299,9 @@ impl TopicObject {
         let published_at = reader.u64()?;
         let deleted_at = reader.u64()?;
         let tombstone_grace = reader.u64()?;
+        let read_cache_keys = reader.u8()?;
+        let read_cache_size = reader.u64()?;
+        let read_ahead = reader.u64()?;
         let body_len = bytes.len() - reader.left();
         if reader.left() != CHECKSUM_LEN {
             return Err(TopicObjectError::WrongLength {
@@ -287,6 +319,9 @@ impl TopicObject {
             (TOMBSTONE, 1..) => TopicState::Tombstone { deleted_at },
             _ => return Err(TopicObjectError::InvalidField("state")),
         };
+        if read_cache_keys & !(READ_CACHE_SIZE_KEY | READ_AHEAD_KEY) != 0 {
+            return Err(TopicObjectError::InvalidField("read_cache_keys"));
+        }
         Ok(Self {
             key: TopicKey {
                 stream_id,
@@ -309,6 +344,16 @@ impl TopicObject {
             published_at,
             state,
             tombstone_grace,
+            read_cache_size: set_size(
+                "read_cache_size",
+                read_cache_keys & READ_CACHE_SIZE_KEY != 0,
+                read_cache_size,
+            )?,
+            read_ahead: set_size(
+                "read_ahead",
+                read_cache_keys & READ_AHEAD_KEY != 0,
+                read_ahead,
+            )?,
         })
     }
 
@@ -384,6 +429,19 @@ fn put_name(bytes: &mut Vec<u8>, field: &'static str, name: &str) -> Result<(), 
     bytes.push(len);
     bytes.extend_from_slice(name.as_bytes());
     Ok(())
+}
+
+/// The size of a key whose bit is `set`. A size without its bit is zero.
+const fn set_size(
+    field: &'static str,
+    set: bool,
+    size: u64,
+) -> Result<Option<u64>, TopicObjectError> {
+    match (set, size) {
+        (true, size) => Ok(Some(size)),
+        (false, 0) => Ok(None),
+        (false, _) => Err(TopicObjectError::InvalidField(field)),
+    }
 }
 
 fn utf8(field: &'static str, bytes: &[u8]) -> Result<String, TopicObjectError> {
@@ -484,6 +542,8 @@ mod tests {
             published_at: 1_700_000_000_500_000,
             state: TopicState::Live,
             tombstone_grace: 3_600_000_000,
+            read_cache_size: Some(64 * 1024 * 1024),
+            read_ahead: Some(0),
         }
     }
 
@@ -491,10 +551,13 @@ mod tests {
     fn given_fixed_len_when_counting_the_fields_should_match_the_layout() {
         // magic, state, cluster_uid, three name lengths, three ids, the
         // partition count, compression, three limits, geo_mode, three
-        // timestamps, the tombstone grace and the checksum.
-        let fields = [8, 1, 16, 1, 1, 1, 8, 8, 8, 4, 1, 8, 8, 8, 1, 8, 8, 8, 8, 4];
+        // timestamps, the tombstone grace, the read cache keys and their two
+        // sizes, and the checksum.
+        let fields = [
+            8, 1, 16, 1, 1, 1, 8, 8, 8, 4, 1, 8, 8, 8, 1, 8, 8, 8, 8, 1, 8, 8, 4,
+        ];
         assert_eq!(fields.iter().sum::<usize>(), FIXED_LEN);
-        assert_eq!(MAX_TOPIC_OBJECT_LEN, 883);
+        assert_eq!(MAX_TOPIC_OBJECT_LEN, 900);
     }
 
     #[test]
@@ -519,6 +582,24 @@ mod tests {
         }
         assert!(object().is_live());
         assert!(!object().into_tombstone(1).is_live());
+    }
+
+    #[test]
+    fn given_each_read_cache_a_topic_sets_when_encoding_and_decoding_should_give_it_back() {
+        let sizes = [None, Some(0), Some(32 * 1024 * 1024)];
+        for read_cache_size in sizes {
+            for read_ahead in sizes {
+                let object = TopicObject {
+                    read_cache_size,
+                    read_ahead,
+                    ..object()
+                };
+
+                let encoded = object.encode().unwrap();
+
+                assert_eq!(TopicObject::decode(&encoded), Ok(object));
+            }
+        }
     }
 
     #[test]
@@ -606,15 +687,17 @@ mod tests {
 
     #[test]
     fn given_another_magic_when_decoding_should_report_an_unsupported_version() {
-        let mut encoded = object().encode().unwrap();
-        encoded[..8].copy_from_slice(b"IGGYTOP1");
+        for magic in [*b"IGGYTOP1", *b"IGGYTOP2"] {
+            let mut encoded = object().encode().unwrap();
+            encoded[..8].copy_from_slice(&magic);
 
-        assert_eq!(
-            TopicObject::decode(&encoded),
-            Err(TopicObjectError::UnsupportedVersion(u64::from_le_bytes(
-                *b"IGGYTOP1"
-            )))
-        );
+            assert_eq!(
+                TopicObject::decode(&encoded),
+                Err(TopicObjectError::UnsupportedVersion(u64::from_le_bytes(
+                    magic
+                )))
+            );
+        }
     }
 
     /// The encoding of `object` with the byte at `offset` set to `value` and
@@ -654,6 +737,39 @@ mod tests {
         assert_eq!(
             TopicObject::decode(&with_byte(&object.into_tombstone(1), 8, LIVE)),
             Err(TopicObjectError::InvalidField("state"))
+        );
+    }
+
+    #[test]
+    fn given_an_unknown_read_cache_key_or_a_size_without_its_key_when_decoding_should_refuse_it() {
+        let unset = TopicObject {
+            read_cache_size: None,
+            read_ahead: None,
+            ..object()
+        };
+        let keys = unset.encode().unwrap().len() - CHECKSUM_LEN - 2 * 8 - 1;
+        let read_cache_size = keys + 1;
+        let read_ahead = read_cache_size + 8;
+
+        for (offset, value, field) in [
+            (keys, READ_CACHE_SIZE_KEY | 4, "read_cache_keys"),
+            (keys, 1 << 7, "read_cache_keys"),
+            (read_cache_size, 1, "read_cache_size"),
+            (read_ahead + 7, 1, "read_ahead"),
+        ] {
+            assert_eq!(
+                TopicObject::decode(&with_byte(&unset, offset, value)),
+                Err(TopicObjectError::InvalidField(field)),
+                "byte {offset} set to {value}"
+            );
+        }
+        assert_eq!(
+            TopicObject::decode(&with_byte(&unset, keys, READ_AHEAD_KEY)),
+            Ok(TopicObject {
+                read_ahead: Some(0),
+                ..unset
+            }),
+            "a key's bit alone sets it to zero"
         );
     }
 

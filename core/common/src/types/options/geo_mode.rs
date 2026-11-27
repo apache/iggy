@@ -49,13 +49,18 @@ pub enum GeoMode {
 }
 
 impl GeoMode {
-    /// The durability a geo topic in this mode always has, whatever its
-    /// create names, or `None` when the mode leaves it to the topic.
+    /// The durability of the messages and of the consumer offsets of a geo
+    /// topic in this mode, whatever its create names, or `None` when the mode
+    /// leaves both to the topic. It applies to each of [`Durability::KEYS`].
     ///
     /// A `geo` send already waits for its upload, but the record that places
     /// its batch is in the local journal, and a replicated acknowledgement
     /// does not wait for that record to reach disk. A crash of every node at
     /// once then loses the batch in every datacenter.
+    ///
+    /// A replica that acknowledges an offset store before it is on disk can
+    /// restart without it, so after a crash of every node the partition
+    /// trusts no replica's log and elects only once every replica is back.
     #[must_use]
     pub const fn fixed_durability(self) -> Option<Durability> {
         match self {

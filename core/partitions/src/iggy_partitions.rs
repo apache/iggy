@@ -139,6 +139,9 @@ where
     /// Where the partitions here read their remote segments from. `None` on a
     /// shard without an object store.
     remote_segments: RefCell<Option<Rc<crate::RemoteSegments>>>,
+    /// What the shard keeps of what it reads from object stores, which the
+    /// reads of its own store and of its geo peers share.
+    read_cache: RefCell<Option<Rc<crate::ReadCache>>>,
     /// Where the partitions that follow another cluster's log read it from,
     /// by the peer's origin name.
     peer_remote_segments: RefCell<Vec<(String, Rc<crate::RemoteSegments>)>>,
@@ -272,11 +275,20 @@ pub struct GaugeShare {
     pub wal_reload_bytes: u64,
     pub repair_ring_entries: usize,
     pub repair_ring_bytes: u64,
+    /// Stored segments that a verify pass found with an object missing.
+    pub stored_segments_missing: usize,
+    /// Stored segments that a verify pass found with an object that differs
+    /// from the chain's record.
+    pub stored_segments_diverged: usize,
 }
 
 impl GaugeShare {
     const fn replaced(self, old: Self, new: Self) -> Self {
         Self {
+            stored_segments_missing: self.stored_segments_missing - old.stored_segments_missing
+                + new.stored_segments_missing,
+            stored_segments_diverged: self.stored_segments_diverged - old.stored_segments_diverged
+                + new.stored_segments_diverged,
             wal_disk_bytes: self.wal_disk_bytes - old.wal_disk_bytes + new.wal_disk_bytes,
             wal_retained_bytes: self.wal_retained_bytes - old.wal_retained_bytes
                 + new.wal_retained_bytes,
@@ -372,6 +384,7 @@ where
             persistence_notifier: RefCell::new(None),
             io_notifier: RefCell::new(None),
             remote_segments: RefCell::new(None),
+            read_cache: RefCell::new(None),
             peer_remote_segments: RefCell::default(),
             repair_memory: None,
             repair_rings: None,
@@ -997,6 +1010,18 @@ where
         *self.remote_segments.borrow_mut() = Some(remote);
     }
 
+    /// Give the shard the cache that its reads of object stores share.
+    pub fn set_read_cache(&self, cache: Rc<crate::ReadCache>) {
+        *self.read_cache.borrow_mut() = Some(cache);
+    }
+
+    /// The cache that the shard's reads of object stores share, `None` on a
+    /// shard that was given none.
+    #[must_use]
+    pub fn read_cache(&self) -> Option<Rc<crate::ReadCache>> {
+        self.read_cache.borrow().clone()
+    }
+
     /// Give the partitions here that follow another cluster's log the store
     /// of their peer, by origin name, in place of the stores they had. A
     /// partition here already takes its peer's store the next time the pump
@@ -1411,6 +1436,10 @@ where
             .partitions
             .borrow_mut()
             .remove(namespace);
+        if let Some(remote) = self.remote_segments.borrow().as_deref() {
+            remote.forget_partition(*namespace);
+        }
+        partition.forget_reads();
         Some(partition)
     }
 
@@ -1601,6 +1630,11 @@ where
             .borrow_mut()
             .entry(namespace)
             .or_insert(None);
+        if let Some(remote) = self.remote_segments.borrow().as_deref() {
+            remote.forget_partition(namespace);
+        }
+        // The blocks its reads keep go at its removal, which follows the
+        // fence: this can run off the pump, which may hold the partition.
         self.wake_namespace(namespace);
     }
 
@@ -1645,7 +1679,8 @@ where
         self.wake_namespace(*namespace);
     }
 
-    /// Snapshot read resources under a synchronous borrow on the owning pump.
+    /// Snapshot read resources under a synchronous borrow on the owning pump,
+    /// for a partition whose topic sets nothing for its reads of the store.
     /// Returns `None` for a missing or tombstoned namespace. Execution carries
     /// no partition borrow; its result returns to [`Self::complete_poll`].
     pub fn build_poll_snapshot(
@@ -1659,7 +1694,9 @@ where
 
     /// [`Self::build_poll_snapshot`] for a poll whose reply holds at most
     /// `byte_budget` bytes of messages, so the snapshot stops at the segment
-    /// that covers them instead of at the partition's tail.
+    /// that covers them instead of at the partition's tail. The caller hands
+    /// the settings of its reads of the store to
+    /// [`PollPlan::read_store_with`].
     pub fn build_poll_snapshot_within(
         &self,
         namespace: &IggyNamespace,
@@ -1927,8 +1964,10 @@ where
         reply: Option<consensus::Sender<Message<ReplyHeader>>>,
     ) {
         let namespace = IggyNamespace::from_raw(message.header().group);
+        // The partition takes its store before the batch commits, so the
+        // commit can tell the shard's cache where the batch ends.
         let partition = (!self.is_tombstoned(&namespace))
-            .then(|| self.get_mut_by_ns(&namespace))
+            .then(|| self.get_mut_with_remote(&namespace))
             .flatten();
         let Some(partition) = partition else {
             warn!(
@@ -2210,6 +2249,109 @@ mod tests {
         partitions.insert(namespace, build_partition());
 
         assert!(holds(partitions.get_by_ns(&namespace).unwrap(), &own));
+    }
+
+    /// A store of one object under every key, whose GETs wait until the
+    /// test sends on what [`Gated::new`] returns.
+    struct Gated {
+        object: Bytes,
+        gate: futures::future::Shared<futures::channel::oneshot::Receiver<()>>,
+    }
+
+    impl Gated {
+        fn new(object: Bytes) -> (Rc<Self>, futures::channel::oneshot::Sender<()>) {
+            let (open, gate) = futures::channel::oneshot::channel();
+            let gated = Self {
+                object,
+                gate: futures::FutureExt::shared(gate),
+            };
+            (Rc::new(gated), open)
+        }
+    }
+
+    impl crate::RemoteObjects for Gated {
+        fn get_range<'a>(
+            &'a self,
+            _key: &'a str,
+            range: std::ops::Range<u64>,
+        ) -> futures::future::LocalBoxFuture<
+            'a,
+            Result<iggy_object_store::ObjectRange, iggy_object_store::ObjectStoreError>,
+        > {
+            let gate = self.gate.clone();
+            futures::FutureExt::boxed_local(async move {
+                let _ = gate.await;
+                let end = usize::try_from(range.end).unwrap().min(self.object.len());
+                Ok(iggy_object_store::ObjectRange {
+                    bytes: self
+                        .object
+                        .slice(usize::try_from(range.start).unwrap()..end),
+                    etag: String::new(),
+                    size: self.object.len() as u64,
+                })
+            })
+        }
+    }
+
+    /// A partition removed from the shard keeps nothing of what a GET in
+    /// flight for it fetches, and a tombstoned one nothing once its removal
+    /// follows.
+    #[compio::test]
+    async fn given_a_get_in_flight_when_its_partition_leaves_the_shard_should_keep_nothing_it_fetched()
+     {
+        let namespace = IggyNamespace::new(1, 1, 0);
+        for removed in [true, false] {
+            let partitions = partitions();
+            let (store, open) = Gated::new(Bytes::from(vec![7; 4096]));
+            let cache = crate::ReadCache::new(crate::ReadCacheSettings {
+                cache_bytes: 64 * 1024 * 1024,
+                block_bytes: 4096,
+                read_ahead: 0,
+                read_ahead_fetches: 4,
+                read_ahead_fetch_bytes: 32 * 1024 * 1024,
+            });
+            let remote = Rc::new(
+                crate::RemoteSegments::new(
+                    Rc::clone(&store) as _,
+                    iggy_object_store::KeyLayout::new("iggy").unwrap(),
+                )
+                .with_cache(Rc::clone(&store) as _, &cache),
+            );
+            partitions.set_remote_segments(Rc::clone(&remote));
+            partitions.insert(namespace, build_partition());
+            let created_revision = partitions.get_by_ns(&namespace).unwrap().created_revision();
+            // The settings that the partition's polls read with.
+            let settings = partitions
+                .get_by_ns(&namespace)
+                .unwrap()
+                .placed_read_plan(None)
+                .read_settings
+                .current();
+            let segment = crate::remote_segments::RemoteRange {
+                key: iggy_object_store::SegmentKey {
+                    prefix: crate::object_prefix(namespace, created_revision),
+                    start_offset: 0,
+                    object: iggy_object_store::SegmentObject::Log,
+                },
+                keyed_end_offset: None,
+                range: 0..4096,
+            };
+            let mut read = Box::pin(remote.read(&segment, 0, 100, None, None, &settings));
+            assert!(futures::poll!(read.as_mut()).is_pending());
+
+            if removed {
+                assert!(partitions.remove(&namespace).is_some());
+            } else {
+                partitions.tombstone(namespace);
+            }
+            open.send(()).unwrap();
+            assert!(read.await.is_ok());
+            if !removed {
+                assert!(partitions.remove(&namespace).is_some());
+            }
+
+            assert_eq!(cache.take_metrics().cached_bytes, 0, "removed: {removed}");
+        }
     }
 
     fn build_partition() -> IggyPartition<IggyMessageBus> {

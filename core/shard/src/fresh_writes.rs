@@ -412,6 +412,12 @@ impl FreshWrites {
         objects
     }
 
+    /// The objects that hold the messages of a send that is not answered,
+    /// as the shard keeps them from here on: none while no send waits.
+    pub(crate) fn unanswered_sends(&self) -> Rc<RefCell<BTreeMap<u128, usize>>> {
+        Rc::clone(&self.awaited)
+    }
+
     /// Keep `send` at the end of the queue of `namespace`, its bytes in the
     /// share of its partition, and its object among the awaited ones.
     fn stage_send(&self, namespace: IggyNamespace, send: StagedSend) {
@@ -1481,6 +1487,12 @@ where
         let fresh = &self.fresh_writes;
         let sequence = finished.sequence;
         let now = self.bus.monotonic_micros();
+        // A store that retries spent its budget on the object already.
+        let store_retries = fresh
+            .uploader
+            .borrow()
+            .as_ref()
+            .is_some_and(|uploader| uploader.store_retries());
         let stored = {
             let mut closed = fresh.closed.borrow_mut();
             let Some(object) = closed.get_mut(&sequence) else {
@@ -1494,6 +1506,7 @@ where
                         .saturating_mul(1_u64 << object.attempts.saturating_sub(1).min(16));
                     let retry_at = now.saturating_add(delay);
                     if error.class() == ErrorClass::Transient
+                        && !store_retries
                         && object.attempts < FRESH_UPLOAD_ATTEMPTS
                         && retry_at.saturating_sub(object.first_started_at)
                             < micros(FRESH_UPLOAD_DEADLINE)
@@ -1538,12 +1551,23 @@ where
             self.metrics.record_fresh_confirmation();
         }
         // A consumer at the tail polls these batches next, and this shard
-        // holds their messages already.
+        // holds their messages already. Sends answered while the object
+        // uploaded, as those behind an object the store failed for good, are
+        // no longer awaited, and an object with none left nobody reads.
         if stored
             && !object.partitions.is_empty()
+            && self
+                .fresh_writes
+                .awaited
+                .borrow()
+                .contains_key(&object.id.get())
             && let Some(remote) = self.plane.partitions().remote_segments()
         {
-            remote.cache_fresh_object(object.id.get(), object.bytes);
+            remote.cache_fresh_object(
+                object.id.get(),
+                object.bytes,
+                object.partitions.iter().copied(),
+            );
         }
         for namespace in object.partitions {
             self.feed_staged_sends(namespace).await;
@@ -1671,10 +1695,15 @@ where
             let object = object_id.get();
             let commit_latency = self.metrics.fresh_commit_latency();
             let handed_at = Instant::now();
+            let remote = partitions.remote_segments();
             self.bus.spawn(async move {
                 let committed = receiver.await.ok().map(Message::into_generic);
                 commit_latency.observe(handed_at.elapsed().as_secs_f64());
-                settle_awaited(&awaited, object);
+                if settle_awaited(&awaited, object)
+                    && let Some(remote) = remote
+                {
+                    remote.settle_fresh_object(object);
+                }
                 let _ = reply.try_send(committed);
             });
             // An object can hold thousands of sends, and the tasks and
@@ -1728,7 +1757,12 @@ where
     fn deny_staged_send(&self, namespace: IggyNamespace, send: StagedSend) {
         self.release_staged_send(namespace, send.bytes);
         self.fresh_writes.forget_claim(namespace);
-        settle_awaited(&self.fresh_writes.awaited, send.object_id.get());
+        let object = send.object_id.get();
+        if settle_awaited(&self.fresh_writes.awaited, object)
+            && let Some(remote) = self.plane.partitions().remote_segments()
+        {
+            remote.settle_fresh_object(object);
+        }
         self.metrics.record_fresh_send_denied();
         Self::answer_partition_submit_deny(
             send.request.header(),
@@ -1762,15 +1796,18 @@ fn sends_of(
     })
 }
 
-/// One send of `object` was answered.
-fn settle_awaited(awaited: &RefCell<BTreeMap<u128, usize>>, object: u128) {
+/// One send of `object` was answered. Returns whether it was the last.
+fn settle_awaited(awaited: &RefCell<BTreeMap<u128, usize>>, object: u128) -> bool {
     let mut awaited = awaited.borrow_mut();
-    if let Some(sends) = awaited.get_mut(&object) {
-        *sends -= 1;
-        if *sends == 0 {
-            awaited.remove(&object);
-        }
+    let Some(sends) = awaited.get_mut(&object) else {
+        return false;
+    };
+    *sends -= 1;
+    if *sends > 0 {
+        return false;
     }
+    awaited.remove(&object);
+    true
 }
 
 fn micros(duration: Duration) -> u64 {

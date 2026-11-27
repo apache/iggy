@@ -1916,6 +1916,8 @@ class IggyClient:
         tombstone_grace: datetime.timedelta | None = None,
         positions_resume_timeout: datetime.timedelta | None = None,
         long_term_rewrite_max_interval: datetime.timedelta | None = None,
+        read_cache_size: builtins.int | None = None,
+        read_ahead: builtins.int | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
         Update an existing topic.
@@ -1961,13 +1963,19 @@ class IggyClient:
                 `datetime.timedelta | None`, unchanged when `None`. This and
                 the five durations below have the meaning and bounds
                 `TopicOptions` gives them, zero is a value, and none of them
-                can be reset. They are the only options an update changes on a
-                geo topic, and the server refuses them on a normal topic.
+                can be reset. With `read_cache_size` and `read_ahead` they are
+                the only options an update changes on a geo topic, and the
+                server refuses them on a normal topic.
             consumer_offset_upload_interval: As `fresh_upload_interval`.
             positions_publish_interval: As `fresh_upload_interval`.
             tombstone_grace: As `fresh_upload_interval`.
             positions_resume_timeout: As `fresh_upload_interval`.
             long_term_rewrite_max_interval: As `fresh_upload_interval`.
+            read_cache_size: Read cache bytes of the topic as `int | None`,
+                unchanged when `None`. This and `read_ahead` have the meaning
+                and bounds `TopicOptions` gives them, zero is a value, and
+                neither can be reset. An update can change them on any topic.
+            read_ahead: As `read_cache_size`.
 
         Returns:
             An awaitable that resolves to `None` when the topic is updated.
@@ -4097,6 +4105,16 @@ class OptionKey:
     r"""
     The geo origin a shadow stream serves, computed by the server.
     """
+    ReadCacheSize: typing.ClassVar[OptionKey]
+    r"""
+    Memory each node keeps for what a topic's reads fetch from the object
+    store. An update can set it, not reset it.
+    """
+    ReadAhead: typing.ClassVar[OptionKey]
+    r"""
+    Most bytes readahead fetches in front of a sequential reader of a
+    topic. An update can set it, not reset it.
+    """
     def __str__(self) -> builtins.str: ...
 
 @typing.final
@@ -5812,6 +5830,20 @@ class Topic:
         setting.
         """
     @property
+    def read_cache_size(self) -> builtins.int | None:
+        r"""
+        Memory in bytes each node keeps for what the topic's reads fetch from
+        the object store, or `None` when the topic leaves it to each node's
+        server setting. Zero keeps nothing they fetch.
+        """
+    @property
+    def read_ahead(self) -> builtins.int | None:
+        r"""
+        Most bytes readahead fetches in front of a sequential reader of the
+        topic, or `None` when the topic leaves it to each node's server
+        setting. Zero turns readahead off.
+        """
+    @property
     def options(self) -> UserHeaders:
         r"""
         Options the creating client set explicitly.
@@ -5929,6 +5961,20 @@ class TopicDetails:
         setting.
         """
     @property
+    def read_cache_size(self) -> builtins.int | None:
+        r"""
+        Memory in bytes each node keeps for what the topic's reads fetch from
+        the object store, or `None` when the topic leaves it to each node's
+        server setting. Zero keeps nothing they fetch.
+        """
+    @property
+    def read_ahead(self) -> builtins.int | None:
+        r"""
+        Most bytes readahead fetches in front of a sequential reader of the
+        topic, or `None` when the topic leaves it to each node's server
+        setting. Zero turns readahead off.
+        """
+    @property
     def options(self) -> UserHeaders:
         r"""
         Options the creating client set explicitly.
@@ -5986,6 +6032,8 @@ class TopicOptions:
         tombstone_grace: datetime.timedelta | None = None,
         positions_resume_timeout: datetime.timedelta | None = None,
         long_term_rewrite_max_interval: datetime.timedelta | None = None,
+        read_cache_size: builtins.int | None = None,
+        read_ahead: builtins.int | None = None,
         raw: builtins.dict[builtins.str, builtins.str] | None = None,
     ) -> TopicOptions:
         r"""
@@ -5994,8 +6042,8 @@ class TopicOptions:
         Every setting left as `None` resolves against the server default at
         admission. Only `message_expiry`, `max_topic_size`, `tiered_storage`,
         `local_retention_age`, `local_retention_size`, the six durations of a
-        geo topic and the name can change after creation, through
-        `update_topic`.
+        geo topic, `read_cache_size`, `read_ahead` and the name can change
+        after creation, through `update_topic`.
 
         The six durations, `fresh_upload_interval` to
         `long_term_rewrite_max_interval`, are `datetime.timedelta | None` and
@@ -6077,6 +6125,19 @@ class TopicOptions:
                 geo peers. Zero does not wait.
             long_term_rewrite_max_interval: Longest wait between two long-term
                 rewrites of a partition, at least 1 second.
+            read_cache_size: Memory in bytes as `int | None` that each node
+                keeps for what the topic's reads fetch from the object store,
+                divided between its partitions. A partition's share is a limit
+                within the read cache of its shard, not a reservation. Zero
+                keeps nothing they fetch, otherwise at least 512 KiB. `None`
+                leaves it unset, so each node applies its `[tiered_storage]`
+                setting of the same name. Any topic type takes it.
+            read_ahead: Most bytes as `int | None` that readahead fetches in
+                front of a sequential reader of the topic. Zero turns readahead
+                off, otherwise at least 128 KiB, and at most an eighth of a
+                `read_cache_size` above zero. `None` leaves it unset, so each
+                node applies its `[tiered_storage]` setting of the same name.
+                Any topic type takes it.
             raw: Additional option keys as `dict[str, str]`, sent as string
                 values so a key newer than this build can be set. A typed field
                 wins on collision.

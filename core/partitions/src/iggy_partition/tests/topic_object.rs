@@ -59,6 +59,8 @@ fn object(key: TopicKey) -> TopicObject {
         published_at: START,
         state: TopicState::Live,
         tombstone_grace: 0,
+        read_cache_size: None,
+        read_ahead: None,
     }
 }
 

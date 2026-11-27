@@ -46,6 +46,8 @@ class TopicDetailsTest {
                         "compression_algorithm",
                         HeaderValue.fromString("gzip"),
                         "positions_resume_timeout",
+                        HeaderValue.fromUint64(BigInteger.ZERO),
+                        "read_cache_size",
                         HeaderValue.fromUint64(BigInteger.ZERO)),
                 Map.of(
                         "max_topic_size",
@@ -84,6 +86,8 @@ class TopicDetailsTest {
         assertThat(topicDetails.localRetentionSize()).contains(BigInteger.valueOf(1_073_741_824L));
         assertThat(topicDetails.positionsResumeTimeout()).contains(BigInteger.ZERO);
         assertThat(topicDetails.tombstoneGrace()).isEmpty();
+        assertThat(topicDetails.readCacheSize()).contains(BigInteger.ZERO);
+        assertThat(topicDetails.readAhead()).isEmpty();
         assertThat(topicDetails.messagesCount()).isEqualTo(BigInteger.ZERO);
         assertThat(topicDetails.partitionsCount()).isEqualTo(1L);
         assertThat(topicDetails.partitions()).isEqualTo(partitions);

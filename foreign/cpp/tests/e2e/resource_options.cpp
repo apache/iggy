@@ -87,6 +87,8 @@ constexpr iggy::TopicOptionKey kTopicOptionKeys[] = {
     iggy::TopicOptionKey::TombstoneGrace,
     iggy::TopicOptionKey::PositionsResumeTimeout,
     iggy::TopicOptionKey::LongTermRewriteMaxInterval,
+    iggy::TopicOptionKey::ReadCacheSize,
+    iggy::TopicOptionKey::ReadAhead,
 };
 
 constexpr iggy::UserOptionKey kUserOptionKeys[] = {
@@ -525,6 +527,45 @@ TEST_P(E2E_ResourceOptionsTransport, GivenGeoDurationOnNormalTopicWhenCreatingOr
     EXPECT_EQ(client.GetTopics(stream_id).size(), 1u);
 }
 
+TEST_P(E2E_ResourceOptionsTransport, GivenReadCacheOnNormalTopicWhenCreatingAndUpdatingShouldKeepZeroAndRefuseReset) {
+    RecordProperty("description",
+                   "Creates a normal topic with a read cache size and a zero readahead, swaps them with an update, "
+                   "refuses a readahead above an eighth of the read cache size as invalid_option_value and a reset "
+                   "as option_not_resettable, and reads each zero back as a value.");
+    const nlohmann::json invalid_option_value  = {{"name", "invalid_option_value"}, {"code", 4042}};
+    const nlohmann::json option_not_resettable = {{"name", "option_not_resettable"}, {"code", 4104}};
+    constexpr std::uint64_t kMib               = 1024 * 1024;
+    auto client                                = GetTransportClient();
+    const auto stream_name                     = GetRandomName(40);
+    const auto stream                          = client.CreateStream(stream_name);
+    TrackStream(stream_name);
+    const auto stream_id = iggy::Identifier::Numeric(stream.Id());
+
+    const auto created =
+        client.CreateTopic(stream_id, "cached", iggy::TopicCreateOptions().SetReadCacheSize(16 * kMib).SetReadAhead(0));
+    const auto topic_id = iggy::Identifier::Numeric(created.Id());
+    const auto topic    = client.GetTopic(stream_id, topic_id);
+    EXPECT_EQ(topic.ReadCacheSize(), std::optional<std::uint64_t>(16 * kMib));
+    EXPECT_EQ(topic.ReadAhead(), std::optional<std::uint64_t>(0));
+
+    ASSERT_NO_THROW(
+        client.UpdateTopic(stream_id, topic_id, iggy::TopicUpdateOptions().SetReadCacheSize(0).SetReadAhead(kMib)));
+    // A readahead takes at most an eighth of a cache other than zero, so 1 MiB fits no cache below 8 MiB.
+    EXPECT_TRUE(ThrowsIggyError(
+        [&] { client.UpdateTopic(stream_id, topic_id, iggy::TopicUpdateOptions().SetReadCacheSize(4 * kMib)); },
+        invalid_option_value));
+    EXPECT_TRUE(ThrowsIggyError(
+        [&] {
+            client.UpdateTopic(stream_id, topic_id, iggy::TopicUpdateOptions().Reset(iggy::TopicOptionKey::ReadAhead));
+        },
+        option_not_resettable));
+
+    const auto updated = client.GetTopic(stream_id, topic_id);
+    EXPECT_EQ(updated.ReadCacheSize(), std::optional<std::uint64_t>(0));
+    EXPECT_EQ(updated.ReadAhead(), std::optional<std::uint64_t>(kMib));
+    EXPECT_EQ(updated.Options().Explicit().count("read_cache_size"), 1u);
+}
+
 TEST_P(E2E_ResourceOptionsTransport, GivenUserOptionsWhenCreatingAndUpdatingShouldPreserveUserBehavior) {
     RecordProperty("description",
                    "Creates a user with typed empty options, patches its username and status, reads its options with "
@@ -801,12 +842,13 @@ TEST_P(E2E_ResourceOptionsTransport, GivenPublicDescribeOptionsWhenCalledShouldR
     const auto shadow_origin = spec_of(iggy::StreamOptionKey::ShadowOrigin);
     EXPECT_TRUE(shadow_origin.ReadOnly() && !shadow_origin.Updatable() && !shadow_origin.Critical());
 
-    // The durations of a geo topic are set-only: they have no default to reset to.
+    // The durations of a geo topic and the read cache settings are set-only: they have no default to reset to.
     const auto topic_specs = client.DescribeOptions(iggy::OptionsScope::Topic);
     for (const auto key :
          {iggy::TopicOptionKey::FreshUploadInterval, iggy::TopicOptionKey::ConsumerOffsetUploadInterval,
           iggy::TopicOptionKey::PositionsPublishInterval, iggy::TopicOptionKey::TombstoneGrace,
-          iggy::TopicOptionKey::PositionsResumeTimeout, iggy::TopicOptionKey::LongTermRewriteMaxInterval}) {
+          iggy::TopicOptionKey::PositionsResumeTimeout, iggy::TopicOptionKey::LongTermRewriteMaxInterval,
+          iggy::TopicOptionKey::ReadCacheSize, iggy::TopicOptionKey::ReadAhead}) {
         SCOPED_TRACE(std::string(iggy::to_string(key)));
         const auto spec = std::find_if(topic_specs.begin(), topic_specs.end(), [key](const iggy::OptionSpec &spec) {
             return spec.Key() == iggy::to_string(key);

@@ -63,7 +63,9 @@ type GeoDurationsInput = {
   positions_publish_interval?: string, tombstone_grace?: string,
   positions_resume_timeout?: string, long_term_rewrite_max_interval?: string
 };
-type UpdateInput = GeoDurationsInput & {
+/** The read cache settings as decimal bytes, absent when unset. */
+type ReadCacheInput = { read_cache_size?: string, read_ahead?: string };
+type UpdateInput = GeoDurationsInput & ReadCacheInput & {
   name?: string, username?: string, status?: string,
   message_expiry?: string, max_topic_size?: string, reset?: string[]
 };
@@ -108,7 +110,7 @@ type Fixture = {
   }[],
   create_topic: {
     case: string,
-    input: GeoDurationsInput & {
+    input: GeoDurationsInput & ReadCacheInput & {
       stream_id: Id, name: string, partitions_count: number, compression_algorithm?: string,
       message_expiry?: string, max_topic_size?: string, segment_size?: string,
       durability: Durability, consumer_offset_durability: Durability, topic_type?: TopicType
@@ -129,7 +131,7 @@ type Fixture = {
   }[],
   topic_responses: {
     case: string, response_hex: string,
-    expected: GeoDurationsInput & {
+    expected: GeoDurationsInput & ReadCacheInput & {
       id: number, created_at: number, name: string, partitions_count: number,
       size_bytes: number, messages_count: number, options: FixtureOptions,
       compression_algorithm: string, message_expiry: string, max_topic_size: string
@@ -174,6 +176,15 @@ const geoDurationsProjection = (topic: Topic): GeoDurationsInput => Object.fromE
   positions_resume_timeout: topic.positionsResumeTimeout,
   long_term_rewrite_max_interval: topic.longTermRewriteMaxInterval
 }).flatMap(([key, value]) => value === null ? [] : [[key, value.toString()]]));
+const readCache = (input: ReadCacheInput) => ({
+  readCacheSize: optionalBigInt(input.read_cache_size),
+  readAhead: optionalBigInt(input.read_ahead)
+});
+/** The read cache settings a topic read reports, in the projection's form: set ones only. */
+const readCacheProjection = (topic: Topic): ReadCacheInput => Object.fromEntries(Object.entries({
+  read_cache_size: topic.readCacheSize,
+  read_ahead: topic.readAhead
+}).flatMap(([key, value]) => value === null ? [] : [[key, value.toString()]]));
 
 const kindName = (value: unknown): string => {
   if (typeof value === 'bigint') return 'uint64';
@@ -210,7 +221,8 @@ const encodeUpdate = (scope: Scope, target: Target, input: UpdateInput): Buffer 
         streamId: target.stream_id!, topicId: target.topic_id!, name: input.name,
         messageExpiry: optionalBigInt(input.message_expiry),
         maxTopicSize: optionalBigInt(input.max_topic_size), reset,
-        ...geoDurations(input)
+        ...geoDurations(input),
+        ...readCache(input)
       });
     case 'stream':
       return UPDATE_STREAM.serialize({ streamId: target.stream_id!, name: input.name, reset });
@@ -279,6 +291,8 @@ describe('given shared vectors when encoding should match server contract', () =
       ['topic', ['tiered_storage', 'name'], 4103],
       ['topic', ['tombstone_grace'], 4104],
       ['topic', ['consumer_offset_upload_interval', 'message_expiry'], 4104],
+      ['topic', ['read_cache_size'], 4104],
+      ['topic', ['read_ahead', 'max_topic_size'], 4104],
       ['user', ['username'], 4104],
       ['topic', ['name', 'encryption_key'], 4041]
     ];
@@ -413,7 +427,9 @@ describe('given shared vectors when encoding should match server contract', () =
         positions_publish_interval: () => topicBlock({ positionsPublishInterval: 1n }),
         tombstone_grace: () => topicBlock({ tombstoneGrace: 1n }),
         positions_resume_timeout: () => topicBlock({ positionsResumeTimeout: 0n }),
-        long_term_rewrite_max_interval: () => topicBlock({ longTermRewriteMaxInterval: 1n })
+        long_term_rewrite_max_interval: () => topicBlock({ longTermRewriteMaxInterval: 1n }),
+        read_cache_size: () => topicBlock({ readCacheSize: 0n }),
+        read_ahead: () => topicBlock({ readAhead: 0n })
       },
       user: {}
     };
@@ -448,7 +464,11 @@ describe('given shared vectors when encoding should match server contract', () =
         positions_resume_timeout: () =>
           updateBlock(UPDATE_TOPIC.serialize({ streamId: 1, topicId: 1, positionsResumeTimeout: 0n }), 2),
         long_term_rewrite_max_interval: () =>
-          updateBlock(UPDATE_TOPIC.serialize({ streamId: 1, topicId: 1, longTermRewriteMaxInterval: 1n }), 2)
+          updateBlock(UPDATE_TOPIC.serialize({ streamId: 1, topicId: 1, longTermRewriteMaxInterval: 1n }), 2),
+        read_cache_size: () =>
+          updateBlock(UPDATE_TOPIC.serialize({ streamId: 1, topicId: 1, readCacheSize: 0n }), 2),
+        read_ahead: () =>
+          updateBlock(UPDATE_TOPIC.serialize({ streamId: 1, topicId: 1, readAhead: 0n }), 2)
       },
       user: {
         username: () => updateBlock(UPDATE_USER.serialize({ userId: 1, username: 'alice2' }), 1),
@@ -532,7 +552,8 @@ describe('given shared vectors when encoding should match server contract', () =
         durability: input.durability,
         consumerOffsetDurability: input.consumer_offset_durability,
         topicType: input.topic_type,
-        ...geoDurations(input)
+        ...geoDurations(input),
+        ...readCache(input)
       });
       assert.equal(encoded.toString('hex'), body_hex, name);
     }
@@ -585,7 +606,8 @@ describe('given shared vectors when encoding should match server contract', () =
         compression_algorithm: compressionAlgorithmName(topic.compressionAlgorithm),
         message_expiry: topic.messageExpiry.toString(),
         max_topic_size: topic.maxTopicSize.toString(),
-        ...geoDurationsProjection(topic)
+        ...geoDurationsProjection(topic),
+        ...readCacheProjection(topic)
       }, expected, name);
       assert.equal(topic.segmentMaxAge.toString(), expected.options.segment_max_age.value, name);
       assert.equal(String(topic.tieredStorage), expected.options.tiered_storage.value, name);

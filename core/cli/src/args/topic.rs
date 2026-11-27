@@ -18,7 +18,7 @@
 use crate::args::common::{GetOutput, ListOutputArgs, NamedPageArgs, parse_key_value, split_reset};
 use clap::{Args, Subcommand};
 use iggy::prelude::{
-    CompressionAlgorithm, GeoTopicDurations, Identifier, IggyExpiry, MaxTopicSize,
+    CompressionAlgorithm, GeoTopicDurations, Identifier, IggyExpiry, MaxTopicSize, TopicReadCache,
     TopicUpdateOptions,
 };
 
@@ -193,8 +193,10 @@ impl From<&TopicUpdateArgs> for TopicUpdateOptions {
             tiered_storage: None,
             local_retention_age: None,
             local_retention_size: None,
-            // `--set` carries them, as every other geo topic option.
+            // `--set` carries them, as every other geo topic option, and the
+            // read cache settings of any topic.
             geo_durations: GeoTopicDurations::default(),
+            read_cache: TopicReadCache::default(),
             reset,
             raw_reset,
             raw: args.set.iter().cloned().collect(),

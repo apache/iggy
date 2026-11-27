@@ -50,7 +50,7 @@ The replica wire revision 4 build of server 0.10.1-edge.2 introduced the current
 
 That build also changes what revokes a credential. A password change ends every session of the account except the binary session that submitted it, and refuses every access token issued before it. Deactivating an account deletes its personal access tokens, so issue new ones after reactivation. Deleting a personal access token, or its expiry, ends the sessions opened with it. Stream and topic lists return only the entries the caller may read. See [Security](/docs/server/security).
 
-Later builds with the same 0.10.1-edge.2 version use replica wire revision 5. To move from revision 4 to 5, stop every node, keep its existing data directory and restart the cluster on the new build.
+Later builds with the same 0.10.1-edge.2 version use replica wire revisions 5 and 6. Revision 6 replicates the read cache options of topics and shadow topics and the persisted consumer offset durability of geo topics. To move from revision 4 or 5 to a later revision, stop every node, keep its existing data directory and restart the cluster on the new build.
 
 ## Release compatibility
 
@@ -67,6 +67,8 @@ Replace one node at a time. Record the metadata and partition operations below b
 - For each hosted partition, use `OperationCommitted` events with `plane="partitions"` in the `iggy.sim` logs. Record the primary's `namespace_raw` and `op`. Wait for the restarted node to log an `op` at or above the recorded value in that namespace. If the partition is idle, an acknowledged write lets you observe a fresh commit.
 
 Apply the new default after every node has rejoined. For a larger `metadata.journal_slots` value, increase it on the backups one at a time, then on the metadata primary.
+
+Later builds of 0.10.1-edge.2 add a `read_cache` field of type `TopicReadCache` to the Rust SDK's `TopicCreateOptions` and `TopicUpdateOptions`. A struct literal that names every field of either one stops compiling. Add `read_cache: TopicReadCache::default()`, which leaves both settings to each node, or end the literal with `..TopicCreateOptions::default()` or `..TopicUpdateOptions::default()`, so that a later field needs no change either. A pattern that destructures every field of `TopicResolvedOptions` adds `read_cache` or `..` the same way.
 
 ## Check the cutover
 

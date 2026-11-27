@@ -24,6 +24,11 @@ const META: &str = "meta";
 const MANIFEST: &str = "manifest.bin";
 const IDENTITY: &str = "identity";
 const FRESH: &str = "fresh";
+const UPLOADS: &str = "uploads";
+/// Hex digits of the id of an upload in parts in the key of its parts.
+const UPLOAD_ID_DIGITS: usize = 32;
+/// Decimal digits of a part number in the key of the part.
+const PART_NUMBER_DIGITS: usize = 5;
 /// Hexadecimal digits of a fresh object's id.
 const FRESH_ID_DIGITS: usize = 32;
 /// Hexadecimal digits of the replica in a fresh object's key.
@@ -284,6 +289,17 @@ impl KeyLayout {
         (parts.next()? == MANIFEST && parts.next().is_none()).then_some(prefix)
     }
 
+    /// Whether `key` is a key of the root that is not an object of a
+    /// segment: a manifest, the identity object, a fresh object, a geo topic
+    /// object, positions or a recovery record.
+    #[must_use]
+    pub fn is_meta_key(&self, key: &str) -> bool {
+        key.strip_prefix(self.root.as_str())
+            .and_then(|rest| rest.strip_prefix('/'))
+            .and_then(|rest| rest.strip_prefix(META))
+            .is_some_and(|rest| rest.starts_with('/'))
+    }
+
     /// The key of the store identity object, which names the cluster that
     /// owns the root. No other root can continue with `meta`, and no id is
     /// `identity`, so no other key of any root is this key.
@@ -346,6 +362,71 @@ impl KeyLayout {
             .then(|| u128::from_str_radix(id, 16).ok())
             .flatten()?;
         (self.fresh_key(id) == key).then_some(id)
+    }
+
+    /// The listing prefix of the parts that uploads in parts keep as objects
+    /// of their own until they complete, with a trailing `/`.
+    ///
+    /// They live under `meta`, which no other root can continue with, and no
+    /// id of a stream is `uploads`, so no manifest key is under it. The sweep
+    /// of orphans takes them for metadata and leaves them alone, and no
+    /// reader of the root or of a peer's root takes them for data: each
+    /// listing of data asks for a prefix of its own, and they fall under none.
+    #[must_use]
+    pub fn uploads_prefix(&self) -> String {
+        format!("{}/{META}/{UPLOADS}/", self.root)
+    }
+
+    /// The prefix of the parts of the upload `upload_id`, with a trailing
+    /// `/`. Part `number` is under it, see [`Self::upload_part_key`].
+    #[must_use]
+    pub fn upload_prefix(&self, upload_id: u128) -> String {
+        format!(
+            "{}{upload_id:0width$x}/",
+            self.uploads_prefix(),
+            width = UPLOAD_ID_DIGITS
+        )
+    }
+
+    /// The key of part `number` of the upload `upload_id`: the
+    /// [`Self::upload_prefix`] of the upload, then the number.
+    #[must_use]
+    pub fn upload_part_key(&self, upload_id: u128, number: u32) -> String {
+        format!(
+            "{}{number:0width$}",
+            self.upload_prefix(upload_id),
+            width = PART_NUMBER_DIGITS
+        )
+    }
+
+    /// The upload and the part number that a listed key names, or `None` when
+    /// this layout did not build the key for a part. Parsing is strict, as for
+    /// [`Self::parse_fresh_key`].
+    #[must_use]
+    pub fn parse_upload_part_key(&self, key: &str) -> Option<(u128, u32)> {
+        let (id, number) = key
+            .strip_prefix(self.uploads_prefix().as_str())?
+            .split_once('/')?;
+        let lowercase_hex = |byte: u8| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte);
+        let upload_id = (id.len() == UPLOAD_ID_DIGITS && id.bytes().all(lowercase_hex))
+            .then(|| u128::from_str_radix(id, 16).ok())
+            .flatten()?;
+        let number = (number.len() == PART_NUMBER_DIGITS
+            && number.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| number.parse().ok())
+        .flatten()?;
+        (self.upload_part_key(upload_id, number) == key).then_some((upload_id, number))
+    }
+
+    /// Whether this layout builds `key`: an object of a segment or of a
+    /// long-term segment, or a key that [`Self::is_meta_key`] takes, which no
+    /// other root can continue with. A longer root shares every listing
+    /// prefix of this one, and its keys fail this test.
+    #[must_use]
+    pub fn owns_key(&self, key: &str) -> bool {
+        self.parse_segment_key(key).is_some()
+            || self.parse_long_term_key(key).is_some()
+            || self.is_meta_key(key)
     }
 
     /// The listing prefix of what the recovery of the cluster
@@ -829,6 +910,43 @@ mod tests {
     }
 
     #[test]
+    fn given_keys_of_the_root_when_matching_meta_keys_should_take_only_those_outside_segments() {
+        let layout = layout();
+        let segment = layout.segment_key(&SegmentKey {
+            prefix: PREFIX,
+            start_offset: 1_000,
+            object: SegmentObject::Log,
+        });
+        let long_term = layout.long_term_key(&LongTermKey {
+            prefix: PREFIX,
+            start_offset: 1_000,
+            end_offset: 1_999,
+            object: SegmentObject::Index,
+        });
+
+        for key in [
+            layout.manifest_key(&PREFIX),
+            layout.identity_key(),
+            layout.fresh_key(7),
+            layout.topic_key(&TOPIC),
+            layout.recovery_key(7),
+            "tenant/iggy/meta/notes".to_owned(),
+        ] {
+            assert!(layout.is_meta_key(&key), "{key}");
+        }
+        for key in [
+            segment,
+            long_term,
+            "tenant/iggy/meta".to_owned(),
+            "tenant/iggy/metadata/1".to_owned(),
+            "tenant/iggymeta/1".to_owned(),
+            "tenant/other/meta/1".to_owned(),
+        ] {
+            assert!(!layout.is_meta_key(&key), "{key}");
+        }
+    }
+
+    #[test]
     fn given_identity_key_when_parsing_as_segment_should_return_none() {
         let layout = layout();
         let key = layout.identity_key();
@@ -1106,6 +1224,76 @@ mod tests {
         assert_eq!(keys[1].split('/').count(), MAX_KEY_SEGMENTS);
         for key in keys {
             assert!(validate_key(&key).is_ok(), "{key}");
+        }
+    }
+
+    #[test]
+    fn given_an_upload_in_parts_when_building_its_part_keys_should_parse_them_back() {
+        let layout = layout();
+        let key = layout.upload_part_key(0x1f, 7);
+
+        assert_eq!(
+            key,
+            "tenant/iggy/meta/uploads/0000000000000000000000000000001f/00007"
+        );
+        assert!(key.starts_with(&layout.upload_prefix(0x1f)));
+        assert!(key.starts_with(&layout.uploads_prefix()));
+        assert!(layout.is_meta_key(&key));
+        assert!(validate_key(&key).is_ok());
+        assert_eq!(layout.parse_upload_part_key(&key), Some((0x1f, 7)));
+        assert_eq!(
+            layout.parse_upload_part_key(&layout.upload_part_key(u128::MAX, 32)),
+            Some((u128::MAX, 32))
+        );
+        for other in [
+            layout.fresh_key(0x1f),
+            layout.identity_key(),
+            KeyLayout::new("tenant/other")
+                .unwrap()
+                .upload_part_key(0x1f, 7),
+            "tenant/iggy/meta/uploads/1f/00007".to_owned(),
+            "tenant/iggy/meta/uploads/0000000000000000000000000000001F/00007".to_owned(),
+            "tenant/iggy/meta/uploads/0000000000000000000000000000001f/7".to_owned(),
+            "tenant/iggy/meta/uploads/0000000000000000000000000000001f/00007/x".to_owned(),
+        ] {
+            assert_eq!(layout.parse_upload_part_key(&other), None, "{other}");
+        }
+        // No reader of data or metadata takes a part for its own kind.
+        assert_eq!(layout.parse_fresh_key(&key), None);
+        assert_eq!(layout.parse_segment_key(&key), None);
+        assert_eq!(layout.parse_long_term_key(&key), None);
+        assert_eq!(layout.parse_manifest_key(&key), None);
+        assert_eq!(layout.parse_topic_key(&key), None);
+        assert_eq!(layout.parse_positions_key(&key), None);
+    }
+
+    #[test]
+    fn given_keys_of_this_root_and_of_a_longer_one_when_asking_ownership_should_tell_them_apart() {
+        let layout = layout();
+        let longer = KeyLayout::new("tenant/iggy/b").unwrap();
+
+        for owned in [
+            layout.segment_key(&SegmentKey {
+                prefix: PREFIX,
+                start_offset: 0,
+                object: SegmentObject::Log,
+            }),
+            layout.fresh_key(1),
+            layout.identity_key(),
+            layout.upload_part_key(1, 1),
+        ] {
+            assert!(layout.owns_key(&owned), "{owned}");
+        }
+        for foreign in [
+            longer.segment_key(&SegmentKey {
+                prefix: PREFIX,
+                start_offset: 0,
+                object: SegmentObject::Log,
+            }),
+            longer.fresh_key(1),
+            "tenant/iggy/unknown".to_owned(),
+        ] {
+            assert!(!layout.owns_key(&foreign), "{foreign}");
         }
     }
 

@@ -38,9 +38,9 @@ use schema::{
     CANONICAL_PATH, CatalogRow, CreateStreamInput, CreateStreamVector, CreateTopicInput,
     CreateTopicVector, CreateUserInput, CreateUserVector, DescribeOptionsVector, DescribedOption,
     ErrorExpectation, GENERATOR, GeoDurationsInput, HttpUpdateVector, IdentifierInput,
-    InvalidKeyVector, KeyInput, LANGUAGE_COPIES, PatchInput, ResourceOptionsFixture,
-    SCHEMA_VERSION, SCOPES, StreamKeyState, StreamKeyVectors, StreamProjection,
-    StreamResponseVector, TargetInput, TopicProjection, TopicResponseVector,
+    InvalidKeyVector, KeyInput, LANGUAGE_COPIES, PatchInput, ReadCacheInput,
+    ResourceOptionsFixture, SCHEMA_VERSION, SCOPES, StreamKeyState, StreamKeyVectors,
+    StreamProjection, StreamResponseVector, TargetInput, TopicProjection, TopicResponseVector,
     UpdateResourceErrorVector, UpdateResourceVector, UserProjection, UserResponseVector,
     WireConstants, admit_create, admit_update, contains_bytes, describe_options_response,
     evaluate_http_update, update_resource_request,
@@ -69,6 +69,15 @@ fn geo_durations() -> GeoDurationsInput {
         tombstone_grace: Some("3600000000".to_owned()),
         positions_resume_timeout: Some("30000000".to_owned()),
         long_term_rewrite_max_interval: Some("20000000".to_owned()),
+    }
+}
+
+/// Both read cache settings of a topic. Zero is a value, the setting turned
+/// off, which an encoder must send rather than drop as a default.
+fn read_cache(size: u64, read_ahead: u64) -> ReadCacheInput {
+    ReadCacheInput {
+        read_cache_size: Some(size.to_string()),
+        read_ahead: Some(read_ahead.to_string()),
     }
 }
 
@@ -294,6 +303,15 @@ fn update_resource_vectors() -> GeneratorResult<Vec<UpdateResourceVector>> {
             numeric_topic.clone(),
             PatchInput {
                 geo_durations: geo_durations(),
+                ..PatchInput::default()
+            },
+        ),
+        (
+            "topic_set_read_cache",
+            OptionsScope::Topic,
+            numeric_topic.clone(),
+            PatchInput {
+                read_cache: read_cache(0, 1024 * 1024),
                 ..PatchInput::default()
             },
         ),
@@ -560,6 +578,24 @@ fn create_topic_vectors() -> GeneratorResult<Vec<CreateTopicVector>> {
                 consumer_offset_durability: Durability::Replicated,
                 topic_type: None,
                 geo_durations: GeoDurationsInput::default(),
+                read_cache: ReadCacheInput::default(),
+            },
+        ),
+        (
+            "topic_with_read_cache",
+            CreateTopicInput {
+                stream_id: IdentifierInput::Numeric(1),
+                name: "archive".to_owned(),
+                partitions_count: 4,
+                compression_algorithm: None,
+                message_expiry: None,
+                max_topic_size: None,
+                segment_size: None,
+                durability: Durability::Replicated,
+                consumer_offset_durability: Durability::Replicated,
+                topic_type: None,
+                geo_durations: GeoDurationsInput::default(),
+                read_cache: read_cache(16 * 1024 * 1024, 0),
             },
         ),
         (
@@ -576,6 +612,7 @@ fn create_topic_vectors() -> GeneratorResult<Vec<CreateTopicVector>> {
                 consumer_offset_durability: Durability::Replicated,
                 topic_type: Some(TopicType::Geo.to_string()),
                 geo_durations: geo_durations(),
+                read_cache: ReadCacheInput::default(),
             },
         ),
     ];
@@ -886,30 +923,51 @@ fn stream_response_vectors() -> GeneratorResult<Vec<StreamResponseVector>> {
 }
 
 fn topic_response_vectors() -> GeneratorResult<Vec<TopicResponseVector>> {
-    Ok(vec![plain_topic_response()?, geo_topic_response()?])
+    Ok(vec![
+        plain_topic_response()?,
+        created_topic_response(
+            "geo_topic_with_durations",
+            5,
+            "orders",
+            &TopicCreateOptions {
+                topic_type: Some(TopicType::Geo),
+                geo_durations: geo_durations().durations()?,
+                ..TopicCreateOptions::default()
+            },
+        )?,
+        created_topic_response(
+            "topic_with_read_cache",
+            6,
+            "archive",
+            &TopicCreateOptions {
+                read_cache: read_cache(0, 2 * 1024 * 1024).read_cache()?,
+                ..TopicCreateOptions::default()
+            },
+        )?,
+    ])
 }
 
-/// A geo topic with every duration set, read back with the defaults that
-/// admission derives for a geo topic.
-fn geo_topic_response() -> GeneratorResult<TopicResponseVector> {
-    let explicit = TopicCreateOptions {
-        topic_type: Some(TopicType::Geo),
-        geo_durations: geo_durations().durations()?,
-        ..TopicCreateOptions::default()
-    }
-    .to_option_map()?;
+/// The topic that a create with `explicit` makes, read back with the
+/// defaults that admission derives for it.
+fn created_topic_response(
+    case: &str,
+    id: u32,
+    name: &str,
+    explicit: &TopicCreateOptions,
+) -> GeneratorResult<TopicResponseVector> {
+    let explicit = explicit.to_option_map()?;
     let mut stored = derived_defaults(OptionsScope::Topic, &explicit)?;
     stored.extend(explicit);
     let (options, derived_options) =
         resource_options_to_wire_split(&public_options(OptionsScope::Topic, &stored)?)?;
     let bytes = GetTopicResponse {
         topic: TopicResponse {
-            id: 5,
+            id,
             created_at: CREATED_AT_MICROS,
             partitions_count: 0,
             size_bytes: 0,
             messages_count: 0,
-            name: WireName::new("orders")?,
+            name: WireName::new(name)?,
             options,
             derived_options,
         },
@@ -919,14 +977,9 @@ fn geo_topic_response() -> GeneratorResult<TopicResponseVector> {
     let expected = TopicProjection::from(&TopicDetails::try_from(GetTopicResponse::decode_from(
         &bytes,
     )?)?);
-    ensure_no_secrets(
-        "geo_topic_with_durations",
-        &bytes,
-        &stored,
-        &expected.options,
-    )?;
+    ensure_no_secrets(case, &bytes, &stored, &expected.options)?;
     Ok(TopicResponseVector {
-        case: "geo_topic_with_durations".to_owned(),
+        case: case.to_owned(),
         response_hex: hex::encode(&bytes),
         expected,
     })

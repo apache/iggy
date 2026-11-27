@@ -382,6 +382,9 @@ type topicResponseVector struct {
 		TombstoneGrace               *string `json:"tombstone_grace"`
 		PositionsResumeTimeout       *string `json:"positions_resume_timeout"`
 		LongTermRewriteMaxInterval   *string `json:"long_term_rewrite_max_interval"`
+		// The read cache sizes of a topic, absent when unset.
+		ReadCacheSize *string `json:"read_cache_size"`
+		ReadAhead     *string `json:"read_ahead"`
 	} `json:"expected"`
 }
 
@@ -508,6 +511,8 @@ func checkCatalog(t *testing.T, catalog []catalogRow) {
 			string(iggcon.TopicOptionTombstoneGrace),
 			string(iggcon.TopicOptionPositionsResumeTimeout),
 			string(iggcon.TopicOptionLongTermRewriteMaxInterval),
+			string(iggcon.TopicOptionReadCacheSize),
+			string(iggcon.TopicOptionReadAhead),
 		},
 		"user": {
 			string(iggcon.UserOptionUsername),
@@ -597,6 +602,8 @@ func checkTypedSurface(t *testing.T, catalog []catalogRow) {
 			"tombstone_grace":                   {create: "TombstoneGrace", update: "TombstoneGrace"},
 			"positions_resume_timeout":          {create: "PositionsResumeTimeout", update: "PositionsResumeTimeout"},
 			"long_term_rewrite_max_interval":    {create: "LongTermRewriteMaxInterval", update: "LongTermRewriteMaxInterval"},
+			"read_cache_size":                   {create: "ReadCacheSize", update: "ReadCacheSize"},
+			"read_ahead":                        {create: "ReadAhead", update: "ReadAhead"},
 		},
 		"user": {
 			"username": {update: "Username"},
@@ -791,6 +798,8 @@ func checkTopicResponse(t *testing.T, constants fixtureConstants, vector topicRe
 	checkDuration(t, iggcon.TopicOptionTombstoneGrace, expected.TombstoneGrace, topic.TombstoneGrace)
 	checkDuration(t, iggcon.TopicOptionPositionsResumeTimeout, expected.PositionsResumeTimeout, topic.PositionsResumeTimeout)
 	checkDuration(t, iggcon.TopicOptionLongTermRewriteMaxInterval, expected.LongTermRewriteMaxInterval, topic.LongTermRewriteMaxInterval)
+	checkByteSize(t, iggcon.TopicOptionReadCacheSize, expected.ReadCacheSize, topic.ReadCacheSize)
+	checkByteSize(t, iggcon.TopicOptionReadAhead, expected.ReadAhead, topic.ReadAhead)
 }
 
 // checkDuration compares a typed duration with the decimal microseconds of
@@ -803,6 +812,19 @@ func checkDuration(t *testing.T, key iggcon.TopicOptionKey, expected *string, go
 	}
 	if assert.NotNil(t, got, key) {
 		assert.Equal(t, parseUint64(t, *expected), uint64(*got), key)
+	}
+}
+
+// checkByteSize compares a typed byte size with the decimal bytes of the
+// projection, where nil on both sides means unset.
+func checkByteSize(t *testing.T, key iggcon.TopicOptionKey, expected *string, got *uint64) {
+	t.Helper()
+	if expected == nil {
+		assert.Nil(t, got, key)
+		return
+	}
+	if assert.NotNil(t, got, key) {
+		assert.Equal(t, parseUint64(t, *expected), *got, key)
 	}
 }
 
@@ -838,6 +860,8 @@ func updateCommand(t *testing.T, scope string, target, input map[string]json.Raw
 			TombstoneGrace:               optionalDuration(t, input["tombstone_grace"]),
 			PositionsResumeTimeout:       optionalDuration(t, input["positions_resume_timeout"]),
 			LongTermRewriteMaxInterval:   optionalDuration(t, input["long_term_rewrite_max_interval"]),
+			ReadCacheSize:                optionalUint64(t, input["read_cache_size"]),
+			ReadAhead:                    optionalUint64(t, input["read_ahead"]),
 		}
 		if raw, ok := input["message_expiry"]; ok {
 			expiry := iggcon.Duration(parseUint64(t, text(t, raw)))
@@ -913,6 +937,8 @@ func createTopicCommand(t *testing.T, input map[string]json.RawMessage) *command
 		TombstoneGrace:               optionalDuration(t, input["tombstone_grace"]),
 		PositionsResumeTimeout:       optionalDuration(t, input["positions_resume_timeout"]),
 		LongTermRewriteMaxInterval:   optionalDuration(t, input["long_term_rewrite_max_interval"]),
+		ReadCacheSize:                optionalUint64(t, input["read_cache_size"]),
+		ReadAhead:                    optionalUint64(t, input["read_ahead"]),
 	}
 	if raw, ok := input["compression_algorithm"]; ok {
 		compression := map[string]iggcon.CompressionAlgorithm{"none": iggcon.CompressionAlgorithmNone, "gzip": iggcon.CompressionAlgorithmGzip}[text(t, raw)]

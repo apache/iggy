@@ -59,6 +59,8 @@ pub(super) struct TestUploader {
     /// The first attempts that fail, in the order they come.
     pub(super) fails_first: Cell<u32>,
     attempts: Cell<u32>,
+    /// What [`FreshObjectUploader::store_retries`] says.
+    pub(super) store_retries: Cell<bool>,
 }
 
 impl TestUploader {
@@ -71,6 +73,7 @@ impl TestUploader {
             refuses: Cell::new(false),
             fails_first: Cell::new(0),
             attempts: Cell::new(0),
+            store_retries: Cell::new(false),
         })
     }
 
@@ -95,6 +98,10 @@ impl FreshObjectUploader for TestUploader {
         } else {
             self.uploader.upload(object_id, bytes, scope)
         }
+    }
+
+    fn store_retries(&self) -> bool {
+        self.store_retries.get()
     }
 }
 
@@ -172,6 +179,13 @@ fn place_partition(owner: &IoTestShard, partition: IggyNamespace) -> IggyNamespa
 /// places its batches and commits nothing: the other replica of its group
 /// never answers. Once its pipeline is full, it has no room for a request.
 fn place_stuck_partition(owner: &IoTestShard) -> IggyNamespace {
+    place_partition(owner, stuck_partition(owner))
+}
+
+/// Make the last partition of the shard a primary in normal status that
+/// commits nothing, as [`place_stuck_partition`] does, without placing its
+/// batches.
+fn stuck_partition(owner: &IoTestShard) -> IggyNamespace {
     const SILENT_REPLICA: u8 = 1;
     let stuck = IggyNamespace::new(0, 0, 2);
     owner.bus.set_replica_forward_fn(Box::new(|_, _, _| Ok(())));
@@ -195,7 +209,7 @@ fn place_stuck_partition(owner: &IoTestShard) -> IggyNamespace {
             IggyByteSize::from(SEGMENT_BYTES),
         ),
     );
-    place_partition(owner, stuck)
+    stuck
 }
 
 /// Submit one send of a message of `payload_len` bytes, as a producer does.
@@ -376,6 +390,32 @@ async fn given_a_store_that_refuses_when_the_window_closes_should_answer_its_pro
     assert_eq!((retries, denied, in_flight, staged), (2, 1, 0, 0));
 }
 
+/// The store's own retries took the budget of the object, so the shard
+/// does not start it over.
+#[compio::test]
+async fn given_a_store_that_retries_when_an_upload_fails_should_answer_its_producers_without_a_retry()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let uploader = TestUploader::new();
+    uploader.refuses.set(true);
+    uploader.store_retries.set(true);
+    owner.set_fresh_uploader(Some(uploader.clone()));
+
+    let answer = pumped(&owner, async {
+        let answer = submit_send(&owner, 1, 100);
+        until(&owner, |_| !answer.is_empty()).await;
+        answer
+    })
+    .await;
+
+    assert!(answer.try_recv().unwrap().is_some());
+    assert_eq!(committed_sends(&owner), 0);
+    assert_eq!(uploader.attempts.get(), 1);
+    let (retries, denied, ..) = owner.metrics().fresh_load_value();
+    assert_eq!((retries, denied), (0, 1));
+}
+
 #[compio::test]
 async fn given_no_uploader_when_a_send_arrives_should_answer_it_at_once_and_keep_nothing() {
     let directory = tempfile::tempdir().unwrap();
@@ -427,7 +467,8 @@ async fn given_sends_in_two_windows_when_both_close_should_store_two_objects_and
 
 /// The shard holds the messages it has just stored, so a consumer at the
 /// tail is served without a read of the store. The store the polls would
-/// read here is empty, so only those kept bytes can answer.
+/// read here is empty, so only those kept bytes can answer. A cache that
+/// keeps nothing fetched holds them all the same.
 #[compio::test]
 async fn given_sends_this_shard_stored_when_polling_them_should_serve_them_without_reading_the_store()
  {
@@ -435,13 +476,17 @@ async fn given_sends_this_shard_stored_when_polling_them_should_serve_them_witho
     let owner = Box::pin(placing_owner(directory.path())).await;
     let uploader = TestUploader::new();
     owner.set_fresh_uploader(Some(uploader.clone()));
-    owner
-        .plane
-        .partitions()
-        .set_remote_segments(Rc::new(partitions::RemoteSegments::new(
-            Rc::new(MemoryStore::new()),
-            layout(),
-        )));
+    let cache = partitions::ReadCache::new(partitions::ReadCacheSettings {
+        cache_bytes: 0,
+        block_bytes: 256 * 1024,
+        read_ahead: 0,
+        read_ahead_fetches: 4,
+        read_ahead_fetch_bytes: 32 * 1024 * 1024,
+    });
+    owner.plane.partitions().set_remote_segments(Rc::new(
+        partitions::RemoteSegments::new(Rc::new(MemoryStore::new()), layout())
+            .with_cache(Rc::new(MemoryStore::new()), &cache),
+    ));
     pumped(&owner, async {
         let _answers = [submit_send(&owner, 1, 100), submit_send(&owner, 2, 300)];
         until(&owner, |owner| committed_sends(owner) == 2).await;
@@ -2203,6 +2248,49 @@ async fn given_an_object_the_store_fails_for_good_when_later_sends_wait_should_a
     assert_eq!((stored, refused), (2, 1));
     assert_eq!(owner.metrics().fresh_load_value(), (2, 2, 0, 0));
     assert_eq!(owner.fresh_pending_bytes(other), (0, 0));
+}
+
+/// The store failed an object for good, and with it every send of the same
+/// partition behind it, while the object of those later sends still
+/// uploaded. Nothing reads that object once it is stored, so the shard does
+/// not hold it.
+#[compio::test]
+async fn given_an_object_whose_sends_were_all_answered_when_its_upload_ends_should_not_hold_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let uploader = GatedUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+    owner.set_fresh_upload_pace(Duration::ZERO, 2);
+    let cache = partitions::ReadCache::new(partitions::ReadCacheSettings {
+        cache_bytes: 0,
+        block_bytes: 256 * 1024,
+        read_ahead: 0,
+        read_ahead_fetches: 4,
+        read_ahead_fetch_bytes: 32 * 1024 * 1024,
+    });
+    owner.plane.partitions().set_remote_segments(Rc::new(
+        partitions::RemoteSegments::new(Rc::new(MemoryStore::new()), layout())
+            .with_cache(Rc::new(MemoryStore::new()), &cache),
+    ));
+
+    pumped(&owner, async {
+        let failed = submit_send(&owner, 1, 100);
+        until(&owner, |_| uploader.started() == 1).await;
+        let later = submit_send(&owner, 2, 100);
+        until(&owner, |_| uploader.started() == 2).await;
+        for (attempt, started) in [(0, 3), (2, 4)] {
+            uploader.settle(attempt, false);
+            until(&owner, |_| uploader.started() == started).await;
+        }
+        uploader.settle(3, false);
+        until(&owner, |_| !failed.is_empty() && !later.is_empty()).await;
+
+        uploader.settle(1, true);
+        until(&owner, |owner| owner.metrics().fresh_uploads_value().0 == 1).await;
+    })
+    .await;
+
+    assert_eq!(cache.take_metrics().held_bytes, 0);
 }
 
 /// The interval counts from the start of the last upload. A send that finds
@@ -4791,6 +4879,71 @@ async fn given_a_backlog_past_the_limit_when_sends_arrive_should_delay_the_sends
         placed[1].placement.length < placed[2].placement.length,
         "the held send committed before the one behind it"
     );
+}
+
+/// A send to a partition that does not place its batches goes straight to
+/// it, past the fresh writes. The shard counts it among the sends that wait
+/// on it until it is answered, so that the rewrites keep to their share
+/// under a load of such sends too.
+#[compio::test]
+async fn given_a_send_that_goes_straight_to_its_partition_when_it_waits_should_count_it_until_it_is_answered()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    owner
+        .plane
+        .partitions()
+        .get_mut_by_ns(&namespace())
+        .unwrap()
+        .set_runtime_options(TopicRuntimeOptions {
+            messages_required_to_save: Some(1),
+            ..Default::default()
+        });
+    let stuck = stuck_partition(&owner);
+    owner
+        .plane
+        .partitions()
+        .get_mut_by_ns(&stuck)
+        .unwrap()
+        .register_builtin_state_machines()
+        .unwrap();
+    let direct_sends = owner.rewrite_pacing.borrow().direct_sends();
+
+    pumped(&owner, async {
+        let answer = submit_send(&owner, 1, 100);
+        until(&owner, |_| !answer.is_empty()).await;
+        assert!(answer.try_recv().unwrap().is_some());
+        until(&owner, |_| direct_sends.get() == 0).await;
+
+        let _unanswered = submit_send_to(&owner, stuck, 2, 100);
+        until(&owner, |_| direct_sends.get() == 1).await;
+        compio::time::sleep(TASK_POLL_INTERVAL * 10).await;
+        assert_eq!(direct_sends.get(), 1, "the send is not answered");
+    })
+    .await;
+    assert_eq!(owner.fresh_writes.unanswered_sends().borrow().len(), 0);
+}
+
+/// While a partition is past its limit, its sends wait for the rewrites
+/// and not behind them, so the rewrites of the shard stop keeping to their
+/// share of its time. Back under the limit, they keep to it again.
+#[compio::test]
+async fn given_a_backlog_past_the_limit_when_the_tick_runs_should_let_the_rewrites_run_flat_out() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(backlog_owner(directory.path(), 1)).await;
+    let behind = owner.rewrite_pacing.borrow().behind();
+
+    pumped(&owner, async {
+        let backlog = commit_and_count_a_backlog(&owner).await;
+        until(&owner, |owner| {
+            owner.metrics().long_term_backlog_value().0 == i64::try_from(backlog).unwrap()
+        })
+        .await;
+        assert!(behind.get(), "past the limit");
+        owner.set_long_term_backlog_limit(0);
+        until(&owner, |_| !behind.get()).await;
+    })
+    .await;
 }
 
 /// An operator sees which partition lags: the shard leaves the messages and

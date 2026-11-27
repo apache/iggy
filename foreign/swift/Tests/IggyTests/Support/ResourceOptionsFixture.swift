@@ -172,8 +172,9 @@ struct ResourceOptionsFixture: Decodable, Sendable {
         }
     }
 
-    /// Typed update input. u64 values are decimal strings, and the durations
-    /// of a geo topic are decimal microseconds.
+    /// Typed update input. u64 values are decimal strings, the durations of
+    /// a geo topic are decimal microseconds, and the read cache settings are
+    /// decimal bytes.
     struct UpdateInput: Decodable {
         let name: String?
         let username: String?
@@ -186,6 +187,8 @@ struct ResourceOptionsFixture: Decodable, Sendable {
         let tombstoneGrace: String?
         let positionsResumeTimeout: String?
         let longTermRewriteMaxInterval: String?
+        let readCacheSize: String?
+        let readAhead: String?
         let reset: [String]?
 
         enum CodingKeys: String, CodingKey {
@@ -198,6 +201,8 @@ struct ResourceOptionsFixture: Decodable, Sendable {
             case tombstoneGrace = "tombstone_grace"
             case positionsResumeTimeout = "positions_resume_timeout"
             case longTermRewriteMaxInterval = "long_term_rewrite_max_interval"
+            case readCacheSize = "read_cache_size"
+            case readAhead = "read_ahead"
         }
     }
 
@@ -255,8 +260,9 @@ struct ResourceOptionsFixture: Decodable, Sendable {
         }
     }
 
-    /// Typed create input. An absent knob is left to the server, and the
-    /// durations of a geo topic are decimal microseconds.
+    /// Typed create input. An absent knob is left to the server, the
+    /// durations of a geo topic are decimal microseconds, and the read cache
+    /// settings are decimal bytes.
     struct CreateTopicInput: Decodable {
         let streamID: TargetID
         let name: String
@@ -274,6 +280,8 @@ struct ResourceOptionsFixture: Decodable, Sendable {
         let tombstoneGrace: String?
         let positionsResumeTimeout: String?
         let longTermRewriteMaxInterval: String?
+        let readCacheSize: String?
+        let readAhead: String?
 
         enum CodingKeys: String, CodingKey {
             case name, durability
@@ -291,6 +299,8 @@ struct ResourceOptionsFixture: Decodable, Sendable {
             case tombstoneGrace = "tombstone_grace"
             case positionsResumeTimeout = "positions_resume_timeout"
             case longTermRewriteMaxInterval = "long_term_rewrite_max_interval"
+            case readCacheSize = "read_cache_size"
+            case readAhead = "read_ahead"
         }
     }
 
@@ -376,6 +386,9 @@ struct ResourceOptionsFixture: Decodable, Sendable {
         let tombstoneGrace: String?
         let positionsResumeTimeout: String?
         let longTermRewriteMaxInterval: String?
+        /// The read cache settings the topic sets, absent when unset.
+        let readCacheSize: String?
+        let readAhead: String?
 
         enum CodingKeys: String, CodingKey {
             case id, name, options
@@ -392,6 +405,8 @@ struct ResourceOptionsFixture: Decodable, Sendable {
             case tombstoneGrace = "tombstone_grace"
             case positionsResumeTimeout = "positions_resume_timeout"
             case longTermRewriteMaxInterval = "long_term_rewrite_max_interval"
+            case readCacheSize = "read_cache_size"
+            case readAhead = "read_ahead"
         }
     }
 

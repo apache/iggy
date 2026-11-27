@@ -28,8 +28,9 @@ type TopicOptionKey string
 // resettable. TopicOptionTieredStorage is enable-only: an update may turn it
 // on, never off, and may not reset it. The six durations of a geo topic,
 // TopicOptionFreshUploadInterval to TopicOptionLongTermRewriteMaxInterval,
-// are updatable and never resettable. Every other key is create-only, so an
-// update refuses it by name.
+// are updatable and never resettable, and so are TopicOptionReadCacheSize and
+// TopicOptionReadAhead. Every other key is create-only, so an update refuses
+// it by name.
 // DescribeOptions enumerates the catalog one server serves, with the bounds
 // each value is checked against.
 const (
@@ -57,6 +58,8 @@ const (
 	TopicOptionTombstoneGrace               TopicOptionKey = "tombstone_grace"
 	TopicOptionPositionsResumeTimeout       TopicOptionKey = "positions_resume_timeout"
 	TopicOptionLongTermRewriteMaxInterval   TopicOptionKey = "long_term_rewrite_max_interval"
+	TopicOptionReadCacheSize                TopicOptionKey = "read_cache_size"
+	TopicOptionReadAhead                    TopicOptionKey = "read_ahead"
 )
 
 // TopicOptions are the options CreateTopic may carry. A nil *TopicOptions
@@ -139,6 +142,22 @@ type TopicOptions struct {
 	// LongTermRewriteMaxInterval is the longest wait between two long-term
 	// rewrites of a partition, at least 1 second.
 	LongTermRewriteMaxInterval *Duration
+	// ReadCacheSize and ReadAhead in bytes set how a normal or geo topic reads
+	// from the object store. Each overrides the [tiered_storage] server setting
+	// of the same name on every node, and nil leaves that setting. Zero is a
+	// value here, not the server-default sentinel of MaxTopicSize, so it is
+	// sent.
+	//
+	// ReadCacheSize is the memory each node keeps for what the topic's reads
+	// fetch, divided between its partitions. A partition's share is a limit
+	// within the read cache of its shard, not a reservation. Zero keeps
+	// nothing, any other value is at least 512 KiB.
+	ReadCacheSize *uint64
+	// ReadAhead is the most bytes that readahead fetches in front of a
+	// sequential reader of the topic. Zero turns readahead off, any other
+	// value is at least 128 KiB. With a nonzero ReadCacheSize, the server
+	// refuses a ReadAhead above one eighth of it.
+	ReadAhead *uint64
 	// Raw carries keys newer than this build.
 	Raw []HeaderEntry
 }
@@ -166,15 +185,20 @@ type TopicUpdate struct {
 	// nothing, Reset returns the key to its default.
 	LocalRetentionSize *uint64
 	// FreshUploadInterval to LongTermRewriteMaxInterval set the durations of
-	// a geo topic in microseconds, see TopicOptions. They are the only keys
-	// an update may change on a geo topic, and a normal topic refuses them.
-	// Zero is a value and is sent. None of them can be reset.
+	// a geo topic in microseconds, see TopicOptions. A normal topic refuses
+	// them. Zero is a value and is sent. None of them can be reset.
 	FreshUploadInterval          *Duration
 	ConsumerOffsetUploadInterval *Duration
 	PositionsPublishInterval     *Duration
 	TombstoneGrace               *Duration
 	PositionsResumeTimeout       *Duration
 	LongTermRewriteMaxInterval   *Duration
+	// ReadCacheSize and ReadAhead set the read cache of any topic in bytes,
+	// see TopicOptions. Zero is a value and is sent. Neither can be reset.
+	// They and the durations above are the only keys an update may change on
+	// a geo topic.
+	ReadCacheSize *uint64
+	ReadAhead     *uint64
 	// Reset names keys to return to their defaults: TopicOptionMessageExpiry,
 	// TopicOptionMaxTopicSize, TopicOptionLocalRetentionAge or
 	// TopicOptionLocalRetentionSize.

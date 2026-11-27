@@ -501,6 +501,17 @@ pub async fn create_chain(partition_dir: &str, prefix: &ObjectPrefix) -> io::Res
     crate::state_transfer::fsync_dir(partition_dir).await
 }
 
+/// Put `chain` in place as the chain of `partition_dir`, whole or not at all,
+/// and fsync the directory so it outlives a crash.
+///
+/// # Errors
+/// Any I/O failure, after which the previous chain, if any, may still be in
+/// place.
+pub async fn write_chain(partition_dir: &str, chain: &Chain) -> io::Result<()> {
+    replace_chain(partition_dir, chain.encode()).await?;
+    fsync_dir(partition_dir).await
+}
+
 /// Put `bytes` in place as the chain of `partition_dir`, whole or not at all.
 /// The caller fsyncs the directory.
 ///
@@ -976,8 +987,11 @@ impl SegmentChain {
             prefix: chain.prefix,
             valid_len: chain.valid_len,
             sealed: chain.sealed,
+            // A segment leaves a disk only after an advance matched it, so a
+            // remote record is the proof on its own. A replica rebuilt by a
+            // state transfer holds such records without their advances.
+            confirmed: chain.remote.clone(),
             remote: chain.remote,
-            confirmed: BTreeSet::new(),
             advances: BTreeMap::new(),
             diverged: BTreeSet::new(),
             trim_point: chain.trim_point,
@@ -1119,9 +1133,9 @@ impl SegmentChain {
     /// chain may not hold the latest yet.
     ///
     /// A segment is remote only when `without_log`, ascending, holds its start
-    /// offset. The chain's own remote records do not decide it: an eviction cut
-    /// short after its record leaves the `.log` in place, and that segment
-    /// travels as bytes.
+    /// offset. A transfer leaves out the bytes of the stored front alone, the
+    /// unbroken run of stored segments from the first one, so a stored segment
+    /// behind that run is sealed here even when the chain records it remote.
     fn snapshot<'a>(
         &self,
         without_log: &[u64],
@@ -1186,6 +1200,36 @@ impl SegmentChain {
         self.sealed
             .values()
             .take_while(|segment| self.confirmed.contains(&segment.start_offset))
+    }
+
+    /// The sealed segments from `start_offset` on whose hash a floor advance
+    /// matched, in offset order.
+    pub(crate) fn confirmed_from(
+        &self,
+        start_offset: u64,
+    ) -> impl Iterator<Item = SegmentRecord> + '_ {
+        self.confirmed
+            .range(start_offset..)
+            .filter_map(|start_offset| self.sealed.get(start_offset).copied())
+    }
+
+    /// The start offset of the last sealed segment whose hash a floor advance
+    /// matched.
+    pub(crate) fn last_confirmed(&self) -> Option<u64> {
+        self.confirmed
+            .iter()
+            .rev()
+            .find(|start_offset| self.sealed.contains_key(start_offset))
+            .copied()
+    }
+
+    /// The record of the sealed segment starting at `start_offset`, when a
+    /// floor advance matched its hash.
+    pub(crate) fn confirmed_record(&self, start_offset: u64) -> Option<SegmentRecord> {
+        self.sealed
+            .get(&start_offset)
+            .filter(|_| self.confirmed.contains(&start_offset))
+            .copied()
     }
 
     /// The trim point retention appends before it unlinks the segment ending at

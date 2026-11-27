@@ -26,7 +26,7 @@ use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
     Checkpoint, CommitAfter, CommitPolicy, Consumer, ConsumerKind, EncryptorKind, IdKind,
     Identifier, IggyDuration, IggyError, IggyMessage, NonZeroIggyDuration, PollOptions,
-    PolledMessages, PollingKind, PollingStrategy, ReaderStamp,
+    PolledMessages, PollingKind, PollingStrategy, ReaderStamp, StreamDetails, TopicDetails,
 };
 use iggy_common::{StreamClient, TopicClient};
 use std::fmt::{self, Debug, Formatter};
@@ -427,6 +427,11 @@ impl IggyConsumer {
         self.state.progress.count(checkpoint, 1, ends_batch);
     }
 
+    /// The id of the reader whose stamp the checkpoints of this consumer carry.
+    pub(crate) fn reader_id(&self) -> u64 {
+        self.state.progress.reader()
+    }
+
     /// Whether the client is up or comes back without the caller.
     pub(crate) async fn client_can_recover(&self) -> bool {
         self.client.read().await.can_recover().await
@@ -666,91 +671,105 @@ impl IggyConsumer {
             return Ok(());
         }
         self.validate()?;
-
-        let stream_id = self.stream_id.clone();
-        let topic_id = self.topic_id.clone();
-        let consumer_name = &self.consumer_name;
-
         info!(
-            "Initializing consumer: {consumer_name} for stream: {stream_id}, topic: {topic_id}..."
+            "Initializing consumer: {} for stream: {}, topic: {}...",
+            self.consumer_name, self.stream_id, self.topic_id
         );
+        self.find().await?;
+        self.start_reader().await
+    }
 
-        {
-            let mut retries = 0;
-            let init_retries = self.init_retries.unwrap_or_default();
-            let interval = self.init_retry_interval;
+    /// Initializes a consumer whose stream and topic the caller has just found, as
+    /// [`init`](Self::init) does without looking them up again.
+    pub(crate) async fn init_found(&mut self) -> Result<(), IggyError> {
+        if self.initialized {
+            return Ok(());
+        }
+        self.validate()?;
+        self.start_reader().await
+    }
 
-            let mut timer = time::interval(interval.get_duration());
-            timer.tick().await;
+    /// Looks up the stream and the topic of the consumer, with the init retries of its builder.
+    pub(crate) async fn find(&self) -> Result<(StreamDetails, TopicDetails), IggyError> {
+        let stream_id = &self.stream_id;
+        let topic_id = &self.topic_id;
+        let mut retries = 0;
+        let init_retries = self.init_retries.unwrap_or_default();
+        let interval = self.init_retry_interval;
 
-            let client = self.client.read().await;
-            let mut stream_exists = client.get_stream(&stream_id).await?.is_some();
-            let mut topic_exists = client.get_topic(&stream_id, &topic_id).await?.is_some();
+        let mut timer = time::interval(interval.get_duration());
+        timer.tick().await;
 
-            // Absent streams or topics are not necessarily permanent failures.
-            // It may happen that get_stream/ get_topic races the initial setup of the stream/ topic.
-            // Retry for init_retries times, while waiting interval between retries.
-            loop {
-                if stream_exists && topic_exists {
-                    info!(
-                        "Stream: {stream_id} and topic: {topic_id} were found. Initializing consumer...",
-                    );
-                    break;
-                }
+        let client = self.client.read().await;
+        let mut stream = client.get_stream(stream_id).await?;
+        let mut topic = client.get_topic(stream_id, topic_id).await?;
 
-                if retries >= init_retries {
-                    break;
-                }
+        // Absent streams or topics are not necessarily permanent failures.
+        // It may happen that get_stream/ get_topic races the initial setup of the stream/ topic.
+        // Retry for init_retries times, while waiting interval between retries.
+        loop {
+            if stream.is_some() && topic.is_some() {
+                info!(
+                    "Stream: {stream_id} and topic: {topic_id} were found. Initializing consumer...",
+                );
+                break;
+            }
 
-                retries += 1;
-                if !stream_exists {
-                    warn!(
-                        "Stream: {stream_id} does not exist. Retrying ({retries}/{init_retries}) in {interval}...",
-                    );
-                    timer.tick().await;
-                    stream_exists = client.get_stream(&stream_id).await?.is_some();
-                }
+            if retries >= init_retries {
+                break;
+            }
 
-                if !stream_exists {
-                    continue;
-                }
-
-                topic_exists = client.get_topic(&stream_id, &topic_id).await?.is_some();
-                if topic_exists {
-                    break;
-                }
-
+            retries += 1;
+            if stream.is_none() {
                 warn!(
-                    "Topic: {topic_id} does not exist in stream: {stream_id}. Retrying ({retries}/{init_retries}) in {interval}...",
+                    "Stream: {stream_id} does not exist. Retrying ({retries}/{init_retries}) in {interval}...",
                 );
                 timer.tick().await;
+                stream = client.get_stream(stream_id).await?;
             }
 
-            if !stream_exists {
-                error!("Stream: {stream_id} was not found.");
-                return Err(match stream_id.kind {
-                    IdKind::String => IggyError::StreamNameNotFound(stream_id.get_string_value()?),
-                    IdKind::Numeric => {
-                        IggyError::StreamIdNotFound(Identifier::from_identifier(&stream_id))
-                    }
-                });
+            if stream.is_none() {
+                continue;
             }
 
-            if !topic_exists {
-                error!("Topic: {topic_id} was not found in stream: {stream_id}.");
-                return Err(match topic_id.kind {
-                    IdKind::String => IggyError::TopicNameNotFound(
-                        topic_id.get_string_value()?,
-                        stream_id.to_string(),
-                    ),
-                    IdKind::Numeric => IggyError::TopicIdNotFound(
-                        Identifier::from_identifier(&topic_id),
-                        Identifier::from_identifier(&stream_id),
-                    ),
-                });
+            topic = client.get_topic(stream_id, topic_id).await?;
+            if topic.is_some() {
+                break;
             }
+
+            warn!(
+                "Topic: {topic_id} does not exist in stream: {stream_id}. Retrying ({retries}/{init_retries}) in {interval}...",
+            );
+            timer.tick().await;
         }
 
+        let Some(stream) = stream else {
+            error!("Stream: {stream_id} was not found.");
+            return Err(match stream_id.kind {
+                IdKind::String => IggyError::StreamNameNotFound(stream_id.get_string_value()?),
+                IdKind::Numeric => {
+                    IggyError::StreamIdNotFound(Identifier::from_identifier(stream_id))
+                }
+            });
+        };
+
+        let Some(topic) = topic else {
+            error!("Topic: {topic_id} was not found in stream: {stream_id}.");
+            return Err(match topic_id.kind {
+                IdKind::String => IggyError::TopicNameNotFound(
+                    topic_id.get_string_value()?,
+                    stream_id.to_string(),
+                ),
+                IdKind::Numeric => IggyError::TopicIdNotFound(
+                    Identifier::from_identifier(topic_id),
+                    Identifier::from_identifier(stream_id),
+                ),
+            });
+        };
+        Ok((stream, topic))
+    }
+
+    async fn start_reader(&mut self) -> Result<(), IggyError> {
         self.reader = Some(self.reader_builder().build().await?);
         self.initialized = true;
         info!(
@@ -761,7 +780,7 @@ impl IggyConsumer {
     }
 
     /// The checks that need no I/O, so a configuration that cannot run fails before the lookups.
-    fn validate(&self) -> Result<(), IggyError> {
+    pub(crate) fn validate(&self) -> Result<(), IggyError> {
         self.reader_builder().into_parts()?;
         Ok(())
     }
@@ -924,6 +943,21 @@ impl ReceivedMessage {
             checkpoint,
         }
     }
+
+    /// A message that the reader of the stamp of `checkpoint` yielded.
+    #[cfg(test)]
+    pub(crate) fn yielded(
+        message: IggyMessage,
+        current_offset: u64,
+        checkpoint: Checkpoint,
+    ) -> Self {
+        Self {
+            message,
+            current_offset,
+            partition_id: checkpoint.partition_id(),
+            checkpoint,
+        }
+    }
 }
 
 /// Yields messages one at a time, from the current batch first and from the reader once it is
@@ -1022,7 +1056,7 @@ impl IggyConsumer {
 
     /// Under `CommitAfter::Processing`, the message that the stream yielded last counts once the
     /// stream is polled again or shuts down.
-    fn count_uncounted(&mut self) {
+    pub(crate) fn count_uncounted(&mut self) {
         if let Some((checkpoint, ends_batch)) = self.uncounted.take() {
             self.count(checkpoint, ends_batch);
         }

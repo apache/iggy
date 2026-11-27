@@ -22,12 +22,13 @@ use std::io;
 use std::ops::Range;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use futures::stream::{self, LocalBoxStream, Stream, StreamExt};
 
 use crate::error::ObjectStoreError;
+use crate::layout::KeyLayout;
 
 /// Most keys one `list` page returns and one `delete` call takes: S3's limit
 /// for both.
@@ -47,6 +48,14 @@ pub const MAX_KEY_SEGMENTS: usize = 254;
 /// Most bytes of user metadata on one object, names and values together:
 /// S3's limit.
 pub const MAX_METADATA_LEN: usize = 2048;
+
+/// The user metadata entry that names the put that stored an object.
+///
+/// Its value is 32 lowercase hex digits. Every attempt of one put carries the
+/// same value, so a put that finds an object under its key tells its own from
+/// another writer's, and the temporaries of an upload in parts are named
+/// after it.
+pub const PUT_ID_METADATA: &str = "put-id";
 
 /// An object's user metadata, by name.
 ///
@@ -96,12 +105,12 @@ pub trait ObjectStore {
     /// A failed put stores nothing and leaves an earlier object as it was, and
     /// so does a put that is dropped before the provider took its whole body.
     /// A put that ends without an answer after the provider took the whole
-    /// body is the exception: one dropped then, or one that failed with
-    /// [`ObjectStoreError::Malformed`] or with a
-    /// [`crate::ErrorClass::Transient`] error other than
-    /// [`ObjectStoreError::ChecksumMismatch`]. The store can commit such a put
-    /// and lose its answer, so a retry with `IfAbsent` can meet the caller's
-    /// own object, which [`ObjectMeta::crc32c`] tells apart.
+    /// body is the exception: one dropped then, or one that failed with an
+    /// error for which [`ObjectStoreError::put_may_have_stored`] holds. The
+    /// store can commit such a put and lose its answer, so a retry with
+    /// `IfAbsent` can meet the caller's own object, which
+    /// [`ObjectMeta::crc32c`] tells apart. A put that failed with
+    /// [`ObjectStoreError::NotSent`] never reached the store.
     ///
     /// # Errors
     /// [`ObjectStoreError::InvalidKey`] for a key that [`validate_key`]
@@ -187,25 +196,222 @@ pub trait ObjectStore {
         &self,
         request: &ListRequest<'_>,
     ) -> impl Future<Output = Result<ListPage, ObjectStoreError>>;
+
+    /// How the provider uploads one object in parts, `None` when it does not
+    /// and takes every object in one put. Only a provider that returns
+    /// limits takes the other calls of an upload in parts, and a caller
+    /// uploads in parts only a put whose [`PutOptions::parts`] allows it.
+    fn parts_limits(&self) -> Option<PartsLimits> {
+        None
+    }
+
+    /// Begins an upload in parts of the object under `key`, with the mode,
+    /// the user metadata and the CRC32C of `options`. Nothing is visible
+    /// under `key` until [`Self::complete_parts`] creates the object whole,
+    /// and only then is the mode decided. A provider that keeps the parts as
+    /// objects of its own names them under [`KeyLayout::uploads_prefix`] of
+    /// `layout`, after the [`PUT_ID_METADATA`] of `options` when it holds one.
+    ///
+    /// # Errors
+    /// [`ObjectStoreError::Unsupported`] when the store does not take an
+    /// upload in parts the way the provider asks for it, so the caller puts
+    /// the object whole, and any error the store returns.
+    fn begin_parts(
+        &self,
+        key: &str,
+        options: &PutOptions,
+        layout: &KeyLayout,
+    ) -> impl Future<Output = Result<PartsUpload, ObjectStoreError>> {
+        let _ = (key, options, layout);
+        std::future::ready(Err(parts_unsupported()))
+    }
+
+    /// Stores part `number`, from 1, of `upload`. `crc32c` is the CRC32C of
+    /// the part's bytes, which the store checks. Sending the same part again
+    /// with the same bytes stores it once more or finds it stored, so a part
+    /// can be retried freely. A provider whose parts are objects of their own
+    /// creates each one only where none is, so an attempt that lands late
+    /// never replaces the part that a retry stored.
+    ///
+    /// # Errors
+    /// [`ObjectStoreError::NotFound`] when the store holds no such upload,
+    /// [`ObjectStoreError::ChecksumMismatch`] when the bytes do not hash to
+    /// `crc32c`, and any error the store returns.
+    fn put_part(
+        &self,
+        upload: &PartsUpload,
+        number: u32,
+        body: PutBody,
+        crc32c: u32,
+    ) -> impl Future<Output = Result<StoredPart, ObjectStoreError>> {
+        let _ = (upload, number, body, crc32c);
+        std::future::ready(Err(parts_unsupported()))
+    }
+
+    /// Creates the object of `upload` from `parts`, in order, `len` bytes in
+    /// all. With [`PutMode::IfAbsent`] it creates nothing when the key holds
+    /// an object. With [`PutOptions::crc32c`], it creates nothing unless the
+    /// whole object hashes to that value. What the upload keeps apart from
+    /// the object stays for [`Self::release_parts`].
+    ///
+    /// The same as [`ObjectStore::put`], a completion that ends without an
+    /// answer can have created the object, and a retry can then meet it, or
+    /// find the upload gone.
+    ///
+    /// # Errors
+    /// [`ObjectStoreError::PreconditionFailed`] when `IfAbsent` finds an
+    /// object, [`ObjectStoreError::NotFound`] when the upload or one of its
+    /// parts is gone, [`ObjectStoreError::ChecksumMismatch`] when the object
+    /// does not hash to the CRC32C, and any error the store returns.
+    fn complete_parts(
+        &self,
+        upload: &PartsUpload,
+        parts: &[StoredPart],
+        options: &PutOptions,
+        len: u64,
+    ) -> impl Future<Output = Result<(), ObjectStoreError>> {
+        let _ = (upload, parts, options, len);
+        std::future::ready(Err(parts_unsupported()))
+    }
+
+    /// Removes what `upload` kept apart from the object that
+    /// [`Self::complete_parts`] created. A provider that keeps nothing apart
+    /// from the object once the upload completes does nothing.
+    ///
+    /// # Errors
+    /// Any error the store returns.
+    fn release_parts(
+        &self,
+        upload: &PartsUpload,
+    ) -> impl Future<Output = Result<(), ObjectStoreError>> {
+        let _ = upload;
+        std::future::ready(Ok(()))
+    }
+
+    /// Ends `upload` without an object and removes what it kept, `parts`
+    /// parts at most. An upload that is gone already counts as aborted.
+    ///
+    /// # Errors
+    /// Any error the store returns.
+    fn abort_parts(
+        &self,
+        upload: &PartsUpload,
+        parts: u32,
+    ) -> impl Future<Output = Result<(), ObjectStoreError>> {
+        let _ = (upload, parts);
+        std::future::ready(Err(parts_unsupported()))
+    }
+
+    /// Removes one page of the uploads in parts under the root of `layout`
+    /// that began more than `older_than` ago by the store's clock, as far as
+    /// the provider can tell it, after `after`: the uploads that a crash or a
+    /// cancelled put left. It never touches an object of the root, nor an
+    /// upload under a key that `layout` does not build. A provider that
+    /// keeps nothing of an upload apart from the object removes nothing.
+    ///
+    /// Each request of the page, the listing and every removal, waits at
+    /// most `request_timeout` for its answer. A removal that gets none counts
+    /// as failed, and the page goes on with the next upload.
+    ///
+    /// # Errors
+    /// Any error the store returns for the listing. An upload that the store
+    /// refuses to remove counts in [`SweptUploads::failed`].
+    fn sweep_uploads(
+        &self,
+        layout: &KeyLayout,
+        older_than: Duration,
+        after: Option<&str>,
+        request_timeout: Duration,
+    ) -> impl Future<Output = Result<SweptUploads, ObjectStoreError>> {
+        let _ = (layout, older_than, after, request_timeout);
+        std::future::ready(Ok(SweptUploads::default()))
+    }
+}
+
+/// What a provider takes of an upload in parts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartsLimits {
+    /// The fewest bytes of a part other than the last.
+    pub min_part_len: u64,
+    /// The most parts of one upload.
+    pub max_parts: u32,
+}
+
+/// An upload in parts that [`ObjectStore::begin_parts`] began.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartsUpload {
+    /// The key of the object that the upload creates.
+    pub key: String,
+    /// The provider's name of the upload: the upload id on S3, the key
+    /// prefix of the temporary objects on GCS.
+    pub id: String,
+}
+
+/// A part that [`ObjectStore::put_part`] stored, as its completion names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPart {
+    /// From 1.
+    pub number: u32,
+    /// What the store answered for the part: its etag on S3, the generation
+    /// of its temporary object on GCS.
+    pub tag: String,
+    pub crc32c: u32,
+}
+
+/// What one page of [`ObjectStore::sweep_uploads`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SweptUploads {
+    /// Uploads aborted, or temporary objects deleted.
+    pub removed: u64,
+    /// Uploads younger than the cutoff, which the sweep left alone.
+    pub kept: u64,
+    /// Uploads the store refused to remove.
+    pub failed: u64,
+    /// Where the next page starts, `None` after the last one.
+    pub next: Option<String>,
+}
+
+fn parts_unsupported() -> ObjectStoreError {
+    ObjectStoreError::Unsupported("uploads in parts".to_owned())
 }
 
 /// The bytes of one put: a declared length and the pieces that make it up.
 ///
 /// A provider sends each piece as it comes, so a large body never sits in
-/// memory whole.
+/// memory whole. A body held in memory can be sent again, see
+/// [`Self::try_clone`], and one that streams cannot.
 pub struct PutBody {
     len: u64,
-    pieces: LocalBoxStream<'static, io::Result<Bytes>>,
+    source: BodySource,
+}
+
+enum BodySource {
+    /// Bytes in memory, handed over `piece_len` bytes at a time.
+    Memory {
+        bytes: Bytes,
+        piece_len: usize,
+    },
+    Stream(LocalBoxStream<'static, io::Result<Bytes>>),
 }
 
 impl PutBody {
-    /// A body held in memory.
+    /// A body held in memory, handed over in one piece.
     #[must_use]
     pub fn from_bytes(bytes: impl Into<Bytes>) -> Self {
+        Self::from_bytes_in_pieces(bytes, usize::MAX)
+    }
+
+    /// A body held in memory, handed over `piece_len` bytes at a time, so a
+    /// provider that sums or copies what it sends does so in steps.
+    #[must_use]
+    pub fn from_bytes_in_pieces(bytes: impl Into<Bytes>, piece_len: usize) -> Self {
         let bytes = bytes.into();
         Self {
             len: bytes.len() as u64,
-            pieces: stream::iter([Ok(bytes)]).boxed_local(),
+            source: BodySource::Memory {
+                bytes,
+                piece_len: piece_len.max(1),
+            },
         }
     }
 
@@ -219,7 +425,7 @@ impl PutBody {
     pub fn from_stream(len: u64, pieces: impl Stream<Item = io::Result<Bytes>> + 'static) -> Self {
         Self {
             len,
-            pieces: pieces.boxed_local(),
+            source: BodySource::Stream(pieces.boxed_local()),
         }
     }
 
@@ -231,6 +437,57 @@ impl PutBody {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Whether [`Self::try_clone`] gives a copy: the body is held in memory.
+    #[must_use]
+    pub const fn is_repeatable(&self) -> bool {
+        matches!(self.source, BodySource::Memory { .. })
+    }
+
+    /// The bytes of `range` of a body held in memory, in pieces of the same
+    /// length, as a body of their own. `None` for a body that streams, and
+    /// for a range past the end.
+    #[must_use]
+    pub fn try_slice(&self, range: Range<u64>) -> Option<Self> {
+        let BodySource::Memory { bytes, piece_len } = &self.source else {
+            return None;
+        };
+        let start = usize::try_from(range.start).ok()?;
+        let end = usize::try_from(range.end).ok()?;
+        (start <= end && end <= bytes.len()).then(|| Self {
+            len: range.end - range.start,
+            source: BodySource::Memory {
+                bytes: bytes.slice(start..end),
+                piece_len: *piece_len,
+            },
+        })
+    }
+
+    /// The CRC32C of a body held in memory, `None` for one that streams.
+    #[must_use]
+    pub fn crc32c(&self) -> Option<u32> {
+        match &self.source {
+            BodySource::Memory { bytes, .. } => Some(crc32c::crc32c(bytes)),
+            BodySource::Stream(_) => None,
+        }
+    }
+
+    /// Another body of the same bytes, in the same pieces, for a put that
+    /// sends them again. `None` for a body that streams, which yields its
+    /// pieces once.
+    #[must_use]
+    pub fn try_clone(&self) -> Option<Self> {
+        match &self.source {
+            BodySource::Memory { bytes, piece_len } => Some(Self {
+                len: self.len,
+                source: BodySource::Memory {
+                    bytes: bytes.clone(),
+                    piece_len: *piece_len,
+                },
+            }),
+            BodySource::Stream(_) => None,
+        }
     }
 
     /// The pieces for a provider to send, checked against the declared
@@ -245,8 +502,18 @@ impl PutBody {
     /// byte of a failed body. An empty body has no last byte, so a provider
     /// reads it to its end before it sends the request.
     pub fn into_pieces(self) -> impl Stream<Item = io::Result<Bytes>> + Unpin + 'static {
+        let pieces = match self.source {
+            BodySource::Memory { bytes, piece_len } => {
+                let len = bytes.len();
+                stream::iter((0..len).step_by(piece_len).map(move |start| {
+                    Ok(bytes.slice(start..len.min(start.saturating_add(piece_len))))
+                }))
+                .boxed_local()
+            }
+            BodySource::Stream(pieces) => pieces,
+        };
         ExactLen {
-            pieces: self.pieces,
+            pieces,
             remaining: self.len,
             last: None,
             done: false,
@@ -259,6 +526,7 @@ impl fmt::Debug for PutBody {
         formatter
             .debug_struct("PutBody")
             .field("len", &self.len)
+            .field("repeatable", &self.is_repeatable())
             .finish_non_exhaustive()
     }
 }
@@ -342,6 +610,25 @@ pub struct PutOptions {
     /// provider that can send a checksum after the body, as S3 can in a
     /// trailer, compares one.
     pub crc32c: Option<u32>,
+    /// Whether the put may go up in parts. Whole by default.
+    pub parts: PutParts,
+}
+
+/// Whether a put may go up in parts.
+///
+/// A provider's [`ObjectStore::put`] ignores it. Only the caller that drives
+/// the calls of an upload in parts reads it. An upload in parts adds the
+/// round trips of its begin and its completion, and on GCS the deletes of its
+/// temporary objects, so only a large object that no producer waits for, a
+/// long-term segment, asks for it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PutParts {
+    /// One request sends the whole body.
+    #[default]
+    Whole,
+    /// A body that is long enough may go up in parts, see
+    /// [`ObjectStore::begin_parts`].
+    Allowed,
 }
 
 /// What [`ObjectStore::head`] returns.
@@ -774,6 +1061,40 @@ mod tests {
         assert!(!body.is_empty());
         assert!(PutBody::from_bytes(Bytes::new()).is_empty());
         assert_eq!(drain(body).unwrap(), b"segment");
+    }
+
+    #[test]
+    fn given_bytes_in_pieces_when_draining_should_hand_over_each_piece_and_the_rest() {
+        let body = PutBody::from_bytes_in_pieces(Bytes::from_static(b"abcdefg"), 3);
+
+        let yielded: Vec<Bytes> = block_on(body.into_pieces().try_collect()).unwrap();
+
+        assert_eq!(yielded, ["abc", "def", "g"]);
+        let empty = PutBody::from_bytes_in_pieces(Bytes::new(), 3);
+        assert_eq!(drain(empty).unwrap(), b"");
+    }
+
+    #[test]
+    fn given_body_in_memory_when_cloning_should_give_a_copy_of_the_same_pieces() {
+        let body = PutBody::from_bytes_in_pieces(Bytes::from_static(b"segment"), 4);
+
+        let copy = body.try_clone().unwrap();
+
+        assert!(body.is_repeatable() && copy.is_repeatable());
+        assert_eq!(copy.len(), 7);
+        let pieces: Vec<Bytes> = block_on(copy.into_pieces().try_collect()).unwrap();
+        assert_eq!(pieces, ["segm", "ent"]);
+        assert_eq!(drain(body).unwrap(), b"segment");
+        assert!(PutBody::from_bytes("bytes").try_clone().is_some());
+    }
+
+    #[test]
+    fn given_streamed_body_when_cloning_should_refuse() {
+        let body = PutBody::from_stream(6, pieces(&[b"ab", b"cdef"]));
+
+        assert!(!body.is_repeatable());
+        assert!(body.try_clone().is_none());
+        assert_eq!(drain(body).unwrap(), b"abcdef");
     }
 
     #[test]

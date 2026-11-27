@@ -75,12 +75,15 @@ where
             .as_ref()
             .map_or(0, |persistence| persistence.reload_bytes());
         let (repair_ring_entries, repair_ring_bytes) = self.repair_ring_occupancy();
+        let (stored_segments_missing, stored_segments_diverged) = self.stored_segment_findings();
         GaugeShare {
             wal_disk_bytes,
             wal_retained_bytes,
             wal_reload_bytes,
             repair_ring_entries,
             repair_ring_bytes,
+            stored_segments_missing,
+            stored_segments_diverged,
         }
     }
 

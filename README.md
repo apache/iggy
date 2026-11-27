@@ -146,7 +146,7 @@ The server, SDKs and CLI are versioned independently. For example, server 0.9.0 
 
 We also publish edge releases (versions with an `-edge.N` suffix, and `apache/iggy:edge`) for the SDKs and the Docker images. They track the latest changes, but are not guaranteed to be stable and are not recommended for production use.
 
-This checkout uses client protocol 0.12.3, replica wire revision 5 and metadata snapshot format 21. Upgrade all replicas together. Moving from replica wire revision 4 alone preserves existing data directories. Upgrades from an incompatible storage format require fresh storage. When upgrading across the credential change introduced in revision 4, sign in again over HTTP. The server refuses access tokens issued before that change. See [Upgrade recovery](core/server/README.md#upgrade-recovery).
+This checkout uses client protocol 0.12.3, replica wire revision 6 and metadata snapshot format 21. Upgrade all replicas together. Moving from replica wire revision 4 or 5 alone preserves existing data directories. Upgrades from an incompatible storage format require fresh storage. When upgrading across the credential change introduced in revision 4, sign in again over HTTP. The server refuses access tokens issued before that change. See [Upgrade recovery](core/server/README.md#upgrade-recovery).
 
 ---
 

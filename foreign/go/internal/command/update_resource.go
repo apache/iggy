@@ -90,6 +90,8 @@ var optionCatalog = []optionRule{
 	{key: string(iggcon.TopicOptionTombstoneGrace), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}, updatable: true},
 	{key: string(iggcon.TopicOptionPositionsResumeTimeout), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}, updatable: true},
 	{key: string(iggcon.TopicOptionLongTermRewriteMaxInterval), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}, updatable: true},
+	{key: string(iggcon.TopicOptionReadCacheSize), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}, updatable: true},
+	{key: string(iggcon.TopicOptionReadAhead), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}, updatable: true},
 	{key: string(iggcon.StreamOptionShadowOrigin), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeStream}, readOnly: true},
 	{key: "critical_keys", scopes: []iggcon.OptionsScope{iggcon.OptionsScopeStream, iggcon.OptionsScopeTopic, iggcon.OptionsScopeUser}, readOnly: true},
 }

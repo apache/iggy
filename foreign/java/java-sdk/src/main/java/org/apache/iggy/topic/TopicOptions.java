@@ -33,10 +33,11 @@ import java.util.Set;
  *
  * <p>Every key here is fixed at create except {@code message_expiry}, {@code max_topic_size},
  * {@code local_retention_age} and {@code local_retention_size}, which a {@link TopicUpdate} may change
- * later, {@code tiered_storage}, which it may turn on, and the six durations of a geo topic, which it may set
- * again. A key left unset is resolved by the server and reported in the topic's derived options, except
- * those durations, which stay unset for each node to apply its own server setting. {@code describeOptions}
- * enumerates what a given server accepts.
+ * later, {@code tiered_storage}, which it may turn on, and the six durations of a geo topic,
+ * {@code read_cache_size} and {@code read_ahead}, which it may set again. A key left unset is resolved by
+ * the server and reported in the topic's derived options, except those durations and sizes, which stay
+ * unset for each node to apply its own server setting. {@code describeOptions} enumerates what a given
+ * server accepts.
  *
  * <pre>{@code
  * var options = TopicOptions.builder()
@@ -298,6 +299,30 @@ public final class TopicOptions {
          */
         public Builder longTermRewriteMaxInterval(BigInteger micros) {
             return set(TopicOptionKey.LONG_TERM_REWRITE_MAX_INTERVAL, HeaderValue.fromUint64(micros));
+        }
+
+        /**
+         * The memory in bytes that each node keeps for what the topic's reads fetch from the object store,
+         * divided between its partitions. A partition's share is a limit within the read cache of its shard,
+         * not a reservation. Zero keeps nothing that they fetch, any other value is at least 512 KiB. Overrides
+         * the server's {@code [tiered_storage] read_cache_size}.
+         *
+         * <p>This and {@link #readAhead} are on a normal or a geo topic. Zero is a value for them and is sent,
+         * unlike a zero {@code max_topic_size}. Left unset, each node applies its own server setting of the
+         * same name.
+         */
+        public Builder readCacheSize(BigInteger bytes) {
+            return set(TopicOptionKey.READ_CACHE_SIZE, HeaderValue.fromUint64(bytes));
+        }
+
+        /**
+         * The most bytes that readahead fetches from the object store in front of a sequential reader of the
+         * topic. Zero turns readahead off, any other value is at least 128 KiB. With a nonzero
+         * {@link #readCacheSize}, the server refuses more than one eighth of it. Overrides the server's
+         * {@code [tiered_storage] read_ahead}.
+         */
+        public Builder readAhead(BigInteger bytes) {
+            return set(TopicOptionKey.READ_AHEAD, HeaderValue.fromUint64(bytes));
         }
 
         /** An option this build has no setter for. A typed setter wins on collision. */

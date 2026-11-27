@@ -20,7 +20,7 @@
 use crate::boot::topology::{RosterCells, TcpTopology, build_cluster_roster};
 use crate::consumer_group::lease::ConsumerGroupLiveness;
 use crate::dispatch::host::ServerHost;
-use crate::partition_helpers::load_partition_or_fence;
+use crate::partition_helpers::{ChainRecovery, load_partition_or_fence};
 use crate::server_error::ServerError;
 use crate::session_manager::SessionManager;
 use crate::shell::{
@@ -43,7 +43,9 @@ use message_bus::IggyMessageBus;
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
 use metadata::stm::snapshot::Snapshot;
 use metadata::stm::stream::{Partition, Streams};
-use partitions::{IggyPartitions, PartitionsConfig, RepairRingBudget, StreamKeyIdentity};
+use partitions::{
+    IggyPartitions, PartitionsConfig, RepairRingBudget, StoreViewRequest, StreamKeyIdentity,
+};
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use shard::builder::IggyShardBuilder;
 use shard::config::DeferredPollConfig;
@@ -58,7 +60,7 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// A partition this shard owns, with what building it needs from metadata.
 struct OwnedPartition {
@@ -94,6 +96,9 @@ pub(in crate::boot) struct ShardBuild {
     /// Owned namespaces left unbuilt, for the reconciler to clean up if their
     /// delete commits before they build.
     pub unbuilt: Vec<IggyNamespace>,
+    /// The unbuilt partitions whose segment chain is gone, with what each
+    /// asks of the object store, for the reconciler to read.
+    pub chain_rebuilds: Vec<(IggyNamespace, StoreViewRequest)>,
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -279,6 +284,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
     // `Arc<TopicStats>` atomics race only against other atomic adds.
     let mut deferred_streams = BTreeSet::new();
     let mut unbuilt = Vec::new();
+    let mut chain_rebuilds = Vec::new();
     for OwnedPartition {
         stream_id,
         topic_id,
@@ -316,11 +322,31 @@ pub(in crate::boot) async fn build_shard_for_thread(
             partition_metadata.replica_set(topology.replica_count),
             Rc::clone(&bus),
             &partitions,
+            None,
         )
         .await;
+        if let Ok((_, ChainRecovery::Refused)) = &loaded {
+            metrics.record_chain_rebuild_refusal();
+        }
         let partition = match loaded {
-            Ok(Some(partition)) => partition,
-            Ok(None) => continue,
+            Ok((Some(partition), _)) => partition,
+            Ok((None, _)) => continue,
+            // The store is out of reach until the node passes its identity
+            // check, so the reconciler rebuilds the chain.
+            Err(ServerError::PartitionChainMissing { request, .. }) => {
+                debug!(
+                    stream_id,
+                    topic_id,
+                    partition_id = partition_metadata.id,
+                    from = request.from,
+                    front = request.front,
+                    "skipping this partition at boot; the segment chain is gone, and the \
+                     reconciler reads the object store for it"
+                );
+                chain_rebuilds.push((namespace, *request));
+                unbuilt.push(namespace);
+                continue;
+            }
             // A refused claim is a failed superblock write, not damage: the
             // namespace stays materialisable, so skipping it here costs one
             // partition its start instead of the whole shard, and the
@@ -449,6 +475,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
         consumer_group_liveness,
         shard_handle,
         unbuilt,
+        chain_rebuilds,
     })
 }
 
@@ -540,6 +567,11 @@ const _: () = assert!(
         == shard::SERVED_SEGMENT_CACHE_BYTES_DEFAULT
 );
 const _: () = assert!(configs::cluster::DEFAULT_REPAIR_CHUNK_MAX as u64 == shard::REPAIR_CHUNK_MAX);
+const _: () = assert!(iggy_common::READ_CACHE_BLOCK_SIZE_MIN == partitions::DISK_POLL_CHUNK_MIN);
+const _: () =
+    assert!(configs::tiered_storage::READ_CACHE_BLOCK_SIZE_MAX == partitions::DISK_POLL_CHUNK_MAX);
+const _: () = assert!(iggy_common::READ_AHEAD_CACHE_SHARE == iggy_object_store::AHEAD_SHARE as u64);
+const _: () = assert!(iggy_common::READ_AHEAD_BLOCKS_MIN == partitions::READ_AHEAD_START_BLOCKS);
 const _: () = assert!(
     configs::cluster::STATE_CHUNK_HEADER_LEN
         == size_of::<iggy_binary_protocol::consensus::StateChunkHeader>() as u64

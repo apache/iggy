@@ -84,6 +84,8 @@ When moving from a storage marker older than `IGGY-TIERED-SEGMENT-CHAIN-2`, star
 
 Replica wire revision 5 lets a ReplicaHello carry the identities of the releases its sender lists as compatible. To move from revision 4 to 5 on `IGGY-TIERED-SEGMENT-CHAIN-2`, stop every node, keep its data directory and restart all nodes on the new build. See [Upgrade recovery](#upgrade-recovery).
 
+Replica wire revision 6 replicates the read cache options of topics and shadow topics and the persisted consumer offset durability of geo topics, and its partition state transfer sends every segment that the store holds as its chain record alone. To move from revision 4 or 5 to 6 on `IGGY-TIERED-SEGMENT-CHAIN-2`, stop every node, keep its data directory and restart all nodes on the new build.
+
 For an older storage marker, use an offline cutover with logical re-ingestion:
 
 1. Stop application writes, consumers that advance offsets, and administrative
@@ -372,7 +374,8 @@ write to settle. Waiters acquire the in-flight permit after the partition gate,
 so they do not consume the session's budget for other partitions.
 
 Durability defaults remain `Replicated`. A geo topic in the `geo` mode has no
-choice: it is always `Persisted`, and the option is ignored on create. See
+choice: its messages and consumer offsets are always `Persisted`, and both
+options are ignored on create. See
 [geo topics](docs/GEO_TOPICS.md#create-a-geo-topic).
 Ordinary SDK sends and explicit offset writes support the configured policy.
 Crash-safe send retries require `Persisted`; crash-safe explicit offset retries
@@ -517,6 +520,59 @@ The cluster accepts `tiered_storage` on a topic only while every node has a
 backend and passes the store identity check described below. Until then the
 request fails with `FeatureUnavailable`.
 
+A poll reads an object in the store in blocks of `read_cache_block_size`,
+256 KiB by default, and each shard keeps up to `read_cache_size` of them in
+memory: tiered and long-term segments, the indexes of long-term segments, fresh
+objects, and the segments of geo peers. The index of a tiered segment is not
+kept there: a poll fetches it once into a local index file on disk. A smaller
+block wastes less on small or random reads, and a larger one suits consumers
+that read forward. A poll of bytes that
+another poll read a moment ago takes them from there, and polls that miss the
+same block at once share one read. When polls read a segment in order, the
+shard also fetches up to `read_ahead` bytes past the last poll before any poll
+asks for them, on into the next segment. These fetches take the speculative
+fetch caps of `[tiered_storage.jobs]`. One starts only while no fetch that a
+poll waits for is queued, and it can run beside the ones that already run. The
+same budget holds the fresh objects a shard uploads for geo topics, in up to
+seven eighths of it, until the long-term rewrite takes their messages, so a
+consumer at the tail reads them from memory, and a rewrite hands the end of
+each long-term segment it stores to the cache. A shard with a high upload rate
+wants 64 MiB or more. With `read_cache_size` at 0, each poll reads exactly its
+bytes from the store and nothing it fetches is kept, but the shard still holds
+what it uploads, in a fixed 64 MiB of its own. A geo peer's bytes are served
+only while the node reads that peer, and never across a change of the cluster
+that owns its root. The budget is shared by every partition of the shard.
+
+A topic can set `read_cache_size` and `read_ahead` for itself, on a normal and
+on a geo topic, and an update can change them without a restart. The topic's
+`read_cache_size` is shared evenly between its partitions, and each share is a
+limit on what that partition keeps within the cache of its shard, not a
+reservation: a partition over its limit evicts its own blocks, and what a quiet
+partition leaves unused is there for the others. A share below 8 blocks of the
+node's `read_cache_block_size` keeps nothing. The topic's `read_ahead` replaces
+the node's for its readers, and a partition reads ahead at most an eighth of
+its share and an eighth of the cache of its shard. `0` turns either off for the
+topic. Unset, each node applies its own
+setting: only the cache of the shard bounds the topic's partitions, and they
+read ahead the node's `read_ahead`. Neither can be reset. The fresh objects a
+shard uploads are held for the polls at the tail whatever a topic sets. A
+topic without `tiered_storage` accepts both, and they apply once its reads go
+to the store. A shadow topic reads with the values that the geo topic it
+shadows sets, see [Shadow streams](#shadow-streams), and no client can set
+them on it. The
+counters `remote_read_block_hits_total`, `remote_read_block_misses_total`,
+`remote_read_ahead_hits_total`, `remote_read_blocks_fetched_ahead_total`,
+`remote_read_demand_bytes_total`, `remote_read_ahead_bytes_total`,
+`remote_read_fresh_releases_total`, `remote_read_carried_bytes_total` and
+`remote_read_limit_evictions_total`, the blocks and whole objects, such as a
+segment's `.index`, that left because their partition was over its limit, and the gauges `remote_read_cache_bytes` and
+`remote_read_held_bytes`, show what the cache of each shard does.
+
+A replica rebuilt by state transfer gets only the records of the segments
+that the store holds, and reads those segments from the store. A replica that
+cannot read its store waits for it before it rebuilds a tiered partition, and
+stays behind its group until then.
+
 Each partition of a tiered topic also has a manifest object,
 `<prefix>/meta/<stream>/<topic>/<partition>/<created_revision>/manifest.bin`.
 It lists the segments that the store holds, with their offsets, timestamps,
@@ -525,9 +581,198 @@ partition. Such a reader takes only the segments that the manifest lists. Any
 other object under the partition's prefix can belong to an upload that never
 committed, or to a segment that retention removed. The partition's primary
 writes it on each run of the message cleaner, when a segment was uploaded or
-removed since the last one. The cluster never reads its own manifests back.
-The objects of a removed segment are deleted only once the manifest no longer
-lists it.
+removed since the last one. The cluster reads its own manifests back only to
+check a chain file it rebuilds, as the next paragraphs describe, and never
+takes a segment from one. The objects of a removed segment are deleted only
+once the manifest no longer lists it.
+
+Each replica of a partition of a tiered topic records its segments in the file
+`remote.chain` in the partition's directory, which is the only local record of
+the segments whose `.log` left the disk. A node that finds no chain file for
+such a partition, when the directory held its history before, decides from
+what is left on disk:
+
+- No segment `.log` is left: the node refuses the partition. The store holds
+  only the segments that were uploaded, never everything that was
+  acknowledged, so it never stands in for a lost log.
+- The first `.log` starts at the first offset that retention kept, so nothing
+  can be missing: the partition starts a new chain, as when a topic turns
+  tiering on.
+- The first `.log` starts later, and the partition has no tiered floor and no
+  `.index` or `.anchor` left below it, so nothing left the disk: retention
+  that ran before tiering took effect commits no truncation and leaves such a
+  front. The partition starts a new chain that records that front.
+- Otherwise the node rebuilds the chain from the store before the partition
+  serves. It lists the partition's objects, reads the metadata of each segment
+  from the first offset retention kept up to the first local `.log`, and
+  follows each segment to the next one. Every segment it takes must start where
+  the one before it ended, or past a gap that a local `.anchor` names, end at or
+  below the tiered floor and below the first local `.log` and the segment the
+  WAL checkpoint names, hold bytes, have an index, and agree with the manifest
+  when the manifest lists it. The manifest is only a check: it can trail the
+  store by a minute, so a segment it does not list yet is taken from the
+  store. The trim point of the rebuilt chain is the truncation that metadata
+  committed, so the rebuild drives no truncation and no delete. When
+  retention removed the segment before a gap that an `.anchor` names, the walk
+  starts past the gap, and the trim point is the offset before it.
+
+The rebuild waits until the node passes the store identity check, and costs
+one listing of the partition's objects, one HEAD of each segment it reads,
+several at a time, and one read of at most the first 16 MiB of the manifest.
+The reads run in the background, at most two partitions at a time on a shard,
+as jobs of the demand fetch class, and the 16 MiB are held only while the
+manifest is read. A failed HEAD of a segment the walk takes, or a store that
+does not answer, makes the partition wait and read again later. A manifest
+larger than 16 MiB is not decoded, and the rebuild goes on without checking
+against it. A deletion of the topic does not wait for the store: a partition
+that waits for it is retired like one recovery refused. A range of offsets
+below the first local `.log` that the store does not account for refuses the
+partition, and the log names it. A partition with one replica then stays down
+with its files as they were and no new chain file. A replicated one sets its
+files aside and rejoins by state transfer. Each shard exports
+`partition_chain_rebuilds_total`, `partition_chain_rebuild_refusals_total` and
+`partitions_awaiting_chain_rebuild`, the partitions that wait for the store.
+
+The primary of each partition of a tiered topic checks once a day that the
+store still holds the segments its chain records as stored, and once more each
+time it becomes the primary, as after a restart. A pass checks the segments
+stored when it started, and the ones stored later wait for the next pass. The
+check sends one HEAD for the `.log` and one for the `.index` of each segment,
+at most 64 segments a job, in the housekeeping jobs that wait for fetches and
+uploads. Each shard runs at most 4 such jobs at once, and a partition that
+finds them all running waits its turn behind the ones that found them running
+before it. The check lists nothing and leaves the read cache alone. On the
+`fs` backend a HEAD reads the first 8 KiB of the object's file, which holds
+its header and can hold the first bytes of the segment. On the other backends
+it reads no byte of the object. An object the store does not hold counts as
+missing, and the `.index` of a missing `.log` is not asked for. A `.log` of
+another size than the chain records, with another CRC32C than the one the
+store computed when it took the upload, or with metadata that does not decode
+or describes another segment than the chain records, counts as diverged, and
+so does an `.index` that is not a whole number of entries. The metadata is
+compared even when the CRC32C matches, as rebuilding a lost chain from the
+store reads it. The node logs each such segment once as an error when it finds
+it, and once more when a later check finds it as recorded again. It repairs,
+deletes and fences nothing.
+
+A store error is no finding, and the segment counts as neither missing nor
+verified, unless the HEAD of the `.log` already showed a finding, which counts.
+After a timeout, a 5xx answer or throttling, the next job asks for the segment
+again, until 3 jobs in a row got no answer for it. The pass then goes on with
+the next segments, and asks for it once more after the last of them. After any
+other error, or when that last ask fails too, the next pass checks the
+segment. A pass that left segments without an answer still ends and counts as
+a pass. When the node fails the store identity check, the jobs in flight count
+for nothing, and once it passes again each partition starts a new pass.
+
+Each shard exports `partition_segment_verify_passes_total`,
+`partition_stored_segments_verified_total`,
+`partition_segment_verify_unanswered_total`, the jobs that got no answer for a
+HEAD, and the gauges `partition_stored_segments_missing` and
+`partition_stored_segments_diverged` over the partitions it leads, which drop
+to 0 when it stops leading them. No provider computes a CRC32C again on a
+HEAD, so the check compares what the store recorded when it took the object,
+not the bytes it holds now: a byte that flips inside an object file of the
+`fs` backend is not found.
+
+On an S3 general purpose bucket, the server needs `s3:ListBucket` on the
+bucket besides `s3:GetObject` for a HEAD of a missing object to answer 404.
+Without it S3 answers 403, which the check takes for an error, not for a
+missing object, so it finds no missing segment.
+
+Each run of the message cleaner starts the next job of each partition's pass,
+from the same request that starts its object deletes. A node with
+`cleaner_enabled = false` in `[data_maintenance.messages]` checks no segment,
+and its `partition_stored_segments_missing` and
+`partition_stored_segments_diverged` stay at 0 whatever the store lost.
+
+A committed delete of a partition, or of the topic or stream that holds it,
+queues the delete of the partition's objects in the memory of the metadata
+primary. A restart, a change of the metadata primary, a full queue, or a change
+feed that overflowed each leave those objects in the store, and nothing else
+deletes them. So shard 0 of the caught-up metadata primary sweeps
+the root of the store, while its node passes the store identity check
+described below:
+
+- It reads the revision that committed metadata reached and the partition
+  incarnations it holds, then the store identity object, then lists every key
+  under the prefix, in housekeeping jobs of at most 16 pages of 1,000 keys.
+- It sorts the keys by partition incarnation: stream, topic, partition and
+  the revision the partition was created at. An incarnation is an orphan when
+  committed metadata holds no partition of it and its revision is not above
+  the one the sweep read before the listing.
+- It deletes an orphan only once full sweeps in a row of the same primary
+  process found the same objects of it, by their number and the time the
+  store gives the newest, for `[tiered_storage] orphan_grace`, 6 hours by
+  default. The grace runs on the monotonic clock of the primary, from the
+  start of the second of those sweeps, so neither a clock of the primary that
+  is ahead of the store's nor a step of its wall clock shortens it, and a new
+  object of the orphan starts it again.
+- The delete goes through the same queue as a committed delete, in turns
+  that each list at most 4 pages of the incarnation and give the delete slot
+  back between them. Orphans take at most a quarter of the queue, so the rest
+  stays free for committed deletes. Every turn checks committed metadata and
+  the view of the primary, and reads the claim of the store identity object
+  again: a turn whose claim names another cluster, sits in another object, or
+  was committed at another moment deletes nothing. The first turns list the
+  whole incarnation and delete nothing. The turns after them list it again
+  and delete what each of them listed, in this order within the turn: every
+  `.index` it listed, then every `.log` it listed. The manifest goes after the
+  last of those turns, once its listing ended and every segment object it
+  listed is gone, so the manifest is the last object of the incarnation to go.
+  That turn deletes the manifest by its key even when the listing found none,
+  so an unlink of the filesystem backend whose directory sync failed is made
+  durable. A turn that finds a long-term segment, a geo topic object, or an
+  object newer than the sweeps found or no newer than the claim ends the
+  delete.
+- The primary sweeps every hour, or every `orphan_grace` when that is shorter.
+  `orphan_grace = "disabled"` turns the sweep off. A sweep that does not list
+  the whole root, a store identity object that names another cluster, and a
+  change of the metadata primary or of its view each drop what the sweeps
+  found, so the count starts again with the next sweeps.
+
+The sweep never deletes:
+
+- A partition incarnation that committed metadata holds, or one created after
+  the sweep read the revision of metadata.
+- The data of geo topics: an incarnation with a long-term segment, or whose
+  topic incarnation has a geo topic object, live or a tombstone, and any fresh
+  object. The sweep of geo topics owns those.
+- Anything under `<prefix>/meta/`, except the manifest of an incarnation it
+  deletes, which goes last.
+- The data of another cluster. The sweep runs only while the node passes the
+  store identity check, and stops when the identity object it reads names
+  another cluster.
+- An incarnation with an object that is no newer than this cluster's claim of
+  the prefix, the time the store gives the identity object, compared in whole
+  seconds, as what a retired cluster left before a recovery. An object from
+  the second of the claim counts as older than it, as a store can give a
+  listing a finer time than a HEAD. A repair or a recovery that puts the
+  identity object again moves the claim later, so objects that this cluster
+  wrote before then count as older than the claim as well. The node logs such
+  incarnations as a warning and leaves them to an operator.
+- A key that is not the key of a segment object or a manifest.
+
+Each shard exports `orphan_sweeps_total`, the sweeps that listed the whole
+root, the gauge `orphan_incarnations`, the orphans the last sweep found,
+`orphan_incarnations_deleted_total`, the gauge `orphan_objects_before_claim`,
+the objects no newer than the claim of the incarnations the last sweep left to
+an operator, and `orphan_identity_skips_total`, the sweeps and deletes that
+stopped at a store identity object other than the one they expected. Only
+shard 0 of the metadata primary moves them. A sweep costs a HEAD and a read of
+the identity object and one listing request per 1,000 keys under the prefix,
+fresh objects and the keys of other prefixes nested in it included. The delete
+of an orphan lists the incarnation twice, and costs a HEAD and a read of the
+identity object per turn, a listing of the key of its geo topic object per
+turn that deletes and at the end of the first listing, a listing of the key
+of its manifest at the end of each listing, and the deletes. It lists those
+keys rather than asking for a HEAD, as a policy scoped to a prefix can refuse
+the HEAD of an absent key.
+
+Restoring metadata while tiered storage is in use is not supported. If
+metadata is rolled back or restored under the same cluster id, the
+incarnations of the history that was lost become orphans once the revision of
+metadata passes theirs, and the sweep deletes them.
 
 The `fs` backend keeps the objects in a directory. The `s3` backend keeps them
 in a bucket on AWS S3 or on a store with its API, such as Ceph RGW or R2. With
@@ -539,7 +784,9 @@ The `gcs` backend keeps the objects in a Google Cloud Storage bucket, which
 S3 interoperability endpoint: GCS takes a create-only put as its own
 `ifGenerationMatch=0` precondition, and the server relies on create-only puts.
 An empty `endpoint` is Google Cloud Storage. An emulator, such as
-fake-gcs-server, takes its own URL and `auth = "none"`. GCS takes one write
+fake-gcs-server, takes its own URL and `auth = "none"`. On any endpoint but an
+`https` one of Google, every object goes up whole, because an emulator
+composes over an object whatever a create-only condition says. GCS takes one write
 per second to one object name, so on `gcs` set `[geo]
 consumer_offset_upload_interval` to `1 s` or more, or to `disabled`.
 
@@ -547,6 +794,114 @@ The `mock_s3` backend keeps the objects in the memory of the server, where
 every shard reads them, and answers each call after the latencies of
 `[tiered_storage.mock_s3]`. The server loses them all when it stops, so it is
 for benchmarks and tests only.
+
+Each shard bounds and retries the calls it sends to the store. A head, a
+read, a listing or a delete that gets no answer within `request_timeout`, or
+fails with a 5xx answer, throttling or a connection that broke or never
+opened, is sent again after `retry_delay`, doubled up to `max_retry_delay`, up
+to `max_attempts` in all. A create-only put whose body the node holds in
+memory, a fresh object or a long-term segment, is sent again the same way,
+and each of its requests counts, a second attempt too. The shard does not
+upload a fresh object again after these attempts. An
+overwrite, such as a manifest, a positions object or a topic object, is sent
+again only when its request never left the node, for example when the
+connection was refused or the name lookup or TLS handshake failed. An attempt
+that may have reached the store can land after a later overwrite of the same
+key and roll it back, so any other failure of an overwrite goes to the caller.
+Every attempt of one put carries the same `put-id` entry in the object's user
+metadata. An attempt at a create-only put,
+a fresh object or a long-term segment, is given up when the store takes no
+64 KiB piece of its body for `put_attempt_stall_timeout`, 1 second by default,
+or gives no answer for `put_attempt_answer_timeout`, 5 seconds by default,
+after the last piece. A create that lands late finds the object and stores
+nothing. An attempt at an overwrite, such as a manifest or a positions object,
+waits `progress_timeout` in both cases instead, because one cut early could
+land after a later put of other bytes. When the store refuses a create-only
+put after an attempt that may have reached it, the shard reads the object's
+metadata, and the put counts as stored when the object carries the put's id,
+its size and its CRC32C. A store that keeps no CRC32C has the bytes read back
+for it. Otherwise the refusal
+goes to the caller, which runs its own check. A put that streams a sealed
+segment from its file is sent once, and fails when the store takes no piece of
+it, or gives no answer after the last piece, for `progress_timeout`. On the
+`fs` backend, where a slow put means a busy volume of the node, every attempt
+waits `progress_timeout` in both cases and gets no second attempt.
+
+A create-only put whose body the node holds in memory, such as the upload of a
+fresh object that producers wait for, gets a second attempt on another
+connection once it has run for `second_attempt_after` plus
+`second_attempt_after_per_mib` for each MiB of its body, 300 ms plus 60 ms by
+default. The first attempt to store the object wins, and the other is dropped,
+which cancels its request. A store that took the dropped attempt whole
+refuses it, because the object is there by then. At most
+`jobs.second_attempts` run at once on a shard, and they take no slot of
+`jobs.fresh_uploads`. `second_attempt_after = "disabled"` turns them off. An
+overwrite never gets a second attempt, because a dropped attempt could land
+after a later put of other bytes. Each shard exports
+`object_store_put_retries_total`, `object_store_put_second_attempts_total`,
+`object_store_put_second_attempt_wins_total` and
+`object_store_put_own_objects_found_total`.
+
+A long-term segment of at least twice `part_size`, 8 MiB by default, goes up in
+parts on the `s3` and `gcs` backends. Every other put goes whole, such as a
+fresh object that producers wait for. Up to `jobs.parts_in_flight` parts go
+side by side over all the uploads of a shard, and an upload with no part in
+flight always sends one, and a part that waits takes the first slot that comes
+free. Each part is sent again after a failure as a put is, with the same
+bytes, so no part needs a check. A part gets no second attempt beside its
+first, because the one that loses could land after the object exists. Then
+one request creates the object whole and create-only, with the user metadata
+and the CRC32C of the whole object, which the store checks. On `s3` the
+upload is a multipart upload with a full object CRC32C, and the completion
+carries `If-None-Match: *`. A completion that S3 refuses for a conditional
+conflict starts a new upload with every part. On `gcs` each part is a
+temporary object under `<prefix>/meta/uploads/<put-id>/`, created only where
+none is, so an attempt that lands late replaces nothing. GCS ignores a CRC32C
+in a compose, so a compose joins the parts into a temporary composite first,
+the node compares the CRC32C that it reports, and only then does a compose
+with `ifGenerationMatch=0` create the object from it. After the object has its
+answer, the node deletes every version of the temporary objects within
+`request_timeout`. Only an `https` endpoint of Google takes uploads in parts.
+GCS composes at most 32 parts, so a
+part takes at least a 32nd of its object there. On GCS, a bucket with soft
+delete on keeps deleted objects billable for its retention, 7 days by default,
+so each long-term segment stored in parts is billed about twice for that time.
+Turning soft delete off on the bucket, or `part_size = "0"`, avoids it. The
+completion is sent again after a failure, and the object under the key settles
+a completion that may have reached the store, as for a put. An upload that ends
+without its object is aborted, and one that runs past half of
+`abandoned_upload_grace` gives up.
+A store that refuses multipart uploads or the full object checksum as not
+implemented, at the begin or at the completion, makes the node put every object
+whole from then on, and the node
+logs that once. Each shard exports `object_store_parts_uploads_total`,
+`object_store_parts_uploads_completed_total`,
+`object_store_parts_uploads_aborted_total`, `object_store_parts_fallbacks_total`
+and `object_store_parts_sent_total`.
+
+A crash or a cancelled put can leave an upload in parts behind: the parts of an
+S3 multipart upload, which S3 keeps and charges for until it is aborted, or the
+temporary objects of a GCS upload. Shard 0 of the caught-up metadata primary
+removes the ones that began more than `abandoned_upload_grace` ago, 1 hour by
+default, every hour or every grace when that is shorter. It sweeps only while
+its node passes the store identity check, and only once the identity object it
+reads names this cluster. On `s3` it lists the multipart uploads under the
+prefix and aborts the old ones whose keys this cluster builds, and on `gcs` it
+deletes every old version of the temporary objects, by the store's clock. Each
+request of the sweep waits at most `request_timeout`, and one that gets no
+answer leaves its upload for the next sweep, which goes on from where the last
+one stopped. The grace protects a live upload on another
+shard or node: an upload gives up at half the grace, and the other half covers
+the skew between the clocks. `abandoned_upload_grace = "disabled"` turns the
+sweep off, and an upload in parts then has no deadline. The grace is at least
+30 minutes, so its second half takes the 15 minutes of skew that S3 accepts.
+On `s3` the sweep, and the abort of an upload in parts that fails, need
+`s3:ListBucketMultipartUploads` on the bucket (`arn:aws:s3:::<bucket>`) and
+`s3:AbortMultipartUpload` on its objects (`arn:aws:s3:::<bucket>/*`), besides
+`s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` and `s3:ListBucket`.
+Without them the sweep removes nothing and logs why, and S3 keeps charging for
+the parts of every abandoned upload. A bucket lifecycle rule that aborts
+incomplete multipart uploads is the alternative.
 
 The `s3` backend signs each request with the first credentials that the node
 has, in the order of the AWS SDKs:
@@ -722,9 +1077,34 @@ another peer.
 When the node starts, shard 0 reads each peer's store identity object,
 `<prefix>/meta/identity`. After that it reads the object every minute. While the node
 reads nothing from the peer, or the peer's store does not answer, it reads the
-object every 5 seconds. The node remembers the first cluster that the object
-names. It keeps that cluster in memory only, so after a restart it reads the
-object again.
+object every 5 seconds.
+
+Each check compares the cluster that the object names with the clusters that
+committed metadata recorded for the peer: the ones its shadow streams came
+from, and for a retired peer the ones its retirement kept. The node reads the
+peer when the object names one of them. While metadata holds no shadow stream
+of the peer, the node takes the first cluster that the object names. When the
+object names another cluster, the node follows the recovery records under the
+peer's root, `<prefix>/meta/recovery/<cluster_uid>/record`, from a recorded
+cluster. A cluster that a recovery rebuilt from the store of a recorded one
+writes such a record, so the node reads the peer as that successor. The node
+reads a record only in this case, and once for each cluster that it finds.
+A check reads a few records at most, and the next check, 5 seconds later,
+goes on where it stopped, until the records end or lead back to a cluster
+that it read. Until the records prove the cluster, also while the store does
+not answer the read of a record, the node reads nothing from the peer. The
+node keeps what it found in memory only, so after a restart it judges the
+object again against what metadata recorded.
+
+When metadata changes the clusters that it records for the peer, and the
+cluster that the node reads is neither one of them nor a successor that the
+records proved, the node stops reading the peer and checks it at once.
+
+A pass that commits what it read of a peer, the manifests of its partitions or
+the positions of its groups, reads the identity object before its other reads
+and after them. It commits what it read only when both reads name the cluster
+that the node reads the peer as. Otherwise it commits nothing, and asks shard
+0 to check the peer within a second, so the polls of the peer stop too.
 
 Only a configuration that can never work stops the boot, for example a prefix
 that is not a usable key prefix. A peer whose store does not answer never stops
@@ -735,7 +1115,7 @@ Each shard exports two gauges for its node per peer, labelled with the peer's
 
 - `geo_peer_identity_verified` is 1 while the node reads the peer. It is 0
   until a check reads the peer's identity object, and while the object is
-  missing, refused or changed.
+  missing, refused, changed or names a cluster that metadata did not record.
 - `geo_peer_unreachable` is 1 while the peer's store does not answer the check.
   A node that verified the peer keeps reading what the store returns.
 
@@ -752,7 +1132,18 @@ restarts. This happens when:
   object back, as the tiered storage section describes.
 
 Before you restart the node, find out which cluster owns the peer's prefix now.
-After the restart, the node remembers the cluster that it finds then.
+After the restart, the node reads the peer only if the cluster that it finds
+then is one that its shadow streams of the peer came from, or a successor that
+recovery records prove.
+
+A node logs that the root of a geo peer is claimed by a cluster that its
+shadow streams did not come from when a check finds such a cluster and no
+recovery record leads to it. It names the recorded clusters and the one it
+found, and reads nothing from the peer. This happens when the peer's entry
+points at the store of another cluster, or when the peer's metadata was
+rebuilt without a recovery. Correct the entry, or retire the origin when the
+cluster that the shadow streams follow is gone. The next check after metadata
+changes what it records of the peer judges the object again.
 
 A node also reads nothing from a peer whose identity object names this cluster.
 Then the peer's store and prefix are this cluster's own.
@@ -766,11 +1157,13 @@ these objects to find the geo topics of this cluster. One listing of
 `<prefix>/meta/topics/` finds all of them. An object holds the origin, the
 `cluster_uid`, the stream and topic names and ids, and the partition count. It
 also holds the compression algorithm, the largest message size, the retention
-limits and the geo mode.
+limits, the geo mode, and the `read_cache_size` and `read_ahead` that the topic
+sets.
 
 The caught-up metadata primary stores the object of a new geo topic within
 about a second of its creation. When the content of the object changes, for
-example after a stream rename, it stores the object again. The primary of each
+example after a stream rename or an update of the topic's read cache settings,
+it stores the object again. The primary of each
 partition of a geo topic reads the object before it takes messages, and again
 after each change of primary. Until then, the partition refuses messages with
 `TransientNotAccepted`, which the SDKs retry. A store that does not answer
@@ -810,6 +1203,12 @@ cluster, one operation at a time, so every node holds the same shadow streams:
 - An object that the peer's store no longer lists for 2 minutes removes its
   shadow topic.
 - A shadow stream without topics and without live objects is removed.
+- A shadow topic takes the `read_cache_size` and `read_ahead` that its live
+  object sets, at its adoption and after each change, and a key that the
+  object does not set is unset on the shadow topic too. The values stay as the
+  peer set them: each node bounds them to its own cache as it does for any
+  topic. While the peer's store does not answer, and after its origin retired,
+  a shadow topic keeps the last values it took.
 
 A read of a shadow stream, alone or in a listing, reports the read-only key
 `shadow_origin` with the peer's origin, and no other stream carries it. Every
@@ -840,13 +1239,19 @@ shadow topics on the metadata primary.
 
 If the identity object of a peer names another cluster than the one that the
 shadow streams came from, the server logs it. It leaves those shadow streams
-as they are.
+as they are, unless the node reads the peer as the successor that recovery
+records prove of the only cluster that metadata records of the peer. Then the
+shadow streams follow the successor's topic objects, and a stream of the
+successor without a shadow stream gets none.
 
 An operator retires a peer whose datacenter never returns with
 `iggy geo retire <origin>`, or `POST /geo/origins/{origin}/retire`, which needs
 root or the global `manage_servers` permission. The retirement commits through
 the metadata of this cluster and cannot be undone. From then on, the nodes send
-the peer's store only the reads of polls. Each shadow partition of the peer
+the peer's store only the reads of polls, and after each start one read of its
+identity object, which the polls wait for. A node serves no poll of a retired
+peer whose identity object names a cluster that the retirement did not record,
+unless a recovery record leads to it. Each shadow partition of the peer
 drops the segments that the retention of its topic in the peer removes, and the
 primary removes each shadow topic once that `message_expiry` passed since the
 retirement, then each empty shadow stream. A client may delete the shadow
@@ -1015,7 +1420,7 @@ A topic's `topic_type` is `normal` or `geo`. A topic without it is stored as `no
 
 Only a geo topic has a `geo_mode`: `geo` or `geo_tiered`. A geo topic without one is stored with `geo`. Clients cannot pick `geo_tiered` yet, and the server refuses it with `FeatureUnavailable` (5). The server refuses a normal topic that sets a mode with `InvalidOptionValue` (4042).
 
-A geo topic keeps its name, its partition count and its options, all but its durations. The server stores `partition_resize_policy` as `fixed` on it, so adding or deleting its partitions returns `PartitionResizeDisabled` (2023). An update of its name or of any other option returns `OptionNotUpdatable` (4103).
+A geo topic keeps its name, its partition count and its options, all but its durations and its `read_cache_size` and `read_ahead`. The server stores `partition_resize_policy` as `fixed` on it, so adding or deleting its partitions returns `PartitionResizeDisabled` (2023). An update of its name or of any other option returns `OptionNotUpdatable` (4103).
 
 A geo topic can set six durations, each of which overrides the server setting of the same name for this topic: `fresh_upload_interval`, `consumer_offset_upload_interval`, `positions_publish_interval`, `tombstone_grace`, `positions_resume_timeout` and `long_term_rewrite_max_interval`.
 Unset, each node applies its own setting. An update can change them, and a reset of one returns `OptionNotResettable` (4104). A normal topic that sets one returns `InvalidOptionValue` (4042). See [durations of a geo topic](docs/GEO_TOPICS.md#durations-of-a-geo-topic).
@@ -1024,7 +1429,11 @@ A create that sets `tiered_storage` to `true`, or a `partition_resize_policy` ot
 
 Both keys are critical. A node on a build without them refuses a topic that sets them, and does not serve it as a normal topic.
 
-The updatable keys are `name` for streams and topics, `username` and `status` for users, and a topic's `message_expiry` and `max_topic_size`. The durations of a geo topic are updatable too. Only those two topic keys can be reset to their default, any other reset is refused with `OptionNotResettable` (4104). Read-only keys, such as the stream key projections below, are refused with `ReadOnlyOption` (4105).
+Any topic can set `read_cache_size` and `read_ahead`, each of which overrides the `[tiered_storage]` setting of the same name for this topic, see [tiered storage](#tiered-storage). `0` is a value that turns the setting off for the topic. Unset, each node applies its own setting.
+An update can change them, and a reset of one returns `OptionNotResettable` (4104). A create or an update that leaves the topic with both set refuses a `read_ahead` above an eighth of a `read_cache_size` other than `0` with `InvalidOptionValue` (4042).
+
+The updatable keys are `name` for streams and topics, `username` and `status` for users, and a topic's `message_expiry`, `max_topic_size`, `local_retention_age`, `local_retention_size`, `read_cache_size` and `read_ahead`. An update can turn a topic's `tiered_storage` on, never off. The durations of a geo topic are updatable too.
+Only `message_expiry`, `max_topic_size`, `local_retention_age` and `local_retention_size` can be reset to their default, any other reset is refused with `OptionNotResettable` (4104). Read-only keys, such as the stream key projections below, are refused with `ReadOnlyOption` (4105).
 
 Only root may rename the root user or change its status. Root cannot deactivate itself. These requests return `CannotModifyRootUser` (4108), and a rejected update leaves root active with its existing username.
 
@@ -1118,11 +1527,11 @@ A peer on another release is admitted only when the release compatibility table 
 
 A node with a row sends the identities of its listed releases in its ReplicaHello and runs the link under the identity of the listed release, so the other node needs no knowledge of the first one.
 
-This checkout accepts client protocol 0.12.3 at login. Replica wire revision 5 is checked separately when servers connect.
+This checkout accepts client protocol 0.12.3 at login. Replica wire revision 6 is checked separately when servers connect.
 
 REST has no version handshake, so a 0.11 HTTP client is not refused at login. A create body that sends an option beside `options`, such as a top-level `message_expiry`, and an update body with a nested member, such as the `{"name": ..., "options": {}}` stream update older SDKs send, are refused with `InvalidCommand` (3), and the error's `field` names the member.
 
-Metadata snapshot format 21 is the only readable format. Registration, password changes and client-table receipts use the new replicated layouts. Upgrades from an incompatible storage or snapshot format require fresh storage on every replica. A revision 4 cluster already on the current storage marker and snapshot format can reuse its directories in a coordinated restart to revision 5.
+Metadata snapshot format 21 is the only readable format. Registration, password changes and client-table receipts use the new replicated layouts. Upgrades from an incompatible storage or snapshot format require fresh storage on every replica. A revision 4 or 5 cluster already on the current storage marker and snapshot format can reuse its directories in a coordinated restart to revision 6.
 
 The protocol number is independent of server and SDK package versions. Its
 current and minimum values are maintained manually for stable releases. The

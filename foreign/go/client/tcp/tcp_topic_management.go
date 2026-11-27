@@ -102,6 +102,8 @@ func (c *IggyTcpClient) UpdateTopic(
 		TombstoneGrace:               update.TombstoneGrace,
 		PositionsResumeTimeout:       update.PositionsResumeTimeout,
 		LongTermRewriteMaxInterval:   update.LongTermRewriteMaxInterval,
+		ReadCacheSize:                update.ReadCacheSize,
+		ReadAhead:                    update.ReadAhead,
 		Reset:                        update.Reset,
 		RawReset:                     update.RawReset,
 		Options:                      update.Options,

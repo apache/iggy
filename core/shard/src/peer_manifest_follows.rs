@@ -21,11 +21,15 @@
 //! Shard 0 lists the manifests of each peer stream that a shadow stream
 //! serves, see [`LifecycleFrame::PeerManifestsListed`], and hands each
 //! shard the manifests of the shadow partitions it owns, with their etags.
-//! For each one whose primary this replica is and whose etag the partition
-//! has not committed, the shard reads the manifest from the peer's store in
-//! a detached task. The pump checks the manifest against the peer log and
-//! commits it through the partition-submit path, as one or more commands of
-//! `partitions::peer_manifests`.
+//! For the ones whose primary this replica is and whose etag the partition
+//! has not committed, the shard reads the manifests from the peer's store in
+//! detached tasks of at most [`MANIFESTS_PER_PASS`] each, every one between
+//! two reads of the peer's identity object of its own. The pump checks each
+//! manifest against the peer log and commits it through the
+//! partition-submit path, as one or more commands of
+//! `partitions::peer_manifests`, only when both identity reads of its task
+//! named the cluster that the node reads the peer as, see
+//! [`IdentityBracket`].
 //!
 //! What a shard knows of etags lives in memory and only on the primary. A
 //! new primary reads every manifest once, and one that the partition already
@@ -41,6 +45,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use consensus::PartitionsHandle;
+use futures::future::join_all;
 use iggy_binary_protocol::PrepareHeader;
 use iggy_common::{IggyExpiry, IggyTimestamp};
 use iggy_object_store::PartitionManifest;
@@ -51,8 +56,14 @@ use partitions::RemoteObjects;
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
 
+use crate::peers::{IdentityBracket, SharedPeerStatus, read_identity};
 use crate::shards_table::ShardsTable;
 use crate::{IggyShard, LifecycleFrame, RestorableMetadataStm, ShardFrame, channel};
+
+/// The most manifests that one task reads between its two reads of the
+/// peer's identity object. A slow read holds back the manifests of its own
+/// task alone.
+pub const MANIFESTS_PER_PASS: usize = 16;
 
 /// One manifest a listing of a peer stream found, for the shadow partition
 /// it describes.
@@ -75,15 +86,26 @@ pub struct FinishedPeerManifestRead {
     pub etag: String,
     /// The manifest, or why it was not read.
     pub outcome: Result<PartitionManifest, String>,
+    /// What the reads of the peer's identity object around the task found.
+    pub identity: IdentityBracket,
+}
+
+/// Where a shard reads the manifests of one peer.
+#[derive(Clone)]
+pub struct PeerManifestSource {
+    /// See [`crate::peers::PeerStore::manifest_objects`].
+    pub objects: Rc<dyn RemoteObjects>,
+    /// The key of the peer's store identity object.
+    pub identity_key: String,
+    pub status: SharedPeerStatus,
 }
 
 /// What this shard knows of the manifests of the shadow partitions whose
 /// primary it is.
 #[derive(Default)]
 pub struct PeerManifestFollows {
-    /// Where the manifests of each peer are read, by origin. See
-    /// [`crate::PeerStore::manifest_objects`].
-    objects: RefCell<Vec<(String, Rc<dyn RemoteObjects>)>>,
+    /// Where the manifests of each peer are read, by origin.
+    objects: RefCell<Vec<(String, PeerManifestSource)>>,
     follows: RefCell<HashMap<IggyNamespace, Follow>>,
     /// Results of reads whose frame the inbox refused. The partition counts
     /// such a read as in flight until it sees the result, so the next listing
@@ -117,7 +139,7 @@ where
     SB: SuperblockStore,
 {
     /// Give this shard where it reads the manifests of each peer, by origin.
-    pub(crate) fn set_peer_manifest_objects(&self, objects: Vec<(String, Rc<dyn RemoteObjects>)>) {
+    pub(crate) fn set_peer_manifest_objects(&self, objects: Vec<(String, PeerManifestSource)>) {
         *self.peer_manifest_follows.objects.borrow_mut() = objects;
     }
 
@@ -162,14 +184,7 @@ where
         if self.senders.get(self.id as usize).is_none() {
             return;
         }
-        let Some(objects) = self
-            .peer_manifest_follows
-            .objects
-            .borrow()
-            .iter()
-            .find(|(peer, _)| peer == origin)
-            .map(|(_, objects)| Rc::clone(objects))
-        else {
+        let Some(source) = self.peer_manifest_source(origin) else {
             return;
         };
         let listed: HashMap<IggyNamespace, ListedPeerManifest> = manifests
@@ -178,6 +193,7 @@ where
             .collect();
         let partitions = self.plane.partitions();
         let mut follows = self.peer_manifest_follows.follows.borrow_mut();
+        let mut reads = Vec::new();
         // A partition that left the listing, or whose primary moved away,
         // starts afresh when it comes back.
         follows.retain(|namespace, follow| {
@@ -231,7 +247,10 @@ where
             }
             follow.reading = true;
             self.metrics.record_peer_manifest_read(origin);
-            self.spawn_peer_manifest_read(Rc::clone(&objects), origin.to_owned(), manifest);
+            reads.push(manifest);
+        }
+        if !reads.is_empty() {
+            self.spawn_peer_manifest_reads(&source, origin, reads);
         }
         let (behind, lag) = follows
             .values()
@@ -243,45 +262,51 @@ where
         self.metrics.set_shadow_manifest_lag(origin, behind, lag);
     }
 
-    /// Read `manifest` from the peer's store in a detached task, which sends
-    /// the result back to this shard's pump.
-    fn spawn_peer_manifest_read(
+    /// Where this shard reads the manifests of the peer `origin`.
+    fn peer_manifest_source(&self, origin: &str) -> Option<PeerManifestSource> {
+        self.peer_manifest_follows
+            .objects
+            .borrow()
+            .iter()
+            .find(|(peer, _)| peer == origin)
+            .map(|(_, source)| source.clone())
+    }
+
+    /// Read `manifests` from the peer's store in the detached tasks of
+    /// [`peer_manifest_passes`], and send the results of each task back to
+    /// this shard's pump once that task ends.
+    fn spawn_peer_manifest_reads(
         &self,
-        objects: Rc<dyn RemoteObjects>,
-        origin: String,
-        manifest: ListedPeerManifest,
+        source: &PeerManifestSource,
+        origin: &str,
+        manifests: Vec<ListedPeerManifest>,
     ) {
-        let Some(sender) = self.senders.get(self.id as usize).cloned() else {
+        let Some(sender) = self.senders.get(self.id as usize) else {
             return;
         };
-        let undelivered = Rc::clone(&self.peer_manifest_follows.undelivered);
-        // Through the bus, not the runtime directly: the simulator supplies
-        // its own executor.
-        self.bus.spawn(async move {
-            let outcome = match objects.get_range(&manifest.key, 0..u64::MAX).await {
-                Ok(object) => {
-                    PartitionManifest::decode(&object.bytes).map_err(|error| error.to_string())
+        for pass in peer_manifest_passes(source, origin, manifests) {
+            let sender = sender.clone();
+            let undelivered = Rc::clone(&self.peer_manifest_follows.undelivered);
+            // Through the bus, not the runtime directly: the simulator
+            // supplies its own executor.
+            self.bus.spawn(async move {
+                for finished in pass.await {
+                    let frame =
+                        ShardFrame::lifecycle(LifecycleFrame::PeerManifestRead(Box::new(finished)));
+                    // The partition starts no other read until it sees this
+                    // result, so a refused frame must not lose it.
+                    if let Err(
+                        crossfire::TrySendError::Full(frame)
+                        | crossfire::TrySendError::Disconnected(frame),
+                    ) = sender.try_send(frame)
+                        && let ShardFrame::Lifecycle(LifecycleFrame::PeerManifestRead(finished)) =
+                            frame
+                    {
+                        undelivered.borrow_mut().push(*finished);
+                    }
                 }
-                Err(error) => Err(error.to_string()),
-            };
-            let finished = FinishedPeerManifestRead {
-                namespace: manifest.namespace,
-                created_revision: manifest.created_revision,
-                origin,
-                etag: manifest.etag,
-                outcome,
-            };
-            let frame = ShardFrame::lifecycle(LifecycleFrame::PeerManifestRead(Box::new(finished)));
-            // The partition starts no other read until it sees this
-            // result, so a refused frame must not lose it.
-            if let Err(
-                crossfire::TrySendError::Full(frame) | crossfire::TrySendError::Disconnected(frame),
-            ) = sender.try_send(frame)
-                && let ShardFrame::Lifecycle(LifecycleFrame::PeerManifestRead(finished)) = frame
-            {
-                undelivered.borrow_mut().push(*finished);
-            }
-        });
+            });
+        }
     }
 
     /// Commit a manifest that a read brought back, when the partition is
@@ -318,6 +343,24 @@ where
                     return;
                 }
             };
+            // Checked on the pump, so a status that shard 0 moved while the
+            // task ran counts too.
+            if !self
+                .peer_manifest_source(&finished.origin)
+                .is_some_and(|source| source.status.adopts(finished.identity))
+            {
+                self.metrics
+                    .record_peer_manifest_read_failure(&finished.origin);
+                tracing::debug!(
+                    shard = self.id,
+                    namespace_raw = finished.namespace.inner(),
+                    origin = finished.origin,
+                    identity = ?finished.identity,
+                    "the identity object of the geo peer did not name the cluster this node reads \
+                     before and after the manifest read; the next listing reads it again"
+                );
+                return;
+            }
             let Some(partition) = self
                 .plane
                 .partitions()
@@ -455,4 +498,62 @@ where
                 .await;
         }
     }
+}
+
+/// One pass for each [`MANIFESTS_PER_PASS`] of `manifests`. Each reads its
+/// manifests between two reads of the peer's identity object of its own,
+/// and ends with what it read. A pass whose first identity read fails reads
+/// no manifest, and ends with that error for each of them.
+pub fn peer_manifest_passes(
+    source: &PeerManifestSource,
+    origin: &str,
+    manifests: Vec<ListedPeerManifest>,
+) -> Vec<impl Future<Output = Vec<FinishedPeerManifestRead>> + use<>> {
+    let mut passes = Vec::with_capacity(manifests.len().div_ceil(MANIFESTS_PER_PASS));
+    let mut manifests = manifests.into_iter().peekable();
+    while manifests.peek().is_some() {
+        let pass = manifests.by_ref().take(MANIFESTS_PER_PASS).collect();
+        passes.push(read_peer_manifests(source.clone(), origin.to_owned(), pass));
+    }
+    passes
+}
+
+#[allow(clippy::future_not_send)]
+async fn read_peer_manifests(
+    source: PeerManifestSource,
+    origin: String,
+    manifests: Vec<ListedPeerManifest>,
+) -> Vec<FinishedPeerManifestRead> {
+    let objects = &*source.objects;
+    let before = read_identity(objects, &source.identity_key).await;
+    let (outcomes, identity) = if let Err(error) = &before {
+        let error = format!("reading the identity object of the geo peer failed: {error}");
+        let outcomes: Vec<Result<PartitionManifest, String>> =
+            manifests.iter().map(|_| Err(error.clone())).collect();
+        (outcomes, IdentityBracket::Unread)
+    } else {
+        let outcomes = join_all(manifests.iter().map(|manifest| async move {
+            match objects.get_range(&manifest.key, 0..u64::MAX).await {
+                Ok(object) => {
+                    PartitionManifest::decode(&object.bytes).map_err(|error| error.to_string())
+                }
+                Err(error) => Err(error.to_string()),
+            }
+        }))
+        .await;
+        let after = read_identity(objects, &source.identity_key).await;
+        (outcomes, IdentityBracket::of(&before, &after))
+    };
+    manifests
+        .into_iter()
+        .zip(outcomes)
+        .map(|(manifest, outcome)| FinishedPeerManifestRead {
+            namespace: manifest.namespace,
+            created_revision: manifest.created_revision,
+            origin: origin.clone(),
+            etag: manifest.etag,
+            outcome,
+            identity,
+        })
+        .collect()
 }

@@ -1683,6 +1683,7 @@ async fn assert_topic_recovered(
         geo_mode: seed.geo_mode.and(recovered.geo_mode),
         // No default is derived for them, so they read back as sent.
         geo_durations: recovered.geo_durations,
+        read_cache: recovered.read_cache,
         raw: BTreeMap::new(),
     };
     assert_eq!(
