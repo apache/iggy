@@ -51,7 +51,7 @@ use futures::future::LocalBoxFuture;
 use iggy_object_store::{KeyLayout, ObjectRange, ObjectStoreError, ReadOnlyStore, TierJobClass};
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
-use partitions::{ExecutorObjects, RemoteObjects, RemoteSegments};
+use partitions::{ExecutorObjects, ReadCache, ReadGate, RemoteObjects, RemoteSegments, StoreSlot};
 
 use crate::IggyShard;
 use crate::shards_table::ShardsTable;
@@ -349,10 +349,34 @@ where
     B: MessageBus + Clone + Unpin + 'static,
 {
     /// Where the partitions that follow this peer's logs read them: the
-    /// peer's tier service, under the peer's root.
+    /// peer's tier service, under the peer's root. Through `cache`, as the
+    /// store in `slot`, when the shard keeps what such reads fetch.
     #[must_use]
-    pub fn remote_segments(&self) -> RemoteSegments {
-        RemoteSegments::new(Rc::new(self.objects()), self.layout.clone())
+    pub fn remote_segments(
+        &self,
+        cache: Option<&Rc<ReadCache>>,
+        slot: StoreSlot,
+    ) -> RemoteSegments {
+        cache.filter(|cache| cache.keeps_fetched()).map_or_else(
+            || {
+                RemoteSegments::new(
+                    Rc::new(self.objects(TierJobClass::DemandFetch)),
+                    self.layout.clone(),
+                )
+            },
+            |cache| {
+                RemoteSegments::through_cache(
+                    Rc::new(self.objects(TierJobClass::DemandFetch)),
+                    Rc::new(self.objects(TierJobClass::SpeculativeFetch)),
+                    self.layout.clone(),
+                    cache,
+                    slot,
+                    Rc::new(PeerGate {
+                        status: self.status.clone(),
+                    }),
+                )
+            },
+        )
     }
 
     /// Where the primaries of this peer's shadow partitions read its
@@ -368,13 +392,34 @@ where
         })
     }
 
-    fn objects(&self) -> PeerObjects<B> {
+    /// The reads of the polls of this peer's shadow partitions, in `class`
+    /// of the peer's tier service: demand fetches for what a poll waits
+    /// for, speculative fetches for readahead.
+    fn objects(&self, class: TierJobClass) -> PeerObjects<B> {
         PeerObjects {
             origin: self.origin.clone(),
-            reads: ExecutorObjects::new(self.service.clone()),
+            reads: ExecutorObjects::with_class(self.service.clone(), class),
             status: self.status.clone(),
             polls: true,
         }
+    }
+}
+
+/// What a shard asks before it serves the polls of a peer's shadow
+/// partitions from its cache: what [`PeerObjects`] asks before each read
+/// of the peer's store.
+struct PeerGate {
+    status: SharedPeerStatus,
+}
+
+impl ReadGate for PeerGate {
+    fn admit(&self) -> Option<u128> {
+        let status = self.status.get();
+        // A retired peer whose identity this process never verified serves
+        // the polls of what its shadow partitions committed, under no uid.
+        status
+            .serves_polls()
+            .then(|| status.identity.readable().unwrap_or(0))
     }
 }
 
@@ -424,10 +469,15 @@ where
     where
         B: Clone + Unpin,
     {
+        let cache = self.plane.partitions().read_cache();
         self.plane.partitions().set_peer_remote_segments(
             stores
                 .iter()
-                .map(|peer| (peer.origin().to_owned(), Rc::new(peer.remote_segments())))
+                .zip(1..=u8::MAX)
+                .map(|(peer, slot)| {
+                    let remote = peer.remote_segments(cache.as_ref(), StoreSlot(slot));
+                    (peer.origin().to_owned(), Rc::new(remote))
+                })
                 .collect(),
         );
         self.set_peer_manifest_objects(
@@ -464,6 +514,30 @@ mod tests {
     const OWN: u128 = 9;
 
     type Bus = Rc<IggyMessageBus>;
+
+    /// The cache serves the polls of a peer's shadow partitions only while
+    /// a read of its store would go out, and keeps the bytes of each
+    /// identity apart.
+    #[test]
+    fn given_each_status_of_a_peer_when_its_cache_asks_should_admit_what_its_reads_admit() {
+        let gate = PeerGate {
+            status: SharedPeerStatus::default(),
+        };
+        let set = |status: PeerStatus| gate.status.set(status);
+
+        assert_eq!(gate.admit(), None, "not verified yet");
+        set(PeerStatus::default().after(PeerRead::Found(PEER)));
+        assert_eq!(gate.admit(), Some(PEER));
+        set(gate.status.get().after(PeerRead::Unreachable));
+        assert_eq!(gate.admit(), Some(PEER), "an outage changes nothing");
+        set(gate.status.get().after(PeerRead::Found(OTHER)));
+        assert_eq!(gate.admit(), None, "another cluster owns the root now");
+        set(PeerStatus {
+            retired: true,
+            ..PeerStatus::default()
+        });
+        assert_eq!(gate.admit(), Some(0), "a retired peer serves its history");
+    }
 
     #[test]
     fn given_each_read_when_moving_the_identity_should_learn_once_and_latch_a_change() {
@@ -723,7 +797,7 @@ mod tests {
         let provider = RecordingStore::new(stored);
         let calls = provider.calls();
         let peer = peer("dc-b", provider);
-        let objects = peer.objects();
+        let objects = peer.objects(TierJobClass::DemandFetch);
 
         let unverified = objects.get_range(&key, 0..5).await;
         assert!(
@@ -813,7 +887,11 @@ mod tests {
         );
         assert_eq!(calls.all(), Vec::new());
 
-        let polled = peer.objects().get_range(&key, 0..5).await.unwrap();
+        let polled = peer
+            .objects(TierJobClass::DemandFetch)
+            .get_range(&key, 0..5)
+            .await
+            .unwrap();
         assert_eq!(polled.bytes.as_ref(), b"bytes");
         assert_eq!(calls.all().len(), 1);
     }

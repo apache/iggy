@@ -37,6 +37,9 @@ use integration::harness::{TestHarness, TestServerConfig, wait_for_consumer_grou
 use server_common::sharding::IggyNamespace;
 use tokio::time::{Instant, sleep};
 
+use super::http_client::HttpClient;
+use super::tiered_storage_fs::{METRICS_DEADLINE, settled_read_cache_counts};
+
 const STREAM: &str = "geo-stream";
 const TOPIC: &str = "geo-topic";
 const PARTITION_ID: u32 = 0;
@@ -49,6 +52,52 @@ const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// How long the bucket may take to prove the last committed batch: one
 /// object of proof rows alone after a wait and an upload.
 const PROVEN_DEADLINE: Duration = Duration::from_secs(30);
+/// How long the rewrite of a partition may take to take every message into
+/// long-term segments: its interval grows up to 10 s, and its segment then
+/// has to commit.
+const REWRITE_DEADLINE: Duration = Duration::from_secs(90);
+
+/// A consumer at the tail reads what the shard uploaded from memory, and one
+/// behind the rewrite reads the long-term segments that the rewrite handed
+/// to the cache, so neither asks the bucket.
+#[tokio::test]
+async fn given_a_geo_topic_when_consumers_read_before_and_after_its_rewrite_should_not_ask_the_bucket()
+ {
+    let store = tempfile::tempdir().expect("a directory for the object store");
+    let mut harness = server_with_fs_store(store.path());
+    harness.start().await.expect("the server boots");
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+    let http = HttpClient::login_root(&harness).await;
+    let stream = Identifier::named(STREAM).expect("stream identifier");
+    let topic = Identifier::named(TOPIC).expect("topic identifier");
+    client
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .expect("create stream");
+    create_geo_topic(&client, &stream, TOPIC, None)
+        .await
+        .expect("create the geo topic");
+    send(&client, &stream, &topic, 0..MESSAGES).await;
+
+    assert_reads_every_message(&client, &stream, &topic, MESSAGES).await;
+    let tail =
+        settled_read_cache_counts(&http, METRICS_DEADLINE, |counts| counts.block_hits > 0).await;
+    assert_eq!(tail.demand_bytes, 0, "the tail read the bucket: {tail:?}");
+    let rewritten = settled_read_cache_counts(&http, REWRITE_DEADLINE, |counts| {
+        counts.fresh_releases > 0 && counts.held_bytes == 0
+    })
+    .await;
+    assert!(rewritten.carried_bytes > 0, "{rewritten:?}");
+    assert_reads_every_message(&client, &stream, &topic, MESSAGES).await;
+    let behind =
+        settled_read_cache_counts(&http, METRICS_DEADLINE, |counts| *counts != rewritten).await;
+
+    assert!(behind.block_hits > rewritten.block_hits, "{behind:?}");
+    assert_eq!(
+        behind.demand_bytes, 0,
+        "a read behind the rewrite read the bucket: {rewritten:?}, then {behind:?}"
+    );
+}
 
 #[tokio::test]
 async fn given_a_geo_topic_when_producing_should_store_the_sends_and_read_them_back() {

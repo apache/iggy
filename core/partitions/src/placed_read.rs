@@ -47,7 +47,7 @@ use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BatchHeader};
 use iggy_binary_protocol::placement::{self, PLACED_BATCH_SIZE, PlacedBatch};
 use iggy_binary_protocol::{Command, Operation, PrepareHeader};
 use iggy_object_store::{
-    FreshObjectId, FreshProofRow, LongTermKey, ManifestSegment, ObjectPrefix, SegmentObject,
+    FreshObjectId, FreshProofRow, ManifestSegment, ObjectPrefix, SegmentKey, SegmentObject,
 };
 use server_common::iobuf::{Frozen, Owned};
 use server_common::send_messages::{decode_batch_slice, decode_prepare_batch_trusted};
@@ -57,6 +57,7 @@ use crate::RemoteSegments;
 use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::journal::MessageLookup;
 use crate::poll_plan::{DiskFault, PartitionDirResolution};
+use crate::remote_segments::RemoteRange;
 use crate::remote_segments::{FRESH_READ_BYTES_MAX, FRESH_READ_GAP_BYTES, FreshReads};
 
 const PREPARE_HEADER_SIZE: usize = size_of::<PrepareHeader>();
@@ -124,6 +125,9 @@ pub struct PlacedReadPlan {
     /// The last offset a long-term segment holds. The placed batches at or
     /// below it name fresh objects that may be gone.
     pub(crate) long_term_floor: Option<u64>,
+    /// The long-term segment after the last of [`Self::long_term`], which the
+    /// poll does not read and readahead may.
+    pub(crate) long_term_next: Option<ManifestSegment>,
 }
 
 /// What [`PlacedReadPlan::read`] returns.
@@ -311,7 +315,7 @@ impl PlacedReadPlan {
         wanted: &mut Wanted,
         batches: &mut Vec<Frozen<4096>>,
     ) -> Result<(), DiskFault> {
-        for segment in &self.long_term {
+        for (at, segment) in self.long_term.iter().enumerate() {
             if wanted.is_full() {
                 break;
             }
@@ -325,41 +329,57 @@ impl PlacedReadPlan {
             // A shard that has not connected its store yet cannot read the
             // segment now, and can once it has.
             let remote = self.remote.as_deref().ok_or(DiskFault::Retryable)?;
-            let key = |object| LongTermKey {
-                prefix: self.prefix,
-                start_offset: segment.start_offset,
-                end_offset: segment.end_offset,
-                object,
-            };
-            let index_key = key(SegmentObject::Index);
+            let log = self.long_term_log(segment);
+            let next = self
+                .long_term
+                .get(at + 1)
+                .or(self.long_term_next.as_ref())
+                .map(|next| self.long_term_log(next));
             let index = self
-                .wait(remote.read_long_term_object(&index_key, 0..LONG_TERM_INDEX_BYTES))
+                .wait(remote.read_long_term_index(&log, LONG_TERM_INDEX_BYTES))
                 .await?;
-            let log = key(SegmentObject::Log);
             let mut position = wanted.first_position(&index, segment.size);
             let mut len = LONG_TERM_READ_BYTES;
             while position < segment.size && !wanted.is_full() {
                 let end = segment.size.min(position.saturating_add(len));
+                let read = usize::try_from(end - position).map_err(|_| DiskFault::Tiered)?;
                 let chunk = self
-                    .wait(remote.read_long_term_object(&log, position..end))
+                    .wait(remote.read(&log, position, read, next.as_ref(), wanted.poll_offset()))
                     .await?;
-                if chunk.len() as u64 != end - position {
-                    return Err(DiskFault::Tiered);
-                }
-                match take_whole_batches(&chunk, wanted, batches)? {
-                    Read::Batches(bytes) => {
+                let fault = match take_whole_batches(chunk.as_slice(), wanted, batches) {
+                    Ok(Read::Batches(bytes)) => {
                         position += bytes;
                         len = LONG_TERM_READ_BYTES;
+                        continue;
                     }
                     // The batch at `position` is larger than the chunk.
-                    Read::Needs(bytes) if bytes > len && position + bytes <= segment.size => {
+                    Ok(Read::Needs(bytes)) if bytes > len && position + bytes <= segment.size => {
                         len = bytes;
+                        continue;
                     }
-                    Read::Needs(_) => return Err(DiskFault::Tiered),
-                }
+                    Ok(Read::Needs(_)) => DiskFault::Tiered,
+                    Err(fault) => fault,
+                };
+                // Bytes that are not whole batches may be in the cache, and
+                // the next poll asks the store for them again.
+                remote.forget_cached(&log, position, read);
+                return Err(fault);
             }
         }
         Ok(())
+    }
+
+    /// Where the `.log` of the long-term `segment` is.
+    const fn long_term_log(&self, segment: &ManifestSegment) -> RemoteRange {
+        RemoteRange {
+            key: SegmentKey {
+                prefix: self.prefix,
+                start_offset: segment.start_offset,
+                object: SegmentObject::Log,
+            },
+            keyed_end_offset: Some(segment.end_offset),
+            range: 0..segment.size,
+        }
     }
 
     async fn collect_from_segments(
@@ -845,6 +865,19 @@ impl Wanted {
         self.limited || self.messages >= u64::from(self.query.count())
     }
 
+    /// The offset the poll reads next, when it knows one. A consumer's next
+    /// poll can read some of the same bytes again, and its later offset
+    /// tells it apart from another poll of the same messages.
+    const fn poll_offset(&self) -> Option<u64> {
+        if self.messages > 0 {
+            return Some(self.next_offset);
+        }
+        match self.query {
+            MessageLookup::Offset { offset, .. } => Some(offset),
+            MessageLookup::Timestamp { .. } => None,
+        }
+    }
+
     /// Whether taking a batch that the read holds as `held` bytes would pass
     /// a byte limit. Never before a batch counted a message of the poll.
     const fn over_limit(&self, held: usize) -> bool {
@@ -1144,7 +1177,7 @@ async fn read_placed_records(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::RemoteObjects;
+    use crate::{ReadCache, ReadCacheSettings, RemoteObjects};
     use futures::FutureExt;
     use futures::future::LocalBoxFuture;
     use iggy_binary_protocol::placement::Placement;
@@ -1201,14 +1234,30 @@ mod tests {
     /// A plan that reads nothing from the disk and its fresh objects from
     /// `objects`.
     fn plan(objects: &Rc<Objects>) -> PlacedReadPlan {
+        plan_through(objects, 0)
+    }
+
+    /// [`plan`] through a cache of `cache_bytes`.
+    fn plan_through(objects: &Rc<Objects>, cache_bytes: usize) -> PlacedReadPlan {
         PlacedReadPlan {
             partition_dir: PartitionDirResolution::NoFiles,
             segments: Vec::new(),
             resident: Vec::new(),
-            remote: Some(Rc::new(RemoteSegments::new(
-                Rc::clone(objects) as Rc<dyn RemoteObjects>,
-                layout(),
-            ))),
+            // A cache that keeps nothing fetched, as at a read cache size of
+            // 0, still holds what the shard uploaded.
+            remote: Some(Rc::new(
+                RemoteSegments::new(Rc::clone(objects) as Rc<dyn RemoteObjects>, layout())
+                    .with_cache(
+                        Rc::clone(objects) as Rc<dyn RemoteObjects>,
+                        &ReadCache::new(ReadCacheSettings {
+                            cache_bytes,
+                            block_bytes: 256 * 1024,
+                            read_ahead: 0,
+                            read_ahead_fetches: 4,
+                            read_ahead_fetch_bytes: 32 * 1024 * 1024,
+                        }),
+                    ),
+            )),
             deadline: None,
             prefix: ObjectPrefix {
                 stream_id: 1,
@@ -1218,6 +1267,7 @@ mod tests {
             },
             long_term: Vec::new(),
             long_term_floor: None,
+            long_term_next: None,
         }
     }
 
@@ -1373,7 +1423,8 @@ mod tests {
             .iter()
             .flat_map(|(_, placed)| placed.clone())
             .collect();
-        let plan = plan(&store);
+        // A cache that keeps what polls fetch.
+        let plan = plan_through(&store, 64 * 1024 * 1024);
         let remote = plan.remote.clone().unwrap();
 
         blobs_of(&plan, &placed).await.unwrap();
@@ -1383,6 +1434,7 @@ mod tests {
             let range = placement.position..placement.position + placement.length;
             assert_eq!(remote.cached_fresh(placement.object_id, &range), None);
         }
+        assert_eq!(remote.take_read_metrics().unwrap().cached_bytes, 0);
     }
 
     #[compio::test]
@@ -1393,7 +1445,7 @@ mod tests {
         plan.remote
             .as_ref()
             .unwrap()
-            .cache_fresh_object(1, object.clone());
+            .cache_fresh_object(1, object.clone(), std::iter::empty());
 
         let taken = blobs_of(&plan, &placed).await.unwrap();
 
@@ -1409,10 +1461,11 @@ mod tests {
         let last = changed.len() - 1;
         changed[last] ^= 1;
         let plan = plan(&store);
-        plan.remote
-            .as_ref()
-            .unwrap()
-            .cache_fresh_object(1, Bytes::from(changed));
+        plan.remote.as_ref().unwrap().cache_fresh_object(
+            1,
+            Bytes::from(changed),
+            std::iter::empty(),
+        );
 
         assert_eq!(blobs_of(&plan, &placed).await, Err(DiskFault::Tiered));
     }
@@ -1426,7 +1479,10 @@ mod tests {
         let blob_len = REWRITE_YIELD_BYTES / 4 - BATCH_HEADER_SIZE;
         let (object, placed) = object_of(1, 0, 8, blob_len, 0);
         let plan = plan(&store);
-        plan.remote.as_ref().unwrap().cache_fresh_object(1, object);
+        plan.remote
+            .as_ref()
+            .unwrap()
+            .cache_fresh_object(1, object, std::iter::empty());
 
         let stretches = stretches_of(&plan, &placed).await;
 
@@ -1442,7 +1498,7 @@ mod tests {
         plan.remote
             .as_ref()
             .unwrap()
-            .cache_fresh_object(1, object.clone());
+            .cache_fresh_object(1, object.clone(), std::iter::empty());
 
         let stretches = stretches_of(&plan, &placed).await;
 

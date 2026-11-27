@@ -52,7 +52,7 @@ use iggy_binary_protocol::batch::BATCH_HEADER_SIZE;
 use iggy_binary_protocol::placement::PlacedBatch;
 use iggy_common::IggyTimestamp;
 use iggy_object_store::{
-    KeyLayout, LongTermKey, ManifestSegment, ObjectPrefix, ObjectStore, SegmentObject,
+    KeyLayout, LongTermKey, ManifestSegment, ObjectPrefix, ObjectStore, SegmentKey, SegmentObject,
     TierExecutor, TierJobCancelled, TierJobClass, TierJobRequest, TierScope, TierScopeToken,
 };
 use journal::superblock::SuperblockStore;
@@ -66,6 +66,7 @@ use crate::journal::MessageLookup;
 use crate::long_term::{LONG_TERM_SEGMENTS_MAX, LongTermLog, ObjectRegistration, REGISTER_OBJECT};
 use crate::placed_read::{BatchPiece, PlacedReadPlan};
 use crate::poll_plan::DiskFault;
+use crate::remote_segments::RemoteRange;
 use crate::segment_chain::{HashSource, SegmentHasher, SegmentRecord};
 use crate::segment_upload::{UploadError, memory_body, store_segment};
 use crate::state_machine::CommandKind;
@@ -248,6 +249,18 @@ impl SegmentRewrite {
         )
         .await
         .map_err(RewriteError::Upload)?;
+        if let Some(remote) = &self.read.remote {
+            let segment = RemoteRange {
+                key: SegmentKey {
+                    prefix: self.prefix,
+                    start_offset: record.start_offset,
+                    object: SegmentObject::Log,
+                },
+                keyed_end_offset: Some(record.end_offset),
+                range: 0..record.size,
+            };
+            remote.carry_long_term(&segment, &log, &index).await;
+        }
         Ok(ManifestSegment {
             start_offset: record.start_offset,
             end_offset: record.end_offset,
@@ -831,6 +844,16 @@ where
             self.long_term_backlog.take(size);
         }
         self.prune_proof_rows();
+        self.note_long_term_floor_to_cache();
+    }
+
+    /// Tell the shard's cache where the long-term floor stands, so it lets go
+    /// of the fresh objects whose batches of this partition the floor
+    /// passed.
+    pub(crate) fn note_long_term_floor_to_cache(&self) {
+        if let (Some(remote), Some(floor)) = (self.remote_segments(), self.long_term_floor()) {
+            remote.note_long_term_floor(self.namespace(), floor);
+        }
     }
 
     /// The rewrite state of the current view. What an earlier view left is

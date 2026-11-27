@@ -20,7 +20,7 @@ use super::segment_chain::{PREFIX, tiered_partition};
 use super::*;
 use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::poll_plan::{DiskFault, PollPlan, PollReadResult, PollTier, RemoteFailure};
-use crate::{ReadCacheSettings, RemoteObjects, RemoteSegments, SegmentLocation};
+use crate::{ReadCache, ReadCacheSettings, RemoteObjects, RemoteSegments, SegmentLocation};
 use futures::FutureExt;
 use futures::channel::oneshot;
 use futures::future::LocalBoxFuture;
@@ -161,16 +161,14 @@ pub(super) fn attach(
 /// Like [`attach`], with a cache of the blocks of the `.log` objects that
 /// polls read, and no readahead.
 fn attach_cached(partition: &mut IggyPartition<IggyMessageBus>, objects: Rc<dyn RemoteObjects>) {
-    let remote = RemoteSegments::new(Rc::clone(&objects), layout()).with_blocks(
-        objects,
-        ReadCacheSettings {
-            cache_bytes: 1024 * 1024,
-            block_bytes: 4096,
-            read_ahead: 0,
-            read_ahead_fetches: 4,
-            read_ahead_fetch_bytes: 1024 * 1024,
-        },
-    );
+    let cache = ReadCache::new(ReadCacheSettings {
+        cache_bytes: 1024 * 1024,
+        block_bytes: 4096,
+        read_ahead: 0,
+        read_ahead_fetches: 4,
+        read_ahead_fetch_bytes: 1024 * 1024,
+    });
+    let remote = RemoteSegments::new(Rc::clone(&objects), layout()).with_cache(objects, &cache);
     partition.set_remote_segments(Rc::new(remote));
 }
 

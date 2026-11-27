@@ -39,7 +39,7 @@ Each shard also exports its own lower-level metrics, labelled `shard="<id>"`. Th
 curl -s -H "Authorization: Bearer <token>" http://localhost:3000/metrics | grep '^# HELP'
 ```
 
-With tiered storage, the `remote_read_*` series show the cache of segments that each shard read from the object store:
+With tiered storage or geo peers, the `remote_read_*` series show the cache of what each shard read from object stores:
 
 | Metric | Type | What it counts |
 |--------|------|----------------|
@@ -49,7 +49,10 @@ With tiered storage, the `remote_read_*` series show the cache of segments that 
 | `remote_read_blocks_fetched_ahead_total` | counter | Blocks that readahead fetched |
 | `remote_read_demand_bytes_total` | counter | Bytes of the store reads that polls waited for |
 | `remote_read_ahead_bytes_total` | counter | Bytes of the store reads of readahead |
+| `remote_read_fresh_releases_total` | counter | Fresh objects the cache stopped holding once the long-term floors of their partitions passed them |
+| `remote_read_carried_bytes_total` | counter | Bytes of long-term segments that rewrites handed to the cache as they stored them |
 | `remote_read_cache_bytes` | gauge | Bytes that the cache holds |
+| `remote_read_held_bytes` | gauge | Bytes of the fresh objects the shard uploaded that the cache holds for the polls of their partitions |
 
 ## What to alert on
 

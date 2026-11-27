@@ -141,7 +141,11 @@ shadow topic. A message becomes readable in another datacenter once its origin p
    batch header and where its messages sit in the fresh object, 320 bytes in all. The replicas
    store this record on their disks. The messages themselves are only in the bucket.
 4. The producer is acknowledged when the placed batch commits. The message is **committed**.
-   Polls in this cluster read it at once, from the bucket, through a cache of 64 MiB per shard.
+   Polls in this cluster read it at once. The shard that stored the object holds it in memory
+   until the long-term segment below takes its messages, even with `read_cache_size` at 0, and
+   other polls read the bucket through the shard's read cache, `[tiered_storage] read_cache_size`.
+   When the cache needs the room for newer objects first, it lets an object go before that, and
+   polls of its messages read them from the bucket.
 5. In the background, the partition's primary rewrites committed messages into **long-term
    segments** in the bucket, at most 64 MiB each, and commits each one to the partition's
    long-term log. It then stores the partition's **manifest**,
@@ -990,8 +994,8 @@ Requests to a cluster's own bucket:
   for each object that fills to 4 MiB first;
 - up to four puts a second on a shard whose sends are more than 250 ms apart, for the proof rows
   that no object with messages carried in that time;
-- a get for each poll that misses the shard's 64 MiB cache, and gets for the rewrites and merges,
-  which read the messages back;
+- a get for each run of blocks a poll misses in the shard's read cache, and gets for the rewrites
+  and merges, which read the messages back;
 - a put for each long-term segment and its index, and a put of the partition's manifest at most
   once a second, only when its long-term log changed. The manifest is one object, about 88 bytes
   per segment it lists, that each put rewrites whole;

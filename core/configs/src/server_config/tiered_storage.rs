@@ -292,10 +292,11 @@ pub struct TieredStorageConfig {
     #[serde(default = "default_max_retry_delay")]
     #[config_env(leaf)]
     pub max_retry_delay: IggyDuration,
-    /// The bytes of the segments read from the store that one shard keeps
-    /// in memory for the next polls of the same bytes. Zero turns the cache
-    /// and readahead off. Otherwise at least [`READ_AHEAD_CACHE_SHARE`]
-    /// blocks.
+    /// The bytes of what one shard reads from object stores that it keeps in
+    /// memory for the next polls of the same bytes, which also hold the
+    /// fresh objects it uploads. Zero keeps nothing that reads fetch and
+    /// turns readahead off, and the shard still holds what it uploads.
+    /// Otherwise at least [`READ_AHEAD_CACHE_SHARE`] blocks.
     #[serde(default = "default_read_cache_size")]
     #[config_env(leaf)]
     pub read_cache_size: IggyByteSize,
@@ -577,7 +578,6 @@ impl Validatable<ConfigurationError> for TieredStorageConfig {
             return refuse("prefix must not be empty");
         }
         self.validate_tuning()?;
-        self.validate_read_cache()?;
         if self.backend == TieredStorageBackend::MockS3 {
             self.validate_mock_s3()?;
         }
@@ -586,14 +586,16 @@ impl Validatable<ConfigurationError> for TieredStorageConfig {
 }
 
 impl TieredStorageConfig {
-    /// Checks the job caps, timeouts and retries. The tier services of geo
-    /// peers take them too, so they must hold even without a backend of this
+    /// Checks the job caps, timeouts, retries and read cache. The tier
+    /// services of geo peers take them too, and their reads go through the
+    /// read cache, so they must hold even without a backend of this
     /// cluster's own.
     ///
     /// # Errors
     /// [`ConfigurationError::InvalidConfigurationValue`] for a cap of zero, a
-    /// duration outside its bounds, no attempt, or a backoff cap below its
-    /// start.
+    /// duration outside its bounds, no attempt, a backoff cap below its
+    /// start, or a read cache that is on and whose block size, size and
+    /// readahead do not fit together.
     pub fn validate_tuning(&self) -> Result<(), ConfigurationError> {
         let jobs = &self.jobs;
         let counts = [
@@ -637,6 +639,7 @@ impl TieredStorageConfig {
         if self.max_retry_delay.get_duration() < self.retry_delay.get_duration() {
             return refuse("max_retry_delay must not be shorter than retry_delay");
         }
+        self.validate_read_cache()?;
         if self.fresh_upload_interval.get_duration() > FRESH_UPLOAD_INTERVAL_MAX {
             return refuse(&format!(
                 "fresh_upload_interval must be at most {}",
@@ -653,10 +656,10 @@ impl TieredStorageConfig {
         self.validate_fresh_pending_bytes()
     }
 
-    /// The block size, size and readahead of a cache that is on. Only the
-    /// reads of this cluster's own store go through it, so the tier services
-    /// of geo peers do not need them. The messages give exact bytes:
-    /// rounded, a value one byte past a bound prints as the bound.
+    /// The block size, size and readahead of a cache that is on. A cache
+    /// that is off keeps nothing that reads fetch, and none of them take
+    /// effect. The messages give exact bytes: rounded, a value one byte past
+    /// a bound prints as the bound.
     fn validate_read_cache(&self) -> Result<(), ConfigurationError> {
         let cache_size = self.read_cache_size.as_bytes_u64();
         if cache_size == 0 {
@@ -1127,9 +1130,10 @@ mod tests {
         assert!(read_cache("64 MiB", "0", "0").validate().is_err());
     }
 
-    /// Geo peers' reads do not go through the read cache.
+    /// Geo peers' reads go through the read cache, so a node with peers and
+    /// no store of its own checks it too.
     #[test]
-    fn given_read_cache_settings_that_do_not_fit_when_validating_the_tuning_of_geo_peers_should_pass()
+    fn given_read_cache_settings_that_do_not_fit_when_validating_the_tuning_of_geo_peers_should_refuse()
      {
         for (size, block_size, read_ahead) in [
             ("64 MiB", "2 MiB", "2 MiB"),
@@ -1142,7 +1146,7 @@ mod tests {
                 read_ahead: read_ahead.parse().unwrap(),
                 ..TieredStorageConfig::default()
             };
-            assert!(no_backend.validate_tuning().is_ok(), "{size} {block_size}");
+            assert!(no_backend.validate_tuning().is_err(), "{size} {block_size}");
             assert!(no_backend.validate().is_ok(), "{size} {block_size}");
             assert!(
                 read_cache(size, block_size, read_ahead).validate().is_err(),

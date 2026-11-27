@@ -427,7 +427,8 @@ async fn given_sends_in_two_windows_when_both_close_should_store_two_objects_and
 
 /// The shard holds the messages it has just stored, so a consumer at the
 /// tail is served without a read of the store. The store the polls would
-/// read here is empty, so only those kept bytes can answer.
+/// read here is empty, so only those kept bytes can answer. A cache that
+/// keeps nothing fetched holds them all the same.
 #[compio::test]
 async fn given_sends_this_shard_stored_when_polling_them_should_serve_them_without_reading_the_store()
  {
@@ -435,13 +436,17 @@ async fn given_sends_this_shard_stored_when_polling_them_should_serve_them_witho
     let owner = Box::pin(placing_owner(directory.path())).await;
     let uploader = TestUploader::new();
     owner.set_fresh_uploader(Some(uploader.clone()));
-    owner
-        .plane
-        .partitions()
-        .set_remote_segments(Rc::new(partitions::RemoteSegments::new(
-            Rc::new(MemoryStore::new()),
-            layout(),
-        )));
+    let cache = partitions::ReadCache::new(partitions::ReadCacheSettings {
+        cache_bytes: 0,
+        block_bytes: 256 * 1024,
+        read_ahead: 0,
+        read_ahead_fetches: 4,
+        read_ahead_fetch_bytes: 32 * 1024 * 1024,
+    });
+    owner.plane.partitions().set_remote_segments(Rc::new(
+        partitions::RemoteSegments::new(Rc::new(MemoryStore::new()), layout())
+            .with_cache(Rc::new(MemoryStore::new()), &cache),
+    ));
     pumped(&owner, async {
         let _answers = [submit_send(&owner, 1, 100), submit_send(&owner, 2, 300)];
         until(&owner, |owner| committed_sends(owner) == 2).await;
@@ -2203,6 +2208,49 @@ async fn given_an_object_the_store_fails_for_good_when_later_sends_wait_should_a
     assert_eq!((stored, refused), (2, 1));
     assert_eq!(owner.metrics().fresh_load_value(), (2, 2, 0, 0));
     assert_eq!(owner.fresh_pending_bytes(other), (0, 0));
+}
+
+/// The store failed an object for good, and with it every send of the same
+/// partition behind it, while the object of those later sends still
+/// uploaded. Nothing reads that object once it is stored, so the shard does
+/// not hold it.
+#[compio::test]
+async fn given_an_object_whose_sends_were_all_answered_when_its_upload_ends_should_not_hold_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let uploader = GatedUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+    owner.set_fresh_upload_pace(Duration::ZERO, 2);
+    let cache = partitions::ReadCache::new(partitions::ReadCacheSettings {
+        cache_bytes: 0,
+        block_bytes: 256 * 1024,
+        read_ahead: 0,
+        read_ahead_fetches: 4,
+        read_ahead_fetch_bytes: 32 * 1024 * 1024,
+    });
+    owner.plane.partitions().set_remote_segments(Rc::new(
+        partitions::RemoteSegments::new(Rc::new(MemoryStore::new()), layout())
+            .with_cache(Rc::new(MemoryStore::new()), &cache),
+    ));
+
+    pumped(&owner, async {
+        let failed = submit_send(&owner, 1, 100);
+        until(&owner, |_| uploader.started() == 1).await;
+        let later = submit_send(&owner, 2, 100);
+        until(&owner, |_| uploader.started() == 2).await;
+        for (attempt, started) in [(0, 3), (2, 4)] {
+            uploader.settle(attempt, false);
+            until(&owner, |_| uploader.started() == started).await;
+        }
+        uploader.settle(3, false);
+        until(&owner, |_| !failed.is_empty() && !later.is_empty()).await;
+
+        uploader.settle(1, true);
+        until(&owner, |owner| owner.metrics().fresh_uploads_value().0 == 1).await;
+    })
+    .await;
+
+    assert_eq!(cache.take_metrics().held_bytes, 0);
 }
 
 /// The interval counts from the start of the last upload. A send that finds

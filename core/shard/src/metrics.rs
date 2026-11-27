@@ -531,8 +531,8 @@ pub struct ShardMetrics {
     /// Fresh objects this shard stored that carry proof rows and no data,
     /// because no window closed soon enough after their batches committed.
     fresh_confirmations_total: Counter,
-    /// Blocks of `.log` objects that polls took from the read cache of the
-    /// node's own store, and the blocks they fetched or waited for.
+    /// Blocks of objects that polls took from the read cache of the shard,
+    /// and the blocks they fetched or waited for.
     remote_read_block_hits_total: Counter,
     remote_read_block_misses_total: Counter,
     /// First reads of blocks that readahead fetched, and the blocks it
@@ -544,6 +544,14 @@ pub struct ShardMetrics {
     remote_read_ahead_bytes_total: Counter,
     /// Bytes that the read cache holds.
     remote_read_cache_bytes: Gauge,
+    /// Of those, bytes of the fresh objects this shard uploaded that it
+    /// holds for the polls of their partitions.
+    remote_read_held_bytes: Gauge,
+    /// Fresh objects the shard stopped holding once the long-term floors of
+    /// their partitions passed them.
+    remote_read_fresh_releases_total: Counter,
+    /// Bytes of long-term segments that rewrites handed to the read cache.
+    remote_read_carried_bytes_total: Counter,
     /// 1 while this node passes the store identity check of tiered storage.
     /// Both object store gauges hold for the whole node, so every shard
     /// exports the same ones, see [`Self::share_object_store_gauges`].
@@ -790,6 +798,9 @@ impl ShardMetrics {
             remote_read_demand_bytes_total: Counter::default(),
             remote_read_ahead_bytes_total: Counter::default(),
             remote_read_cache_bytes: Gauge::default(),
+            remote_read_held_bytes: Gauge::default(),
+            remote_read_fresh_releases_total: Counter::default(),
+            remote_read_carried_bytes_total: Counter::default(),
             object_store_identity_verified: Gauge::default(),
             object_store_unreachable: Gauge::default(),
             geo_peer_identity_verified: Family::default(),
@@ -951,8 +962,8 @@ impl ShardMetrics {
     }
 
     /// Set `object_store_identity_verified`, for every shard that shares it.
-    /// What the read cache of the node's own store did since the last take,
-    /// see [`partitions::RemoteSegments::take_read_metrics`].
+    /// What the read cache of the shard did since the last take, see
+    /// [`partitions::ReadCache::take_metrics`].
     pub fn record_remote_reads(&self, reads: &partitions::RemoteReadMetrics) {
         self.remote_read_block_hits_total.inc_by(reads.block_hits);
         self.remote_read_block_misses_total
@@ -966,6 +977,12 @@ impl ShardMetrics {
         self.remote_read_ahead_bytes_total.inc_by(reads.ahead_bytes);
         self.remote_read_cache_bytes
             .set(i64::try_from(reads.cached_bytes).unwrap_or(i64::MAX));
+        self.remote_read_held_bytes
+            .set(i64::try_from(reads.held_bytes).unwrap_or(i64::MAX));
+        self.remote_read_fresh_releases_total
+            .inc_by(reads.fresh_releases);
+        self.remote_read_carried_bytes_total
+            .inc_by(reads.carried_bytes);
     }
 
     pub fn set_object_store_identity_verified(&self, verified: bool) {
@@ -2989,12 +3006,12 @@ impl ShardMetrics {
         );
         registry.register(
             "remote_read_block_hits",
-            "blocks of segments in the object store that polls took from the read cache",
+            "blocks of objects in the object store that polls took from the read cache",
             self.remote_read_block_hits_total.clone(),
         );
         registry.register(
             "remote_read_block_misses",
-            "blocks of segments in the object store that polls fetched, or waited for while \
+            "blocks of objects in the object store that polls fetched, or waited for while \
              another poll fetched them",
             self.remote_read_block_misses_total.clone(),
         );
@@ -3020,8 +3037,27 @@ impl ShardMetrics {
         );
         registry.register(
             "remote_read_cache_bytes",
-            "bytes of segments in the object store that the read cache holds",
+            "bytes of objects in the object store that the read cache holds",
             self.remote_read_cache_bytes.clone(),
+        );
+        registry.register(
+            "remote_read_held_bytes",
+            "bytes of the fresh objects this shard uploaded that the read cache holds for the \
+             polls of their partitions",
+            self.remote_read_held_bytes.clone(),
+        );
+        registry.register(
+            "remote_read_fresh_releases",
+            "fresh objects the read cache stopped holding: once the long-term floors of their \
+             partitions passed them, once every send in them was answered and none committed, \
+             or once their partitions left the shard",
+            self.remote_read_fresh_releases_total.clone(),
+        );
+        registry.register(
+            "remote_read_carried_bytes",
+            "bytes of long-term segments that rewrites handed to the read cache as they stored \
+             them",
+            self.remote_read_carried_bytes_total.clone(),
         );
         registry.register(
             "object_store_identity_verified",
@@ -3691,6 +3727,9 @@ mod tests {
             demand_bytes: 512,
             ahead_bytes: 1024,
             cached_bytes: 2048,
+            held_bytes: 256,
+            fresh_releases: 5,
+            carried_bytes: 4096,
         };
         metrics.record_remote_reads(&reads);
         metrics.record_remote_reads(&partitions::RemoteReadMetrics {
@@ -3710,6 +3749,9 @@ mod tests {
             "remote_read_demand_bytes_total 1024",
             "remote_read_ahead_bytes_total 2048",
             "remote_read_cache_bytes 1536",
+            "remote_read_held_bytes 256",
+            "remote_read_fresh_releases_total 10",
+            "remote_read_carried_bytes_total 8192",
         ] {
             assert!(buffer.lines().any(|scraped| scraped == line), "{line}");
         }

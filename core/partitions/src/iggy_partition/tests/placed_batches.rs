@@ -979,21 +979,36 @@ async fn given_the_same_batches_placed_when_polling_should_return_the_bytes_of_a
     assert_eq!(polled, expected);
 }
 
+/// The cache that reads through `cache_bytes` of it go through.
+fn read_cache(cache_bytes: usize) -> Rc<crate::ReadCache> {
+    crate::ReadCache::new(crate::ReadCacheSettings {
+        cache_bytes,
+        block_bytes: 256 * 1024,
+        read_ahead: 0,
+        read_ahead_fetches: 4,
+        read_ahead_fetch_bytes: 32 * 1024 * 1024,
+    })
+}
+
+/// Whatever the cache keeps of what it fetches, it holds what the shard
+/// uploaded.
 #[compio::test]
 async fn given_a_fresh_object_this_shard_stored_when_polling_should_not_ask_the_store() {
-    let (whole, placed, object) = whole_and_placed(RECEIVER_OPS);
-    let expected = Box::pin(polls_of_whole_batches(&whole)).await;
-    let (_directory, mut partition) = Box::pin(placing_partition_with(&placed)).await;
-    let remote = Rc::new(crate::RemoteSegments::new(
-        Rc::new(NoStore),
-        super::remote_poll::layout(),
-    ));
-    remote.cache_fresh_object(FRESH_OBJECT, object);
-    partition.set_remote_segments(remote);
+    for cache_bytes in [0, 64 * 1024 * 1024] {
+        let (whole, placed, object) = whole_and_placed(RECEIVER_OPS);
+        let expected = Box::pin(polls_of_whole_batches(&whole)).await;
+        let (_directory, mut partition) = Box::pin(placing_partition_with(&placed)).await;
+        let remote = Rc::new(
+            crate::RemoteSegments::new(Rc::new(NoStore), super::remote_poll::layout())
+                .with_cache(Rc::new(NoStore), &read_cache(cache_bytes)),
+        );
+        remote.cache_fresh_object(FRESH_OBJECT, object, std::iter::empty());
+        partition.set_remote_segments(remote);
 
-    let polled = Box::pin(super::remote_poll::polled_all(&mut partition)).await;
+        let polled = Box::pin(super::remote_poll::polled_all(&mut partition)).await;
 
-    assert_eq!(polled, expected);
+        assert_eq!(polled, expected, "a cache of {cache_bytes} bytes");
+    }
 }
 
 async fn poll_error(partition: &mut IggyPartition<IggyMessageBus>) -> IggyError {
@@ -2367,10 +2382,13 @@ async fn given_batches_of_one_fresh_object_when_polling_them_should_ask_the_stor
         store: Box::pin(store_with(object)).await,
         reads: std::cell::Cell::new(0),
     });
-    super::remote_poll::attach(
-        &mut partition,
-        Rc::clone(&counted) as Rc<dyn crate::RemoteObjects>,
-    );
+    partition.set_remote_segments(Rc::new(
+        crate::RemoteSegments::new(
+            Rc::clone(&counted) as Rc<dyn crate::RemoteObjects>,
+            super::remote_poll::layout(),
+        )
+        .with_cache(Rc::new(NoStore), &read_cache(64 * 1024 * 1024)),
+    ));
 
     let polled = Box::pin(super::remote_poll::polled_all(&mut partition)).await;
 
@@ -2379,10 +2397,10 @@ async fn given_batches_of_one_fresh_object_when_polling_them_should_ask_the_stor
     assert_eq!(counted.reads.get(), 1);
 }
 
-/// The objects a busy shard stored can leave the cache no room for what a
-/// poll fetches. The poll takes its batches from its own read all the same.
+/// A cache that keeps nothing fetched still lets a poll take its batches of
+/// one fresh object from one read.
 #[compio::test]
-async fn given_a_cache_without_room_when_polling_batches_of_one_fresh_object_should_ask_the_store_once()
+async fn given_a_cache_that_keeps_nothing_fetched_when_polling_batches_of_one_fresh_object_should_ask_the_store_once()
  {
     let (_whole, placed, object) = whole_and_placed(RECEIVER_OPS);
     let (_directory, mut partition) = Box::pin(placing_partition_with(&placed)).await;
@@ -2390,11 +2408,11 @@ async fn given_a_cache_without_room_when_polling_batches_of_one_fresh_object_sho
         store: Box::pin(store_with(object)).await,
         reads: std::cell::Cell::new(0),
     });
-    let mut remote = crate::RemoteSegments::new(
+    let remote = crate::RemoteSegments::new(
         Rc::clone(&counted) as Rc<dyn crate::RemoteObjects>,
         super::remote_poll::layout(),
-    );
-    remote.set_fresh_cache_bytes(0);
+    )
+    .with_cache(Rc::new(NoStore), &read_cache(0));
     partition.set_remote_segments(Rc::new(remote));
 
     let args = PollingArgs::new(iggy_common::PollingStrategy::offset(0), 10, false);

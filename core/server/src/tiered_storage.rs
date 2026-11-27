@@ -43,7 +43,7 @@ use message_bus::IggyMessageBus;
 use partitions::{
     ExecutorDeleter, ExecutorFreshSweeper, ExecutorFreshUploader, ExecutorLongTermMerger,
     ExecutorLongTermWriter, ExecutorManifestPublisher, ExecutorTopicObjects, ExecutorUploader,
-    ReadCacheSettings, RemoteSegments,
+    ReadCache, ReadCacheSettings, RemoteSegments,
 };
 use shard::tier_service::{ClassLimits, StoreCallPolicy, TierService, TierServiceConfig};
 use shard::{Sender, channel};
@@ -238,6 +238,19 @@ async fn probe_conditional_create<S: ObjectStore>(
     }
 }
 
+/// What the `[tiered_storage]` settings of `config` say a shard keeps of what
+/// it reads.
+#[must_use]
+pub fn read_cache_settings(config: &TieredStorageConfig) -> ReadCacheSettings {
+    ReadCacheSettings {
+        cache_bytes: usize::try_from(config.read_cache_size.as_bytes_u64()).unwrap_or(usize::MAX),
+        block_bytes: config.read_cache_block_size.as_bytes_u64(),
+        read_ahead: config.read_ahead.as_bytes_u64(),
+        read_ahead_fetches: usize::try_from(config.jobs.speculative_fetches).unwrap_or(usize::MAX),
+        read_ahead_fetch_bytes: config.jobs.speculative_fetch_bytes.as_bytes_u64(),
+    }
+}
+
 /// Give `shard` a tier service over the configured store, and run the store
 /// identity check of [`crate::store_identity`] next to it. The shard gets
 /// its segment uploader and object deleter only while its node passes the
@@ -269,21 +282,15 @@ pub fn start(
         config.fresh_pending_bytes.as_bytes_u64(),
         config.fresh_partition_pending_bytes.as_bytes_u64(),
     );
+    let cache = ReadCache::new(read_cache_settings(config));
+    shard.plane.partitions().set_read_cache(Rc::clone(&cache));
     shard
         .plane
         .partitions()
         .set_remote_segments(Rc::new(RemoteSegments::cached(
             service.clone(),
             layout.clone(),
-            ReadCacheSettings {
-                cache_bytes: usize::try_from(config.read_cache_size.as_bytes_u64())
-                    .unwrap_or(usize::MAX),
-                block_bytes: config.read_cache_block_size.as_bytes_u64(),
-                read_ahead: config.read_ahead.as_bytes_u64(),
-                read_ahead_fetches: usize::try_from(config.jobs.speculative_fetches)
-                    .unwrap_or(usize::MAX),
-                read_ahead_fetch_bytes: config.jobs.speculative_fetch_bytes.as_bytes_u64(),
-            },
+            &cache,
         )));
     shard
         .plane
