@@ -337,7 +337,9 @@ impl Streaming {
             .stderr(Stdio::null())
             .status();
         let _ = self.child.wait();
-        while let Ok(line) = self.lines.try_recv() {
+        // The reader thread can still be handing over lines the container wrote just before it
+        // exited. Drain until it closes the channel, not until the channel is momentarily empty.
+        while let Ok(line) = self.lines.recv() {
             self.seen.push(line);
         }
         std::mem::take(&mut self.seen)
@@ -477,6 +479,17 @@ pub fn key_index(key: &str) -> Option<usize> {
     key.strip_prefix('k')?.parse().ok()
 }
 
+/// A value the Python probe printed, with its percent-escapes undone.
+#[must_use]
+pub fn unescape(word: &str) -> String {
+    if word == "%" {
+        return String::new();
+    }
+    word.replace("%20", " ")
+        .replace("%0A", "\n")
+        .replace("%25", "%")
+}
+
 /// How a record's value is checked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Values {
@@ -484,9 +497,9 @@ pub enum Values {
     Probe,
     /// Only the key is checked; the value and headers are the client's own encoding.
     KeyOnly,
-    /// As `KeyOnly`, from a client that interleaves its input partitions (a stream processor),
-    /// so the order of indexes within an output partition is not a fact.
-    KeyOnlyUnordered,
+    /// A JSON `{"i": N, "v": "vNNN"}` value, from a stream processor that interleaves its input
+    /// partitions, so the order of indexes within an output partition is not a fact.
+    JsonUnordered,
 }
 
 /// An acknowledged record's partition and offset, when the client reports them.
@@ -565,15 +578,35 @@ pub fn facts_from_events(events: &[Event], values: Values, facts: &mut Facts) {
 }
 
 fn span(offsets: &[i64]) -> String {
-    let mut sorted = offsets.to_vec();
-    sorted.sort_unstable();
-    match (sorted.first(), sorted.last()) {
-        (Some(first), Some(last)) => format!("{} at {first}-{last}", sorted.len()),
+    match (offsets.iter().min(), offsets.iter().max()) {
+        (Some(first), Some(last)) => format!("{} at {first}-{last}", offsets.len()),
         _ => "0".to_string(),
     }
 }
 
+/// The record indexes a phase carries. Every scenario produces a first batch `0..COUNT` and a
+/// second `COUNT..2 * COUNT`; a resumed consumer reads the second, and a reader that sees the
+/// whole topic sees every batch so far.
+fn expected_indexes(phase: &str) -> std::ops::Range<usize> {
+    match phase {
+        "resume" => COUNT..2 * COUNT,
+        "stream" => 0..2 * COUNT,
+        "restart" => 0..3 * COUNT,
+        _ => 0..COUNT,
+    }
+}
+
+/// Whether a JSON sink value carries `index` and the value of `want_value` for it.
+fn json_record_matches(value: &str, index: usize, want_value: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&unescape(value)) else {
+        return false;
+    };
+    value.get("i").and_then(serde_json::Value::as_u64) == u64::try_from(index).ok()
+        && value.get("v").and_then(serde_json::Value::as_str) == Some(want_value)
+}
+
 fn record_facts(phase: &str, seen: &[&Event], values: Values, facts: &mut Facts) {
+    let expected = expected_indexes(phase);
     let mut intact = 0;
     let mut keys = BTreeMap::<String, usize>::new();
     let mut by_partition: BTreeMap<i32, Vec<(i64, Option<usize>)>> = BTreeMap::new();
@@ -591,11 +624,16 @@ fn record_facts(phase: &str, seen: &[&Event], values: Values, facts: &mut Facts)
             continue;
         };
         *keys.entry(key.clone()).or_default() += 1;
-        let index = key_index(key);
+        let index = key_index(key).filter(|index| expected.contains(index));
         if let Some(index) = index {
             lowest = lowest.min(index);
             let (_, want_value, want_headers) = expected_record(index);
-            if values != Values::Probe || (*value == want_value && *headers == want_headers) {
+            let matches = match values {
+                Values::Probe => *value == want_value && *headers == want_headers,
+                Values::KeyOnly => true,
+                Values::JsonUnordered => json_record_matches(value, index, &want_value),
+            };
+            if matches {
                 intact += 1;
             }
         }
@@ -612,7 +650,7 @@ fn record_facts(phase: &str, seen: &[&Event], values: Values, facts: &mut Facts)
     );
     let ordered = by_partition.values().all(|records| {
         records.windows(2).all(|pair| {
-            pair[0].0 < pair[1].0 && (values == Values::KeyOnlyUnordered || pair[0].1 < pair[1].1)
+            pair[0].0 < pair[1].0 && (values == Values::JsonUnordered || pair[0].1 < pair[1].1)
         })
     });
     facts.set(format!("{phase}.ordered"), ordered);
@@ -649,9 +687,9 @@ pub fn step_of(fact: &str) -> &'static str {
 }
 
 /// Every column, in report order. A client shows `n/a` where it records no fact.
-pub const STEPS: [&str; 10] = [
-    "run", "produce", "consume", "commit", "resume", "sink", "source", "snapshot", "stream",
-    "restart",
+pub const STEPS: [&str; 11] = [
+    "run", "produce", "consume", "commit", "resume", "sink", "source", "start", "snapshot",
+    "stream", "restart",
 ];
 
 /// The result of one step of one client on the gateway.
@@ -868,4 +906,54 @@ fn a_duplicate_or_a_reordering_is_a_fact() {
     assert_eq!(facts.get("resume.duplicates"), Some("1"));
     assert_eq!(facts.get("resume.ordered"), Some("false"));
     assert_eq!(facts.get("resume.first_index"), Some("12"));
+}
+
+#[test]
+fn span_reads_the_extrema_without_reordering() {
+    assert_eq!(span(&[5, 1, 9, 3]), "4 at 1-9");
+    assert_eq!(span(&[]), "0");
+}
+
+#[test]
+fn an_unexpected_key_is_not_intact() {
+    let stdout = "REC sink 0 0 k000 {\"i\":0,\"v\":\"v000\"} -\n\
+                  REC sink 0 1 k012 {\"i\":12,\"v\":\"v012\"} -\n";
+    let mut facts = Facts::default();
+    facts_from_events(&parse_events(stdout), Values::JsonUnordered, &mut facts);
+    assert_eq!(facts.get("sink.count"), Some("2"));
+    assert_eq!(facts.get("sink.intact"), Some("1"));
+}
+
+#[test]
+fn a_json_value_that_does_not_match_its_key_is_not_intact() {
+    let stdout = "REC sink 0 0 k000 {\"i\":0,\"v\":\"v999\"} -\n\
+                  REC sink 0 1 k001 {\"i\":2,\"v\":\"v001\"} -\n\
+                  REC sink 0 2 k002 {\"i\":2,\"v\":\"v002\"} -\n";
+    let mut facts = Facts::default();
+    facts_from_events(&parse_events(stdout), Values::JsonUnordered, &mut facts);
+    assert_eq!(facts.get("sink.intact"), Some("1"));
+}
+
+#[test]
+fn the_connect_start_step_is_rendered() {
+    assert_eq!(step_of("start.ready"), "start");
+    let mut gateway = Facts::default();
+    gateway.set("start.ready", true);
+    let mut kafka = Facts::default();
+    kafka.set("start.ready", true);
+    let verdict = judge_client("connect-debezium", &gateway, &kafka, &[]);
+    let markdown = render(
+        "connect",
+        &[row(
+            "connect-debezium",
+            "1",
+            &gateway,
+            &kafka,
+            &verdict,
+            (1.0, 1.0),
+        )],
+        &[],
+    );
+    assert!(markdown.contains("| start |"), "{markdown}");
+    assert!(markdown.contains("| pass |"), "{markdown}");
 }

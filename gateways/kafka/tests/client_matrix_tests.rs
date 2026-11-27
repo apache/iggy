@@ -33,6 +33,7 @@
 //! summary. Missing Docker, images, a JDK or the `iggy-server` binary skip the suite, unless
 //! `KAFKA_E2E_REQUIRED=1` turns the skip into a failure.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -61,7 +62,7 @@ use facts::{Allowed, Facts, Verdict, parse_allowed};
 use matrix::{
     CLIENT_TIMEOUT, COUNT, Event, PARTITIONS, Row, Run, Values, cache_dir, clients_dir, digest,
     facts_from_events, host_user_args, judge_client, parse_events, path_str, publish, render, row,
-    run_container,
+    run_container, unescape,
 };
 use oracle::{
     KAFKA_ORACLE_IMAGE, KafkaOracle, Target, TargetKind, Unavailable, WireClient, env_flag,
@@ -673,12 +674,27 @@ async fn client_matrix_smoke() {
     );
 }
 
+/// Every client `allowed_differences.toml` may name: the smoke clients and the nightly ones.
+fn known_clients() -> Vec<&'static str> {
+    let mut clients: Vec<&'static str> = Smoke::ALL.iter().map(|client| client.name()).collect();
+    clients.extend([
+        "vector",
+        "fluent-bit",
+        "risingwave",
+        "flink",
+        "connect-debezium",
+    ]);
+    clients
+}
+
 #[test]
-fn every_declared_client_difference_names_a_client_and_an_issue() {
+fn every_declared_client_difference_names_a_known_client_and_an_issue() {
+    let known = known_clients();
     for entry in allowed() {
+        let client = entry.scenario.strip_prefix("client/").unwrap_or_default();
         assert!(
-            entry.scenario.starts_with("client/"),
-            "{}: client matrix scenarios are named client/<client>",
+            known.contains(&client),
+            "{}: scenario is client/<client> with a client the matrix runs",
             entry.scenario
         );
         assert!(
@@ -1307,7 +1323,7 @@ async fn flink_scenario(target: Target, prefix: String) -> Result<Facts, String>
         .await?,
     );
     events.retain(|event| *event != Event::Done);
-    facts_from_events(&events, Values::KeyOnlyUnordered, &mut facts);
+    facts_from_events(&events, Values::JsonUnordered, &mut facts);
     Ok(facts)
 }
 
@@ -1320,6 +1336,7 @@ async fn client_matrix_nightly_flink() {
     let sane = [
         ("sink.job", "finished".to_string()),
         ("sink.count", count.clone()),
+        ("sink.intact", count.clone()),
         ("sink.duplicates", "0".to_string()),
         ("produce.acked", count),
     ];
@@ -1332,35 +1349,86 @@ async fn client_matrix_nightly_flink() {
     .await;
 }
 
-/// A value the Python probe printed, with its percent-escapes undone.
-fn unescape(word: &str) -> String {
-    if word == "%" {
-        return String::new();
-    }
-    word.replace("%20", " ")
-        .replace("%0A", "\n")
-        .replace("%25", "%")
+/// The integer `field` a record's JSON value carries, looking in Debezium's envelope
+/// (`payload.after`, or `after` without schemas) and at the top level.
+fn json_field(event: &Event, field: &str) -> Option<i64> {
+    let Event::Rec { value, .. } = event else {
+        return None;
+    };
+    let value = serde_json::from_str::<serde_json::Value>(&unescape(value)).ok()?;
+    let envelope = value.get("payload").unwrap_or(&value);
+    envelope
+        .get("after")
+        .and_then(|after| after.get(field))
+        .or_else(|| envelope.get(field))
+        .and_then(serde_json::Value::as_i64)
 }
 
-/// Every distinct integer `field` the JSON values of `events` carry, looking in Debezium's
-/// envelope (`payload.after`, or `after` without schemas) and at the top level.
-fn json_ids(events: &[Event], field: &str) -> std::collections::BTreeSet<i64> {
+/// Every `field` the JSON values of `events` carry, with repetitions.
+fn json_id_values(events: &[Event], field: &str) -> Vec<i64> {
     events
         .iter()
-        .filter_map(|event| match event {
-            Event::Rec { value, .. } => {
-                serde_json::from_str::<serde_json::Value>(&unescape(value)).ok()
-            }
-            _ => None,
+        .filter_map(|event| json_field(event, field))
+        .collect()
+}
+
+/// Every distinct integer `field` the JSON values of `events` carry.
+fn json_ids(events: &[Event], field: &str) -> BTreeSet<i64> {
+    json_id_values(events, field).into_iter().collect()
+}
+
+/// The next offset of every partition in `events`.
+fn end_offsets(events: &[Event]) -> BTreeMap<i32, i64> {
+    let mut ends = BTreeMap::new();
+    for event in events {
+        if let Event::Rec {
+            partition, offset, ..
+        } = event
+        {
+            let end = ends.entry(*partition).or_insert(0);
+            *end = (*end).max(*offset + 1);
+        }
+    }
+    ends
+}
+
+/// The IDs of the records in `events` at or after `ends` on their partition.
+fn ids_after(events: &[Event], ends: &BTreeMap<i32, i64>) -> Vec<i64> {
+    events
+        .iter()
+        .filter(|event| match event {
+            Event::Rec {
+                partition, offset, ..
+            } => *offset >= ends.get(partition).copied().unwrap_or(0),
+            _ => false,
         })
-        .filter_map(|value| {
-            let envelope = value.get("payload").unwrap_or(&value);
-            envelope
-                .get("after")
-                .and_then(|after| after.get(field))
-                .or_else(|| envelope.get(field))
-                .and_then(serde_json::Value::as_i64)
-        })
+        .filter_map(|event| json_field(event, "id"))
+        .collect()
+}
+
+/// A sorted, de-duplicated list of `ids` as a fact value.
+fn ids_fact(ids: &[i64]) -> String {
+    let unique: BTreeSet<i64> = ids.iter().copied().collect();
+    unique
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// How many IDs in `ids` repeat.
+fn duplicate_ids(ids: &[i64]) -> usize {
+    let mut counts: BTreeMap<i64, usize> = BTreeMap::new();
+    for id in ids {
+        *counts.entry(*id).or_default() += 1;
+    }
+    counts.values().map(|count| count.saturating_sub(1)).sum()
+}
+
+/// The IDs the rows inserted after the restart carry.
+fn restart_ids() -> BTreeSet<i64> {
+    (2 * COUNT..3 * COUNT)
+        .map(|index| i64::try_from(index).expect("COUNT fits i64"))
         .collect()
 }
 
@@ -1569,19 +1637,61 @@ async fn connect_scenario(target: Target, prefix: String) -> Result<Facts, Strin
 
     connect.stop(Duration::from_secs(30));
     drop(connect);
-    let connect = start_connect(&target, &prefix, rest)?;
+    restart_connect(
+        &target, &prefix, &topic, rest, &postgres, &stream, &mut facts,
+    )
+    .await?;
+    Ok(facts)
+}
+
+/// Starts a new worker, then checks that only the rows inserted after the recorded offsets
+/// arrived: a worker that replays its snapshot must not look like a successful resume.
+async fn restart_connect(
+    target: &Target,
+    prefix: &str,
+    topic: &str,
+    rest: u16,
+    postgres: &Postgres,
+    stream: &[Event],
+    facts: &mut Facts,
+) -> Result<(), String> {
+    let before = read_until(
+        target,
+        topic,
+        "before-restart",
+        Duration::from_secs(60),
+        |_| true,
+    )
+    .await?;
+    let mut ends = end_offsets(stream);
+    for (partition, end) in end_offsets(&before) {
+        ends.entry(partition)
+            .and_modify(|current| *current = (*current).max(end))
+            .or_insert(end);
+    }
+    let connect = start_connect(target, prefix, rest)?;
     let ready = connect_ready(&connect, rest).await;
     facts.set("restart.ready", ready);
     postgres.insert(2 * COUNT)?;
+    let expected = restart_ids();
     let restart = read_until(
-        &target,
-        &topic,
+        target,
+        topic,
         "restart",
         Duration::from_secs(120),
-        |events| ids(events) >= 3 * COUNT,
+        |events| {
+            let observed: BTreeSet<i64> = ids_after(events, &ends).into_iter().collect();
+            expected.is_subset(&observed)
+        },
     )
     .await?;
-    facts.set("restart.ids", ids(&restart));
+    let after = ids_after(&restart, &ends);
+    facts.set("restart.ids", ids_fact(&after));
+    facts.set("restart.duplicates", duplicate_ids(&after));
+    facts.set(
+        "restart.missing",
+        expected.iter().filter(|id| !after.contains(*id)).count(),
+    );
     let status = connect_rest(
         &connect,
         rest,
@@ -1598,7 +1708,7 @@ async fn connect_scenario(target: Target, prefix: String) -> Result<Facts, Strin
         })
         .unwrap_or_else(|| "unknown".to_string());
     facts.set("restart.task_state", running);
-    Ok(facts)
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1606,11 +1716,14 @@ async fn client_matrix_nightly_connect_debezium() {
     if !nightly_enabled("connect-debezium") {
         return;
     }
+    let expected: Vec<i64> = restart_ids().into_iter().collect();
     let sane = [
         ("start.ready", "true".to_string()),
         ("snapshot.ids", COUNT.to_string()),
         ("stream.ids", (2 * COUNT).to_string()),
-        ("restart.ids", (3 * COUNT).to_string()),
+        ("restart.ids", ids_fact(&expected)),
+        ("restart.duplicates", "0".to_string()),
+        ("restart.missing", "0".to_string()),
         ("restart.task_state", "RUNNING".to_string()),
     ];
     nightly(

@@ -76,8 +76,9 @@ records back, intact, resumed exactly), the row is **broken**: the probe or the
 setup is wrong, not the gateway.
 
 The matrix prints one row per client and one column per step: `pass`, `fail,
-known (#issue)`, `**FAIL**` (undeclared), or `n/a`. CI writes it to the job
-summary and uploads it as the `client-matrix` artifact.
+known (#issue)`, `**FAIL**` (undeclared), or `n/a`. Only the nightly workflow
+publishes it, to the job summary and as the `client-matrix` artifact; the smoke
+run in the Rust test job does not publish it.
 
 ## Running it locally
 
