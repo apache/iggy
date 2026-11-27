@@ -411,3 +411,431 @@ func TestDeserializeAccessTokens_EmptyPayloadIsAnEmptyList(t *testing.T) {
 		t.Fatalf("got %+v, want no tokens", tokens)
 	}
 }
+
+func TestDeserializeLogInResponse_ValidAndTruncated(t *testing.T) {
+	valid := binary.LittleEndian.AppendUint32(nil, 42)
+	got, err := DeserializeLogInResponse(valid)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil || got.UserId != 42 {
+		t.Fatalf("got %+v, want UserId = 42", got)
+	}
+
+	for cut := 0; cut < len(valid); cut++ {
+		truncated := valid[:cut]
+		_, err := DeserializeLogInResponse(truncated)
+		if err == nil {
+			t.Fatalf("expected error for payload cut to %d bytes, got nil", cut)
+		}
+		if !errors.Is(err, ierror.ErrTruncatedPayload) {
+			t.Fatalf("expected ErrTruncatedPayload, got %v", err)
+		}
+	}
+}
+
+func TestDeserializeOffset_ValidAndTruncated(t *testing.T) {
+	valid := binary.LittleEndian.AppendUint32(nil, 1)
+	valid = binary.LittleEndian.AppendUint64(valid, 100)
+	valid = binary.LittleEndian.AppendUint64(valid, 90)
+
+	got, err := DeserializeOffset(valid)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil || got.PartitionId != 1 || got.CurrentOffset != 100 || got.StoredOffset != 90 {
+		t.Fatalf("got %+v, want PartitionId=1, Current=100, Stored=90", got)
+	}
+
+	empty, err := DeserializeOffset(nil)
+	if err != nil || empty != nil {
+		t.Fatalf("empty payload: got (%+v, %v), want (nil, nil)", empty, err)
+	}
+	empty2, err := DeserializeOffset([]byte{})
+	if err != nil || empty2 != nil {
+		t.Fatalf("zero-length payload: got (%+v, %v), want (nil, nil)", empty2, err)
+	}
+
+	for cut := 1; cut < len(valid); cut++ {
+		truncated := valid[:cut]
+		_, err := DeserializeOffset(truncated)
+		if err == nil {
+			t.Fatalf("expected error for payload cut to %d bytes, got nil", cut)
+		}
+		if !errors.Is(err, ierror.ErrTruncatedPayload) {
+			t.Fatalf("expected ErrTruncatedPayload, got %v", err)
+		}
+	}
+}
+
+func TestDeserializeToConsumerGroupMember_ValidAndTruncated(t *testing.T) {
+	valid := binary.LittleEndian.AppendUint32(nil, 10)
+	valid = binary.LittleEndian.AppendUint32(valid, 2)
+	valid = binary.LittleEndian.AppendUint32(valid, 101)
+	valid = binary.LittleEndian.AppendUint32(valid, 102)
+
+	member, readBytes, err := DeserializeToConsumerGroupMember(valid, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if readBytes != len(valid) {
+		t.Errorf("readBytes = %d, want %d", readBytes, len(valid))
+	}
+	if member.ID != 10 || member.PartitionsCount != 2 || len(member.Partitions) != 2 ||
+		member.Partitions[0] != 101 || member.Partitions[1] != 102 {
+		t.Errorf("got member %+v", member)
+	}
+
+	for cut := 0; cut < len(valid); cut++ {
+		truncated := valid[:cut]
+		_, _, err := DeserializeToConsumerGroupMember(truncated, 0)
+		if err == nil {
+			t.Fatalf("expected error for payload cut to %d bytes, got nil", cut)
+		}
+		if !errors.Is(err, ierror.ErrTruncatedPayload) {
+			t.Fatalf("expected ErrTruncatedPayload, got %v", err)
+		}
+	}
+
+	// Oversized partition count
+	oversized := binary.LittleEndian.AppendUint32(nil, 1)
+	oversized = binary.LittleEndian.AppendUint32(oversized, 1<<30)
+	if _, _, err := DeserializeToConsumerGroupMember(oversized, 0); err == nil {
+		t.Fatal("expected error for oversized partitions count, got nil")
+	}
+}
+
+func TestDeserializeConsumerGroup_ValidAndTruncated(t *testing.T) {
+	name := "group1"
+	valid := binary.LittleEndian.AppendUint32(nil, 1)
+	valid = binary.LittleEndian.AppendUint32(valid, 4)
+	valid = binary.LittleEndian.AppendUint32(valid, 1)
+	valid = append(valid, byte(len(name)))
+	valid = append(valid, name...)
+	// Member 1
+	valid = binary.LittleEndian.AppendUint32(valid, 10)
+	valid = binary.LittleEndian.AppendUint32(valid, 1)
+	valid = binary.LittleEndian.AppendUint32(valid, 101)
+
+	details, err := DeserializeConsumerGroup(valid)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if details.Name != name || details.MembersCount != 1 || len(details.Members) != 1 {
+		t.Fatalf("got %+v", details)
+	}
+
+	for cut := 0; cut < len(valid); cut++ {
+		truncated := valid[:cut]
+		_, err := DeserializeConsumerGroup(truncated)
+		if err == nil {
+			t.Fatalf("expected error for payload cut to %d bytes, got nil", cut)
+		}
+	}
+}
+
+func TestDeserializePermissions_ValidAndTruncated(t *testing.T) {
+	// Global: 10 bytes (all 1), hasStreams: 1
+	valid := []byte{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}
+	// Stream: streamId=5, 6 perms, hasTopics: 1
+	valid = binary.LittleEndian.AppendUint32(valid, 5)
+	valid = append(valid, 1, 0, 1, 0, 1, 0) // 6 stream perms
+	valid = append(valid, 1)                // hasTopics: 1
+	// Topic: topicId=9, 4 perms, topic delimiter: 0
+	valid = binary.LittleEndian.AppendUint32(valid, 9)
+	valid = append(valid, 1, 1, 0, 0) // 4 topic perms
+	valid = append(valid, 0)          // topic delimiter 0 (end of topics)
+	valid = append(valid, 0)          // stream delimiter 0 (end of streams)
+
+	perms, err := deserializePermissions(valid)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !perms.Global.ManageServers || len(perms.Streams) != 1 {
+		t.Fatalf("got %+v", perms)
+	}
+	streamPerm, ok := perms.Streams[5]
+	if !ok || !streamPerm.ManageStream || streamPerm.ReadStream || len(streamPerm.Topics) != 1 {
+		t.Fatalf("stream 5: %+v", streamPerm)
+	}
+	topicPerm, ok := streamPerm.Topics[9]
+	if !ok || !topicPerm.ManageTopic || topicPerm.PollMessages {
+		t.Fatalf("topic 9: %+v", topicPerm)
+	}
+
+	for cut := 0; cut < len(valid); cut++ {
+		truncated := valid[:cut]
+		_, err := deserializePermissions(truncated)
+		if err == nil {
+			t.Fatalf("expected error for payload cut to %d bytes, got nil", cut)
+		}
+		if !errors.Is(err, ierror.ErrTruncatedPayload) {
+			t.Fatalf("expected ErrTruncatedPayload, got %v", err)
+		}
+	}
+
+	// Invalid topic delimiter (2 instead of 0 or 1)
+	corruptDelim := make([]byte, len(valid))
+	copy(corruptDelim, valid)
+	corruptDelim[len(corruptDelim)-2] = 2
+	if _, err := deserializePermissions(corruptDelim); err == nil {
+		t.Fatal("expected error for invalid delimiter, got nil")
+	}
+}
+
+func TestDeserializeUser_ValidAndTruncated(t *testing.T) {
+	username := "alice"
+	// User: id(4), createdAt(8), status(1), usernameLength(1), username, options(4), derivedOptions(4), hasPermissions(1)
+	valid := binary.LittleEndian.AppendUint32(nil, 7)
+	valid = binary.LittleEndian.AppendUint64(valid, 1000)
+	valid = append(valid, 1) // status: Active
+	valid = append(valid, byte(len(username)))
+	valid = append(valid, username...)
+	valid = binary.LittleEndian.AppendUint32(valid, 0) // options len: 0
+	valid = binary.LittleEndian.AppendUint32(valid, 0) // derived options len: 0
+	valid = append(valid, 1)                           // hasPermissions: 1
+
+	permsPayload := []byte{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0} // 10 global + hasStreams=0
+	valid = binary.LittleEndian.AppendUint32(valid, uint32(len(permsPayload)))
+	valid = append(valid, permsPayload...)
+
+	user, err := DeserializeUser(valid)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if user.Id != 7 || user.Username != username || user.Permissions == nil {
+		t.Fatalf("got %+v", user)
+	}
+
+	// Truncated at every possible length
+	for cut := 0; cut < len(valid); cut++ {
+		truncated := valid[:cut]
+		_, err := DeserializeUser(truncated)
+		if err == nil {
+			t.Fatalf("expected error for user cut to %d bytes, got nil", cut)
+		}
+	}
+
+	// User without permissions (hasPermissions = 0)
+	noPerms := binary.LittleEndian.AppendUint32(nil, 8)
+	noPerms = binary.LittleEndian.AppendUint64(noPerms, 2000)
+	noPerms = append(noPerms, 2) // status: Inactive
+	noPerms = append(noPerms, byte(len(username)))
+	noPerms = append(noPerms, username...)
+	noPerms = binary.LittleEndian.AppendUint32(noPerms, 0)
+	noPerms = binary.LittleEndian.AppendUint32(noPerms, 0)
+	noPerms = append(noPerms, 0) // hasPermissions: 0
+
+	userNoPerm, err := DeserializeUser(noPerms)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if userNoPerm.Id != 8 || userNoPerm.Permissions != nil {
+		t.Fatalf("got %+v", userNoPerm)
+	}
+
+	// Permissions length that points past the buffer
+	bogusPermLen := make([]byte, len(valid))
+	copy(bogusPermLen, valid)
+	binary.LittleEndian.PutUint32(bogusPermLen[len(valid)-len(permsPayload)-4:], 1000)
+	if _, err := DeserializeUser(bogusPermLen); err == nil {
+		t.Fatal("expected error for bogus permissions length, got nil")
+	}
+}
+
+func TestClientInfo_ValidAndTruncated(t *testing.T) {
+	addr := "127.0.0.1:8090"
+	valid := binary.LittleEndian.AppendUint32(nil, 1)  // id
+	valid = binary.LittleEndian.AppendUint32(valid, 2) // userId
+	valid = append(valid, 1)                           // transport: Tcp
+	valid = binary.LittleEndian.AppendUint32(valid, uint32(len(addr)))
+	valid = append(valid, addr...)
+	valid = binary.LittleEndian.AppendUint32(valid, 1) // consumerGroupsCount: 1
+	// 1 consumer group: streamId(4), topicId(4), groupId(4)
+	valid = binary.LittleEndian.AppendUint32(valid, 10)
+	valid = binary.LittleEndian.AppendUint32(valid, 20)
+	valid = binary.LittleEndian.AppendUint32(valid, 30)
+
+	// Test DeserializeClient
+	clientDetails, err := DeserializeClient(valid)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if clientDetails.ID != 1 || clientDetails.Address != addr || len(clientDetails.ConsumerGroups) != 1 {
+		t.Fatalf("got %+v", clientDetails)
+	}
+
+	for cut := 0; cut < len(valid); cut++ {
+		truncated := valid[:cut]
+		_, err := DeserializeClient(truncated)
+		if err == nil {
+			t.Fatalf("expected error for DeserializeClient cut to %d bytes, got nil", cut)
+		}
+	}
+
+	// Test MapClientInfo
+	clientInfoBytes := valid[:13+len(addr)+4]
+	client, readBytes, err := MapClientInfo(clientInfoBytes, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if readBytes != len(clientInfoBytes) || client.Address != addr {
+		t.Fatalf("got %+v, readBytes %d", client, readBytes)
+	}
+
+	for cut := 0; cut < len(clientInfoBytes); cut++ {
+		truncated := clientInfoBytes[:cut]
+		_, _, err := MapClientInfo(truncated, 0)
+		if err == nil {
+			t.Fatalf("expected error for MapClientInfo cut to %d bytes, got nil", cut)
+		}
+		if !errors.Is(err, ierror.ErrTruncatedPayload) {
+			t.Fatalf("expected ErrTruncatedPayload, got %v", err)
+		}
+	}
+
+	// Test DeserializeClients (multiple clients)
+	twoClients := append(append([]byte(nil), clientInfoBytes...), clientInfoBytes...)
+	clients, err := DeserializeClients(twoClients)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(clients) != 2 {
+		t.Fatalf("expected 2 clients, got %d", len(clients))
+	}
+
+	empty, err := DeserializeClients(nil)
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("expected empty slice, got (%+v, %v)", empty, err)
+	}
+
+	for cut := 1; cut < len(twoClients); cut++ {
+		if cut == len(clientInfoBytes) {
+			continue // exactly 1 complete client, which is a valid payload
+		}
+		truncated := twoClients[:cut]
+		_, err := DeserializeClients(truncated)
+		if err == nil {
+			t.Fatalf("expected error for DeserializeClients cut to %d bytes, got nil", cut)
+		}
+	}
+}
+
+func TestDeserializeAccessToken_ValidAndTruncated(t *testing.T) {
+	token := "secret-pat-token"
+	valid := append([]byte{byte(len(token))}, token...)
+
+	got, err := DeserializeAccessToken(valid)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.Token != token {
+		t.Fatalf("got %q, want %q", got.Token, token)
+	}
+
+	for cut := 0; cut < len(valid); cut++ {
+		truncated := valid[:cut]
+		_, err := DeserializeAccessToken(truncated)
+		if err == nil {
+			t.Fatalf("expected error for token cut to %d bytes, got nil", cut)
+		}
+		if !errors.Is(err, ierror.ErrTruncatedPayload) {
+			t.Fatalf("expected ErrTruncatedPayload, got %v", err)
+		}
+	}
+
+	// Token length pointing past end
+	oversized := []byte{100, 'a', 'b', 'c'}
+	if _, err := DeserializeAccessToken(oversized); err == nil {
+		t.Fatal("expected error for oversized token length, got nil")
+	}
+}
+
+func TestDeserializeAccessTokens_Truncated(t *testing.T) {
+	appendToken := func(payload []byte, name string, expiry uint64) []byte {
+		payload = append(payload, byte(len(name)))
+		payload = append(payload, name...)
+		return binary.LittleEndian.AppendUint64(payload, expiry)
+	}
+	valid := appendToken(nil, "token1", 123456789)
+
+	for cut := 1; cut < len(valid); cut++ {
+		truncated := valid[:cut]
+		_, err := DeserializeAccessTokens(truncated)
+		if err == nil {
+			t.Fatalf("expected error for tokens cut to %d bytes, got nil", cut)
+		}
+	}
+}
+
+func FuzzDeserializeLogInResponse(f *testing.F) {
+	f.Add([]byte{0x01, 0x02, 0x03, 0x04})
+	f.Add([]byte{})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		_, _ = DeserializeLogInResponse(data)
+	})
+}
+
+func FuzzDeserializeOffset(f *testing.F) {
+	f.Add(make([]byte, 20))
+	f.Add([]byte{})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		_, _ = DeserializeOffset(data)
+	})
+}
+
+func FuzzDeserializeToConsumerGroupMember(f *testing.F) {
+	f.Add(make([]byte, 8))
+	f.Add([]byte{})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		_, _, _ = DeserializeToConsumerGroupMember(data, 0)
+	})
+}
+
+func FuzzDeserializeConsumerGroup(f *testing.F) {
+	f.Add(make([]byte, 13))
+	f.Add([]byte{})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		_, _ = DeserializeConsumerGroup(data)
+	})
+}
+
+func FuzzDeserializeUser(f *testing.F) {
+	f.Add(make([]byte, 20))
+	f.Add([]byte{})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		_, _ = DeserializeUser(data)
+	})
+}
+
+func FuzzDeserializeClient(f *testing.F) {
+	f.Add(make([]byte, 17))
+	f.Add([]byte{})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		_, _ = DeserializeClient(data)
+	})
+}
+
+func FuzzDeserializeClients(f *testing.F) {
+	f.Add(make([]byte, 17))
+	f.Add([]byte{})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		_, _ = DeserializeClients(data)
+	})
+}
+
+func FuzzDeserializeAccessToken(f *testing.F) {
+	f.Add([]byte{4, 't', 'e', 's', 't'})
+	f.Add([]byte{})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		_, _ = DeserializeAccessToken(data)
+	})
+}
+
+func FuzzDeserializeAccessTokens(f *testing.F) {
+	f.Add([]byte{4, 't', 'e', 's', 't', 0, 0, 0, 0, 0, 0, 0, 0})
+	f.Add([]byte{})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		_, _ = DeserializeAccessTokens(data)
+	})
+}

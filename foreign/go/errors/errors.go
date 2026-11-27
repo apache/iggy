@@ -21,7 +21,11 @@ package ierror
 
 import "errors"
 
-var ErrNilContext = errors.New("nil context")
+var (
+	ErrNilContext       = errors.New("nil context")
+	ErrTruncatedPayload = errors.New("truncated payload")
+	ErrMalformedPayload = errors.New("malformed payload")
+)
 
 // Unwrap preserves generic lane-blocked recovery while a fetch also names
 // the partition whose retained operation must be resolved or abandoned.

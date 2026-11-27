@@ -36,7 +36,7 @@ func (c *IggyTcpClient) GetConsumerOffset(ctx context.Context, consumer iggcon.C
 		return nil, err
 	}
 
-	return binaryserialization.DeserializeOffset(buffer), nil
+	return binaryserialization.DeserializeOffset(buffer)
 }
 
 func (c *IggyTcpClient) StoreConsumerOffset(ctx context.Context, consumer iggcon.Consumer, streamId iggcon.Identifier, topicId iggcon.Identifier, offset uint64, partitionId *uint32) error {
