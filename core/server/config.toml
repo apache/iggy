@@ -1583,7 +1583,10 @@ handshake_grace = "10 s"
 # node spends this times its shards. "0" keeps nothing that reads fetch and
 # turns readahead off: those reads go to the store each time. It never stops
 # the shard from holding what it uploads, which then takes a fixed 64 MiB of
-# its own. Otherwise at least 8 blocks of 'read_cache_block_size'.
+# its own. Otherwise at least 8 blocks of 'read_cache_block_size'. Every
+# partition of the shard reads within it. A size of a topic's own, once a
+# topic can set one, is a limit on what each of its partitions keeps, not a
+# reservation: what a quiet partition leaves unused is there for the others.
 #read_cache_size = "64 MiB"
 # The piece of a segment that the cache fetches and keeps. A smaller block
 # wastes less on a small or random read. A larger block means fewer entries

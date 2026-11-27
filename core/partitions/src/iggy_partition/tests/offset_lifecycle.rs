@@ -566,6 +566,7 @@ async fn given_in_flight_sealed_poll_when_state_is_installed_should_wipe_its_rea
         deadline: None,
         bytes_per_message: None,
         widest_batch_bytes: 0,
+        read_settings: crate::PartitionReadSettings::SHARD,
         validate_checksum: true,
         segments: vec![DiskSegment {
             start_offset: 0,

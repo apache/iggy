@@ -538,11 +538,16 @@ wants 64 MiB or more. With `read_cache_size` at 0, each poll reads exactly its
 bytes from the store and nothing it fetches is kept, but the shard still holds
 what it uploads, in a fixed 64 MiB of its own. A geo peer's bytes are served
 only while the node reads that peer, and never across a change of the cluster
-that owns its root. The counters `remote_read_block_hits_total`,
-`remote_read_block_misses_total`, `remote_read_ahead_hits_total`,
-`remote_read_blocks_fetched_ahead_total`, `remote_read_demand_bytes_total`,
-`remote_read_ahead_bytes_total`, `remote_read_fresh_releases_total` and
-`remote_read_carried_bytes_total`, and the gauges `remote_read_cache_bytes` and
+that owns its root. The budget is shared by every partition of the shard. A
+size of a topic's own, once a topic can set one, is a limit on what each of its
+partitions keeps, not a reservation: a partition over its limit evicts its own
+blocks, and what a quiet partition leaves unused is there for the others. The
+counters `remote_read_block_hits_total`, `remote_read_block_misses_total`,
+`remote_read_ahead_hits_total`, `remote_read_blocks_fetched_ahead_total`,
+`remote_read_demand_bytes_total`, `remote_read_ahead_bytes_total`,
+`remote_read_fresh_releases_total`, `remote_read_carried_bytes_total` and
+`remote_read_limit_evictions_total`, the blocks and whole objects, such as a
+segment's `.index`, that left because their partition was over its limit, and the gauges `remote_read_cache_bytes` and
 `remote_read_held_bytes`, show what the cache of each shard does.
 
 A replica rebuilt by state transfer gets only the records of the segments

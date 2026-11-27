@@ -51,6 +51,7 @@ With tiered storage or geo peers, the `remote_read_*` series show the cache of w
 | `remote_read_ahead_bytes_total` | counter | Bytes of the store reads of readahead |
 | `remote_read_fresh_releases_total` | counter | Fresh objects the cache stopped holding once the long-term floors of their partitions passed them |
 | `remote_read_carried_bytes_total` | counter | Bytes of long-term segments that rewrites handed to the cache as they stored them |
+| `remote_read_limit_evictions_total` | counter | Blocks and objects that left the cache because their partition was over its limit |
 | `remote_read_cache_bytes` | gauge | Bytes that the cache holds |
 | `remote_read_held_bytes` | gauge | Bytes of the fresh objects the shard uploaded that the cache holds for the polls of their partitions |
 

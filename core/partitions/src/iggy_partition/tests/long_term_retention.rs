@@ -21,12 +21,12 @@ use super::placed_batches::{
     placing_partition_of_small_segments, store_segment_up_to, store_with, whole_and_placed,
     whole_and_placed_in,
 };
-use super::remote_poll::{layout, polled_all};
+use super::remote_poll::{layout, polled_all, polled_all_reading};
 use super::*;
 use crate::long_term::{TRIM_SEGMENTS, TrimSegments};
 use crate::placed_read::LONG_TERM_SEGMENTS_PER_POLL;
 use crate::state_machine::{Applied, MachineCommand};
-use crate::{ReadCache, ReadCacheSettings, RemoteObjects, RemoteSegments};
+use crate::{PartitionReadSettings, ReadCache, ReadCacheSettings, RemoteObjects, RemoteSegments};
 use futures::FutureExt;
 use futures::future::LocalBoxFuture;
 use iggy_common::{IggyDuration, IggyExpiry, PollingStrategy};
@@ -584,6 +584,44 @@ async fn given_long_term_segments_polled_twice_when_the_shard_keeps_what_it_read
     unique.sort();
     unique.dedup();
     assert_eq!(unique.len(), asked.len(), "{asked:?}");
+}
+
+/// What the polls of a geo partition keep of its long-term segments is the
+/// partition's, and leaves with it. A limit below eight blocks keeps none.
+#[compio::test]
+async fn given_long_term_segments_polled_through_a_cache_when_limited_or_gone_should_keep_none_of_them()
+ {
+    let (_directory, mut partition, counted) =
+        Box::pin(rewritten_partition_reading_through(64 * 1024 * 1024)).await;
+    let cached = |partition: &IggyPartition<IggyMessageBus>| {
+        partition
+            .remote_segments()
+            .and_then(|remote| remote.take_read_metrics())
+            .map_or(0, |metrics| metrics.cached_bytes)
+    };
+    let under = PartitionReadSettings {
+        limit: Some(1),
+        read_ahead: None,
+        left: None,
+    };
+
+    let first = Box::pin(polled_all(&mut partition)).await;
+    assert!(cached(&partition) > 0);
+    let asked = counted.keys.borrow().len();
+    let limited = Box::pin(polled_all_reading(&mut partition, &under)).await;
+    assert_eq!(cached(&partition), 0);
+    let keys = counted.keys.borrow().clone();
+    let (cached_pass, limited_pass) = keys.split_at(asked);
+    assert!(
+        cached_pass.iter().all(|key| limited_pass.contains(key)),
+        "each object asked again: {keys:?}"
+    );
+    Box::pin(polled_all(&mut partition)).await;
+    assert!(cached(&partition) > 0);
+    partition.forget_reads();
+
+    assert_eq!(first, limited);
+    assert_eq!(cached(&partition), 0);
 }
 
 /// With no bytes for the cache, a poll of long-term segments asks the store

@@ -552,6 +552,9 @@ pub struct ShardMetrics {
     remote_read_fresh_releases_total: Counter,
     /// Bytes of long-term segments that rewrites handed to the read cache.
     remote_read_carried_bytes_total: Counter,
+    /// Blocks and objects that left the read cache because their partition
+    /// was over its limit.
+    remote_read_limit_evictions_total: Counter,
     /// 1 while this node passes the store identity check of tiered storage.
     /// Both object store gauges hold for the whole node, so every shard
     /// exports the same ones, see [`Self::share_object_store_gauges`].
@@ -801,6 +804,7 @@ impl ShardMetrics {
             remote_read_held_bytes: Gauge::default(),
             remote_read_fresh_releases_total: Counter::default(),
             remote_read_carried_bytes_total: Counter::default(),
+            remote_read_limit_evictions_total: Counter::default(),
             object_store_identity_verified: Gauge::default(),
             object_store_unreachable: Gauge::default(),
             geo_peer_identity_verified: Family::default(),
@@ -983,6 +987,8 @@ impl ShardMetrics {
             .inc_by(reads.fresh_releases);
         self.remote_read_carried_bytes_total
             .inc_by(reads.carried_bytes);
+        self.remote_read_limit_evictions_total
+            .inc_by(reads.limit_evictions);
     }
 
     pub fn set_object_store_identity_verified(&self, verified: bool) {
@@ -3073,6 +3079,12 @@ impl ShardMetrics {
             self.remote_read_carried_bytes_total.clone(),
         );
         registry.register(
+            "remote_read_limit_evictions",
+            "blocks and objects that left the read cache because their partition was over its \
+             limit",
+            self.remote_read_limit_evictions_total.clone(),
+        );
+        registry.register(
             "object_store_identity_verified",
             "1 while this node passes the store identity check of tiered storage, so it runs uploads and object deletes",
             self.object_store_identity_verified.clone(),
@@ -3743,6 +3755,7 @@ mod tests {
             held_bytes: 256,
             fresh_releases: 5,
             carried_bytes: 4096,
+            limit_evictions: 7,
         };
         metrics.record_remote_reads(&reads);
         metrics.record_remote_reads(&partitions::RemoteReadMetrics {
@@ -3765,6 +3778,7 @@ mod tests {
             "remote_read_held_bytes 256",
             "remote_read_fresh_releases_total 10",
             "remote_read_carried_bytes_total 8192",
+            "remote_read_limit_evictions_total 14",
         ] {
             assert!(buffer.lines().any(|scraped| scraped == line), "{line}");
         }

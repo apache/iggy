@@ -6388,6 +6388,23 @@ where
         })
     }
 
+    /// How the polls of `namespace` read the store through the shard's read
+    /// cache: the limit and the readahead that its topic sets for each of
+    /// its partitions, from the topic's options and partition count. No
+    /// topic sets them yet, so every partition reads with the shard's own
+    /// settings, and only the shard's budget binds.
+    #[must_use]
+    #[allow(
+        clippy::unused_self,
+        reason = "the topic options that set them read the shard's metadata"
+    )]
+    const fn partition_read_settings(
+        &self,
+        _namespace: IggyNamespace,
+    ) -> partitions::PartitionReadSettings {
+        partitions::PartitionReadSettings::SHARD
+    }
+
     /// Simulator-only: mutates `IggyPartitions` off the pump task, bypassing the
     /// reconciler's `ReconcileOp::InsertOwned` funnel (production's runtime path;
     /// bootstrap recovery uses `load_partition`). VSR replica id comes from

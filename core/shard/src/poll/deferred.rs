@@ -1573,6 +1573,7 @@ where
             waiter.request.consumer,
             &waiter.request.args,
             max_selected_bytes,
+            &self.partition_read_settings(waiter.namespace),
         ) else {
             self.reject_deferred_poll(id, &waiter, IggyError::TransientNotAccepted);
             return;

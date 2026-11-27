@@ -443,7 +443,13 @@ where
             PartitionRead::Poll { consumer, args, .. }
             | PartitionRead::PollOnPrimary { consumer, args, .. }
             | PartitionRead::UnboundPollOnPrimary { consumer, args, .. } => {
-                match partitions.build_poll_snapshot(&namespace, consumer, &args) {
+                match partitions.build_poll_snapshot_within(
+                    &namespace,
+                    consumer,
+                    &args,
+                    usize::MAX,
+                    &self.partition_read_settings(namespace),
+                ) {
                     None => PartitionReadReply::NotFound,
                     Some(plan) if plan.needs_off_pump_io() => {
                         let route_failure = self.senders.get(usize::from(self.id)).map_or(

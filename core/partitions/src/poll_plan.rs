@@ -21,6 +21,7 @@
 //! yield. Execution returns facts about that snapshot. Only the partition
 //! owner validates its history and accepts progress.
 
+use crate::PartitionReadSettings;
 use crate::iggy_index::{IGGY_INDEX_SIZE, IggyIndex, IggyIndexCache};
 use crate::iggy_index_reader::IggyIndexReader;
 use crate::journal::{
@@ -205,6 +206,8 @@ pub struct DiskReadPlan {
     /// chunk holding no complete batch, so a count-derived estimate below this
     /// buys nothing and costs the re-read it triggers.
     pub(crate) widest_batch_bytes: u64,
+    /// How the partition's reads of remote segments use the shard's cache.
+    pub(crate) read_settings: PartitionReadSettings,
 }
 
 pub struct DiskSegment {
@@ -1450,10 +1453,17 @@ impl DiskReadPlan {
                     (None, MessageLookup::Offset { offset, .. }) => Some(offset),
                     (None, MessageLookup::Timestamp { .. }) => None,
                 };
-                let cached = remote.holds(range, walk.position, len);
+                let cached = remote.holds(range, walk.position, len, &self.read_settings);
                 let read = async {
                     remote
-                        .read(range, walk.position, len, *next, poll_offset)
+                        .read(
+                            range,
+                            walk.position,
+                            len,
+                            *next,
+                            poll_offset,
+                            &self.read_settings,
+                        )
                         .await
                         .map_err(|fault| {
                             // A `.log` that was gone without an eviction was
@@ -2110,6 +2120,7 @@ mod tests {
             deadline: None,
             bytes_per_message,
             widest_batch_bytes,
+            read_settings: crate::PartitionReadSettings::SHARD,
             segments: Vec::new(),
             start_position: 0,
             start_index_offset: None,
@@ -2206,6 +2217,7 @@ mod tests {
             deadline: None,
             bytes_per_message: None,
             widest_batch_bytes: 0,
+            read_settings: crate::PartitionReadSettings::SHARD,
             segments: Vec::new(),
             start_position: 0,
             start_index_offset: None,
@@ -2384,6 +2396,7 @@ mod tests {
             deadline: None,
             bytes_per_message: None,
             widest_batch_bytes: 0,
+            read_settings: crate::PartitionReadSettings::SHARD,
             segments: Vec::new(),
             start_position: 0,
             start_index_offset: None,
@@ -2536,6 +2549,7 @@ mod tests {
                         deadline: None,
                         bytes_per_message: None,
                         widest_batch_bytes: 0,
+                        read_settings: crate::PartitionReadSettings::SHARD,
                         segments: vec![DiskSegment {
                             start_offset: 0,
                             persisted: bytes.len() as u64,
@@ -2673,6 +2687,7 @@ mod tests {
                     deadline: None,
                     bytes_per_message: None,
                     widest_batch_bytes: 0,
+                    read_settings: crate::PartitionReadSettings::SHARD,
                     segments: vec![DiskSegment {
                         start_offset: 0,
                         persisted: bytes.len() as u64,
@@ -2901,6 +2916,7 @@ mod tests {
                     deadline: None,
                     bytes_per_message: None,
                     widest_batch_bytes: 0,
+                    read_settings: crate::PartitionReadSettings::SHARD,
                     segments: vec![DiskSegment {
                         start_offset: 0,
                         persisted: persisted as u64,
