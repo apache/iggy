@@ -939,6 +939,7 @@ async fn load_partition(
             partitions_config,
             namespace,
             segment_checkpoint.is_some(),
+            segment_checkpoint.map(|checkpoint| checkpoint.next_offset),
         )
         .await?;
     }
@@ -967,7 +968,7 @@ async fn load_partition(
             }
         }
     }
-    ensure_initial_segment(&mut partition, partitions_config, namespace, true).await?;
+    ensure_initial_segment(&mut partition, partitions_config, namespace, true, None).await?;
     if replica_count == 1 && !partition.durability().is_persisted() {
         partition
             .reanchor_to_offset_frontier(partitions_config)
@@ -1549,7 +1550,7 @@ pub async fn build_partition_fresh(
     partition.restore_offset_frontier(recovered_state.as_ref());
 
     recover_consumer_offsets(&mut partition, partitions_config, namespace).await?;
-    ensure_initial_segment(&mut partition, partitions_config, namespace, false).await?;
+    ensure_initial_segment(&mut partition, partitions_config, namespace, false, None).await?;
 
     // Claim the first offset-reservation block HERE so no send ever pays the
     // create, write, file fsync, rename and directory fsync of a first claim
@@ -2952,6 +2953,140 @@ mod tests {
         let partitions_config = solo_partitions_config(&config);
         std::fs::remove_file(partitions_config.get_messages_path(1, 1, 0, 0)).unwrap();
         std::fs::remove_file(partitions_config.get_index_path(1, 1, 0, 0)).unwrap();
+        let partitions = solo_partitions(&config);
+        let partition = Box::pin(load_partition(
+            &config,
+            partitions.config(),
+            namespace,
+            Arc::new(PartitionStats::default()),
+            &Partition::new(0, namespace.inner(), IggyTimestamp::now(), 0, 0),
+            runtime,
+            CLUSTER,
+            REPLICA,
+            ReplicaSet::all(REPLICAS),
+            Rc::new(IggyMessageBus::new(0)),
+            None,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(partition.log.active_segment().start_offset, 1);
+        assert_eq!(partition.log.active_segment().size.as_bytes_u64(), 0);
+        assert!(partition.log.messages_writers().last().unwrap().is_none());
+        assert_eq!(
+            std::fs::read(partitions_config.get_messages_path(1, 1, 0, 1)).unwrap(),
+            tail_body
+        );
+        drop(partition);
+        let recovered = journal::PartitionPrepareJournal::open(&wal, namespace.inner(), 0)
+            .await
+            .unwrap();
+        assert_eq!(recovered.head(), 2);
+        assert_eq!(
+            recovered.prepares().await.unwrap()[1].as_slice()[size_of::<PrepareHeader>()..],
+            tail_body
+        );
+    }
+
+    /// The checkpoint cursor ends the removed segment 0 exactly, and the recorded
+    /// frontier lies above it. The emptied chain must start at the cursor, where the
+    /// WAL's tail begins, not at the frontier.
+    #[compio::test]
+    async fn loading_after_retention_plants_the_empty_chain_at_the_checkpoint_when_the_frontier_is_above_it()
+     {
+        let root = tempfile::tempdir().unwrap();
+        let config = solo_config(&root);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let mut parent = 0;
+        let prepares = [0, 1].map(|offset| {
+            let prepare = send_prepare(&config, offset + 1, parent, offset);
+            parent = prepare.header().checksum;
+            prepare
+        });
+        let tail_body = prepares[1].as_slice()[size_of::<PrepareHeader>()..].to_vec();
+        // One batch fills a segment, so the second batch starts the next one.
+        let segment_size = IggyByteSize::from(tail_body.len() as u64);
+        let runtime = TopicRuntimeOptions {
+            durability: iggy_common::Durability::Persisted,
+            segment_size: Some(segment_size),
+            preallocate_segments: Some(false),
+            ..Default::default()
+        };
+        drop(
+            build_partition_fresh(
+                &config,
+                &solo_partitions_config(&config),
+                namespace,
+                Arc::new(PartitionStats::default()),
+                0,
+                0,
+                runtime,
+                CLUSTER,
+                REPLICA,
+                ReplicaSet::all(REPLICAS),
+                0,
+                Rc::new(IggyMessageBus::new(0)),
+            )
+            .await
+            .unwrap(),
+        );
+        let wal = Path::new(&config.get_partition_path(1, 1, 0)).join("prepares-0");
+        let mut journal = journal::PartitionPrepareJournal::open(&wal, namespace.inner(), 0)
+            .await
+            .unwrap();
+        for prepare in prepares {
+            journal.append(prepare.into_frozen()).await.unwrap();
+        }
+        let mut protection = OFFSETS_MAGIC.to_vec();
+        protection.push(OFFSETS_VERSION);
+        // next_offset, emptied_at, required_metadata_frontier
+        for value in [1_u64, 0, 0] {
+            protection.extend_from_slice(&value.to_le_bytes());
+        }
+        protection.extend_from_slice(
+            &u32::try_from(config.partition.dedup_clients_max)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        protection.extend_from_slice(&[0; (ConsumerKind::COUNT + 1) * size_of::<u32>()]);
+        protection.extend_from_slice(&0_u32.to_le_bytes());
+        protection.push(0);
+        protection.extend_from_slice(&0_u32.to_le_bytes());
+        protection.push(0);
+        protection.extend_from_slice(&0_u128.to_le_bytes());
+        protection.extend_from_slice(&0_u32.to_le_bytes());
+        protection.extend_from_slice(&0_u64.to_le_bytes());
+        protection.extend_from_slice(&0_u32.to_le_bytes());
+        protection
+            .extend_from_slice(&consensus::state_artifact_checksum(&protection).to_le_bytes());
+        let mut checkpoint = RETRY_CHECKPOINT_MAGIC.to_vec();
+        checkpoint.extend_from_slice(&namespace.inner().to_le_bytes());
+        checkpoint.extend_from_slice(&0_u64.to_le_bytes());
+        checkpoint.extend_from_slice(&1_u64.to_le_bytes());
+        checkpoint.extend_from_slice(&protection);
+        checkpoint
+            .extend_from_slice(&consensus::state_artifact_checksum(&checkpoint).to_le_bytes());
+        std::fs::write(wal.join("receipts-1.checkpoint"), checkpoint).unwrap();
+        journal.checkpoint(1).await.unwrap();
+        drop(journal);
+        let partitions_config = solo_partitions_config(&config);
+        std::fs::remove_file(partitions_config.get_messages_path(1, 1, 0, 0)).unwrap();
+        std::fs::remove_file(partitions_config.get_index_path(1, 1, 0, 0)).unwrap();
+        let (store, _) =
+            open_partition_superblock(&config.get_partition_path(1, 1, 0), test_identity(), 0)
+                .await
+                .unwrap();
+        store
+            .write(
+                &VsrState {
+                    commit_max: 0,
+                    offset_frontier: 3,
+                    ..recorded_state(0, 0)
+                }
+                .to_bytes(),
+            )
+            .await
+            .unwrap();
+        drop(store);
         let partitions = solo_partitions(&config);
         let partition = Box::pin(load_partition(
             &config,
