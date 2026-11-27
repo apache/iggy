@@ -782,7 +782,9 @@ The `gcs` backend keeps the objects in a Google Cloud Storage bucket, which
 S3 interoperability endpoint: GCS takes a create-only put as its own
 `ifGenerationMatch=0` precondition, and the server relies on create-only puts.
 An empty `endpoint` is Google Cloud Storage. An emulator, such as
-fake-gcs-server, takes its own URL and `auth = "none"`. GCS takes one write
+fake-gcs-server, takes its own URL and `auth = "none"`. On any endpoint but an
+`https` one of Google, every object goes up whole, because an emulator
+composes over an object whatever a create-only condition says. GCS takes one write
 per second to one object name, so on `gcs` set `[geo]
 consumer_offset_upload_interval` to `1 s` or more, or to `disabled`.
 
@@ -790,6 +792,114 @@ The `mock_s3` backend keeps the objects in the memory of the server, where
 every shard reads them, and answers each call after the latencies of
 `[tiered_storage.mock_s3]`. The server loses them all when it stops, so it is
 for benchmarks and tests only.
+
+Each shard bounds and retries the calls it sends to the store. A head, a
+read, a listing or a delete that gets no answer within `request_timeout`, or
+fails with a 5xx answer, throttling or a connection that broke or never
+opened, is sent again after `retry_delay`, doubled up to `max_retry_delay`, up
+to `max_attempts` in all. A create-only put whose body the node holds in
+memory, a fresh object or a long-term segment, is sent again the same way,
+and each of its requests counts, a second attempt too. The shard does not
+upload a fresh object again after these attempts. An
+overwrite, such as a manifest, a positions object or a topic object, is sent
+again only when its request never left the node, for example when the
+connection was refused or the name lookup or TLS handshake failed. An attempt
+that may have reached the store can land after a later overwrite of the same
+key and roll it back, so any other failure of an overwrite goes to the caller.
+Every attempt of one put carries the same `put-id` entry in the object's user
+metadata. An attempt at a create-only put,
+a fresh object or a long-term segment, is given up when the store takes no
+64 KiB piece of its body for `put_attempt_stall_timeout`, 1 second by default,
+or gives no answer for `put_attempt_answer_timeout`, 5 seconds by default,
+after the last piece. A create that lands late finds the object and stores
+nothing. An attempt at an overwrite, such as a manifest or a positions object,
+waits `progress_timeout` in both cases instead, because one cut early could
+land after a later put of other bytes. When the store refuses a create-only
+put after an attempt that may have reached it, the shard reads the object's
+metadata, and the put counts as stored when the object carries the put's id,
+its size and its CRC32C. A store that keeps no CRC32C has the bytes read back
+for it. Otherwise the refusal
+goes to the caller, which runs its own check. A put that streams a sealed
+segment from its file is sent once, and fails when the store takes no piece of
+it, or gives no answer after the last piece, for `progress_timeout`. On the
+`fs` backend, where a slow put means a busy volume of the node, every attempt
+waits `progress_timeout` in both cases and gets no second attempt.
+
+A create-only put whose body the node holds in memory, such as the upload of a
+fresh object that producers wait for, gets a second attempt on another
+connection once it has run for `second_attempt_after` plus
+`second_attempt_after_per_mib` for each MiB of its body, 300 ms plus 60 ms by
+default. The first attempt to store the object wins, and the other is dropped,
+which cancels its request. A store that took the dropped attempt whole
+refuses it, because the object is there by then. At most
+`jobs.second_attempts` run at once on a shard, and they take no slot of
+`jobs.fresh_uploads`. `second_attempt_after = "disabled"` turns them off. An
+overwrite never gets a second attempt, because a dropped attempt could land
+after a later put of other bytes. Each shard exports
+`object_store_put_retries_total`, `object_store_put_second_attempts_total`,
+`object_store_put_second_attempt_wins_total` and
+`object_store_put_own_objects_found_total`.
+
+A long-term segment of at least twice `part_size`, 8 MiB by default, goes up in
+parts on the `s3` and `gcs` backends. Every other put goes whole, such as a
+fresh object that producers wait for. Up to `jobs.parts_in_flight` parts go
+side by side over all the uploads of a shard, and an upload with no part in
+flight always sends one, and a part that waits takes the first slot that comes
+free. Each part is sent again after a failure as a put is, with the same
+bytes, so no part needs a check. A part gets no second attempt beside its
+first, because the one that loses could land after the object exists. Then
+one request creates the object whole and create-only, with the user metadata
+and the CRC32C of the whole object, which the store checks. On `s3` the
+upload is a multipart upload with a full object CRC32C, and the completion
+carries `If-None-Match: *`. A completion that S3 refuses for a conditional
+conflict starts a new upload with every part. On `gcs` each part is a
+temporary object under `<prefix>/meta/uploads/<put-id>/`, created only where
+none is, so an attempt that lands late replaces nothing. GCS ignores a CRC32C
+in a compose, so a compose joins the parts into a temporary composite first,
+the node compares the CRC32C that it reports, and only then does a compose
+with `ifGenerationMatch=0` create the object from it. After the object has its
+answer, the node deletes every version of the temporary objects within
+`request_timeout`. Only an `https` endpoint of Google takes uploads in parts.
+GCS composes at most 32 parts, so a
+part takes at least a 32nd of its object there. On GCS, a bucket with soft
+delete on keeps deleted objects billable for its retention, 7 days by default,
+so each long-term segment stored in parts is billed about twice for that time.
+Turning soft delete off on the bucket, or `part_size = "0"`, avoids it. The
+completion is sent again after a failure, and the object under the key settles
+a completion that may have reached the store, as for a put. An upload that ends
+without its object is aborted, and one that runs past half of
+`abandoned_upload_grace` gives up.
+A store that refuses multipart uploads or the full object checksum as not
+implemented, at the begin or at the completion, makes the node put every object
+whole from then on, and the node
+logs that once. Each shard exports `object_store_parts_uploads_total`,
+`object_store_parts_uploads_completed_total`,
+`object_store_parts_uploads_aborted_total`, `object_store_parts_fallbacks_total`
+and `object_store_parts_sent_total`.
+
+A crash or a cancelled put can leave an upload in parts behind: the parts of an
+S3 multipart upload, which S3 keeps and charges for until it is aborted, or the
+temporary objects of a GCS upload. Shard 0 of the caught-up metadata primary
+removes the ones that began more than `abandoned_upload_grace` ago, 1 hour by
+default, every hour or every grace when that is shorter. It sweeps only while
+its node passes the store identity check, and only once the identity object it
+reads names this cluster. On `s3` it lists the multipart uploads under the
+prefix and aborts the old ones whose keys this cluster builds, and on `gcs` it
+deletes every old version of the temporary objects, by the store's clock. Each
+request of the sweep waits at most `request_timeout`, and one that gets no
+answer leaves its upload for the next sweep, which goes on from where the last
+one stopped. The grace protects a live upload on another
+shard or node: an upload gives up at half the grace, and the other half covers
+the skew between the clocks. `abandoned_upload_grace = "disabled"` turns the
+sweep off, and an upload in parts then has no deadline. The grace is at least
+30 minutes, so its second half takes the 15 minutes of skew that S3 accepts.
+On `s3` the sweep, and the abort of an upload in parts that fails, need
+`s3:ListBucketMultipartUploads` on the bucket (`arn:aws:s3:::<bucket>`) and
+`s3:AbortMultipartUpload` on its objects (`arn:aws:s3:::<bucket>/*`), besides
+`s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` and `s3:ListBucket`.
+Without them the sweep removes nothing and logs why, and S3 keeps charging for
+the parts of every abandoned upload. A bucket lifecycle rule that aborts
+incomplete multipart uploads is the alternative.
 
 The `s3` backend signs each request with the first credentials that the node
 has, in the order of the AWS SDKs:

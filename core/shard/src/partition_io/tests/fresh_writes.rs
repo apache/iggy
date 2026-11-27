@@ -59,6 +59,8 @@ pub(super) struct TestUploader {
     /// The first attempts that fail, in the order they come.
     pub(super) fails_first: Cell<u32>,
     attempts: Cell<u32>,
+    /// What [`FreshObjectUploader::store_retries`] says.
+    pub(super) store_retries: Cell<bool>,
 }
 
 impl TestUploader {
@@ -71,6 +73,7 @@ impl TestUploader {
             refuses: Cell::new(false),
             fails_first: Cell::new(0),
             attempts: Cell::new(0),
+            store_retries: Cell::new(false),
         })
     }
 
@@ -95,6 +98,10 @@ impl FreshObjectUploader for TestUploader {
         } else {
             self.uploader.upload(object_id, bytes, scope)
         }
+    }
+
+    fn store_retries(&self) -> bool {
+        self.store_retries.get()
     }
 }
 
@@ -374,6 +381,32 @@ async fn given_a_store_that_refuses_when_the_window_closes_should_answer_its_pro
     assert_eq!((stored, refused), (0, 1));
     let (retries, denied, in_flight, staged) = owner.metrics().fresh_load_value();
     assert_eq!((retries, denied, in_flight, staged), (2, 1, 0, 0));
+}
+
+/// The store's own retries took the budget of the object, so the shard
+/// does not start it over.
+#[compio::test]
+async fn given_a_store_that_retries_when_an_upload_fails_should_answer_its_producers_without_a_retry()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let uploader = TestUploader::new();
+    uploader.refuses.set(true);
+    uploader.store_retries.set(true);
+    owner.set_fresh_uploader(Some(uploader.clone()));
+
+    let answer = pumped(&owner, async {
+        let answer = submit_send(&owner, 1, 100);
+        until(&owner, |_| !answer.is_empty()).await;
+        answer
+    })
+    .await;
+
+    assert!(answer.try_recv().unwrap().is_some());
+    assert_eq!(committed_sends(&owner), 0);
+    assert_eq!(uploader.attempts.get(), 1);
+    let (retries, denied, ..) = owner.metrics().fresh_load_value();
+    assert_eq!((retries, denied), (0, 1));
 }
 
 #[compio::test]

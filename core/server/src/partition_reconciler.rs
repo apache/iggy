@@ -203,6 +203,7 @@ use crate::peer_positions::PeerPositionLister;
 use crate::server_error::ServerError;
 use crate::shadow_topics::{ShadowTopics, peer_log_of};
 use crate::shell::{ServerShard, ShellBus, ShellShard};
+use crate::upload_sweep::UploadSweep;
 use ahash::{AHashMap, AHashSet};
 use configs::server::ServerConfig;
 use consensus::Consensus;
@@ -463,6 +464,9 @@ pub struct ReconcilerCtx {
     /// committed metadata no longer holds. Shard 0 of the metadata primary
     /// only.
     orphan_sweep: OrphanSweep,
+    /// The sweep of the uploads in parts that never completed. Shard 0 of the
+    /// metadata primary only.
+    upload_sweep: UploadSweep,
     /// The objects of this cluster's geo topics in its store, which the
     /// metadata primary keeps in step with committed metadata.
     geo_topics: GeoTopics,
@@ -530,6 +534,7 @@ impl ReconcilerCtx {
             .read(|inner| Arc::clone(&inner.stats_registry));
         let geo_topics = GeoTopics::new(&config.geo);
         let orphan_sweep = OrphanSweep::new(&config.tiered_storage);
+        let upload_sweep = UploadSweep::new(&config.tiered_storage);
         let shadow_topics = ShadowTopics::new(&config.geo);
         let peer_manifests = PeerManifestLister::new(&config.geo);
         let peer_positions = PeerPositionLister::new(&config.geo);
@@ -556,6 +561,7 @@ impl ReconcilerCtx {
             lifecycle_reports: LifecycleReports::default(),
             incarnation_deletes: IncarnationDeletes::default(),
             orphan_sweep,
+            upload_sweep,
             geo_topics,
             shadow_topics,
             peer_manifests,
@@ -875,6 +881,7 @@ pub async fn run_reconciler(
 
     ctx.incarnation_deletes.stop();
     ctx.orphan_sweep.stop();
+    ctx.upload_sweep.stop();
     ctx.geo_topics.stop();
     ctx.shadow_topics.stop(&ctx.shard);
     ctx.peer_manifests.stop();
@@ -972,6 +979,7 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     ctx.orphan_sweep
         .pass(&ctx.shard, &ctx.incarnation_deletes, now, Instant::now());
     ctx.incarnation_deletes.pass(&ctx.shard, now);
+    ctx.upload_sweep.pass(&ctx.shard, now);
     ctx.geo_topics.pass(&ctx.shard, now);
     ctx.shadow_topics.pass(&ctx.shard, now);
     let place = NodePlace {

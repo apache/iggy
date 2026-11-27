@@ -73,9 +73,9 @@ pub use object_delete::{
     ClaimReadOutcome, DeletedIncarnations, ExecutorDeleter, INCARNATION_DELETE_RETRY,
     IncarnationSettled, ListedSegment, MAX_QUEUED_INCARNATIONS, MAX_QUEUED_ORPHANS,
     ObjectDeleteDone, ObjectDeleteJob, ObjectDeleteOutcome, ObjectDeleteStart, ObjectDeleteWork,
-    ObjectDeleter, RETIRED_OBJECT_GRACE, RootListOutcome, SweptObjects, delete_incarnation,
-    delete_long_term_segments, delete_objects, delete_segments, list_segment_starts,
-    sweep_long_term, sweep_segments, sweepable,
+    ObjectDeleter, RETIRED_OBJECT_GRACE, RootListOutcome, SweptObjects, UploadSweepOutcome,
+    delete_incarnation, delete_long_term_segments, delete_objects, delete_segments,
+    list_segment_starts, sweep_long_term, sweep_segments, sweepable,
 };
 mod orphan_sweep;
 pub use orphan_sweep::{
@@ -111,8 +111,8 @@ pub use proven_batch::{ProvenBatch, ProvenBatchError};
 mod topic_object;
 pub use segment_chain::object_prefix;
 pub use segment_upload::{
-    ExecutorUploader, SegmentUpload, SegmentUploadAttempt, SegmentUploader, StartedSegmentUpload,
-    UploadError, UploadOutcome, upload_segment,
+    ExecutorUploader, MEMORY_PIECE_LEN, SegmentUpload, SegmentUploadAttempt, SegmentUploader,
+    StartedSegmentUpload, UploadError, UploadOutcome, memory_body, upload_segment,
 };
 mod segment_verify;
 pub use segment_verify::{

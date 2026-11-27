@@ -592,6 +592,7 @@ async fn store_report<S: ObjectStore>(
         mode: PutMode::Overwrite,
         metadata: UserMetadata::default(),
         crc32c: None,
+        ..PutOptions::default()
     };
     store
         .put(

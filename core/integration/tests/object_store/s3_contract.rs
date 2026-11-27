@@ -37,6 +37,7 @@ macro_rules! s3_store {
 
 iggy_object_store::contract_cases!(s3_store);
 iggy_object_store::if_absent_contract_cases!(s3_store);
+iggy_object_store::parts_contract_cases!(s3_store);
 
 /// A wrong secret is a refusal that no retry gets past.
 #[test]

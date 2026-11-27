@@ -1300,6 +1300,102 @@ async fn log_of_whole_batches(records: &[Vec<u8>]) -> Vec<u8> {
     segment_file_bytes(directory.path()).concat()
 }
 
+/// A store over a [`SharedStore`] that keeps the key and the options of each
+/// put it takes.
+struct KeepsPutOptions {
+    inner: SharedStore,
+    puts: Rc<std::cell::RefCell<Vec<(String, iggy_object_store::PutOptions)>>>,
+}
+
+impl iggy_object_store::ObjectStore for KeepsPutOptions {
+    async fn put(
+        &self,
+        key: &str,
+        body: iggy_object_store::PutBody,
+        options: &iggy_object_store::PutOptions,
+    ) -> Result<(), iggy_object_store::ObjectStoreError> {
+        self.puts
+            .borrow_mut()
+            .push((key.to_owned(), options.clone()));
+        self.inner.put(key, body, options).await
+    }
+
+    async fn get_range(
+        &self,
+        key: &str,
+        range: std::ops::Range<u64>,
+    ) -> Result<iggy_object_store::ObjectRange, iggy_object_store::ObjectStoreError> {
+        self.inner.get_range(key, range).await
+    }
+
+    async fn head(
+        &self,
+        key: &str,
+    ) -> Result<iggy_object_store::ObjectMeta, iggy_object_store::ObjectStoreError> {
+        self.inner.head(key).await
+    }
+
+    async fn delete(
+        &self,
+        keys: &[String],
+    ) -> Result<iggy_object_store::DeleteOutcome, iggy_object_store::ObjectStoreError> {
+        self.inner.delete(keys).await
+    }
+
+    async fn list(
+        &self,
+        request: &iggy_object_store::ListRequest<'_>,
+    ) -> Result<iggy_object_store::ListPage, iggy_object_store::ObjectStoreError> {
+        self.inner.list(request).await
+    }
+}
+
+/// The `.log` of a long-term segment is the one put that may go up in
+/// parts, because no producer waits for it. Its `.index` goes whole.
+#[compio::test]
+async fn given_committed_placed_batches_when_rewriting_should_let_only_the_log_go_up_in_parts() {
+    let (_, placed, object) = whole_and_placed(RECEIVER_OPS);
+    let store = Box::pin(store_with(object)).await;
+    let (_directory, mut partition) = Box::pin(placing_primary_with(&placed, &store)).await;
+    let puts = Rc::default();
+    let writer = crate::ExecutorLongTermWriter::new(
+        iggy_object_store::InlineTierExecutor::new(KeepsPutOptions {
+            inner: SharedStore(Rc::clone(&store)),
+            puts: Rc::clone(&puts),
+        }),
+        super::remote_poll::layout(),
+    );
+    let (id, rewrite, scope) = Box::pin(begin_registered_rewrite(
+        &mut partition,
+        Registering::AsOp(100),
+    ))
+    .await
+    .unwrap();
+
+    let outcome = crate::LongTermWriter::write(&writer, rewrite, scope).await;
+
+    partition.finish_segment_rewrite(id, outcome).unwrap();
+    let parts: Vec<_> = puts
+        .borrow()
+        .iter()
+        .map(|(key, options)| (key.clone(), options.parts))
+        .collect();
+    let key = |object| long_term_key(0, RECEIVER_OPS - 1, object);
+    assert_eq!(
+        parts,
+        [
+            (
+                key(iggy_object_store::SegmentObject::Log),
+                iggy_object_store::PutParts::Allowed
+            ),
+            (
+                key(iggy_object_store::SegmentObject::Index),
+                iggy_object_store::PutParts::Whole
+            ),
+        ]
+    );
+}
+
 /// A reader of the bucket gets the partition's log without a placement or a
 /// fresh object: the long-term segment is the `.log` of a partition that
 /// kept the same batches whole.

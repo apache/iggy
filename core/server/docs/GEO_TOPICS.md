@@ -184,9 +184,17 @@ about an hour later.
   cannot check this rule.
 - **Credentials.** Each cluster needs read and write access to its own bucket: get, put, list
   and delete. On S3 that is `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` and
-  `s3:ListBucket`. Each cluster needs only read access to the bucket of each peer: `s3:GetObject`
-  and `s3:ListBucket`. On GCS, the role Storage Object User on the own bucket and Storage Object
-  Viewer on each peer's bucket. The server never writes to a peer's bucket.
+  `s3:ListBucket`, and for the multipart uploads of long-term segments
+  `s3:ListBucketMultipartUploads` on the bucket (`arn:aws:s3:::<bucket>`) and
+  `s3:AbortMultipartUpload` on its objects (`arn:aws:s3:::<bucket>/*`). A node aborts a
+  multipart upload that fails, and the sweep of abandoned uploads lists and aborts the ones
+  that a crash or a cancelled put left.
+  Without these two actions the sweep removes nothing and logs why, and S3 keeps charging for
+  the parts of every abandoned upload. A bucket lifecycle rule that aborts incomplete multipart
+  uploads is the alternative: it deletes no object. Each cluster needs only read access to the
+  bucket of each peer: `s3:GetObject` and `s3:ListBucket`. On GCS, the role Storage Object User
+  on the own bucket and Storage Object Viewer on each peer's bucket. The server never writes to
+  a peer's bucket.
 - **On GCS, one write per second per object.** GCS throttles a second write to one object name
   within a second. A partition stores its manifest at most once a second, within that limit. Each
   node rewrites one positions object per log, so set `[geo] consumer_offset_upload_interval` to
@@ -1064,7 +1072,9 @@ Requests to a cluster's own bucket:
 
 Storage: a message stays in its fresh object until at least 10 minutes after every message of
 that object is published, and in a long-term segment until retention removes it. Each replica
-keeps 320 bytes per batch on its disk.
+keeps 320 bytes per batch on its disk. On GCS, a bucket with soft delete on keeps each deleted
+fresh object billable for its retention, 7 days by default, so turn soft delete off on the bucket
+to avoid it.
 
 ## Metrics
 

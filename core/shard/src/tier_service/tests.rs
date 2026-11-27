@@ -552,11 +552,14 @@ fn quick_calls() -> StoreCallPolicy {
         max_attempts: 3,
         retry_delay: Duration::from_millis(1),
         max_retry_delay: Duration::from_millis(2),
+        attempt_stall_timeout: Duration::from_millis(50),
+        attempt_answer_timeout: Duration::from_millis(50),
+        ..StoreCallPolicy::default()
     }
 }
 
 fn tier_store(store: TestStore) -> TierStore<TestStore, Bus> {
-    TierStore::new(store, bus(), quick_calls())
+    TierStore::new(store, bus(), quick_calls(), StoreWriter::default())
 }
 
 /// The names of the files in `directory`, sorted.
@@ -699,7 +702,12 @@ async fn given_fs_put_cut_by_the_progress_timeout_when_putting_it_again_should_s
  {
     let directory = tempfile::tempdir().unwrap();
     let parent = directory.path().join("a");
-    let store = TierStore::new(FsStore::new(directory.path()), bus(), quick_calls());
+    let store = TierStore::new(
+        FsStore::new(directory.path()),
+        bus(),
+        quick_calls(),
+        StoreWriter::default(),
+    );
     let if_absent = PutOptions {
         mode: PutMode::IfAbsent,
         ..PutOptions::default()

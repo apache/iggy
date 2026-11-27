@@ -48,8 +48,8 @@ use futures::future::LocalBoxFuture;
 use iggy_common::IggyTimestamp;
 use iggy_object_store::{
     KeyLayout, ListRequest, LongTermKey, MAX_KEYS_PER_REQUEST, ObjectPrefix, ObjectStore,
-    ObjectStoreError, SegmentKey, SegmentMetadata, SegmentObject, TierExecutor, TierJobCancelled,
-    TierJobClass, TierJobRequest, TierScope, TierScopeToken,
+    ObjectStoreError, SegmentKey, SegmentMetadata, SegmentObject, SweptUploads, TierExecutor,
+    TierJobCancelled, TierJobClass, TierJobRequest, TierScope, TierScopeToken,
 };
 use tracing::warn;
 
@@ -150,6 +150,10 @@ pub type ClaimReadOutcome = Result<Result<Option<ClaimStamp>, ObjectStoreError>,
 /// `orphan_sweep_job::list_root`.
 pub type RootListOutcome = Result<Result<RootPages, ObjectStoreError>, TierJobCancelled>;
 
+/// What one page of a sweep of abandoned uploads in parts did, or that its
+/// scope was cancelled first.
+pub type UploadSweepOutcome = Result<Result<SweptUploads, ObjectStoreError>, TierJobCancelled>;
+
 /// A job to run, with the token of the scope its owner keeps.
 pub type ObjectDeleteStart = (ObjectDeleteJob, TierScopeToken);
 
@@ -176,6 +180,20 @@ pub trait ObjectDeleter {
         claimed_at: SystemTime,
         scope: TierScopeToken,
     ) -> LocalBoxFuture<'static, RootListOutcome>;
+
+    /// Remove one page, after `after`, of the uploads in parts under the
+    /// root that began more than `older_than` ago, under `scope`, see
+    /// [`ObjectStore::sweep_uploads`]. A deleter without a store of uploads
+    /// in parts removes nothing.
+    fn sweep_uploads(
+        &self,
+        older_than: Duration,
+        after: Option<String>,
+        scope: TierScopeToken,
+    ) -> LocalBoxFuture<'static, UploadSweepOutcome> {
+        let _ = (older_than, after, scope);
+        Box::pin(std::future::ready(Ok(Ok(SweptUploads::default()))))
+    }
 }
 
 /// Deletes through a tier executor. Deletes go in its delete class and a
@@ -308,6 +326,28 @@ impl<E: TierExecutor> ObjectDeleter for ExecutorDeleter<E> {
             .submit(
                 TierJobRequest::new(TierJobClass::Housekeeping, scope),
                 move |store| async move { list_root(&*store, &layout, after, claimed_at).await },
+            )
+            .boxed_local()
+    }
+
+    /// One page in one job of the housekeeping class.
+    fn sweep_uploads(
+        &self,
+        older_than: Duration,
+        after: Option<String>,
+        scope: TierScopeToken,
+    ) -> LocalBoxFuture<'static, UploadSweepOutcome> {
+        let layout = self.layout.clone();
+        self.executor
+            .submit(
+                TierJobRequest::new(TierJobClass::Housekeeping, scope),
+                // The tier store bounds each request of the page by its own
+                // request timeout.
+                move |store| async move {
+                    store
+                        .sweep_uploads(&layout, older_than, after.as_deref(), Duration::MAX)
+                        .await
+                },
             )
             .boxed_local()
     }

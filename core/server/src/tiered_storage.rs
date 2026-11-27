@@ -46,7 +46,10 @@ use partitions::{
     ExecutorStoreViewReader, ExecutorTopicObjects, ExecutorUploader, ReadCache, ReadCacheSettings,
     RemoteSegments,
 };
-use shard::tier_service::{ClassLimits, StoreCallPolicy, TierService, TierServiceConfig};
+use shard::tier_service::{
+    ClassLimits, PartsPolicy, SecondAttempts, StoreCallPolicy, StoreWriter, TierService,
+    TierServiceConfig,
+};
 use shard::{Sender, channel};
 use tracing::{info, warn};
 
@@ -273,7 +276,14 @@ pub fn start(
     // `preflight` and `probe` refused the boot already when these fail.
     let backend = store(config, node_store).ok().flatten()?;
     let layout = layout(config).ok()?;
-    let service = TierService::new(backend, Rc::clone(bus), &service_config(config));
+    let writer = StoreWriter {
+        replica: replica_id,
+        shard: shard.id,
+        layout: Some(layout.clone()),
+        counters: shard.metrics().tier_store_counters(),
+    };
+    let service =
+        TierService::with_writer(backend, Rc::clone(bus), &service_config(config), writer);
     shard.set_fresh_upload_pace(
         config.fresh_upload_interval.get_duration(),
         usize::try_from(config.jobs.fresh_uploads).unwrap_or(usize::MAX),
@@ -305,7 +315,7 @@ pub fn start(
             service.clone(),
             layout.clone(),
         )),
-        Rc::new(ExecutorFreshUploader::new(service.clone(), layout.clone())),
+        Rc::new(ExecutorFreshUploader::new(service.clone(), layout.clone()).with_store_retries()),
         Rc::new(ExecutorLongTermWriter::new(service.clone(), layout.clone())),
         Rc::new(ExecutorLongTermMerger::new(service.clone(), layout.clone())),
         Rc::new(ExecutorFreshSweeper::new(service.clone(), layout.clone())),
@@ -353,9 +363,28 @@ pub fn start(
 }
 
 /// The section's caps and timeouts in the form the tier service takes.
+///
+/// A put to the `fs` backend writes a scratch file on a volume of the node,
+/// where a slow put means a busy disk: an attempt there keeps the progress
+/// timeout, and no second attempt starts another scratch write beside it.
 #[must_use]
 pub fn service_config(config: &TieredStorageConfig) -> TierServiceConfig {
     let jobs = &config.jobs;
+    let filesystem = config.backend == TieredStorageBackend::Fs;
+    let progress_timeout = config.progress_timeout.get_duration();
+    let (attempt_stall_timeout, attempt_answer_timeout) = if filesystem {
+        (progress_timeout, progress_timeout)
+    } else {
+        (
+            config.put_attempt_stall_timeout.get_duration(),
+            config.put_attempt_answer_timeout.get_duration(),
+        )
+    };
+    let second_attempt_slots = if filesystem {
+        0
+    } else {
+        usize::try_from(jobs.second_attempts).unwrap_or(usize::MAX)
+    };
     let limits = |count: u32, bytes: Option<IggyByteSize>| ClassLimits {
         jobs: usize::try_from(count).unwrap_or(usize::MAX),
         bytes: bytes.map(|bytes| bytes.as_bytes_u64()),
@@ -369,12 +398,33 @@ pub fn service_config(config: &TieredStorageConfig) -> TierServiceConfig {
         housekeeping: limits(jobs.housekeeping, None),
         calls: StoreCallPolicy {
             request_timeout: config.request_timeout.get_duration(),
-            progress_timeout: config.progress_timeout.get_duration(),
+            progress_timeout,
             max_attempts: config.max_attempts,
             retry_delay: config.retry_delay.get_duration(),
             max_retry_delay: config.max_retry_delay.get_duration(),
+            attempt_stall_timeout,
+            attempt_answer_timeout,
+            second_attempts: SecondAttempts {
+                after: config.second_attempt_after.get_duration(),
+                after_per_mib: config.second_attempt_after_per_mib.get_duration(),
+                slots: second_attempt_slots,
+            },
+            parts: PartsPolicy {
+                part_len: config.part_size.as_bytes_u64(),
+                in_flight: usize::try_from(jobs.parts_in_flight).unwrap_or(usize::MAX),
+                deadline: parts_deadline(config),
+            },
         },
     }
+}
+
+/// How long an upload in parts may run: half the grace of the sweep of
+/// abandoned uploads, so the sweep never meets a live one, and no limit
+/// without the sweep.
+#[must_use]
+pub fn parts_deadline(config: &TieredStorageConfig) -> Option<Duration> {
+    let grace = config.abandoned_upload_grace.get_duration();
+    (!grace.is_zero()).then(|| grace / 2)
 }
 
 /// The configured store, or `None` without a backend. An `s3` store signs
@@ -581,6 +631,29 @@ mod tests {
             service_config(&TieredStorageConfig::default()),
             TierServiceConfig::default()
         );
+    }
+
+    #[test]
+    fn given_the_fs_backend_when_mapping_should_keep_the_progress_timeout_and_send_no_second_attempt()
+     {
+        let config = fs_config(Path::new("/tmp/tiers"));
+
+        let calls = service_config(&config).calls;
+
+        let progress = config.progress_timeout.get_duration();
+        assert_eq!(calls.attempt_stall_timeout, progress);
+        assert_eq!(calls.attempt_answer_timeout, progress);
+        assert_eq!(calls.second_attempts.threshold(1024 * 1024), None);
+        let s3 = TieredStorageConfig {
+            backend: TieredStorageBackend::S3,
+            ..config
+        };
+        let calls = service_config(&s3).calls;
+        assert_eq!(
+            calls.attempt_stall_timeout,
+            s3.put_attempt_stall_timeout.get_duration()
+        );
+        assert!(calls.second_attempts.threshold(1024 * 1024).is_some());
     }
 
     #[test]

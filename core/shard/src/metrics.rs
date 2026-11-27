@@ -289,6 +289,149 @@ fn reason_index(s: &str) -> Option<usize> {
     REASONS.iter().position(|r| *r == s)
 }
 
+/// What the tier store of a shard did to the puts it can send again, see
+/// [`crate::tier_service::TierStore`]. Clones count into the same counters.
+#[derive(Debug, Clone, Default)]
+pub struct TierStoreCounters {
+    put_retries: Counter,
+    second_attempts: Counter,
+    second_attempt_wins: Counter,
+    own_objects_found: Counter,
+    parts_uploads: Counter,
+    parts_uploads_completed: Counter,
+    parts_uploads_aborted: Counter,
+    parts_fallbacks: Counter,
+    parts_sent: Counter,
+}
+
+impl TierStoreCounters {
+    /// A put is sent again after an attempt that failed.
+    pub(crate) fn record_put_retry(&self) {
+        self.put_retries.inc();
+    }
+
+    /// A slow create-only put got a second attempt beside its first.
+    pub(crate) fn record_second_attempt(&self) {
+        self.second_attempts.inc();
+    }
+
+    /// The second attempt of a put stored the object first.
+    pub(crate) fn record_second_attempt_win(&self) {
+        self.second_attempt_wins.inc();
+    }
+
+    /// A create-only put that the store refused found the object that an
+    /// earlier attempt of the same put stored.
+    pub(crate) fn record_own_object_found(&self) {
+        self.own_objects_found.inc();
+    }
+
+    /// An upload in parts began.
+    pub(crate) fn record_parts_upload(&self) {
+        self.parts_uploads.inc();
+    }
+
+    /// An upload in parts created its object.
+    pub(crate) fn record_parts_upload_completed(&self) {
+        self.parts_uploads_completed.inc();
+    }
+
+    /// An upload in parts ended without its object and was aborted.
+    pub(crate) fn record_parts_upload_aborted(&self) {
+        self.parts_uploads_aborted.inc();
+    }
+
+    /// A put that would go up in parts went whole, because the store does
+    /// not take uploads in parts.
+    pub(crate) fn record_parts_fallback(&self) {
+        self.parts_fallbacks.inc();
+    }
+
+    /// One attempt at a part went out.
+    pub(crate) fn record_part_sent(&self) {
+        self.parts_sent.inc();
+    }
+
+    /// Test-only read: uploads in parts begun, completed, aborted, fallen
+    /// back to a whole put, and parts sent.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn parts_values(&self) -> (u64, u64, u64, u64, u64) {
+        (
+            self.parts_uploads.get(),
+            self.parts_uploads_completed.get(),
+            self.parts_uploads_aborted.get(),
+            self.parts_fallbacks.get(),
+            self.parts_sent.get(),
+        )
+    }
+
+    /// Test-only read: put retries, second attempts, second attempt wins and
+    /// own objects found.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn values(&self) -> (u64, u64, u64, u64) {
+        (
+            self.put_retries.get(),
+            self.second_attempts.get(),
+            self.second_attempt_wins.get(),
+            self.own_objects_found.get(),
+        )
+    }
+
+    fn register(&self, registry: &mut Registry) {
+        registry.register(
+            "object_store_put_retries",
+            "attempts at a put to the object store, whose body the shard holds in memory, after an \
+             attempt that failed",
+            self.put_retries.clone(),
+        );
+        registry.register(
+            "object_store_put_second_attempts",
+            "second attempts at a create-only put to the object store that ran past \
+             tiered_storage.second_attempt_after",
+            self.second_attempts.clone(),
+        );
+        registry.register(
+            "object_store_put_second_attempt_wins",
+            "create-only puts to the object store whose second attempt stored the object first",
+            self.second_attempt_wins.clone(),
+        );
+        registry.register(
+            "object_store_put_own_objects_found",
+            "create-only puts that the object store refused because an earlier attempt of the same \
+             put had stored the object, counted as stored",
+            self.own_objects_found.clone(),
+        );
+        registry.register(
+            "object_store_parts_uploads",
+            "uploads in parts of large objects to the object store that began",
+            self.parts_uploads.clone(),
+        );
+        registry.register(
+            "object_store_parts_uploads_completed",
+            "uploads in parts that created their object",
+            self.parts_uploads_completed.clone(),
+        );
+        registry.register(
+            "object_store_parts_uploads_aborted",
+            "uploads in parts that ended without their object and were aborted",
+            self.parts_uploads_aborted.clone(),
+        );
+        registry.register(
+            "object_store_parts_fallbacks",
+            "puts that would have gone up in parts and went whole, because the object store does \
+             not take uploads in parts",
+            self.parts_fallbacks.clone(),
+        );
+        registry.register(
+            "object_store_parts_sent",
+            "attempts at the parts of uploads in parts",
+            self.parts_sent.clone(),
+        );
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct DeferredPollMetrics {
     pub pending: Gauge,
@@ -575,6 +718,8 @@ pub struct ShardMetrics {
     /// 1 while the object store did not answer the last read of its identity
     /// object: the boot probe, then each identity check.
     object_store_unreachable: Gauge,
+    /// What the tier store of this shard did to its puts.
+    tier_store: TierStoreCounters,
     /// Per geo peer, 1 while this node reads the peer: a check verified the
     /// cluster that owns the peer's root. Node-wide like the object store
     /// gauges.
@@ -833,6 +978,7 @@ impl ShardMetrics {
             remote_read_limit_evictions_total: Counter::default(),
             object_store_identity_verified: Gauge::default(),
             object_store_unreachable: Gauge::default(),
+            tier_store: TierStoreCounters::default(),
             geo_peer_identity_verified: Family::default(),
             geo_peer_unreachable: Family::default(),
             geo_peer_retired: Family::default(),
@@ -1047,6 +1193,12 @@ impl ShardMetrics {
             origin: origin.to_owned(),
         };
         self.geo_peer_retired.get_or_create(&label).set(1);
+    }
+
+    /// The counters that the tier store of this shard moves.
+    #[must_use]
+    pub fn tier_store_counters(&self) -> TierStoreCounters {
+        self.tier_store.clone()
     }
 
     /// Export the object store and geo peer gauges of `node` from this shard
@@ -3283,6 +3435,7 @@ impl ShardMetrics {
             "1 while the object store did not answer the last read of its identity object, at boot or in the check every minute",
             self.object_store_unreachable.clone(),
         );
+        self.tier_store.register(registry);
         registry.register(
             "geo_peer_identity_verified",
             "1 while this node reads the geo peer: a check verified the cluster that owns its root",

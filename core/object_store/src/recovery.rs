@@ -252,6 +252,7 @@ impl RecoveryRecord {
             mode: PutMode::IfAbsent,
             metadata: UserMetadata::default(),
             crc32c: Some(crc32c::crc32c(&body)),
+            ..PutOptions::default()
         };
         match store
             .put(
