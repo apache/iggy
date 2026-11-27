@@ -1581,7 +1581,9 @@ does not repair those records automatically.
 Partition directories hold a `created.revision` file with the revision that
 created the partition. Recovery deletes a directory whose file names an older
 revision. The partition then starts empty, as if it had no directory, and in a
-cluster the replica copies its data from the other replicas.
+cluster the replica copies its data from the other replicas. The file carries a
+checksum. Recovery refuses a partition whose file fails it and keeps the
+directory.
 
 A directory that an older server made has no such file. A delete that did not
 finish before a restart leaves such a directory on disk, and a later create

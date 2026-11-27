@@ -1114,7 +1114,11 @@ impl DiskReadPlan {
             _ => 0,
         };
         let mut walk = DiskWalk::starting_at(position, skipped);
-        walk.unproven_entry = resolved.filter(|_| self.starts_remote());
+        // An entry that names a later batch would start the walk past messages
+        // the poll asked for. Boot checks a local index, but not damage after
+        // boot, and a fetch checks only that a remote entry stays inside its
+        // segment. So the walk proves the entry it starts from.
+        walk.unproven_entry = resolved;
         walk.max_bytes = max_bytes;
         walk.max_selected_bytes = max_selected_bytes;
         // Set when an open/read retry exhausts. The walk breaks immediately so
@@ -1180,22 +1184,6 @@ impl DiskReadPlan {
         );
 
         self.outcome(walk, fault, count)
-    }
-
-    /// Whether the walk starts in a remote segment.
-    ///
-    /// Such a segment is read on its index's word, and the most a fetch can
-    /// check of an index object is that it stays inside the segment. An entry
-    /// that names a later batch would start the walk past messages the poll
-    /// asked for, so the walk proves the entry it starts from.
-    fn starts_remote(&self) -> bool {
-        matches!(
-            self.segments.first(),
-            Some(DiskSegment {
-                source: SegmentSource::Remote(_),
-                ..
-            })
-        )
     }
 
     /// What a finished walk amounts to.
@@ -1275,7 +1263,7 @@ impl DiskReadPlan {
                     namespace_raw = self.namespace_raw,
                     offset = entry.offset,
                     position = entry.position,
-                    "remote poll: an index entry does not name the batch at its position"
+                    "disk poll: an index entry does not name the batch at its position"
                 );
                 return SegmentWalk::Faulted(DiskFault::Unreadable);
             }

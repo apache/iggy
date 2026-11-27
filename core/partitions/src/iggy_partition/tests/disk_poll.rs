@@ -16,7 +16,10 @@
 // under the License.
 
 use super::*;
+use crate::poll_plan::PollTier;
 use crate::remote_segments::IndexFetchFence;
+use iggy_binary_protocol::batch::BatchHeader;
+use iggy_common::{IggyTimestamp, PollingStrategy};
 
 /// Fail-closed disk read: an unreadable EARLIER segment must stop the walk
 /// (return `Faulted`) rather than skip forward and serve a LATER segment's
@@ -818,12 +821,14 @@ async fn read_disk_resolves_oversized_index_without_materializing() {
     }
 
     // Every entry below the target points at byte 0 (the poison prefix),
-    // so only an exact lower-bound hit on the last entry reads the batch.
+    // so only an exact lower-bound hit on the last entry reads the batch. That
+    // entry names the batch, as a written index does.
+    let timestamp = BatchHeader::decode(&batch).unwrap().base_timestamp;
     let mut index_bytes =
         Vec::with_capacity(usize::try_from(entry_count * index_size).expect("fits in usize"));
     for entry in 0..entry_count {
         index_bytes.extend_from_slice(&entry.to_le_bytes());
-        index_bytes.extend_from_slice(&entry.to_le_bytes());
+        index_bytes.extend_from_slice(&timestamp.to_le_bytes());
         let position = if entry == target_offset {
             prefix_len
         } else {
@@ -895,4 +900,47 @@ fn given_ordered_segments_when_locating_an_offset_should_pick_the_last_that_star
 
     assert_eq!(located, [0, 0, 0, 1, 1, 2, 2]);
     assert_eq!(segment_holding(&[], 7), 0);
+}
+
+#[compio::test]
+async fn given_a_local_index_entry_that_names_a_later_batch_when_polling_should_refuse_it() {
+    let (directory, mut partition) = Box::pin(partition_with_sealed_segments(&segment_records(
+        RECEIVER_OPS,
+    )))
+    .await;
+    let log = std::fs::read(directory.path().join(format!("{:020}.log", 0))).unwrap();
+    let first = BatchHeader::decode(&log).unwrap();
+    let second_position = first.total_size() as u64;
+    let second = BatchHeader::decode(&log[usize::try_from(second_position).unwrap()..]).unwrap();
+    assert_eq!((first.base_offset, second.base_offset), (0, 1));
+
+    // Damage after boot: each entry starts the walk at the second batch for a
+    // poll that the first batch answers.
+    let wrong_offset = IggyIndex::new(first.base_offset, first.base_timestamp, second_position);
+    let wrong_timestamp = IggyIndex::new(second.base_offset, 0, second_position);
+    let polls = [
+        (wrong_offset, PollingStrategy::offset(0)),
+        (
+            wrong_timestamp,
+            PollingStrategy::timestamp(IggyTimestamp::from(0)),
+        ),
+    ];
+    for (entry, strategy) in polls {
+        std::fs::write(
+            directory.path().join(format!("{:020}.index", 0)),
+            IggyIndexCache::serialize(&entry),
+        )
+        .unwrap();
+        partition.log.invalidate_sealed_read_state();
+
+        // The second poll resolves the entry from the index the first kept.
+        for _ in 0..2 {
+            let args = PollingArgs::new(strategy, 10, false);
+            let plan = partition.build_poll_plan(PollingConsumer::Consumer(1, 0), &args, false);
+            assert!(matches!(plan.tier, PollTier::Disk { .. }));
+            let result = plan.execute().await;
+            assert_eq!(result.message_count, 0);
+            assert_eq!(result.read_error, Some(IggyError::CannotReadMessage));
+        }
+    }
 }
