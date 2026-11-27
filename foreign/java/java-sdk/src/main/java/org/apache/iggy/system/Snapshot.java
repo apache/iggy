@@ -22,9 +22,19 @@ package org.apache.iggy.system;
 import java.util.Arrays;
 
 /**
- * A system snapshot: the ZIP archive bytes the server returns.
+ * A system snapshot containing the ZIP archive bytes the server returns.
  */
 public record Snapshot(byte[] data) {
+
+    public Snapshot {
+        data = data.clone();
+    }
+
+    /** Returns a copy of the ZIP archive bytes. */
+    @Override
+    public byte[] data() {
+        return data.clone();
+    }
 
     @Override
     public boolean equals(Object other) {

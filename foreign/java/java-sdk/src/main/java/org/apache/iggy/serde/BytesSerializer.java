@@ -97,9 +97,6 @@ public final class BytesSerializer {
     /** Bound on a u8-length-prefixed wire string, in encoded bytes. */
     private static final int MAX_U8_STRING_LENGTH = 255;
 
-    /** The get snapshot request carries its type count in one byte. */
-    private static final int MAX_SNAPSHOT_TYPES = 255;
-
     /** The timestamp delta is a u32 microsecond offset from the batch origin timestamp. */
     private static final BigInteger MAX_TIMESTAMP_DELTA_MICROS = BigInteger.valueOf(0xFFFF_FFFFL);
 
@@ -297,11 +294,7 @@ public final class BytesSerializer {
      */
     public static ByteBuf toGetSnapshot(SnapshotCompression compression, List<SystemSnapshotType> snapshotTypes) {
         var compressionCode = compression.asCode();
-        var validatedTypes = List.copyOf(snapshotTypes);
-        if (validatedTypes.size() > MAX_SNAPSHOT_TYPES) {
-            throw new IggyInvalidArgumentException(
-                    "Too many snapshot types: " + validatedTypes.size() + " (max " + MAX_SNAPSHOT_TYPES + ")");
-        }
+        var validatedTypes = SystemSnapshotType.validatedCopyOf(snapshotTypes);
         var payload = Unpooled.buffer(2 + validatedTypes.size());
         payload.writeByte(compressionCode);
         payload.writeByte(validatedTypes.size());

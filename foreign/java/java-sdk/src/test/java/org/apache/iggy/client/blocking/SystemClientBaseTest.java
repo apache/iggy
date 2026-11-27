@@ -23,6 +23,7 @@ import org.apache.commons.lang3.StringUtils;
 import org.apache.iggy.cluster.ClusterNodeRole;
 import org.apache.iggy.cluster.ClusterNodeStatus;
 import org.apache.iggy.exception.IggyErrorCode;
+import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyValidationException;
 import org.apache.iggy.message.HeaderKind;
@@ -61,6 +62,7 @@ import java.io.IOException;
 import java.math.BigInteger;
 import java.security.SecureRandom;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -186,6 +188,15 @@ public abstract class SystemClientBaseTest extends IntegrationTest {
     }
 
     @Test
+    void shouldRejectMoreThan255SnapshotTypes() {
+        var types = Collections.nCopies(256, SystemSnapshotType.Test);
+
+        assertThatThrownBy(() -> systemClient.snapshot(SnapshotCompression.Deflated, types))
+                .isInstanceOf(IggyInvalidArgumentException.class)
+                .hasMessage("Too many snapshot types: 256 (max 255)");
+    }
+
+    @Test
     void givenUserWithoutManageServersWhenTakingSnapshotShouldBeRefusedAsUnauthorized() {
         // given
         String username = unique("snapshot-reader");
@@ -195,12 +206,10 @@ public abstract class SystemClientBaseTest extends IntegrationTest {
                 .createUser(
                         username, "snapshot-secret", UserStatus.Active, Optional.of(permissions), UserOptions.empty());
         trackUser(user.id());
-        var reader = getClient();
-        reader.users().login(username, "snapshot-secret");
+        client.users().login(username, "snapshot-secret");
 
         // then
-        assertThatThrownBy(
-                        () -> reader.system().snapshot(SnapshotCompression.Deflated, List.of(SystemSnapshotType.Test)))
+        assertThatThrownBy(() -> systemClient.snapshot(SnapshotCompression.Deflated, List.of(SystemSnapshotType.Test)))
                 .isInstanceOfSatisfying(
                         IggyServerException.class,
                         refusal -> assertThat(refusal.getErrorCode()).isEqualTo(IggyErrorCode.UNAUTHORIZED));

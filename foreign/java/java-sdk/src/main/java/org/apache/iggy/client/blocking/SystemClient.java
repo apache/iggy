@@ -55,6 +55,7 @@ public interface SystemClient {
      *
      * <p>The request requires root or the global {@code manageServers} permission.
      * When present, {@link SystemSnapshotType#All} must be the only entry.
+     * The HTTP client accepts archives of up to 64 MiB.
      */
     Snapshot snapshot(SnapshotCompression compression, List<SystemSnapshotType> snapshotTypes);
 

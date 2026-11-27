@@ -78,11 +78,12 @@ class SystemHttpClient implements SystemClient {
 
     @Override
     public Snapshot snapshot(SnapshotCompression compression, List<SystemSnapshotType> snapshotTypes) {
+        var validatedTypes = SystemSnapshotType.validatedCopyOf(snapshotTypes);
         var body = new SnapshotRequest(
                 compression.name(),
-                snapshotTypes.stream().map(SystemSnapshotType::name).toList());
+                validatedTypes.stream().map(SystemSnapshotType::name).toList());
         var request = httpClient.preparePostRequest(SNAPSHOT, body);
-        return new Snapshot(httpClient.executeWithBytesResponse(request));
+        return new Snapshot(httpClient.executeSnapshot(request));
     }
 
     @Override
