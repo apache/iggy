@@ -21,7 +21,7 @@ use crate::clients::MAX_BATCH_LENGTH;
 use crate::clients::producer_builder::SendMode;
 use crate::clients::producer_config::DirectConfig;
 use crate::clients::producer_dispatcher::ProducerDispatcher;
-use crate::clients::producer_idempotence::{Idempotence, RESENDS, TopicProducer};
+use crate::clients::producer_idempotence::{Idempotence, PendingChunk, RESENDS, TopicProducer};
 use crate::driver::operation_deadline;
 use bytes::Bytes;
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
@@ -252,17 +252,18 @@ impl ProducerCore {
         self.ensure_producer_id(&topic_producer).await?;
         // Every resend carries this section, also after a chunk of another
         // partition moved the producer to a new epoch.
-        let mut producer = idempotence.next_producer(&topic_producer, &mut sequence)?;
+        let producer = idempotence.next_producer(&topic_producer, &mut sequence)?;
+        let mut chunk = PendingChunk::new(&topic_producer, sequence, producer);
         let mut uncertain = None;
         let mut attempts = 0;
         loop {
             attempts += 1;
             match self
-                .try_send_messages(stream, topic, &explicit, Some(producer), messages)
+                .try_send_messages(stream, topic, &explicit, Some(chunk.producer()), messages)
                 .await
             {
                 Ok(response) => {
-                    Idempotence::advance(&mut sequence, producer, count);
+                    chunk.written(count);
                     return Ok(response);
                 }
                 // The partition no longer holds the producer, so the chunk
@@ -270,9 +271,9 @@ impl ProducerCore {
                 // send: it can have landed before the partition dropped the
                 // producer, and the new epoch would write it twice.
                 Err(IggyError::ProducerUnknown) if attempts <= RESENDS && uncertain.is_none() => {
-                    topic_producer.next_epoch(producer);
+                    topic_producer.next_epoch(chunk.producer());
                     self.ensure_producer_id(&topic_producer).await?;
-                    producer = idempotence.next_producer(&topic_producer, &mut sequence)?;
+                    chunk.renumber(idempotence)?;
                 }
                 // The same producer section makes a resend safe, whether or
                 // not the first send landed.
@@ -284,9 +285,8 @@ impl ProducerCore {
                     if error == IggyError::ProducerEpochFenced {
                         idempotence.fence();
                     }
-                    // The chunk may have landed. The next chunk starts a new
-                    // epoch, so it never follows a hole.
-                    topic_producer.next_epoch(producer);
+                    // The chunk may have landed. Dropped unwritten, it starts
+                    // a new epoch, so the next chunk never follows a hole.
                     // An earlier send of the chunk can still land, so its
                     // outcome stays unknown.
                     return Err(match uncertain {
@@ -1748,6 +1748,39 @@ mod tests {
             sent,
             [producer(id, 0, 0), producer(id, 0, 1), producer(id, 1, 0)]
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_send_dropped_before_its_outcome_when_sending_the_next_chunk_should_start_the_next_epoch()
+     {
+        let (cluster, plain) = connected_producer().await;
+        let producer_under_test =
+            idempotent_producer(plain.core.client.clone(), Partitioning::partition_id(0));
+        cluster.script(&endpoint(0), SEND_MESSAGES_CODE, [Answer::Silence]);
+
+        let dropped = tokio::time::timeout(
+            Duration::from_secs(1),
+            producer_under_test.send(vec![message(b"old")]),
+        )
+        .await;
+        assert!(dropped.is_err(), "the app timeout drops the send");
+        // A new session no longer holds the dropped send, so nothing blocks the next one.
+        let client = plain.core.client.read().await;
+        client.disconnect().await.unwrap();
+        client.connect().await.unwrap();
+        drop(client);
+        cluster.script(&endpoint(0), SEND_MESSAGES_CODE, [confirmation(0)]);
+
+        producer_under_test
+            .send(vec![message(b"new")])
+            .await
+            .unwrap();
+
+        // The old section would make the partition answer the new chunk with
+        // the offset of the dropped one.
+        let sent = sent_producers(&cluster);
+        let id = sent[0].producer_id();
+        assert_eq!(sent, [producer(id, 0, 0), producer(id, 1, 0)]);
     }
 
     #[tokio::test(start_paused = true)]
