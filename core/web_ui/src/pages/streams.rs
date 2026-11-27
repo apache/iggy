@@ -127,7 +127,13 @@ pub fn StreamPage(stream_id: u32) -> Element {
                     NewTopicForm { stream_id, on_close: close, on_created: saved }
                 },
                 Some(StreamDialog::Settings) => rsx! {
-                    StreamSettingsForm { stream: stream.clone(), on_close: close, on_saved: saved }
+                    StreamSettingsForm {
+                        stream_id,
+                        stream_name: stream.name.clone(),
+                        options: stream.options.clone(),
+                        on_close: close,
+                        on_saved: saved,
+                    }
                 },
                 None => rsx! {},
             }

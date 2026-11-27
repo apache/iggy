@@ -41,6 +41,9 @@ pub fn TopicPage(stream_id: u32, topic_id: u32) -> Element {
         dialog.set(None);
         topic.restart();
     };
+    // The dialog stays open, because a restarted resource keeps its last
+    // value until the new one arrives.
+    let reload = move |_| topic.restart();
 
     let body = match &*topic.read() {
         None => rsx! { Loading {} },
@@ -69,13 +72,35 @@ pub fn TopicPage(stream_id: u32, topic_id: u32) -> Element {
             }
             match dialog() {
                 Some(TopicDialog::Settings) => rsx! {
-                    TopicSettingsForm { stream_id, topic: topic.clone(), on_close: close, on_saved: saved }
+                    TopicSettingsForm {
+                        stream_id,
+                        topic_id,
+                        topic_name: topic.name.clone(),
+                        options: topic.options.clone(),
+                        on_close: close,
+                        on_saved: saved,
+                    }
                 },
                 Some(TopicDialog::AddPartitions) => rsx! {
-                    AddPartitionsForm { stream_id, topic_id, on_close: close, on_saved: saved }
+                    AddPartitionsForm {
+                        stream_id,
+                        topic_id,
+                        partitions_count: topic.partitions_count,
+                        on_close: close,
+                        on_saved: saved,
+                        on_failed: reload,
+                    }
                 },
                 Some(TopicDialog::DeletePartitions) => rsx! {
-                    DeletePartitionsForm { stream_id, topic: topic.clone(), on_close: close, on_saved: saved }
+                    DeletePartitionsForm {
+                        stream_id,
+                        topic_id,
+                        topic_name: topic.name.clone(),
+                        partitions_count: topic.partitions_count,
+                        on_close: close,
+                        on_saved: saved,
+                        on_failed: reload,
+                    }
                 },
                 None => rsx! {},
             }
@@ -86,10 +111,7 @@ pub fn TopicPage(stream_id: u32, topic_id: u32) -> Element {
                 Stat { label: "Size", value: topic.size.clone() }
                 Stat { label: "Message expiry", value: format::message_expiry(&topic.options) }
                 Stat { label: "Max size", value: format::max_topic_size(&topic.options) }
-                Stat {
-                    label: "Compression",
-                    value: format::option_text(&topic.options, "compression_algorithm").unwrap_or("none").to_owned(),
-                }
+                Stat { label: "Compression", value: format::compression_algorithm(&topic.options) }
                 Stat { label: "Created", value: format::timestamp(topic.created_at) }
             }
             h2 { "Partitions" }

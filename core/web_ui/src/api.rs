@@ -21,8 +21,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::Session;
 use crate::models::{
-    CreatePartitions, CreateStream, CreateTopic, IdentityInfo, LoginUser, PolledMessages, Stats,
-    Stream, StreamDetails, TopicDetails, TopicUpdate, UserInfoDetails,
+    CreatePartitions, CreateStream, CreateTopic, DeletePartitions, IdentityInfo, LoginUser,
+    PolledMessages, Stats, Stream, StreamDetails, StreamUpdate, TopicDetails, TopicUpdate,
+    UserInfoDetails,
 };
 
 /// Empty by default so requests go to the server that served the UI. Set at
@@ -100,21 +101,19 @@ impl ApiClient {
             .await
     }
 
-    pub async fn create_stream(&self, stream: &CreateStream) -> Result<StreamDetails, ApiError> {
+    /// The reply describes the new stream, but nothing reads it, so it is not
+    /// decoded and cannot turn a create the server made into an error.
+    pub async fn create_stream(&self, stream: &CreateStream) -> Result<(), ApiError> {
         let response = self
             .send_json(Request::post(&url("/streams")), stream)
             .await?;
-        decode(response).await
+        check_status(response).await.map(drop)
     }
 
     pub async fn rename_stream(&self, stream_id: u32, name: &str) -> Result<(), ApiError> {
-        #[derive(Serialize)]
-        struct Rename<'a> {
-            name: &'a str,
-        }
         let path = format!("/streams/{stream_id}");
         let response = self
-            .send_json(Request::put(&url(&path)), &Rename { name })
+            .send_json(Request::put(&url(&path)), &StreamUpdate { name })
             .await?;
         check_status(response).await.map(drop)
     }
@@ -123,14 +122,11 @@ impl ApiClient {
         self.delete(&format!("/streams/{stream_id}"), &[]).await
     }
 
-    pub async fn create_topic(
-        &self,
-        stream_id: u32,
-        topic: &CreateTopic,
-    ) -> Result<TopicDetails, ApiError> {
+    /// Like [`Self::create_stream`], the reply is not decoded.
+    pub async fn create_topic(&self, stream_id: u32, topic: &CreateTopic) -> Result<(), ApiError> {
         let path = format!("/streams/{stream_id}/topics");
         let response = self.send_json(Request::post(&url(&path)), topic).await?;
-        decode(response).await
+        check_status(response).await.map(drop)
     }
 
     pub async fn update_topic(
@@ -174,7 +170,7 @@ impl ApiClient {
     ) -> Result<(), ApiError> {
         self.delete(
             &format!("/streams/{stream_id}/topics/{topic_id}/partitions"),
-            &[("partitions_count", partitions_count.to_string())],
+            &DeletePartitions { partitions_count }.query(),
         )
         .await
     }

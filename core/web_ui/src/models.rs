@@ -92,6 +92,9 @@ pub struct Stats {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct OptionValue {
     pub value: String,
+    /// Set by the client, as opposed to filled in from a server default.
+    #[serde(default)]
+    pub explicit: bool,
 }
 
 pub type ResourceOptions = BTreeMap<String, OptionValue>;
@@ -155,6 +158,12 @@ pub struct CreateStream {
     pub options: OptionInputs,
 }
 
+/// The `PUT` body that renames a stream, read as `iggy_common::OptionsUpdate`.
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamUpdate<'a> {
+    pub name: &'a str,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateTopic {
     pub name: String,
@@ -188,6 +197,19 @@ impl TopicUpdate {
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct CreatePartitions {
     pub partitions_count: u32,
+}
+
+/// The query of a partitions `DELETE`, read as
+/// `iggy_common::delete_partitions::DeletePartitions`.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct DeletePartitions {
+    pub partitions_count: u32,
+}
+
+impl DeletePartitions {
+    pub fn query(&self) -> [(&'static str, String); 1] {
+        [("partitions_count", self.partitions_count.to_string())]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -229,8 +251,9 @@ mod tests {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
     use iggy_common::{
-        HeaderKey, HeaderValue, IggyByteSize, IggyDuration, IggyTimestamp, OptionKey,
-        PartitionContext, UserStatus,
+        HeaderKey, HeaderValue, IggyByteSize, IggyDuration, IggyTimestamp, OptionAdmissionContext,
+        OptionKey, OptionOperation, OptionsScope, PartitionContext, TopicCreateOptions, UserStatus,
+        admit,
     };
     use serde::de::DeserializeOwned;
 
@@ -457,10 +480,21 @@ mod tests {
             (server.name.as_str(), server.partitions_count),
             ("events", 3)
         );
-        server
-            .options
-            .to_wire()
-            .expect("the server accepts the topic options the form sends");
+        let wire = server.options.to_wire().expect("valid option names");
+        TopicCreateOptions::parse(&wire)
+            .expect("the topic catalog accepts the keys and values the form sends");
+    }
+
+    #[test]
+    fn given_misspelled_topic_option_should_fail_the_catalog_check() {
+        let mirror = CreateTopic {
+            name: "events".to_owned(),
+            partitions_count: 1,
+            options: OptionInputs::from([("message_expiri".to_owned(), "7 days".to_owned())]),
+        };
+        let server: iggy_common::create_topic::CreateTopic = decode(&mirror);
+        let wire = server.options.to_wire().expect("valid option names");
+        assert!(TopicCreateOptions::parse(&wire).is_err());
     }
 
     #[test]
@@ -477,9 +511,33 @@ mod tests {
             ["message_expiry", "name"]
         );
         assert_eq!(server.reset.iter().collect::<Vec<_>>(), ["max_topic_size"]);
-        server
-            .to_patch()
-            .expect("the server accepts the topic update the form sends");
+        let patch = server.to_patch().expect("valid option names");
+        let reset: Vec<String> = server.reset.iter().cloned().collect();
+        admit(
+            OptionsScope::Topic,
+            OptionOperation::Update,
+            &patch.set,
+            &reset,
+            &OptionAdmissionContext::default(),
+        )
+        .expect("topic admission accepts the update the form sends");
+    }
+
+    #[test]
+    fn given_ui_stream_rename_should_decode_as_server_options_update() {
+        let server: iggy_common::OptionsUpdate = decode(&StreamUpdate { name: "renamed" });
+        assert_eq!(server.set.keys().collect::<Vec<_>>(), ["name"]);
+        assert!(server.reset.is_empty());
+    }
+
+    #[test]
+    fn given_ui_delete_partitions_query_should_decode_as_server_delete_partitions() {
+        let mirror = DeletePartitions {
+            partitions_count: 2,
+        };
+        let server: iggy_common::delete_partitions::DeletePartitions = decode(&mirror);
+        assert_eq!(server.partitions_count, 2);
+        assert_eq!(mirror.query(), [("partitions_count", "2".to_owned())]);
     }
 
     #[test]

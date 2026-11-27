@@ -55,9 +55,9 @@ pub fn elapsed(micros: u64) -> String {
 /// The text the topic form starts from for `message_expiry`. Unlike
 /// [`message_expiry`] it never says "never", which the server does not parse.
 pub fn message_expiry_input(options: &ResourceOptions) -> String {
-    match message_expiry(options).as_str() {
-        "never" => "unlimited".to_owned(),
-        text => text.to_owned(),
+    match option_u64(options, "message_expiry").unwrap_or(0) {
+        0 | u64::MAX => "unlimited".to_owned(),
+        micros => duration(micros / MICROS_PER_SECOND),
     }
 }
 
@@ -69,8 +69,20 @@ pub fn max_topic_size(options: &ResourceOptions) -> String {
     }
 }
 
+pub fn compression_algorithm(options: &ResourceOptions) -> String {
+    option_text(options, "compression_algorithm")
+        .unwrap_or("none")
+        .to_owned()
+}
+
 pub fn option_text<'a>(options: &'a ResourceOptions, key: &str) -> Option<&'a str> {
     options.get(key).map(|option| option.value.as_str())
+}
+
+/// Whether the client set the option, rather than the server filling in its
+/// default.
+pub fn is_explicit(options: &ResourceOptions, key: &str) -> bool {
+    options.get(key).is_some_and(|option| option.explicit)
 }
 
 /// Re-renders a server byte size such as `"8615888 KiB"` in the largest
@@ -258,6 +270,7 @@ mod tests {
             key.to_owned(),
             OptionValue {
                 value: value.to_string(),
+                explicit: true,
             },
         )])
     }

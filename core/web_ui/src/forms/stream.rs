@@ -18,43 +18,55 @@
 use dioxus::prelude::*;
 
 use crate::Route;
-use crate::components::{ConfirmDelete, FormActions, Modal, api_client, use_session};
+use crate::components::{
+    ConfirmDelete, DangerZone, FormActions, Modal, api_client, focus_on_mount, use_session,
+};
 use crate::format;
-use crate::models::{CreateStream, StreamDetails};
+use crate::models::{CreateStream, ResourceOptions};
 
-use super::non_blank_options;
+use super::{ResourceName, non_blank_options, run_request};
 
 #[component]
 pub fn NewStreamForm(on_close: EventHandler<()>, on_created: EventHandler<()>) -> Element {
     let session = use_session();
     let mut name = use_signal(String::new);
     let mut encryption_key = use_signal(String::new);
-    let mut busy = use_signal(|| false);
+    let busy = use_signal(|| false);
     let mut error = use_signal(|| None::<String>);
 
     let submit = move |event: FormEvent| async move {
         event.prevent_default();
-        busy.set(true);
+        let ResourceName(name) = match name.read().parse::<ResourceName>() {
+            Ok(name) => name,
+            Err(invalid) => {
+                error.set(Some(invalid.to_string()));
+                return;
+            }
+        };
         let stream = CreateStream {
-            name: name().trim().to_owned(),
+            name,
             options: non_blank_options([("encryption_key", encryption_key())]),
         };
-        let result = api_client(session).create_stream(&stream).await;
-        busy.set(false);
-        match result {
-            Ok(_) => on_created.call(()),
-            Err(failure) => error.set(Some(failure.to_string())),
+        let created = run_request(
+            session,
+            busy,
+            error,
+            api_client(session).create_stream(&stream),
+        )
+        .await;
+        if created.is_some() {
+            on_created.call(());
         }
     };
 
     rsx! {
-        Modal { title: "New stream", on_close,
+        Modal { title: "New stream", on_close, busy: busy(),
             form { class: "form", onsubmit: submit,
                 label {
                     "Name"
                     input {
                         required: true,
-                        autofocus: true,
+                        onmounted: focus_on_mount,
                         value: name,
                         oninput: move |event| name.set(event.value()),
                     }
@@ -82,68 +94,66 @@ pub fn NewStreamForm(on_close: EventHandler<()>, on_created: EventHandler<()>) -
 
 #[component]
 pub fn StreamSettingsForm(
-    stream: StreamDetails,
+    stream_id: u32,
+    stream_name: String,
+    options: ResourceOptions,
     on_close: EventHandler<()>,
     on_saved: EventHandler<()>,
 ) -> Element {
     let session = use_session();
     let navigator = navigator();
-    let stream_id = stream.id;
-    // Taken once at mount, so a refreshed `stream` cannot make the untouched
-    // name look edited and revert someone else's rename.
-    let current_name = use_hook(|| stream.name.clone());
-    let mut name = use_signal(|| stream.name.clone());
-    let mut busy = use_signal(|| false);
+    // Taken once at mount, so a refreshed `stream_name` cannot make the
+    // untouched name look edited and revert someone else's rename.
+    let initial_name = use_signal(|| stream_name.clone());
+    let mut name = use_signal(|| stream_name.clone());
+    let busy = use_signal(|| false);
     let mut error = use_signal(|| None::<String>);
     let mut deleting = use_signal(|| false);
 
-    let rename = move |event: FormEvent| {
-        let current_name = current_name.clone();
-        async move {
-            event.prevent_default();
-            let next_name = name().trim().to_owned();
-            if next_name == current_name {
-                on_close.call(());
+    let rename = move |event: FormEvent| async move {
+        event.prevent_default();
+        let ResourceName(next_name) = match name.read().parse::<ResourceName>() {
+            Ok(name) => name,
+            Err(invalid) => {
+                error.set(Some(invalid.to_string()));
                 return;
             }
-            busy.set(true);
-            let result = api_client(session)
-                .rename_stream(stream_id, &next_name)
-                .await;
-            busy.set(false);
-            match result {
-                Ok(()) => on_saved.call(()),
-                Err(failure) => error.set(Some(failure.to_string())),
-            }
+        };
+        if next_name == *initial_name.read() {
+            on_close.call(());
+            return;
+        }
+        let renamed = run_request(
+            session,
+            busy,
+            error,
+            api_client(session).rename_stream(stream_id, &next_name),
+        )
+        .await;
+        if renamed.is_some() {
+            on_saved.call(());
         }
     };
 
     let delete = move |_| async move {
-        busy.set(true);
-        let result = api_client(session).delete_stream(stream_id).await;
-        busy.set(false);
-        match result {
-            Ok(()) => {
-                navigator.replace(Route::Streams {});
-            }
-            Err(failure) => error.set(Some(failure.to_string())),
+        let deleted = run_request(
+            session,
+            busy,
+            error,
+            api_client(session).delete_stream(stream_id),
+        )
+        .await;
+        if deleted.is_some() {
+            navigator.replace(Route::Streams {});
         }
     };
 
-    let key_source = format::option_text(&stream.options, "encryption_key_source")
-        .unwrap_or("unknown")
-        .to_owned();
-    let key_fingerprint =
-        format::option_text(&stream.options, "encryption_key_fingerprint").map(str::to_owned);
-    let kek_fingerprints = format::option_text(&stream.options, "encryption_kek_fingerprint")
-        .map(|fingerprints| fingerprints.replace(',', ", "));
-
     if deleting() {
         return rsx! {
-            Modal { title: "Delete stream {stream.name}", on_close,
+            Modal { title: "Delete stream {stream_name}", on_close, busy: busy(),
                 ConfirmDelete {
                     title: "Delete stream",
-                    confirm_text: stream.name.clone(),
+                    confirm_text: stream_name.clone(),
                     on_confirm: delete,
                     on_cancel: move |_| deleting.set(false),
                     busy: busy(),
@@ -153,13 +163,22 @@ pub fn StreamSettingsForm(
         };
     }
 
+    let key_source = format::option_text(&options, "encryption_key_source")
+        .unwrap_or("unknown")
+        .to_owned();
+    let key_fingerprint =
+        format::option_text(&options, "encryption_key_fingerprint").map(str::to_owned);
+    let kek_fingerprints = format::option_text(&options, "encryption_kek_fingerprint")
+        .map(|fingerprints| fingerprints.replace(',', ", "));
+
     rsx! {
-        Modal { title: "Stream settings", on_close,
+        Modal { title: "Stream settings", on_close, busy: busy(),
             form { class: "form", onsubmit: rename,
                 label {
                     "Name"
                     input {
                         required: true,
+                        onmounted: focus_on_mount,
                         value: name,
                         oninput: move |event| name.set(event.value()),
                     }
@@ -183,16 +202,14 @@ pub fn StreamSettingsForm(
                     on_cancel: on_close,
                 }
             }
-            div { class: "danger-zone",
-                span { "Deleting a stream removes all its topics and messages." }
-                button {
-                    class: "danger",
-                    onclick: move |_| {
-                        error.set(None);
-                        deleting.set(true);
-                    },
-                    "Delete stream"
-                }
+            DangerZone {
+                warning: "Deleting a stream removes all its topics and messages.",
+                label: "Delete stream",
+                disabled: busy(),
+                on_click: move |_| {
+                    error.set(None);
+                    deleting.set(true);
+                },
             }
         }
     }
