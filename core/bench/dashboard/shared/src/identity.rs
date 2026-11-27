@@ -25,8 +25,8 @@ use bench_report::{
     group_metrics_kind::GroupMetricsKind,
     numeric_parameter::BenchmarkNumericParameter,
     options::{
-        BenchmarkClientOptions, BenchmarkConsumerOptions, BenchmarkDurability, BenchmarkOptions,
-        BenchmarkTcpOptions, BenchmarkTopicOptions,
+        BenchmarkClientOptions, BenchmarkConsumerOptions, BenchmarkOptions, BenchmarkTcpOptions,
+        BenchmarkTopicOptions,
     },
     params::{BenchmarkDataVolume, BenchmarkParams},
     transport::BenchmarkTransport,
@@ -60,7 +60,7 @@ pub struct WorkloadKey {
     pub rate_limit: Option<String>,
     pub data_volume: DataVolumeKey,
     pub topic: BenchmarkTopicOptions,
-    pub consumer: Option<ConsumerOptionsKey>,
+    pub consumer: Option<BenchmarkConsumerOptions>,
     pub client: BenchmarkClientOptions,
     pub tcp: BenchmarkTcpOptions,
     /// `--workload` label.
@@ -74,18 +74,6 @@ pub enum DataVolumeKey {
     /// Reports without a configured volume: the batches that all actors completed. A consumer group
     /// completes a slightly different number in each run, so those runs rarely share a key.
     CompletedBatches(u64),
-}
-
-/// [`BenchmarkConsumerOptions`] with the `f32` as text, so the key implements `Eq` and `Hash`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ConsumerOptionsKey {
-    pub consumer_offset_durability: BenchmarkDurability,
-    pub max_wait_us: u64,
-    pub min_count: u32,
-    pub max_bytes: Option<u32>,
-    /// The shortest text that parses back to the recorded `f32`, so equal text means an equal
-    /// value.
-    pub read_amplification: Option<String>,
 }
 
 /// One field of a [`WorkloadKey`], with the options broken down to single flags, so two keys can
@@ -107,11 +95,11 @@ pub enum WorkloadField {
     MessagesRequiredToSave,
     MaxTopicSize,
     MessageExpiry,
+    TopicStorage,
     ConsumerOffsetDurability,
     MaxWait,
     MinCount,
     MaxBytes,
-    ReadAmplification,
     WarmupTime,
     HighLevelApi,
     ReuseStreams,
@@ -187,7 +175,7 @@ impl From<&BenchmarkParams> for WorkloadKey {
                 DataVolumeKey::Configured,
             ),
             topic,
-            consumer: consumer.map(ConsumerOptionsKey::from),
+            consumer,
             client,
             tcp,
             workload: params.workload.clone(),
@@ -223,6 +211,7 @@ impl WorkloadKey {
             messages_required_to_save,
             max_topic_size,
             message_expiry,
+            storage,
         } = topic;
         let BenchmarkClientOptions {
             warmup_time_us,
@@ -268,6 +257,7 @@ impl WorkloadKey {
                 WorkloadField::MessageExpiry,
                 *message_expiry == other.topic.message_expiry,
             ),
+            (WorkloadField::TopicStorage, *storage == other.topic.storage),
             (
                 WorkloadField::ConsumerOffsetDurability,
                 same_poll_option(consumer, poll, |options| {
@@ -285,10 +275,6 @@ impl WorkloadKey {
             (
                 WorkloadField::MaxBytes,
                 same_poll_option(consumer, poll, |options| &options.max_bytes),
-            ),
-            (
-                WorkloadField::ReadAmplification,
-                same_poll_option(consumer, poll, |options| &options.read_amplification),
             ),
             (
                 WorkloadField::WarmupTime,
@@ -309,18 +295,6 @@ impl WorkloadKey {
         .into_iter()
         .filter_map(|(field, same)| (!same).then_some(field))
         .collect()
-    }
-}
-
-impl From<BenchmarkConsumerOptions> for ConsumerOptionsKey {
-    fn from(options: BenchmarkConsumerOptions) -> Self {
-        Self {
-            consumer_offset_durability: options.consumer_offset_durability,
-            max_wait_us: options.max_wait_us,
-            min_count: options.min_count,
-            max_bytes: options.max_bytes,
-            read_amplification: options.read_amplification.map(|value| value.to_string()),
-        }
     }
 }
 
@@ -382,11 +356,11 @@ impl WorkloadField {
         Self::MessagesRequiredToSave,
         Self::MaxTopicSize,
         Self::MessageExpiry,
+        Self::TopicStorage,
         Self::ConsumerOffsetDurability,
         Self::MaxWait,
         Self::MinCount,
         Self::MaxBytes,
-        Self::ReadAmplification,
         Self::WarmupTime,
         Self::HighLevelApi,
         Self::ReuseStreams,
@@ -425,11 +399,11 @@ impl fmt::Display for WorkloadField {
             Self::MessagesRequiredToSave => "Messages required to save",
             Self::MaxTopicSize => "Max topic size",
             Self::MessageExpiry => "Message expiry",
+            Self::TopicStorage => "Topic storage",
             Self::ConsumerOffsetDurability => "Consumer offset durability",
             Self::MaxWait => "Consumer max wait",
             Self::MinCount => "Consumer min count",
             Self::MaxBytes => "Consumer max bytes",
-            Self::ReadAmplification => "Read amplification",
             Self::WarmupTime => "Warm-up time",
             Self::HighLevelApi => "High-level API",
             Self::ReuseStreams => "Reuse streams",
@@ -508,9 +482,9 @@ fn is_commit(gitref: &str) -> bool {
 }
 
 fn same_poll_option<T: PartialEq + ?Sized>(
-    left: Option<&ConsumerOptionsKey>,
-    right: Option<&ConsumerOptionsKey>,
-    option: fn(&ConsumerOptionsKey) -> &T,
+    left: Option<&BenchmarkConsumerOptions>,
+    right: Option<&BenchmarkConsumerOptions>,
+    option: fn(&BenchmarkConsumerOptions) -> &T,
 ) -> bool {
     left.map(option) == right.map(option)
 }
@@ -525,7 +499,9 @@ fn unix_micros(rfc3339: &str) -> Option<i64> {
 mod tests {
     use super::*;
     use crate::test_fixtures::{CLUSTER_RUN, PHASE_1A_RUN, report};
-    use bench_report::options::{BenchmarkMaxTopicSize, BenchmarkMessageExpiry};
+    use bench_report::options::{
+        BenchmarkDurability, BenchmarkMaxTopicSize, BenchmarkMessageExpiry, BenchmarkTopicStorage,
+    };
 
     const COMMIT: &str = "71f29618b";
     const FULL_COMMIT: &str = "91e020636a1b2c3d4e5f60718293a4b5c6d7e8f9";
@@ -698,7 +674,7 @@ mod tests {
     #[test]
     fn given_change_of_option_rate_limit_or_label_when_keyed_should_change_key() {
         let original = params(PHASE_1A_RUN);
-        let changes: [Change<BenchmarkParams>; 15] = [
+        let changes: [Change<BenchmarkParams>; 16] = [
             ("rate limit", |p| p.rate_limit = Some("40.00 MB".to_owned())),
             ("no rate limit", |p| p.rate_limit = None),
             ("workload label", |p| {
@@ -718,6 +694,9 @@ mod tests {
             }),
             ("message expiry", |p| {
                 options(p).topic.message_expiry = BenchmarkMessageExpiry::AfterUs(1_000_000);
+            }),
+            ("topic storage", |p| {
+                options(p).topic.storage = BenchmarkTopicStorage::Geo;
             }),
             ("consumer options", |p| {
                 options(p).consumer =
@@ -754,14 +733,13 @@ mod tests {
         let mut original = params(PHASE_1A_RUN);
         original.benchmark_kind = BenchmarkKind::PinnedProducerAndConsumer;
         original.options = Some(BenchmarkOptions::legacy(original.benchmark_kind));
-        let changes: [Change<BenchmarkConsumerOptions>; 5] = [
+        let changes: [Change<BenchmarkConsumerOptions>; 4] = [
             ("offset durability", |c| {
                 c.consumer_offset_durability = BenchmarkDurability::Persisted;
             }),
             ("max wait", |c| c.max_wait_us = 250_000),
             ("min count", |c| c.min_count = 10),
             ("max bytes", |c| c.max_bytes = Some(2_097_152)),
-            ("read amplification", |c| c.read_amplification = Some(1.5)),
         ];
 
         for (name, change) in changes {
@@ -791,17 +769,6 @@ mod tests {
     }
 
     #[test]
-    fn given_legacy_read_amplification_when_keyed_should_keep_exact_decimal_text() {
-        let key = ConsumerOptionsKey::from(
-            BenchmarkOptions::legacy(BenchmarkKind::PinnedProducerAndConsumer)
-                .consumer
-                .expect("producer and consumer kinds poll"),
-        );
-
-        assert_eq!(key.read_amplification.as_deref(), Some("1.05"));
-    }
-
-    #[test]
     fn given_runs_of_one_workload_when_diffed_should_find_no_field() {
         let original = params(PHASE_1A_RUN);
         let mut rerun = original.clone();
@@ -817,7 +784,7 @@ mod tests {
     #[test]
     fn given_one_changed_field_when_diffed_should_name_it_down_to_single_option() {
         let original = params(PHASE_1A_RUN);
-        let changes: [FieldChange<BenchmarkParams>; 21] = [
+        let changes: [FieldChange<BenchmarkParams>; 22] = [
             (WorkloadField::Kind, |p| {
                 p.benchmark_kind = BenchmarkKind::BalancedProducer;
             }),
@@ -851,6 +818,9 @@ mod tests {
             (WorkloadField::MessageExpiry, |p| {
                 options(p).topic.message_expiry = BenchmarkMessageExpiry::ServerDefault;
             }),
+            (WorkloadField::TopicStorage, |p| {
+                options(p).topic.storage = BenchmarkTopicStorage::Tiered;
+            }),
             (WorkloadField::WarmupTime, |p| {
                 options(p).client.warmup_time_us = 5_000_000;
             }),
@@ -882,16 +852,13 @@ mod tests {
         let mut original = params(PHASE_1A_RUN);
         original.benchmark_kind = BenchmarkKind::PinnedProducerAndConsumer;
         original.options = Some(BenchmarkOptions::legacy(original.benchmark_kind));
-        let changes: [FieldChange<BenchmarkConsumerOptions>; 5] = [
+        let changes: [FieldChange<BenchmarkConsumerOptions>; 4] = [
             (WorkloadField::ConsumerOffsetDurability, |c| {
                 c.consumer_offset_durability = BenchmarkDurability::Persisted;
             }),
             (WorkloadField::MaxWait, |c| c.max_wait_us = 250_000),
             (WorkloadField::MinCount, |c| c.min_count = 10),
             (WorkloadField::MaxBytes, |c| c.max_bytes = Some(2_097_152)),
-            (WorkloadField::ReadAmplification, |c| {
-                c.read_amplification = Some(1.5);
-            }),
         ];
 
         for (field, change) in changes {
@@ -956,7 +923,6 @@ mod tests {
                 WorkloadField::MaxWait,
                 WorkloadField::MinCount,
                 WorkloadField::MaxBytes,
-                WorkloadField::ReadAmplification,
             ]
         );
     }

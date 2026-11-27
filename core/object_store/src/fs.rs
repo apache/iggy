@@ -72,7 +72,8 @@ const _: () = assert!(MAX_KEY_SEGMENT_LEN + 34 <= 255);
 /// - A listing skips dot-names and shows every other file, so a delete can
 ///   find a damaged one. A file without a valid header shows its file length
 ///   and an empty etag. A listing removes the scratch files of crashed puts
-///   an hour after their last write.
+///   an hour after their last write, unless the store is
+///   [`FsStore::foreign`].
 /// - Directories stay after their objects go.
 /// - `root` must exist. Without it, calls fail with
 ///   [`ObjectStoreError::BucketNotFound`].
@@ -85,6 +86,8 @@ const _: () = assert!(MAX_KEY_SEGMENT_LEN + 34 <= 255);
 #[derive(Debug)]
 pub struct FsStore {
     root: PathBuf,
+    /// Whether a listing removes the scratch files of crashed puts.
+    removes_scratch: bool,
     /// Held by the listing that runs, with what the last page read.
     listing: Arc<Mutex<ListCache>>,
     /// Keys of the directories whose entries a sync made durable.
@@ -135,9 +138,21 @@ impl FsStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
+            removes_scratch: true,
             listing: Arc::default(),
             durable: RefCell::default(),
             leftovers: RefCell::default(),
+        }
+    }
+
+    /// A store in `root`, a directory that another cluster writes. Its
+    /// listings leave every scratch file alone: an old one can still be a
+    /// put of that cluster, and only that cluster may remove it.
+    #[must_use]
+    pub fn foreign(root: impl Into<PathBuf>) -> Self {
+        Self {
+            removes_scratch: false,
+            ..Self::new(root)
         }
     }
 
@@ -492,7 +507,7 @@ impl ObjectStore for FsStore {
     async fn list(&self, request: &ListRequest<'_>) -> Result<ListPage, ObjectStoreError> {
         validate_prefix(request.prefix)?;
         self.clean_up();
-        let walk = Walk::new(&self.root, request);
+        let walk = Walk::new(&self.root, request, self.removes_scratch);
         let mut cache = Arc::clone(&self.listing).lock_owned().await;
         on_thread(move || walk.page(&mut cache)).await
     }

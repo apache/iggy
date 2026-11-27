@@ -111,6 +111,15 @@ public class SystemTcpClient implements SystemClient {
     }
 
     @Override
+    public CompletableFuture<Void> retireGeoOrigin(String origin) {
+        var payload = BytesSerializer.toBytes(origin, "origin");
+
+        log.debug("Retiring geo origin: {}", origin);
+
+        return connection().sendAndRelease(CommandCode.System.RETIRE_GEO_ORIGIN, payload);
+    }
+
+    @Override
     public CompletableFuture<ClusterMetadata> getClusterMetadata() {
         var payload = Unpooled.EMPTY_BUFFER;
 

@@ -765,6 +765,13 @@ pub trait MessageBus {
     fn take_replica_link_stats(&self) -> ReplicaLinkMetrics {
         ReplicaLinkMetrics::default()
     }
+
+    /// Whether frames flow to `replica` now. True by default: the simulator
+    /// bus and the test buses own no replica link, so their answer is the
+    /// result of the next send.
+    fn replica_is_up(&self, _replica: u8) -> bool {
+        true
+    }
 }
 
 /// Production message bus backed by real TCP connections.
@@ -1019,8 +1026,12 @@ impl IggyMessageBus {
     ///
     /// # Panics
     ///
-    /// Panics if called more than once on the same bus.
+    /// Panics if the compiled release row exceeds the replica hello limit or the context was already installed.
     pub fn set_replica_handshake_ctx(&self, ctx: replica::handshake::ReplicaHandshakeCtx) {
+        assert!(
+            ctx.compatible_releases.len() <= replica::handshake::MAX_COMPATIBLE_RELEASES,
+            "release compatibility row exceeds the replica hello limit"
+        );
         assert!(
             self.replica_handshake_ctx.set(ctx).is_ok(),
             "replica_handshake_ctx installed twice (bootstrap invariant)"
@@ -1771,6 +1782,10 @@ impl<T: MessageBus + ?Sized> MessageBus for std::rc::Rc<T> {
     fn take_replica_link_stats(&self) -> ReplicaLinkMetrics {
         (**self).take_replica_link_stats()
     }
+
+    fn replica_is_up(&self, replica: u8) -> bool {
+        (**self).replica_is_up(replica)
+    }
 }
 
 #[allow(clippy::future_not_send)]
@@ -1870,6 +1885,10 @@ impl MessageBus for IggyMessageBus {
             bundles_up: self.bundles_up() as u64,
             ..self.replica_link_stats.take()
         }
+    }
+
+    fn replica_is_up(&self, replica: u8) -> bool {
+        self.owner_table.is_up(replica)
     }
 }
 
@@ -2452,9 +2471,11 @@ mod tests {
         let bus = bus_with_layout(0, 4, 2);
         bus.set_replica_handshake_ctx(replica::handshake::ReplicaHandshakeCtx {
             binary_identity: [0; replica::auth::IDENTITY_LEN],
+            compatible_releases: Rc::default(),
             cluster_id: 1,
             self_id: 2,
             replica_count: 3,
+            heartbeat: crate::replica::auth::HeartbeatTimings::default(),
             auth: None,
             tls: None,
         });

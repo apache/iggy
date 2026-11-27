@@ -17,10 +17,10 @@
 
 module(
     name = "iggy_cpp",
-    version = "0.2.0",
+    version = "0.2.2",
 )
 
-bazel_dep(name = "rules_cc", version = "0.2.27")
+bazel_dep(name = "rules_cc", version = "0.2.28")
 bazel_dep(name = "platforms", version = "1.1.0")
 bazel_dep(name = "googletest", version = "1.18.0.bcr.1")
 bazel_dep(name = "cucumber-cpp", version = "0.9.0")

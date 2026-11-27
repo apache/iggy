@@ -1,0 +1,134 @@
+---
+title: Cluster Configuration
+description: Reference for the [cluster] settings, consensus timing, and node roster
+---
+
+All clustering settings live in the `[cluster]` section of the server configuration. The authoritative defaults with detailed comments are in [`core/server/config.toml`](https://github.com/apache/iggy/blob/server-0.10.0/core/server/config.toml). Every value can also be set through an `IGGY_`-prefixed environment variable, for example `IGGY_CLUSTER_ENABLED=true` or `IGGY_CLUSTER_NODES_0_IP=10.0.1.5`.
+
+With clustering enabled, the server validates the section at boot and **refuses to start** on an invalid value, printing the rule that failed. The repair chunk limit and superblock failure timeout are validated even when clustering is disabled.
+
+## Top-level settings
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `enabled` | `false` | Enables cluster mode. When disabled, the node runs single-node and the rest of the section is mostly inert. |
+| `name` | `"iggy-cluster"` | Unique cluster name shared by every node. Prevents accidental cross-cluster communication. |
+
+> `cluster.name` is a **permanent on-disk identity**, not a label. It's hashed into the cluster id stamped into every metadata and partition superblock on first boot, and the consensus layer derives its cluster id from the name unconditionally. Nodes with different names cannot connect to each other, and changing the name later makes the server refuse to start against existing data.
+
+## Consensus timing
+
+Consensus runs on a **fixed 10ms tick**. Every duration below is converted to whole ticks: values are **rounded down** to a multiple of 10ms, and anything under 10ms is raised to a single tick rather than firing sooner. `repair_gap_debounce_interval` has an additional 500ms floor.
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `heartbeat_timeout` | `5s` | Backup liveness window: a replica that sees no primary traffic for this long starts a view change |
+| `commit_broadcast_interval` | `500ms` | How often the primary broadcasts its commit point. This broadcast is the cluster's liveness signal |
+| `prepare_retransmit_interval` | `250ms` | Retry prepares that backups have not acknowledged |
+| `view_change_retransmit_interval` | `500ms` | Retry `StartViewChange` / `DoViewChange` while a view change is in progress |
+| `view_change_status_timeout` | `5s` | Escalate a view change that does not conclude within this window to a fresh election |
+| `request_start_view_retransmit_interval` | `1s` | How often a recovering replica re-requests the current view's `StartView` |
+| `view_probe_attempts_max` | `5` | Unanswered `RequestStartView` probes a recovering replica tolerates before falling back to an election |
+| `repair_retry_interval` | `1s` | How long a stalled journal-repair stream waits before re-requesting its remaining window |
+| `repair_gap_debounce_interval` | `1s` | How long a committed-history gap waits before opening a repair session. Floored at 500ms |
+| `repair_chunk_max` | `128` | Prepares a peer serves per repair round |
+
+Raise `heartbeat_timeout` on oversubscribed hosts where scheduling stalls fake primary death. Otherwise keep the defaults unless tests show a specific scheduling or network problem.
+
+### Validation rules
+
+Boot-time validation enforces these constraints:
+
+- Every duration must be **nonzero**. The `0`, `disabled`, and `unlimited` sentinels all parse to a zero duration and are rejected. There's no way to switch the liveness window off.
+- `heartbeat_timeout` must be at least `2s` and at least 4x `commit_broadcast_interval`, so one delayed broadcast never trips an election on a healthy primary.
+- `view_change_status_timeout` must be at least 4x `view_change_retransmit_interval`, so a few dropped view-change messages retransmit instead of escalating into a fresh cluster-wide election.
+- `view_probe_attempts_max` must be between 1 and 100.
+- `repair_chunk_max` must be between 1 and 1024, and strictly below `message_bus.peer_queue_capacity`: each repair frame rides the per-peer message-bus queue, and a full round above that capacity would overrun the queue and drop frames.
+
+## Default replication factor
+
+`cluster.default_replication_factor` defaults to `"all"`. It applies to new topics whose creation request omits `replication_factor`. An explicit value must be from 1 through 32 and no greater than the cluster node count. The resolved value is stored with the topic. Changing this default does not change existing topics.
+
+See [Multi-leader partitions](/docs/clustering/multi-leader) for primary placement and the availability consequences of each factor.
+
+## Superblock failure handling
+
+`superblock_wedged_fatal_timeout` defaults to `2m`. It controls how long repeated superblock persistence failures can continue before the process exits. The affected consensus group stays fenced while persistence is failing. `0`, `disabled`, or `unlimited` disables the process exit, leaving the group fenced. A nonzero value must be at least `30s`.
+
+## Coordinator placement
+
+These settings live under `[cluster.coordinator]` and apply when the server has more than one shard:
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `skip_shard_zero_for_replicas` | `true` | Places replica connections on peer shards instead of shard 0 |
+| `replica_connections_per_peer` | `1` | Replica links per peer. Every node must use the same value. |
+| `skip_shard_zero_for_clients` | `false` | When enabled, excludes shard 0 from client connection placement |
+| `skip_shard_zero_for_partitions` | `false` | When enabled, places no partition on shard 0, so a stall of the metadata plane there cannot stop the heartbeats of partition groups. Keep `skip_shard_zero_for_replicas` enabled with it, and use the same value on every node. A server with one shard refuses to start with it enabled. Older server binaries refuse a TOML configuration that contains this key. Remove the key before a rollback to one of them. |
+
+## Node roster
+
+`cluster.nodes` is the full roster of cluster members and is intended to be **byte-identical on every node**. The running node finds its own entry through the `--replica-id` CLI flag. Environment variables replace the entire `cluster.nodes` array rather than merging individual fields into TOML entries. If you configure any roster entry through environment variables, provide the complete roster that way.
+
+```toml
+[[cluster.nodes]]
+name = "iggy-node-1"
+ip = "10.0.1.5"
+advertised_address = "203.0.113.10"
+replica_id = 0
+ports = { tcp = 8090, quic = 8080, http = 3000, websocket = 8093, tcp_replica = 9090 }
+```
+
+### `name`
+
+Node name, unique within the roster and non-empty.
+
+### `ip`
+
+The node's roster address. Replica-to-replica consensus traffic and follower-to-primary HTTP forwarding dial it, so it must be a **literal IPv4 or IPv6 address**. Hostnames and unspecified addresses (`0.0.0.0` or `::`) are rejected when the server resolves the roster at startup.
+
+`ip` is **not the bind interface** for the client transports. `tcp`, `quic`, `http`, and `websocket` bind whatever their own `address` settings say. The roster supplies only their ports. The defaults bind loopback, so a cluster spread across hosts needs each transport's `address` set to `0.0.0.0` or the routable interface. The server warns at startup when a bind cannot serve the advertised `ip`.
+
+### `replica_id`
+
+Numeric replica id for VSR consensus, `0`-based. Ids must be unique and strictly less than the roster size, which makes them contiguous from `0`. Rosters with more than 32 replicas are rejected at startup.
+
+### `ports`
+
+Per-node listener ports: `tcp`, `quic`, `http`, `websocket`, and `tcp_replica`. In cluster mode `ports` is the **single source of listener ports**: every enabled transport needs an explicit per-node port, otherwise the server refuses to start. `tcp` and `tcp_replica` are always required, even when client TCP is disabled. `tcp_replica` carries consensus traffic. Port `0` is rejected, and no two roster entries may claim the same `ip:port`.
+
+### `advertised_address`
+
+Optional client-facing address handed out in cluster metadata and leader redirects. Set it when `ip` is a private replica-network address unreachable by clients (Docker, Kubernetes, NAT). Accepts a literal IP or an RFC 1123 DNS hostname: ASCII letters, digits, `-` and `.`, no port, no trailing dot. When unset, clients receive `ip`.
+
+### `advertised_addresses`
+
+Per-client-network overrides for split networks, where one catch-all `advertised_address` would route in-VPC clients out through the public side:
+
+```toml
+[[cluster.nodes]]
+name = "iggy-node-1"
+ip = "10.0.1.5"                        # replica plane + last-resort fallback
+advertised_address = "203.0.113.10"    # catch-all for unmatched clients
+replica_id = 0
+ports = { tcp = 8090, quic = 8080, http = 3000, websocket = 8093, tcp_replica = 9090 }
+
+[[cluster.nodes.advertised_addresses]]
+client_cidr = "10.0.0.0/16"            # in-VPC clients stay private
+address = "10.0.1.5"
+```
+
+Clients whose transport-level peer IP falls inside `client_cidr` are handed `address` instead of the catch-all. The **longest matching prefix** wins. Clients matching no selector fall back to `advertised_address`, then `ip`. `address` takes the same forms as `advertised_address` (literal IP or hostname, never a port).
+
+Rules and caveats:
+
+- At most 16 selectors per node. Boot rejects duplicate `client_cidr` entries on one node (compared truncated, so `10.0.1.0/16` duplicates `10.0.0.0/16`) and any two nodes advertising one `host:port` to overlapping client sets.
+- Matching is **per address family**: `0.0.0.0/0` matches no IPv6 client and `::/0` matches no IPv4 client, so covering both families takes one selector per family. IPv4-mapped IPv6 CIDRs (`::ffff:10.0.0.0/104`) match like their IPv4 form only at prefix length 96 or longer.
+- Matching sees the transport-level peer address, so clients behind a proxy or load balancer match the proxy's network, not their own.
+- Every `address` must be routable from inside its own `client_cidr`: leader-aware clients redial whatever address metadata advertises, and a selector pointing at an unreachable host strands them mid-redirect.
+- Prefer literal IPs over hostnames. SDKs differ in how they compare an advertised hostname against the address they dialed, and a mismatch costs a reconnect on every fresh connect.
+- Every node must run the same server build, or stable releases that the [release compatibility table](/docs/server/upgrading#release-compatibility) lists. Do not mix 0.9 and 0.10 nodes during an upgrade.
+
+## Authentication and TLS
+
+`[cluster.auth]` configures the pre-shared-key replica handshake and `[cluster.tls]` wraps replica connections in TLS. Both are covered in [Security](/docs/clustering/security).

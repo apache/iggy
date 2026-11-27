@@ -547,6 +547,35 @@ impl Workload {
         &mut self,
         client: &SimClient,
     ) -> Option<(u8, Message<RoutedRequestHeader>)> {
+        self.build_request_with(client, |_, input| ops::build_message(client, input))
+    }
+
+    pub fn build_request_on(
+        &mut self,
+        client: &SimClient,
+        sim: &Simulator,
+    ) -> Option<(u8, Message<RoutedRequestHeader>)> {
+        self.build_request_with(client, |target, input| {
+            if let InFlightInput::ChangePassword(input) = input
+                && !client.shell_wire()
+            {
+                return sim.raw_change_password(
+                    client,
+                    target,
+                    &input.user,
+                    &input.current_password,
+                    &input.new_password,
+                );
+            }
+            ops::build_message(client, input)
+        })
+    }
+
+    fn build_request_with(
+        &mut self,
+        client: &SimClient,
+        build: impl FnOnce(u8, &InFlightInput) -> Message<RoutedRequestHeader>,
+    ) -> Option<(u8, Message<RoutedRequestHeader>)> {
         if !self.client_idle(client.client_id()) {
             return None;
         }
@@ -579,7 +608,7 @@ impl Workload {
             }
             self.stale_owner_stores += 1;
         }
-        let message = ops::build_message(client, &input);
+        let message = build(target, &input);
 
         let header = message.header();
         let key = (client.client_id(), header.request);
@@ -1569,7 +1598,7 @@ fn group_retired(sim: &Simulator, namespace: IggyNamespace, group_id: u64) -> bo
             .partition_shard(namespace)
             .plane
             .partitions()
-            .get_by_ns(&namespace)
+            .peek_by_ns(&namespace)
             .is_some_and(|partition| partition.consumer_group_retired(group_id))
     })
 }
@@ -1662,7 +1691,7 @@ fn drive_tick(
             continue;
         }
         sim.discover_partition_contexts(client);
-        if let Some((target, msg)) = workload.build_request(client) {
+        if let Some((target, msg)) = workload.build_request_on(client, sim) {
             sim.submit_request(client.client_id(), target, msg.into_generic());
         }
     }

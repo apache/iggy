@@ -311,7 +311,7 @@ func TestManagedHeartbeat_CallerExchangesSendNoKeepalive(t *testing.T) {
 	requests := []command.Command{
 		rawRequest{code: command.SendMessagesCode, payload: rawSendPayload(t, stream, topic, iggcon.PartitionId(0))},
 		&command.PollMessages{StreamId: stream, TopicId: topic, Consumer: iggcon.NewSingleConsumer(group.Id), Strategy: iggcon.NextPollingStrategy(), Count: 1},
-		&command.GetStreams{},
+		&command.GetStreams{Query: iggcon.NamedPageQuery{PageQuery: iggcon.NewPageQuery()}},
 	}
 	for _, request := range requests {
 		time.Sleep(2 * managedLinkHeartbeat)

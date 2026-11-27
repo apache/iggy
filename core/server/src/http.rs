@@ -73,10 +73,10 @@ use crate::http::handlers::{
     create_user, delete_cg, delete_consumer_offset, delete_partitions, delete_pat,
     delete_pat_named_login, delete_segments, delete_stream, delete_topic, delete_user,
     describe_options, get_cg, get_cgs, get_client, get_clients, get_cluster_metadata,
-    get_consumer_offset, get_metadata_changes, get_pats, get_snapshot, get_stats, get_stream,
-    get_streams, get_topic, get_topics, get_user, get_users, login_user,
+    get_consumer_offset, get_metadata_changes, get_partitions, get_pats, get_snapshot, get_stats,
+    get_stream, get_streams, get_topic, get_topics, get_user, get_users, login_user,
     login_with_personal_access_token, logout_user, ping, poll_messages, poll_messages_committing,
-    poll_messages_deferred, refresh_token, send_messages, store_consumer_offset,
+    poll_messages_deferred, refresh_token, retire_geo_origin, send_messages, store_consumer_offset,
     update_permissions, update_stream, update_topic, update_user,
 };
 use crate::http::jwt::JwtManager;
@@ -530,7 +530,9 @@ fn forwardable_routes(state: HttpState) -> Router<HttpState> {
         )
         .route(
             "/streams/{stream_id}/topics/{topic_id}/partitions",
-            post(create_partitions).delete(delete_partitions),
+            get(get_partitions)
+                .post(create_partitions)
+                .delete(delete_partitions),
         )
         .route(
             "/streams/{stream_id}/topics/{topic_id}/partitions/{partition_id}",
@@ -552,6 +554,7 @@ fn forwardable_routes(state: HttpState) -> Router<HttpState> {
             "/personal-access-tokens/login",
             delete(delete_pat_named_login),
         )
+        .route("/geo/origins/{origin}/retire", post(retire_geo_origin))
         .route_layer(from_fn_with_state(state, forward::forward_to_primary))
 }
 

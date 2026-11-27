@@ -17,8 +17,9 @@
 
 use crate::server::scenarios::{
     authentication_scenario, consumer_timestamp_polling_scenario, delete_stats_rollback_scenario,
-    invalid_consumer_offset_scenario, message_headers_scenario, permissions_scenario,
-    snapshot_scenario, stream_size_validation_scenario, system_scenario, user_scenario,
+    invalid_consumer_offset_scenario, list_pages_scenario, message_headers_scenario,
+    permissions_scenario, snapshot_scenario, stream_size_validation_scenario, system_scenario,
+    user_scenario,
 };
 use integration::iggy_harness;
 
@@ -57,6 +58,17 @@ async fn system(harness: &TestHarness) {
 )]
 async fn user(harness: &TestHarness) {
     user_scenario::run(harness).await;
+}
+
+#[iggy_harness(
+    test_client_transport = [Tcp, Http, Quic, WebSocket],
+    server(
+        quic.max_idle_timeout = "500s",
+        quic.keep_alive_interval = "15s"
+    )
+)]
+async fn list_pages(harness: &TestHarness) {
+    list_pages_scenario::run(harness).await;
 }
 
 // Same HTTP relay requirement as `system`.

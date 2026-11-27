@@ -17,7 +17,7 @@
 
 [package]
 name = "server"
-version = "0.10.0"
+version = "0.10.1-edge.2"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
@@ -112,8 +112,12 @@ assert_cmd = { workspace = true }
 bytemuck = { workspace = true }
 iggy = { workspace = true }
 metadata = { workspace = true, features = ["simulator"] }
+# `extended` adds `MiMalloc::usable_size`, which the buffer test compares with
+# the journal charge. The resolver keeps it out of non-test targets.
+mimalloc = { workspace = true, features = ["extended"] }
 proc-macro2 = { workspace = true }
 quote = { workspace = true }
+semver = { workspace = true }
 # Reconciler unit tests assert on `ShardMetrics` snapshots and
 # `IggyShard::parked_frame_count`, gated to test/simulator so they cannot grow
 # production callers. `shard`'s own `cfg(test)` is false when compiled as our

@@ -53,7 +53,7 @@ in the configured directory. See the [server recovery guide](../server/README.md
 Mixed versions and rolling upgrades are unsupported. Binary clients share one
 logical session across replica links using BindSession (15) and discover
 partition primaries with GetPartitionRoute (105). The minimum binary protocol
-version is 0.12.2. Commands 14, 103, 104, 107, 123 and 124 are retired. HTTP clients
+version is 0.12.3. Commands 14, 103, 104, 107, 123 and 124 are retired. HTTP clients
 use server-side forwarding.
 
 ```bash
@@ -79,9 +79,7 @@ public `uncertain: usize` field, so struct literals and exhaustive patterns must
 name it. `ConsumerGroupClientState` no longer has its public `partition_count` and
 `set_partition_context` methods.
 
-An established session has its own lifetime. Password or PAT changes and PAT
-expiry do not end it. Logout, session lease expiry, or user deactivation end the
-session and prevent its bind proof from restoring it.
+With server 0.10.1-edge.2, a password change keeps the binary session that submitted it and ends the account's other sessions. Deleting or expiring a personal access token ends access for the sessions opened with it. A valid personal access token can open a new session after a password change. Logout, lease expiry and account deactivation also end session access.
 
 ## Mutation recovery
 
@@ -115,7 +113,7 @@ permission check. A fresh application send can duplicate an uncertain operation.
 Each node counts the messages in its stream, topic and system stats. After a
 successful send, a node that is not the partition primary shows the new count
 only after the next prepare or commit broadcast. When no other write follows,
-this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+this delay is at most `cluster.commit_busy_heartbeat_interval` (500 ms by default).
 See [metadata freshness and counters](../server/README.md#metadata-freshness-and-counters).
 
 An explicit sign-in or logout ends earlier calls: unsent calls fail with 40,
@@ -693,6 +691,40 @@ A partition keeps 4096 producers. Past that limit, it drops the producer that wa
 Released builds of the Rust SDK refuse a binary poll that returns a batch with a producer. They require zero bytes in that part of the header. The same holds for every client that embeds the Rust SDK: the Python, C++ and PHP SDKs, the CLI, the Kafka gateway and the connectors runtime. Released Swift SDKs refuse the batch too. The Go, Java, C# and Node.js SDKs do not read that part of the header. Upgrade every consumer of a topic before a producer writes such batches to it.
 
 Upgrade every server node first as well. A node of an older release cannot store a batch with a producer.
+
+## List pages
+
+`get_streams_page`, `get_topics_page`, `get_partitions_page`, `get_consumer_groups_page` and `get_users_page` read one page of a list. A `PageQuery` sets the order, the direction, the limit and the cursor. The lists of named entities take a `NamedPageQuery`, which adds a name filter to a `PageQuery`. A partition has no name, so `get_partitions_page` takes a `PageQuery`.
+
+To read the next page, send the same query with the `next` cursor of the page. The `next` method of either query builds that query and returns `None` after the last page. A page can be empty and still have a `next`.
+
+```rust
+use iggy::prelude::*;
+
+async fn print_streams(client: &IggyClient) -> Result<(), IggyError> {
+    let mut query = NamedPageQuery {
+        page: PageQuery {
+            order: PageOrder::Created,
+            ..PageQuery::default()
+        },
+        name: Some("orders".to_owned()),
+    };
+    loop {
+        let page = client.get_streams_page(&query).await?;
+        for stream in &page.items {
+            println!("{} {}", stream.id, stream.name);
+        }
+        match query.next(&page)? {
+            Some(next) => query = next,
+            None => return Ok(()),
+        }
+    }
+}
+```
+
+The page methods call `validate` on the query before they send anything. It refuses a limit outside 1 to 1000, and a name that is empty or longer than 255 bytes, with `InvalidCommand`. If a page answers the cursor that it was read with, `next` fails with `InvalidFormat`, so a walk cannot loop forever. A `PageCursor` prints as `pg1_` text, the form that the CLI and the HTTP API use, and `str::parse` reads it back.
+
+`get_streams`, `get_topics`, `get_consumer_groups` and `get_users` return the whole list. Over TCP, QUIC and WebSocket, they read pages of 1000 in id order, so the result is not one consistent read. Over HTTP, they read the bare array, which the server also builds from pages.
 
 ## Metadata changes
 

@@ -41,7 +41,7 @@ use iggy_common::{Identifier, IggyError};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
-use metadata::stm::stream::Streams;
+use metadata::stm::stream::{Streams, StreamsInner};
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
 use shard::{PartitionRead, PartitionReadReply};
@@ -126,6 +126,7 @@ where
                 .map_err(|_| IggyError::InvalidCommand)?;
             // A producer counts its sequence per partition, so its batch must
             // name one. Refused before `Balanced` moves its cursor.
+            refuse_shadow_stream(shard, &header.stream_id)?;
             if !matches!(header.partitioning, WirePartitioning::PartitionId(_))
                 && body
                     .get(4 + metadata_length + BATCH_PRODUCER_OFFSET)
@@ -162,6 +163,7 @@ where
         Operation::DeleteSegments => {
             let request =
                 DeleteSegmentsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
+            refuse_shadow_stream(shard, &request.stream_id)?;
             resolve_partition_namespace(
                 shard,
                 &request.stream_id,
@@ -172,6 +174,31 @@ where
         _ => return Err(IggyError::FeatureUnavailable),
     };
     Ok(namespace.inner())
+}
+
+/// Refuse a client write to a shadow stream, whose partitions read another
+/// cluster's log and take no messages or trims of their own.
+pub fn refuse_shadow_stream<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    stream_id: &WireIdentifier,
+) -> Result<(), IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    if shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .is_shadow_stream(stream_id)
+    {
+        return Err(IggyError::ShadowStreamReadOnly);
+    }
+    Ok(())
 }
 
 /// Whether this node stores `namespace`: true for one every node stores, and
@@ -197,13 +224,28 @@ where
         .is_none_or(|members| members.is_none_or(|members| members.member(node).is_some()))
 }
 
+/// What [`partition_primary`] asks of the shard that owns a partition which
+/// cannot serve yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrimaryLookup {
+    /// The owner holds the lookup while the partition starts, also while an
+    /// older incarnation is in its place, for [`shard::PARTITION_BUILD_HOLD`]
+    /// at most.
+    Hold,
+    /// The owner answers at once with what the partition says now. A primary
+    /// on this node that cannot serve yet is no primary.
+    AnswerNow,
+}
+
 /// The primary of `namespace`'s group. A node storing the partition answers
-/// from its own replica; any other node answers with the view the group's
-/// primary last reported, or the committed initial view before any report.
+/// from its own replica, as `lookup` says. Any other node answers with the
+/// view the group's primary last reported, or the committed initial view
+/// before any report.
 #[allow(clippy::future_not_send)]
 pub async fn partition_primary<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     namespace: IggyNamespace,
+    lookup: PrimaryLookup,
 ) -> Option<PartitionReadReply>
 where
     B: ShellBus,
@@ -223,9 +265,11 @@ where
         members.is_none_or(|members| members.member(topology.self_replica_id).is_some())
     });
     if stored {
-        return shard
-            .partition_read(namespace, PartitionRead::Primary)
-            .await;
+        let read = match lookup {
+            PrimaryLookup::Hold => PartitionRead::Primary,
+            PrimaryLookup::AnswerNow => PartitionRead::PrimaryNow,
+        };
+        return shard.partition_read(namespace, read).await;
     }
     let (members, created_view, reported) = route?;
     // A stale view costs one NotPrimary hop; no view leaves the route empty.
@@ -292,15 +336,29 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    shard.plane.metadata().mux_stm.streams().read(|streams| {
-        let resolved_stream = streams
-            .resolve_stream_id(stream_id)
-            .ok_or_else(|| stream_not_found(stream_id))?;
-        streams
-            .resolve_topic_id(resolved_stream, topic_id)
-            .ok_or_else(|| topic_not_found(stream_id, topic_id))?;
-        Ok(())
-    })
+    shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .read(|streams| resolve_topic(streams, stream_id, topic_id).map(|_| ()))
+}
+
+/// The stream and topic ids of an existing topic, or the typed error of
+/// [`ensure_topic_exists`]. A read that walks the topic resolves it in the
+/// same state.
+pub fn resolve_topic(
+    streams: &StreamsInner,
+    stream_id: &WireIdentifier,
+    topic_id: &WireIdentifier,
+) -> Result<(usize, usize), IggyError> {
+    let resolved_stream = streams
+        .resolve_stream_id(stream_id)
+        .ok_or_else(|| stream_not_found(stream_id))?;
+    let resolved_topic = streams
+        .resolve_topic_id(resolved_stream, topic_id)
+        .ok_or_else(|| topic_not_found(stream_id, topic_id))?;
+    Ok((resolved_stream, resolved_topic))
 }
 
 /// Fence a consumer-group offset commit/delete: a group consumer may only
@@ -406,7 +464,7 @@ where
 /// shape. The identifier only feeds the error message; a wire form with no
 /// domain equivalent (numeric 0 is a live slab id here but not a legacy id)
 /// falls back to the default identifier.
-fn stream_not_found(stream_id: &WireIdentifier) -> IggyError {
+pub fn stream_not_found(stream_id: &WireIdentifier) -> IggyError {
     IggyError::StreamIdNotFound(Identifier::try_from(stream_id).unwrap_or_default())
 }
 
@@ -476,7 +534,7 @@ mod tests {
             &[1, 2],
         );
 
-        let route = partition_primary(&shard, namespace).await;
+        let route = partition_primary(&shard, namespace, PrimaryLookup::Hold).await;
 
         assert!(
             matches!(

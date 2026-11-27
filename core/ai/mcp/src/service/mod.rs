@@ -17,8 +17,9 @@
 
 use iggy::prelude::{
     Client, ClusterClient, CommitPolicy, CompressionAlgorithm, Consumer, ConsumerGroupClient,
-    ConsumerOffsetClient, Identifier, IggyClient, IggyError, IggyExpiry, IggyMessage,
-    IggyTimestamp, MaxTopicSize, MessageClient, OptionKey, PartitionClient, Partitioning,
+    ConsumerOffsetClient, DEFAULT_PAGE_LIMIT, GeoTopicDurations, Identifier, IggyClient, IggyError,
+    IggyExpiry, IggyMessage, IggyTimestamp, MAX_PAGE_LIMIT, MaxTopicSize, MessageClient,
+    NamedPageQuery, OptionKey, Page, PageQuery, PartitionClient, Partitioning,
     PersonalAccessTokenClient, PollOptions, PollingKind, PollingStrategy, SegmentClient,
     StreamClient, StreamCreateOptions, StreamUpdateOptions, SystemClient, SystemSnapshotType,
     TopicClient, TopicCreateOptions, TopicUpdateOptions, UserClient, UserCreateOptions, UserStatus,
@@ -104,10 +105,18 @@ impl IggyService {
         request(self.client.get_stream(&id(&stream_id)?).await)
     }
 
-    #[tool(description = "Get streams")]
-    pub async fn get_streams(&self) -> Result<CallToolResult, ErrorData> {
+    #[tool(
+        description = "Get streams. With limit or cursor, one page as {items, next}. Without both, every stream as an array, in the asked order and with the asked name filter."
+    )]
+    pub async fn get_streams(
+        &self,
+        Parameters(page): Parameters<NamedPageParams>,
+    ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_read()?;
-        request(self.client.get_streams().await)
+        read_list(page, |query| async move {
+            self.client.get_streams_page(&query).await
+        })
+        .await
     }
 
     #[tool(description = "Create stream")]
@@ -146,13 +155,19 @@ impl IggyService {
         request(self.client.delete_stream(&id(&stream_id)?).await)
     }
 
-    #[tool(description = "Get topics")]
+    #[tool(
+        description = "Get topics. With limit or cursor, one page as {items, next}. Without both, every topic of the stream as an array, in the asked order and with the asked name filter."
+    )]
     pub async fn get_topics(
         &self,
-        Parameters(GetTopics { stream_id }): Parameters<GetTopics>,
+        Parameters(GetTopics { stream_id, page }): Parameters<GetTopics>,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_read()?;
-        request(self.client.get_topics(&id(&stream_id)?).await)
+        let stream_id = &id(&stream_id)?;
+        read_list(page, |query| async move {
+            self.client.get_topics_page(stream_id, &query).await
+        })
+        .await
     }
 
     #[tool(description = "Get topic")]
@@ -215,6 +230,24 @@ impl IggyService {
         request(
             self.client
                 .delete_topic(&id(&stream_id)?, &id(&topic_id)?)
+                .await,
+        )
+    }
+
+    #[tool(description = "Get one page of the partitions of a topic as {items, next}")]
+    pub async fn get_partitions(
+        &self,
+        Parameters(GetPartitions {
+            stream_id,
+            topic_id,
+            page,
+        }): Parameters<GetPartitions>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_read()?;
+        let query = page_query(page)?;
+        request(
+            self.client
+                .get_partitions_page(&id(&stream_id)?, &id(&topic_id)?, &query)
                 .await,
         )
     }
@@ -489,20 +522,25 @@ impl IggyService {
         request(self.client.snapshot(compression, types).await)
     }
 
-    #[tool(description = "Get consumer groups")]
+    #[tool(
+        description = "Get consumer groups. With limit or cursor, one page as {items, next}. Without both, every group of the topic as an array, in the asked order and with the asked name filter."
+    )]
     pub async fn get_consumer_groups(
         &self,
         Parameters(GetConsumerGroups {
             stream_id,
             topic_id,
+            page,
         }): Parameters<GetConsumerGroups>,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_read()?;
-        request(
+        let (stream_id, topic_id) = (&id(&stream_id)?, &id(&topic_id)?);
+        read_list(page, |query| async move {
             self.client
-                .get_consumer_groups(&id(&stream_id)?, &id(&topic_id)?)
-                .await,
-        )
+                .get_consumer_groups_page(stream_id, topic_id, &query)
+                .await
+        })
+        .await
     }
 
     #[tool(description = "Get consumer group")]
@@ -663,11 +701,19 @@ impl IggyService {
         request(self.client.delete_personal_access_token(&name).await)
     }
 
-    #[tool(description = "Get users. Requires the admin permission.")]
-    pub async fn get_users(&self) -> Result<CallToolResult, ErrorData> {
+    #[tool(
+        description = "Get users. Requires the admin permission. With limit or cursor, one page as {items, next}. Without both, every user as an array, in the asked order and with the asked name filter."
+    )]
+    pub async fn get_users(
+        &self,
+        Parameters(page): Parameters<NamedPageParams>,
+    ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_read()?;
         self.permissions.ensure_admin()?;
-        request(self.client.get_users().await)
+        read_list(page, |query| async move {
+            self.client.get_users_page(&query).await
+        })
+        .await
     }
 
     #[tool(description = "Get user. Requires the admin permission.")]
@@ -857,6 +903,7 @@ impl TryFrom<UpdateTopic> for TopicUpdateOptions {
             tiered_storage: None,
             local_retention_age: None,
             local_retention_size: None,
+            geo_durations: GeoTopicDurations::default(),
             reset,
             raw_reset,
             raw: update.options,
@@ -917,6 +964,68 @@ fn id(id: &str) -> Result<Identifier, ErrorData> {
         let message = format!("Failed to parse identifier. {e}");
         error!(message);
         ErrorData::invalid_request(message, None)
+    })
+}
+
+/// What a list tool of named entities reads for its page parameters.
+#[derive(Debug, PartialEq)]
+enum ListRead {
+    /// One page, for parameters with `limit` or `cursor`.
+    Page(NamedPageQuery),
+    /// Every page, in pages of [`MAX_PAGE_LIMIT`], in the order and with the
+    /// name filter of the parameters.
+    Whole(NamedPageQuery),
+}
+
+impl TryFrom<NamedPageParams> for ListRead {
+    type Error = ErrorData;
+
+    fn try_from(params: NamedPageParams) -> Result<Self, Self::Error> {
+        let selects_page = params.page.limit.is_some() || params.page.cursor.is_some();
+        let mut query = NamedPageQuery {
+            page: page_query(params.page)?,
+            name: params.name,
+        };
+        if selects_page {
+            return Ok(Self::Page(query));
+        }
+        query.page.limit = MAX_PAGE_LIMIT;
+        Ok(Self::Whole(query))
+    }
+}
+
+/// Answers a list tool of named entities with one page or the whole list, see
+/// [`ListRead`].
+async fn read_list<T: Serialize, Fut>(
+    params: NamedPageParams,
+    mut read_page: impl FnMut(NamedPageQuery) -> Fut,
+) -> Result<CallToolResult, ErrorData>
+where
+    Fut: Future<Output = Result<Page<T>, IggyError>>,
+{
+    match ListRead::try_from(params)? {
+        ListRead::Page(query) => request(read_page(query).await),
+        ListRead::Whole(query) => request(query.read_to_end(read_page).await),
+    }
+}
+
+/// The page query of the page parameters. A missing parameter keeps its
+/// default.
+fn page_query(page: PageParams) -> Result<PageQuery, ErrorData> {
+    let PageParams {
+        limit,
+        cursor,
+        order,
+        descending,
+    } = page;
+    Ok(PageQuery {
+        order: order
+            .map(|order| parsed(&order, "order"))
+            .transpose()?
+            .unwrap_or_default(),
+        descending: descending.unwrap_or_default(),
+        limit: limit.unwrap_or(DEFAULT_PAGE_LIMIT),
+        cursor: cursor.map(|cursor| parsed(&cursor, "cursor")).transpose()?,
     })
 }
 
@@ -982,6 +1091,7 @@ fn operation_id_value(value: &str) -> Result<u64, ErrorData> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iggy::prelude::PageOrder;
     use std::collections::BTreeMap;
 
     #[test]
@@ -1080,6 +1190,65 @@ mod tests {
             .expect("valid create_topic body");
 
             assert!(TopicCreateOptions::try_from(create).is_err(), "{field}");
+        }
+    }
+
+    #[test]
+    fn given_list_tool_arguments_when_converting_should_read_one_page_only_with_limit_or_cursor() {
+        let read = |body: &str| {
+            let params: NamedPageParams = serde_json::from_str(body).expect("valid JSON");
+            ListRead::try_from(params).expect("valid page parameters")
+        };
+        let topics: GetTopics = serde_json::from_str(
+            r#"{"stream_id":"orders","limit":5,"cursor":"pg1_AQcAAAAAAAAA","order":"created","descending":true,"name":"ord"}"#,
+        )
+        .expect("valid get_topics body");
+        assert_eq!(
+            ListRead::try_from(topics.page).expect("valid page parameters"),
+            ListRead::Page(NamedPageQuery {
+                page: PageQuery {
+                    order: PageOrder::Created,
+                    descending: true,
+                    limit: 5,
+                    cursor: Some("pg1_AQcAAAAAAAAA".parse().expect("a page cursor")),
+                },
+                name: Some("ord".to_owned()),
+            })
+        );
+        assert!(matches!(
+            read(r#"{"cursor":"pg1_AQcAAAAAAAAA"}"#),
+            ListRead::Page(_)
+        ));
+
+        let whole_list = PageQuery {
+            limit: MAX_PAGE_LIMIT,
+            ..PageQuery::default()
+        };
+        assert_eq!(read("{}"), ListRead::Whole(whole_list.clone().into()));
+        assert_eq!(
+            read(r#"{"descending":false}"#),
+            ListRead::Whole(whole_list.clone().into()),
+            "a default value alone keeps the whole list"
+        );
+        assert_eq!(
+            read(r#"{"order":"created","descending":true,"name":"ord"}"#),
+            ListRead::Whole(NamedPageQuery {
+                page: PageQuery {
+                    order: PageOrder::Created,
+                    descending: true,
+                    ..whole_list
+                },
+                name: Some("ord".to_owned()),
+            }),
+            "the whole list keeps the order and the name filter"
+        );
+    }
+
+    #[test]
+    fn given_unparsable_page_parameter_when_converting_should_refuse() {
+        for body in [r#"{"order":"name"}"#, r#"{"cursor":"mc1_AQcAAAAAAAAA"}"#] {
+            let page: NamedPageParams = serde_json::from_str(body).expect("valid JSON");
+            assert!(ListRead::try_from(page).is_err(), "{body}");
         }
     }
 

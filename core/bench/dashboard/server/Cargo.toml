@@ -26,13 +26,16 @@ publish = false
 actix-cors = { workspace = true }
 actix-files = { workspace = true }
 actix-web = { workspace = true }
+bench-dashboard-frontend = { workspace = true, features = ["ssr"] }
 bench-dashboard-shared = { workspace = true }
 bench-report = { workspace = true }
+blake3 = { workspace = true }
 charming = { workspace = true, features = ["ssr", "ssr-raster"] }
 chrono = { workspace = true }
 clap = { workspace = true }
 notify = { workspace = true }
 reqwest = { workspace = true }
+resvg = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
@@ -41,6 +44,7 @@ tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+url = { workspace = true }
 uuid = { workspace = true }
 walkdir = { workspace = true }
 zip = { workspace = true, features = ["deflate"] }

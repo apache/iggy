@@ -40,7 +40,7 @@ impl Display for ServerConfig {
              encryption: {}, memory_pool: {:?}, sharding: {:?}, \
              quic: {}, tcp: {}, http: {}, telemetry: {}, \
              metadata: {}, message_bus: {}, partition: {}, external_auth: {}, \
-             tiered_storage: {} }}",
+             tiered_storage: {}, geo: {} }}",
             self.consumer_group,
             self.data_maintenance,
             self.heartbeat,
@@ -59,6 +59,7 @@ impl Display for ServerConfig {
             self.partition,
             self.external_auth,
             self.tiered_storage,
+            self.geo,
         )
     }
 }
@@ -70,6 +71,9 @@ impl Display for PartitionConfig {
             "{{ wal_bytes_max: {}, wal_group_commit_delay_micros: {}, validate_checksum: {}, prepare_queue_depth: {}, dedup_clients_max: {}, consumer_offsets_max: {}, \
              offset_reservation_lease: {}, \
              evicted_ring_capacity: {}, evicted_ring_bytes_max: {}, \
+             journal_memory_node_bytes_max: {}, \
+             checkpoint_idle_delay: {}, checkpoint_max_delay: {}, \
+             wal_reload_node_bytes_max: {}, \
              transfer_served_cache_bytes_max: {}, transfer_artifact_bytes_max: {} }}",
             self.wal_bytes_max,
             self.wal_group_commit_delay_micros,
@@ -80,6 +84,10 @@ impl Display for PartitionConfig {
             self.offset_reservation_lease,
             self.evicted_ring_capacity,
             self.evicted_ring_bytes_max,
+            self.journal_memory_node_bytes_max,
+            self.checkpoint_idle_delay,
+            self.checkpoint_max_delay,
+            self.wal_reload_node_bytes_max,
             self.transfer_served_cache_bytes_max,
             self.transfer_artifact_bytes_max,
         )

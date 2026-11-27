@@ -28,9 +28,15 @@ mod related;
 
 use std::rc::Rc;
 
+use bench_dashboard_shared::embed::OmbChartType;
+use bench_dashboard_shared::labels::{messages_text, milliseconds, version_detail};
+use bench_dashboard_shared::omb::chart::WindowMetric;
 use bench_dashboard_shared::omb::compare::OmbComparability;
 use bench_dashboard_shared::omb::detail::OmbRunDetail;
 use bench_dashboard_shared::omb::id::OmbRunId;
+use bench_dashboard_shared::omb::labels::{
+    environment_text, mebibytes_text, run_name, short_id, size_and_length, workload_heading,
+};
 use bench_dashboard_shared::omb::result::OmbPercentiles;
 use bench_dashboard_shared::omb::setup::{OmbSetup, omb_setup_download_name};
 use bench_dashboard_shared::omb::summary::{OmbRunList, OmbRunSummary};
@@ -39,33 +45,33 @@ use yew_router::prelude::Link;
 
 use self::advanced::Advanced;
 use self::change::{Change, KPIS, Kpi};
-use self::chart::{DetailRef, WindowChart, WindowMetric};
+use self::chart::{DetailRef, WindowChart};
 use self::facts::{
     END_TO_END_TITLE, Fact, FactGroup, NO_SIDECAR_NOTE, UNRECORDED, end_to_end_side,
     environment_groups, estimated_start, ladder, property_groups, publish_side, workload_facts,
 };
 use self::history::{Baseline, History, Machines, history_view};
-use self::related::{related_runs, related_view};
+use self::related::{is_related, related_runs, related_view};
 use crate::api::{fetch_omb_run, omb_result_url, omb_setup_url};
 use crate::components::chart::series_color;
+use crate::components::embed::{EmbedButton, EmbedCard, EmbedChart, EmbedProvider, EmbedRun};
 use crate::components::headline::kpi_card;
 use crate::components::ladder::{Rung, percentile_ladder};
 use crate::components::page::{breadcrumbs, loadable, page_shell, section_head};
-use crate::components::run_labels::{messages_text, milliseconds, version_detail};
 use crate::components::section_nav::{NavSection, SectionNav};
 use crate::components::share_button::ShareButton;
 use crate::pages::omb::common::{
     CONSUME_HINT, EndToEnd, LineOrder, MESSAGES_HINT, NOT_MEASURED, PUBLISH_THROUGHPUT_HINT,
-    conditions, driver_tag, environment_text, mebibytes_text, omb_crumb, omb_page_head, run_name,
-    runs_status, short_id, time_view, version_view,
+    driver_tag, omb_crumb, omb_page_head, runs_status, time_view, version_view,
 };
-use crate::pages::omb::list::workload_crumb;
+use crate::pages::omb::list::workload_query;
 use crate::pages::run::chart::SERIES_COLOR_VARS;
 use crate::router::AppRoute;
 use crate::state::data::{Loadable, fetch_into};
-use crate::state::omb::{OmbData, use_omb_data};
+use crate::state::omb::{OmbData, use_omb_run_data};
 
 const RUN_CRUMB: &str = "Run";
+const WORKLOAD_RUNS_LINK: &str = "Runs with this workload";
 const DETAIL_WHAT: &str = "the OMB result of the run";
 const ESTIMATE_HINT: &str = "The end of the run from the file name, minus the measured length. The \
                              warm-up ran before it.";
@@ -170,9 +176,9 @@ pub struct OmbRunPageProps {
 
 #[function_component(OmbRunPage)]
 pub fn omb_run_page(props: &OmbRunPageProps) -> Html {
-    let data = use_omb_data();
-    let scroll_ref = use_node_ref();
     let id = props.id.parse::<OmbRunId>().ok();
+    let data = use_omb_run_data(id);
+    let scroll_ref = use_node_ref();
     let detail = use_state_eq(|| Loadable::Loading);
     let load_detail = {
         let detail = detail.clone();
@@ -194,6 +200,12 @@ pub fn omb_run_page(props: &OmbRunPageProps) -> Html {
         Lookup::Found(view) => found_view(view, &detail, &load_detail, &scroll_ref),
     };
     page_shell(&scroll_ref, content)
+}
+
+/// Whether the page of `run` reads `other`: a run of its history, or a related run. The server sends
+/// only these runs with the page, so this covers every run that [`RunView::new`] reads.
+pub fn reads(run: &OmbRunSummary, other: &OmbRunSummary) -> bool {
+    other.history_key() == run.history_key() || is_related(run, other)
 }
 
 /// The URL's run in the loaded list.
@@ -357,7 +369,7 @@ fn found_view(
         &PLAIN_SECTIONS
     };
     html! {
-        <>
+        <EmbedProvider run={EmbedRun::Omb(run.id)} charts={embed_charts(run)}>
             { head(run) }
             { headline_strip(view) }
             <SectionNav {sections} scroll_ref={scroll_ref.clone()} />
@@ -426,7 +438,8 @@ fn found_view(
                 { section_head(
                     ARTIFACTS.label,
                     "Files of this run",
-                    "The result file as OMB wrote it, and the setup sidecar if the run has one.",
+                    "The result file as OMB wrote it, the setup sidecar if the run has one, and \
+                     the code to show this run's charts on another page.",
                 ) }
                 { artifacts(run) }
             </section>
@@ -440,12 +453,25 @@ fn found_view(
                 ) }
                 <Advanced detail={detail.clone()} reload={reload.clone()} />
             </section>
-        </>
+        </EmbedProvider>
     }
 }
 
+/// The charts of the run that an embed can draw, in the order of the page. A run without
+/// end-to-end numbers has no end-to-end chart, because the server answers 404 for it.
+fn embed_charts(run: &OmbRunSummary) -> Vec<EmbedChart> {
+    let end_to_end = matches!(EndToEnd::of(run), EndToEnd::Measured(_));
+    OmbChartType::ALL
+        .into_iter()
+        .filter(|chart| end_to_end || *chart != OmbChartType::EndToEndLatency)
+        .map(EmbedChart::Omb)
+        .collect()
+}
+
+/// The heading names the run by its workload values, not by the workload `name`. A crawler indexes
+/// the heading, and the name is free text from the workload file. A link next to it leads to the
+/// run list narrowed to the workload, so a reader can compare repeated runs.
 fn head(run: &OmbRunSummary) -> Html {
-    let workload = workload_crumb(&run.workload.name);
     let environment = run.environment().and_then(environment_text);
     let detail = run
         .version
@@ -453,7 +479,7 @@ fn head(run: &OmbRunSummary) -> Html {
         .and_then(|version| version_detail(version.commit.as_deref(), version.release));
     let above = html! {
         <>
-            { breadcrumbs(&[omb_crumb(), workload], &short_id(run.id)) }
+            { breadcrumbs(&[omb_crumb()], &short_id(run.id)) }
             <p class="run-meta">
                 { driver_tag(&run.driver) }
                 { version_view(run) }
@@ -475,12 +501,24 @@ fn head(run: &OmbRunSummary) -> Html {
             </p>
         </>
     };
+    let actions = html! {
+        <div class="page-head-actions">
+            <Link<AppRoute, Vec<(&'static str, String)>>
+                to={AppRoute::OmbRuns}
+                query={Some(workload_query(&run.workload.name))}
+                classes={classes!("run-action")}
+            >
+                { WORKLOAD_RUNS_LINK }
+            </Link<AppRoute, Vec<(&'static str, String)>>>
+            <ShareButton class={classes!("run-action")} labeled={true} />
+        </div>
+    };
     omb_page_head(
         above,
         None,
-        &run.workload.name,
-        &conditions(run),
-        html! { <ShareButton class={classes!("run-action")} labeled={true} /> },
+        &workload_heading(&run.workload),
+        &size_and_length(run),
+        actions,
     )
 }
 
@@ -546,6 +584,9 @@ fn window_card(detail: &DetailRef, metric: WindowMetric, note: Option<&'static s
     html! {
         <article class="card run-chart-card">
             <h3>{ metric.title() }</h3>
+            if let Some(chart) = OmbChartType::of_window(metric) {
+                <EmbedButton chart={EmbedChart::Omb(chart)} />
+            }
             <WindowChart detail={detail.clone()} {metric} />
             if let Some(note) = note {
                 <p class="card-note">{ note }</p>
@@ -604,6 +645,7 @@ fn ladder_card(title: &str, latency: &OmbPercentiles, side: &[Fact], note: &'sta
     html! {
         <article class="card run-ladder-card">
             <h3>{ title.to_owned() }</h3>
+            <EmbedButton chart={EmbedChart::Omb(OmbChartType::Ladder)} />
             { percentile_ladder(&rungs, false) }
             <div>
                 { fact_list(side) }
@@ -750,6 +792,7 @@ fn artifacts(run: &OmbRunSummary) -> Html {
                     </a>
                 </article>
             }
+            <EmbedCard />
         </div>
     }
 }

@@ -47,13 +47,19 @@ use crate::metadata_changes::{
     MetadataChangeGroup, MetadataChangeStart, MetadataChanges, validated_query,
 };
 use crate::options::OptionSpec as PyOptionSpec;
+use crate::page::{
+    ConsumerGroupsPage, PageOrder, PartitionsPage, StreamsPage, TopicsPage, UsersPage,
+    validated_named_page_query, validated_page_query,
+};
 use crate::partitioning::PyPartitioning;
 use crate::permissions::Permissions as PyPermissions;
 use crate::poll_options::PollOptions;
 use crate::producer::{IggyProducer, ProducerMode, u32_param as producer_u32_param};
 use crate::reader::PartitionReader;
 use crate::receive_message::{Checkpoint, PolledBatch, PollingStrategy};
-use crate::resource_options::{OptionKey, StreamOptions, TopicOptions, UserOptions};
+use crate::resource_options::{
+    OptionKey, StreamOptions, TopicOptions, UserOptions, geo_topic_durations,
+};
 use crate::send_message::{SendMessage, SendMessagesResponse as PySendMessagesResponse};
 use crate::snapshot::{
     SnapshotCompression as PySnapshotCompression, SystemSnapshotType as PySystemSnapshotType,
@@ -491,6 +497,36 @@ impl IggyClient {
         })
     }
 
+    /// Retire the geo origin of a datacenter that never returns.
+    ///
+    /// The cluster then follows nothing more of the origin: its shadow topics
+    /// serve what they hold until their retention removes it, and a client
+    /// may delete them. Retiring an origin that is retired already changes
+    /// nothing. A datacenter that comes back needs another origin name.
+    ///
+    /// Requires root or the global `manage_servers` permission.
+    ///
+    /// Args:
+    ///     origin: The origin name of the lost datacenter, such as `"dc-a"`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` once the cluster committed
+    ///     the retirement.
+    ///
+    /// Raises:
+    ///     IggyError: If the user lacks the permission, the server refuses
+    ///         the origin, or the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn retire_geo_origin<'a>(&self, py: Python<'a>, origin: String) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .retire_geo_origin(&origin)
+                .await
+                .map_err(to_runtime_error)
+        })
+    }
+
     /// Describe the option catalog for a resource scope.
     ///
     /// This is the discovery surface for the `options` argument on
@@ -646,7 +682,11 @@ impl IggyClient {
         })
     }
 
-    /// Get the info about all the users.
+    /// Get the info about all the users, in id order.
+    ///
+    /// The list is read in pages of 1,000, so it is not one consistent read.
+    /// A user that someone creates or deletes during the read can appear or
+    /// not appear. `get_users_page` reads one page.
     ///
     /// Returns:
     ///     An awaitable that resolves to `list[UserInfo]`.
@@ -660,6 +700,41 @@ impl IggyClient {
         future_into_py(py, async move {
             let users = inner.get_users().await.map_err(to_runtime_error)?;
             Ok(users.into_iter().map(PyUserInfo::from).collect::<Vec<_>>())
+        })
+    }
+
+    /// Reads one page of the users. `name` matches the username.
+    ///
+    /// Takes the keyword arguments of `get_streams_page`, with the same
+    /// cursor rules.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `UsersPage`.
+    ///
+    /// Raises:
+    ///     OverflowError: If `limit` is outside the unsigned 32-bit range.
+    ///     IggyError: As for `get_streams_page`. A user without the permission
+    ///         to read the users gets the unauthorized code.
+    #[pyo3(signature = (*, order=None, descending=false, limit=None, cursor=None, name=None))]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[UsersPage]", imports=("collections.abc")))]
+    fn get_users_page<'a>(
+        &self,
+        py: Python<'a>,
+        #[gen_stub(override_type(type_repr = "PageOrder | None"))] order: Option<PageOrder>,
+        descending: bool,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] limit: Option<u32>,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] cursor: Option<&str>,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] name: Option<String>,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let query = validated_named_page_query(order, descending, limit, cursor, name)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            let page = inner
+                .get_users_page(&query)
+                .await
+                .map_err(to_runtime_error)?;
+            UsersPage::try_from(page)
         })
     }
 
@@ -1029,7 +1104,9 @@ impl IggyClient {
 
     /// Gets stream by id.
     /// Returns the stream details, or `None` if the stream does not exist.
-    /// Raises `RuntimeError` on failure.
+    /// Raises `RuntimeError` on failure. Over TCP, QUIC and WebSocket, a reply
+    /// larger than the reply size limit raises `IggyError` with code 97
+    /// (`ReplyTooLarge`). `get_topics_page` reads the topics in pages.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[StreamDetails | None]", imports=("collections.abc")))]
     fn get_stream<'a>(
         &self,
@@ -1048,20 +1125,73 @@ impl IggyClient {
         })
     }
 
-    /// Return all streams.
+    /// Return the streams the user may read, in id order.
+    ///
+    /// The list is read in pages of 1,000, so it is not one consistent read.
+    /// A stream that someone creates or deletes during the read can appear or
+    /// not appear. `get_streams_page` reads one page.
     ///
     /// Returns:
-    ///     A list of `Stream` summaries.
+    ///     A list of `Stream` summaries, the streams the user may read.
     ///
     /// Raises:
-    ///     RuntimeError: If the client is not authenticated, the user lacks global
-    ///         `read_streams` or `manage_streams` permission, or the request fails.
+    ///     RuntimeError: If the client is not authenticated or the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[list[Stream]]", imports=("collections.abc")))]
     fn get_streams<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
             let streams = inner.get_streams().await.map_err(to_runtime_error)?;
             Ok(streams.into_iter().map(Stream::from).collect::<Vec<_>>())
+        })
+    }
+
+    /// Reads one page of the streams the user may read.
+    ///
+    /// Pass the page's `next` as `cursor`, with the same other arguments, to
+    /// read the next page. The read ends at the first page whose `next` is
+    /// `None`. A page can be empty and still have a `next`.
+    ///
+    /// Args:
+    ///     order: `PageOrder.Id`, the default, or `PageOrder.Created`.
+    ///     descending: Read from the last item to the first.
+    ///     limit: Items per page, 1 to 1000. Defaults to 100.
+    ///     cursor: The `next` of the previous page, `None` for the first page.
+    ///     name: Keep only the items whose name holds this text, case-sensitive.
+    ///         1 to 255 bytes.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `StreamsPage`.
+    ///
+    /// Raises:
+    ///     OverflowError: If `limit` is outside the unsigned 32-bit range.
+    ///     IggyError: If the request fails. A cursor or a query that breaks
+    ///         the page rules raises it with the invalid command code before
+    ///         anything is sent. The server refuses a cursor that it cannot
+    ///         use, such as the cursor of another order, with the same code.
+    ///         Over HTTP, a refusal from the server has code 300 (HTTP response
+    ///         error), and its message holds the server error body. The page
+    ///         holds the streams the user may read, so a user without a
+    ///         grant gets an empty page.
+    #[pyo3(signature = (*, order=None, descending=false, limit=None, cursor=None, name=None))]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[StreamsPage]", imports=("collections.abc")))]
+    fn get_streams_page<'a>(
+        &self,
+        py: Python<'a>,
+        #[gen_stub(override_type(type_repr = "PageOrder | None"))] order: Option<PageOrder>,
+        descending: bool,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] limit: Option<u32>,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] cursor: Option<&str>,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] name: Option<String>,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let query = validated_named_page_query(order, descending, limit, cursor, name)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            let page = inner
+                .get_streams_page(&query)
+                .await
+                .map_err(to_runtime_error)?;
+            StreamsPage::try_from(page)
         })
     }
 
@@ -1205,7 +1335,9 @@ impl IggyClient {
 
     /// Gets topic by stream and id.
     /// Returns the topic details, or `None` if the topic does not exist.
-    /// Raises `RuntimeError` on failure.
+    /// Raises `RuntimeError` on failure. Over TCP, QUIC and WebSocket, a reply
+    /// larger than the reply size limit raises `IggyError` with code 97
+    /// (`ReplyTooLarge`). `get_partitions_page` reads the partitions in pages.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[TopicDetails | None]", imports=("collections.abc")))]
     fn get_topic<'a>(
         &self,
@@ -1226,7 +1358,14 @@ impl IggyClient {
         })
     }
 
-    /// Get all topics in a stream.
+    /// Get the topics of a stream, in id order. The list holds only the
+    /// topics the user may read.
+    ///
+    /// The list is read in pages of 1,000, so it is not one consistent read.
+    /// A topic that someone creates or deletes during the read can appear or
+    /// not appear. If the stream goes missing after the first page, the read
+    /// fails for a user with a global read grant, and ends there for any other
+    /// user. `get_topics_page` reads one page.
     ///
     /// Args:
     ///     stream_id: Stream identifier as `str | int`.
@@ -1251,6 +1390,51 @@ impl IggyClient {
                 .await
                 .map_err(to_runtime_error)?;
             Ok(topics.into_iter().map(Topic::from).collect::<Vec<_>>())
+        })
+    }
+
+    /// Reads one page of the topics of a stream. A missing stream, or one the
+    /// user may read no topic of, gives an empty page without `next`. For a
+    /// user with a global read grant, a page read with a cursor raises
+    /// `IggyError` instead, because the stream was deleted during the walk.
+    ///
+    /// Takes the keyword arguments of `get_streams_page`, with the same
+    /// cursor rules.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `TopicsPage`.
+    ///
+    /// Raises:
+    ///     ValueError: If the identifier is invalid.
+    ///     OverflowError: If `limit` is outside the unsigned 32-bit range.
+    ///     IggyError: As for `get_streams_page`. The page holds the topics
+    ///         the user may read.
+    #[pyo3(signature = (stream_id, *, order=None, descending=false, limit=None, cursor=None, name=None))]
+    #[allow(clippy::too_many_arguments)]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[TopicsPage]", imports=("collections.abc")))]
+    fn get_topics_page<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+        #[gen_stub(override_type(type_repr = "PageOrder | None"))] order: Option<PageOrder>,
+        descending: bool,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] limit: Option<u32>,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] cursor: Option<&str>,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] name: Option<String>,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::try_from(stream_id)?;
+        let query = validated_named_page_query(order, descending, limit, cursor, name)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            let page = inner
+                .get_topics_page(&stream_id, &query)
+                .await
+                .map_err(to_runtime_error)?;
+            TopicsPage::try_from(page)
         })
     }
 
@@ -1293,20 +1477,33 @@ impl IggyClient {
     ///         unchanged when `None`. `MaxTopicSize.ServerDefault()` changes
     ///         nothing either, reset `OptionKey.LocalRetentionSize` to return
     ///         to the default.
+    ///     fresh_upload_interval: A duration of a geo topic as
+    ///         `datetime.timedelta | None`, unchanged when `None`. This and
+    ///         the five durations below have the meaning and bounds
+    ///         `TopicOptions` gives them, zero is a value, and none of them
+    ///         can be reset. They are the only options an update changes on a
+    ///         geo topic, and the server refuses them on a normal topic.
+    ///     consumer_offset_upload_interval: As `fresh_upload_interval`.
+    ///     positions_publish_interval: As `fresh_upload_interval`.
+    ///     tombstone_grace: As `fresh_upload_interval`.
+    ///     positions_resume_timeout: As `fresh_upload_interval`.
+    ///     long_term_rewrite_max_interval: As `fresh_upload_interval`.
     ///
     /// Returns:
     ///     An awaitable that resolves to `None` when the topic is updated.
     ///
     /// Raises:
     ///     ValueError: If `message_expiry`, `max_topic_size`,
-    ///         `local_retention_age` or `local_retention_size` is out of range.
+    ///         `local_retention_age` or `local_retention_size` is out of range,
+    ///         or a duration is negative or longer than `2**64 - 1`
+    ///         microseconds.
     ///     OptionError: A `RuntimeError` carrying the error `code` and
     ///         `kind` when the client or the server refuses an option.
     ///     RuntimeError: Before anything is sent, if the update changes
     ///         nothing, names a key both set and reset, the name does not fit,
     ///         or a reset key cannot be reset. Otherwise if the request fails.
     #[pyo3(
-        signature = (stream_id, topic_id, name = None, message_expiry = None, max_topic_size = None, reset = None, options = None, raw_reset = None, tiered_storage = None, local_retention_age = None, local_retention_size = None)
+        signature = (stream_id, topic_id, name = None, message_expiry = None, max_topic_size = None, reset = None, options = None, raw_reset = None, tiered_storage = None, local_retention_age = None, local_retention_size = None, fresh_upload_interval = None, consumer_offset_upload_interval = None, positions_publish_interval = None, tombstone_grace = None, positions_resume_timeout = None, long_term_rewrite_max_interval = None)
     )]
     #[allow(clippy::too_many_arguments)]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
@@ -1336,6 +1533,18 @@ impl IggyClient {
         #[gen_stub(override_type(type_repr = "MaxTopicSize | None"))] local_retention_size: Option<
             &MaxTopicSize,
         >,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        fresh_upload_interval: Option<Py<PyDelta>>,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        consumer_offset_upload_interval: Option<Py<PyDelta>>,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        positions_publish_interval: Option<Py<PyDelta>>,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        tombstone_grace: Option<Py<PyDelta>>,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        positions_resume_timeout: Option<Py<PyDelta>>,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        long_term_rewrite_max_interval: Option<Py<PyDelta>>,
     ) -> PyResult<Bound<'a, PyAny>> {
         let update_options = TopicUpdateOptions {
             name,
@@ -1348,6 +1557,14 @@ impl IggyClient {
             local_retention_size: local_retention_size
                 .map(RustMaxTopicSize::try_from)
                 .transpose()?,
+            geo_durations: geo_topic_durations([
+                fresh_upload_interval,
+                consumer_offset_upload_interval,
+                positions_publish_interval,
+                tombstone_grace,
+                positions_resume_timeout,
+                long_term_rewrite_max_interval,
+            ])?,
             reset: reset_keys(reset),
             raw_reset: raw_reset.into_iter().flatten().collect(),
             raw: options.unwrap_or_default(),
@@ -1484,6 +1701,52 @@ impl IggyClient {
         })
     }
 
+    /// Reads one page of the partitions of a topic.
+    ///
+    /// Takes the keyword arguments of `get_streams_page` except `name`,
+    /// because a partition has no name. The cursor rules are the same.
+    /// Partition ids follow creation, so `PageOrder.Created` gives the id
+    /// order too.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///     topic_id: Topic identifier as `str | int`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `PartitionsPage`.
+    ///
+    /// Raises:
+    ///     ValueError: If an identifier is invalid.
+    ///     OverflowError: If `limit` is outside the unsigned 32-bit range.
+    ///     IggyError: As for `get_streams_page`. A user without the permission
+    ///         to read the topic gets the unauthorized code.
+    #[pyo3(signature = (stream_id, topic_id, *, order=None, descending=false, limit=None, cursor=None))]
+    #[allow(clippy::too_many_arguments)]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[PartitionsPage]", imports=("collections.abc")))]
+    fn get_partitions_page<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+        topic_id: PyIdentifier,
+        #[gen_stub(override_type(type_repr = "PageOrder | None"))] order: Option<PageOrder>,
+        descending: bool,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] limit: Option<u32>,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] cursor: Option<&str>,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::try_from(stream_id)?;
+        let topic_id = Identifier::try_from(topic_id)?;
+        let query = validated_page_query(order, descending, limit, cursor)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            let page = inner
+                .get_partitions_page(&stream_id, &topic_id, &query)
+                .await
+                .map_err(to_runtime_error)?;
+            PartitionsPage::try_from(page)
+        })
+    }
+
     /// Delete the oldest sealed segments of a partition, including all messages
     /// stored in them. The active segment is never deleted, and deletion stops at
     /// the lowest offset any consumer or consumer group has committed on the
@@ -1602,7 +1865,11 @@ impl IggyClient {
         })
     }
 
-    /// Get all consumer groups for the specified stream and topic.
+    /// Get all consumer groups for the specified stream and topic, in id order.
+    ///
+    /// The list is read in pages of 1,000, so it is not one consistent read.
+    /// A group that someone creates or deletes during the read can appear or
+    /// not appear. `get_consumer_groups_page` reads one page.
     ///
     /// Args:
     ///     stream_id: Stream identifier as `str | int`.
@@ -1634,6 +1901,52 @@ impl IggyClient {
                 .into_iter()
                 .map(PyConsumerGroup::from)
                 .collect::<Vec<_>>())
+        })
+    }
+
+    /// Reads one page of the consumer groups of a topic.
+    ///
+    /// Takes the keyword arguments of `get_streams_page`, with the same
+    /// cursor rules. Group ids follow creation, so `PageOrder.Created` gives
+    /// the id order too.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///     topic_id: Topic identifier as `str | int`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `ConsumerGroupsPage`.
+    ///
+    /// Raises:
+    ///     ValueError: If an identifier is invalid.
+    ///     OverflowError: If `limit` is outside the unsigned 32-bit range.
+    ///     IggyError: As for `get_streams_page`. A user without the permission
+    ///         to read the topic gets the unauthorized code.
+    #[pyo3(signature = (stream_id, topic_id, *, order=None, descending=false, limit=None, cursor=None, name=None))]
+    #[allow(clippy::too_many_arguments)]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[ConsumerGroupsPage]", imports=("collections.abc")))]
+    fn get_consumer_groups_page<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+        topic_id: PyIdentifier,
+        #[gen_stub(override_type(type_repr = "PageOrder | None"))] order: Option<PageOrder>,
+        descending: bool,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] limit: Option<u32>,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] cursor: Option<&str>,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] name: Option<String>,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::try_from(stream_id)?;
+        let topic_id = Identifier::try_from(topic_id)?;
+        let query = validated_named_page_query(order, descending, limit, cursor, name)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            let page = inner
+                .get_consumer_groups_page(&stream_id, &topic_id, &query)
+                .await
+                .map_err(to_runtime_error)?;
+            ConsumerGroupsPage::try_from(page)
         })
     }
 
@@ -2771,6 +3084,49 @@ mod tests {
             assert_eq!(
                 cause.getattr("code").unwrap().extract::<u32>().unwrap(),
                 TIERED_READ_FAILED_CODE
+            );
+        });
+    }
+
+    #[test]
+    fn given_reply_too_large_when_mapping_should_keep_its_code() {
+        const REPLY_TOO_LARGE_CODE: u32 = 97;
+        Python::initialize();
+        Python::attach(|py| {
+            let raised = to_runtime_error(IggyError::ReplyTooLarge);
+            assert!(raised.is_instance_of::<PyIggyError>(py));
+            assert!(!raised.is_instance_of::<OptionError>(py));
+            assert!(!raised.is_instance_of::<PendingOperationError>(py));
+            assert_eq!(
+                raised
+                    .value(py)
+                    .getattr("code")
+                    .unwrap()
+                    .extract::<u32>()
+                    .unwrap(),
+                REPLY_TOO_LARGE_CODE
+            );
+        });
+    }
+
+    // The Rust SDK returns 1021 without a retry, so the binding only has to keep its code.
+    #[test]
+    fn given_shadow_stream_refusal_when_mapping_should_keep_its_code_and_message() {
+        const SHADOW_STREAM_READ_ONLY_CODE: u32 = 1021;
+        Python::initialize();
+        Python::attach(|py| {
+            let raised = to_runtime_error(IggyError::ShadowStreamReadOnly);
+            assert!(raised.is_instance_of::<PyIggyError>(py));
+            assert!(!raised.is_instance_of::<OptionError>(py));
+            assert!(!raised.is_instance_of::<PendingOperationError>(py));
+            let value = raised.value(py);
+            assert_eq!(
+                value.getattr("code").unwrap().extract::<u32>().unwrap(),
+                SHADOW_STREAM_READ_ONLY_CODE
+            );
+            assert_eq!(
+                value.str().unwrap().to_str().unwrap(),
+                IggyError::ShadowStreamReadOnly.to_string()
             );
         });
     }

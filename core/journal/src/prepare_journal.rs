@@ -58,19 +58,17 @@ const CHECKSUM_BODY_UNSEALED: u128 = 0;
 
 /// Number of slots in the journal ring buffer.
 ///
-/// Must be larger than the maximum number of entries between consecutive
-/// snapshots. If the journal wraps past this window, older un-snapshotted
-/// entries are silently evicted from the in-memory index (the WAL file
-/// still contains them, but they become unreachable for recovery).
+/// Bounds the entries between two snapshots: an append that would evict an
+/// entry above the snapshot op fails instead.
 ///
-/// **NOTE:** This number needs to be chosen in balance between number of
-/// entries in [`consensus::PIPELINE_PREPARE_QUEUE_MAX`]. Because this number controls
-/// how many committed but not yet snapshotted entries that the buffer can
-/// hold. This may need to be tuned properly.
-pub(crate) const SLOT_COUNT: usize = 1024;
+/// The metadata plane starts a background checkpoint once half the slots
+/// committed past the last one and forces one inline at a small margin only
+/// when appends outrun it. So half the slots must outlast the checkpoint of
+/// the largest catalog: 32,768 ops are about 100 s at 300 metadata ops/s.
+pub(crate) const SLOT_COUNT: usize = 65_536;
 
-/// Default in-memory index size, in slots. Overridable per journal via
-/// [`PrepareJournal::open_with_slots`] (operator knob: `[metadata]
+/// Default in-memory index size, in slots, see `SLOT_COUNT`. Overridable per
+/// journal via [`PrepareJournal::open_with_slots`] (operator knob: `[metadata]
 /// journal_slots` in the server config).
 pub const DEFAULT_SLOT_COUNT: usize = SLOT_COUNT;
 
@@ -381,6 +379,15 @@ fn valid_header_checksum(header: &PrepareHeader) -> bool {
     header.checksum == CHECKSUM_UNSEALED || header.identity_checksum() == header.checksum
 }
 
+/// Whether `header` comes right after the entry with `previous_op` and
+/// `previous_checksum` and does not chain to it. The scan refuses a WAL that
+/// stores such a pair with entries after it.
+const fn breaks_chain(previous_op: u64, previous_checksum: u128, header: &PrepareHeader) -> bool {
+    previous_op + 1 == header.op
+        && previous_checksum != CHECKSUM_UNSEALED
+        && header.parent != previous_checksum
+}
+
 fn valid_body_checksum(header: &PrepareHeader, body: &[u8]) -> bool {
     header.checksum_body == CHECKSUM_BODY_UNSEALED
         || u128::from(XxHash3_64::oneshot(body)) == header.checksum_body
@@ -689,9 +696,7 @@ impl PrepareJournal {
             // ends sealed. A gap means compaction dropped the predecessor, and an
             // unsealed end has nothing to chain from, so neither is evidence of damage.
             if let Some((previous_op, previous_checksum)) = chain_previous
-                && previous_op + 1 == header.op
-                && previous_checksum != CHECKSUM_UNSEALED
-                && header.parent != previous_checksum
+                && breaks_chain(previous_op, previous_checksum, &header)
             {
                 if pos + entry_size < file_len {
                     return Err(JournalError::Io(io::Error::new(
@@ -901,6 +906,8 @@ impl PrepareJournal {
     ///
     /// # Errors
     /// Returns an I/O error if the read fails or the entry is malformed.
+    /// Returns `io::ErrorKind::InvalidData` if the bytes at the indexed
+    /// offset are another entry.
     /// Returns an `io::ErrorKind::Other` error if the journal is
     /// poisoned; the in-memory index and the on-disk layout disagree
     /// and the stored offsets cannot be trusted.
@@ -912,7 +919,7 @@ impl PrepareJournal {
         if let Some(state) = self.poisoned.get() {
             return Err(Self::poisoned_io_error(state));
         }
-        let (offset, size) = {
+        let (offset, size, checksum) = {
             let headers = self.headers.borrow();
             let offsets = self.offsets.borrow();
             let slot = slot_for_op(header.op, self.slot_count);
@@ -923,15 +930,28 @@ impl PrepareJournal {
             let Some(offset) = offsets[slot] else {
                 return Ok(None);
             };
-            (offset, stored.size as usize)
+            (offset, stored.size as usize, stored.checksum)
         };
         let buf = vec![0u8; size];
         let buf = self.storage.read_at(offset, buf).await?;
-        let msg = Message::try_from(Owned::<MESSAGE_ALIGN>::copy_from_slice(&buf)).map_err(
-            |e: iggy_binary_protocol::consensus::ConsensusError| {
-                io::Error::new(io::ErrorKind::InvalidData, e.to_string())
-            },
-        )?;
+        let msg: Message<PrepareHeader> = Message::try_from(
+            Owned::<MESSAGE_ALIGN>::copy_from_slice(&buf),
+        )
+        .map_err(|e: iggy_binary_protocol::consensus::ConsensusError| {
+            io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+        })?;
+        // An offset that outlived a rewrite of the file reads another entry.
+        if msg.header().checksum != checksum {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "journal index points op {} at offset {offset}, which holds op {} with \
+                     another header checksum",
+                    header.op,
+                    msg.header().op,
+                ),
+            ));
+        }
         Ok(Some(msg))
     }
 
@@ -1122,6 +1142,10 @@ impl Journal for PrepareJournal {
         self.header((header.op - 1) as usize)
     }
 
+    fn slot_count(&self) -> Option<usize> {
+        Some(self.slot_count)
+    }
+
     fn remaining_capacity(&self) -> Option<usize> {
         let Some(last) = self.last_op.get() else {
             return Some(self.slot_count);
@@ -1134,13 +1158,15 @@ impl Journal for PrepareJournal {
         Some(self.slot_count.saturating_sub(used))
     }
 
-    /// Remove entries with ops in `ops` from the journal,
-    /// returning the removed entries sorted by op.
+    /// Remove entries with ops in `ops` from the journal without reading
+    /// them, returning how many were removed.
     ///
     /// Internally advances the snapshot watermark to `end_op` so that
     /// future appends treat drained slots as safe to overwrite. Rewrites
-    /// the WAL file keeping only entries outside the drained range.
-    async fn drain(&self, ops: RangeInclusive<u64>) -> io::Result<Vec<Self::Entry>> {
+    /// the WAL file keeping only entries outside the drained range, in op
+    /// order. Refuses a rewrite that would put two entries side by side that
+    /// do not chain and that the file keeps apart.
+    async fn drain(&self, ops: RangeInclusive<u64>) -> io::Result<usize> {
         if let Some(state) = self.poisoned.get() {
             return Err(Self::poisoned_io_error(state));
         }
@@ -1155,8 +1181,7 @@ impl Journal for PrepareJournal {
         let _drain_guard = DrainInFlightGuard(&self.drain_in_flight);
         let end_op = *ops.end();
 
-        // Partition slots into drained and live entries.
-        let mut to_drain: Vec<(PrepareHeader, u64)> = Vec::new();
+        let mut drained = 0usize;
         let mut live: Vec<(PrepareHeader, u64)> = Vec::new();
         {
             let headers = self.headers.borrow();
@@ -1164,27 +1189,31 @@ impl Journal for PrepareJournal {
             for slot in 0..self.slot_count {
                 if let (Some(h), Some(off)) = (&headers[slot], offsets[slot]) {
                     if ops.contains(&h.op) {
-                        to_drain.push((*h, off));
+                        drained += 1;
                     } else {
                         live.push((*h, off));
                     }
                 }
             }
         }
-        to_drain.sort_unstable_by_key(|(h, _)| h.op);
         live.sort_unstable_by_key(|(h, _)| h.op);
-
-        // Read drained entries from disk before rewriting the WAL.
-        let mut drained = Vec::with_capacity(to_drain.len());
-        for (header, offset) in &to_drain {
-            let buf = vec![0u8; header.size as usize];
-            let buf = self.storage.read_at(*offset, buf).await?;
-            let msg = Message::try_from(Owned::<MESSAGE_ALIGN>::copy_from_slice(&buf)).map_err(
-                |e: iggy_binary_protocol::consensus::ConsensusError| {
-                    io::Error::new(io::ErrorKind::InvalidData, e.to_string())
-                },
-            )?;
-            drained.push(msg);
+        // A view repair can append a repaired entry while the entry of the
+        // older view right below it is still here. The file boots because
+        // the two are apart in it, and op order would put them side by side.
+        // The reconcile of the view log removes the older entry.
+        if let Some(pair) = live.windows(2).find(|pair| {
+            let ((below, offset), (above, above_offset)) = (&pair[0], &pair[1]);
+            breaks_chain(below.op, below.checksum, above)
+                && offset + u64::from(below.size) != *above_offset
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "drain would store op {} right after op {}, which it does not chain to, \
+                     and the boot scan rejects such a pair",
+                    pair[1].0.op, pair[0].0.op,
+                ),
+            ));
         }
 
         self.rewrite_wal(&live, &RewriteStages::DRAIN).await?;
@@ -1222,6 +1251,11 @@ impl Journal for PrepareJournal {
     }
 
     async fn append(&self, entry: Self::Entry) -> io::Result<()> {
+        debug_assert!(
+            !self.drain_in_flight.get(),
+            "append while a drain or remove_range rewrites the WAL: the new file would lack \
+             the entry. The caller must keep the two apart, as the metadata journal_gate does"
+        );
         if let Some(state) = self.poisoned.get() {
             return Err(Self::poisoned_io_error(state));
         }
@@ -1311,7 +1345,7 @@ impl Journal for PrepareJournal {
         if self.poisoned.get().is_some() {
             return None;
         }
-        let (size, offset) = {
+        let (size, offset, checksum) = {
             let headers = self.headers.borrow();
             let offsets = self.offsets.borrow();
             let slot = slot_for_op(header.op, self.slot_count);
@@ -1319,12 +1353,15 @@ impl Journal for PrepareJournal {
             if stored.op != header.op {
                 return None;
             }
-            (stored.size as usize, offsets[slot]?)
+            (stored.size as usize, offsets[slot]?, stored.checksum)
         };
 
         let buffer = vec![0u8; size];
         let buffer = self.storage.read_at(offset, buffer).await.ok()?;
-        Message::try_from(Owned::<MESSAGE_ALIGN>::copy_from_slice(&buffer)).ok()
+        let entry: Self::Entry =
+            Message::try_from(Owned::<MESSAGE_ALIGN>::copy_from_slice(&buffer)).ok()?;
+        // An offset that outlived a rewrite of the file reads another entry.
+        (entry.header().checksum == checksum).then_some(entry)
     }
 }
 
@@ -1892,6 +1929,55 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_an_entry_of_an_older_view_below_a_repaired_one_when_draining_should_refuse_the_order_that_boot_rejects()
+     {
+        // What a view repair leaves before its reconcile: op 2 of the older
+        // view, then the repaired ops 4 and 3. Op 4 vouches for op 3, so op 3
+        // is appended after it, and the scan accepts that order.
+        const BODY: usize = 64;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        {
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
+            let op_1 = make_identity_sealed_prepare(1, BODY, 0);
+            let checksum_1 = op_1.header().checksum;
+            journal.append(op_1.deep_copy()).await.unwrap();
+            let older_2 = make_identity_sealed_prepare(2, BODY, checksum_1);
+            journal.append(older_2.deep_copy()).await.unwrap();
+            let repaired_2 = make_identity_sealed_prepare(2, 2 * BODY, checksum_1);
+            let op_3 = make_identity_sealed_prepare(3, BODY, repaired_2.header().checksum);
+            let op_4 = make_identity_sealed_prepare(4, BODY, op_3.header().checksum);
+            journal.append(op_4.deep_copy()).await.unwrap();
+            journal.append(op_3.deep_copy()).await.unwrap();
+
+            let error = journal.drain(0..=1).await.unwrap_err();
+
+            assert!(
+                error.to_string().contains("does not chain"),
+                "the drain must refuse to store op 3 right after the older op 2, got: {error}"
+            );
+        }
+        {
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
+            assert_eq!(
+                journal.last_op(),
+                Some(4),
+                "the refused drain keeps a WAL that boots"
+            );
+            assert!(
+                journal.drain(0..=1).await.is_err(),
+                "a restart must not change what the drain refuses"
+            );
+            // The reconcile removes the older entry, and the trim runs after it.
+            assert_eq!(journal.remove_range(2..=2).await.unwrap(), 1);
+            assert_eq!(journal.drain(0..=1).await.unwrap(), 1);
+        }
+        let journal = PrepareJournal::open(&path, 1).await.unwrap();
+        assert_eq!(journal.last_op(), Some(4));
+        assert!(journal.header(3).is_some() && journal.header(2).is_none());
+    }
+
+    #[compio::test]
     async fn scan_skips_verification_for_unsealed_entries() {
         // A WAL from a pre-sealing build must still open: `checksum` reads as the
         // unsealed sentinel, so neither the identity nor the chain is checked.
@@ -2423,18 +2509,15 @@ mod tests {
         let path = dir.path().join("journal.wal");
         let journal = PrepareJournal::open(&path, 0).await.unwrap();
 
-        // Append 5 entries
+        let mut appended = Vec::new();
         for op in 1..=5 {
-            journal.append(make_prepare(op, 64)).await.unwrap();
+            let prepare = make_prepare(op, 64);
+            appended.push(prepare.deep_copy());
+            journal.append(prepare).await.unwrap();
         }
         let size_before = journal.storage.file_len();
 
-        // Drain entries 1-3
-        let drained = journal.drain(1..=3).await.unwrap();
-        assert_eq!(drained.len(), 3);
-        assert_eq!(drained[0].header().op, 1);
-        assert_eq!(drained[1].header().op, 2);
-        assert_eq!(drained[2].header().op, 3);
+        assert_eq!(journal.drain(1..=3).await.unwrap(), 3);
 
         let size_after = journal.storage.file_len();
         assert!(
@@ -2450,13 +2533,15 @@ mod tests {
             );
         }
 
-        // Live entries are still readable
         for op in 4..=5 {
             let h = *journal.header(op as usize).unwrap();
             assert_eq!(h.op, op);
             let entry = journal.entry_at(&h).await.unwrap().unwrap();
-            assert_eq!(entry.header().op, op);
-            assert_eq!(entry.as_slice()[HEADER_SIZE..].len(), 64);
+            assert_eq!(
+                entry.as_slice(),
+                appended[op as usize - 1].as_slice(),
+                "live op {op} must survive the drain byte for byte"
+            );
         }
 
         // Reopen and verify the drained WAL is valid
@@ -2567,6 +2652,37 @@ mod tests {
         let journal = PrepareJournal::open_with_slots(&path, 1, 2).await.unwrap();
         assert!(journal.header(1).is_none());
         assert_eq!(journal.header(3).map(|header| header.op), Some(3));
+    }
+
+    /// A WAL written under the old default of 1,024 slots, with its live ops
+    /// wrapped around that index, reopens whole under the current default.
+    #[compio::test]
+    async fn reopen_with_the_default_slots_keeps_a_wal_written_with_fewer() {
+        const OLD_DEFAULT_SLOT_COUNT: usize = 1_024;
+        const SNAPSHOT_OP: u64 = 1_500;
+        const LAST_OP: u64 = SNAPSHOT_OP + OLD_DEFAULT_SLOT_COUNT as u64;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = PrepareJournal::open_with_slots(&path, SNAPSHOT_OP, OLD_DEFAULT_SLOT_COUNT)
+            .await
+            .unwrap();
+        for op in SNAPSHOT_OP + 1..=LAST_OP {
+            journal.append(make_prepare(op, 32)).await.unwrap();
+        }
+        drop(journal);
+
+        let journal = PrepareJournal::open(&path, SNAPSHOT_OP).await.unwrap();
+        assert_eq!(journal.last_op(), Some(LAST_OP));
+        for op in SNAPSHOT_OP + 1..=LAST_OP {
+            let header = *journal
+                .header(usize::try_from(op).unwrap())
+                .unwrap_or_else(|| panic!("op {op} must stay indexed"));
+            assert_eq!(header.op, op);
+            assert!(
+                journal.entry_at(&header).await.unwrap().is_some(),
+                "op {op} must stay readable"
+            );
+        }
     }
 
     const POISON_REASON: &str = "test: simulated post-rename failure";
@@ -2797,8 +2913,7 @@ mod tests {
             journal.append(make_prepare(op, 64)).await.unwrap();
         }
 
-        let (a, b) = futures::join!(journal.drain(1..=4), journal.drain(1..=4));
-        let results = [a.map(|v| v.len()), b.map(|v| v.len())];
+        let results: [_; 2] = futures::join!(journal.drain(1..=4), journal.drain(1..=4)).into();
         let (winners, losers): (Vec<_>, Vec<_>) =
             results.into_iter().partition(std::result::Result::is_ok);
         assert_eq!(
@@ -2822,5 +2937,125 @@ mod tests {
         let h = *journal.header(9).unwrap();
         let entry = journal.entry_at(&h).await.unwrap().unwrap();
         assert_eq!(entry.header().op, 9);
+    }
+
+    #[compio::test]
+    async fn entry_read_during_a_drain_returns_the_live_entry() {
+        // Equal sizes and a live suffix longer than each drained prefix: a stale
+        // offset then lands on another entry of the rewritten file, not past its end.
+        const FIRST_DRAIN_TO: u64 = 2;
+        const SECOND_DRAIN_TO: u64 = 4;
+        const LAST_OP: u64 = 8;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
+        let mut appended = Vec::new();
+        for op in 1..=LAST_OP {
+            let prepare = make_prepare(op, 64);
+            appended.push(prepare.deep_copy());
+            journal.append(prepare).await.unwrap();
+        }
+        let live_after = |drained_to: u64| &appended[drained_to as usize..];
+
+        let mut drain = Box::pin(journal.drain(1..=FIRST_DRAIN_TO));
+        let mut reads_mid_drain = 0;
+        let removed = loop {
+            if let std::task::Poll::Ready(removed) = futures::poll!(&mut drain) {
+                break removed.unwrap();
+            }
+            assert_live_entries(&journal, live_after(FIRST_DRAIN_TO)).await;
+            reads_mid_drain += 1;
+        };
+        assert_eq!(removed, FIRST_DRAIN_TO as usize);
+        assert!(reads_mid_drain > 0, "the drain never suspended");
+        assert_live_entries(&journal, live_after(FIRST_DRAIN_TO)).await;
+
+        // Submitted on the old file and completed after the reopen replaced it.
+        let probe = &appended[LAST_OP as usize - 1];
+        let mut in_flight = Box::pin(journal.entry(probe.header()));
+        assert!(futures::poll!(&mut in_flight).is_pending());
+        assert_eq!(
+            journal.drain(1..=SECOND_DRAIN_TO).await.unwrap(),
+            (SECOND_DRAIN_TO - FIRST_DRAIN_TO) as usize
+        );
+        let read = in_flight
+            .await
+            .expect("a read in flight across the reopen must find its entry");
+        assert_eq!(
+            read.as_slice(),
+            probe.as_slice(),
+            "the read crossed the reopen"
+        );
+        assert_live_entries(&journal, live_after(SECOND_DRAIN_TO)).await;
+    }
+
+    // Every production caller appends under the gate that a rewrite of the
+    // WAL holds too. This proves that the debug tripwire catches an append
+    // that bypassed it. Compiled out of release builds.
+    #[cfg(debug_assertions)]
+    #[compio::test]
+    #[should_panic(expected = "append while a drain or remove_range rewrites the WAL")]
+    async fn given_a_parked_drain_when_appending_should_trip_the_rewrite_guard() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
+        for op in 1..=4 {
+            journal.append(make_prepare(op, 64)).await.unwrap();
+        }
+        let mut drain = Box::pin(journal.drain(1..=2));
+        assert!(
+            futures::poll!(&mut drain).is_pending(),
+            "the drain never suspended"
+        );
+
+        let _ = journal.append(make_prepare(5, 64)).await;
+    }
+
+    #[compio::test]
+    async fn given_a_slot_at_the_offset_of_another_entry_when_reading_should_refuse_it() {
+        const BODY: usize = 64;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
+        let first = make_identity_sealed_prepare(1, BODY, 0);
+        let second = make_identity_sealed_prepare(2, BODY, first.header().checksum);
+        let probe = *first.header();
+        journal.append(first).await.unwrap();
+        journal.append(second).await.unwrap();
+        // What a rewrite would leave if an entry kept an offset of the
+        // replaced file.
+        {
+            let mut offsets = journal.offsets.borrow_mut();
+            offsets[slot_for_op(1, journal.slot_count)] =
+                offsets[slot_for_op(2, journal.slot_count)];
+        }
+
+        assert!(
+            journal.entry(&probe).await.is_none(),
+            "op 1 read the entry of op 2"
+        );
+        let error = journal
+            .entry_at(&probe)
+            .await
+            .map(|entry| entry.map(|entry| entry.header().op))
+            .expect_err("op 1 read the entry of another op");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// Reads each of `expected`, which must return its own bytes.
+    #[allow(clippy::future_not_send)]
+    async fn assert_live_entries(journal: &PrepareJournal, expected: &[Message<PrepareHeader>]) {
+        for entry in expected {
+            let op = entry.header().op;
+            let read = journal
+                .entry(entry.header())
+                .await
+                .unwrap_or_else(|| panic!("live op {op} read as missing"));
+            assert_eq!(
+                read.as_slice(),
+                entry.as_slice(),
+                "op {op} read bytes of another entry"
+            );
+        }
     }
 }

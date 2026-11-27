@@ -18,14 +18,17 @@
 //! OpenMessaging Benchmark (OMB) results. OMB measures differently from iggy-bench, so its runs
 //! have their own model, and no iggy-bench type takes an OMB run.
 
+pub mod chart;
 pub mod compare;
 pub mod detail;
 pub mod id;
+pub mod labels;
+pub mod quantile;
 pub mod result;
 pub mod setup;
 pub mod summary;
 #[cfg(test)]
-mod test_fixtures;
+pub(crate) mod test_fixtures;
 pub mod workload;
 
 /// OMB samples its statistics once per window of this length. The value is fixed in the OMB code,

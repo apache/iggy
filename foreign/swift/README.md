@@ -154,6 +154,9 @@ try await client.updateUser("alice", options: UserUpdateOptions(status: .inactiv
 
 Only `message_expiry`, `max_topic_size`, `local_retention_age` and `local_retention_size` can be reset. An update can turn `tiered_storage` on, never off. Compression and the other topic settings are fixed at create, and no stream or user key is resettable yet. A typed update that breaks these rules fails before anything is sent, with the error the server would return.
 
+A geo topic takes six durations of its own: `freshUploadInterval`, `consumerOffsetUploadInterval`, `positionsPublishInterval`, `tombstoneGrace`, `positionsResumeTimeout` and `longTermRewriteMaxInterval`. Each travels as whole microseconds and overrides the server setting of the same name, and nil leaves that setting. Zero is a value and is sent.
+An update can set them, and they are the only keys it may change on a geo topic, but it cannot reset them. A normal topic refuses them. `Topic` and `TopicDetails` read them back, nil when unset.
+
 Everything else, such as a taken name or a missing resource, is refused by the server. `describeOptions(scope:)` lists every key of a scope with flags saying what an update may do with it. Renaming the signed-in user, through `username` or a raw `username` entry, moves the credentials later reconnects use.
 
 Keys this SDK has no typed member for go in `raw`, values as strings the server parses, and reset names in `rawReset`. The server alone decides on a patch that carries either, since it may know keys this SDK does not:
@@ -165,6 +168,32 @@ try await client.updateTopic(streamID: "payments-v2", topicID: "orders", options
 `StreamCreateOptions.encryptionKey` gives the stream its own data key. It must be 32 random bytes, never derived from a password. It travels inside the create request over whatever transport the client uses, so protecting it in transit with TLS is the caller's choice.
 
 The server stores it wrapped and never returns it: reads report `encryptionKeySource`, `encryptionKeyFingerprint`, and `encryptionKekFingerprints`, and `EncryptionKey.fingerprint(_:)` computes the fingerprint of a key to compare. Without a key, a server with encryption enabled generates one for the stream.
+
+### List pages
+
+`getStreams()`, `getTopics(streamID:)`, `getConsumerGroups(streamID:topicID:)` and `getUsers()` return a whole list. Each of them reads the list in pages of at most 1,000 items, so the result is not one consistent read. An entity that someone creates or deletes during the read can appear or not appear. The read keeps the sign-in it started with, and one request timeout covers every page. If the server answers with the cursor it was sent, the read fails with `invalidCommand`.
+
+`getStreamsPage(_:)`, `getTopicsPage(streamID:query:)`, `getPartitionsPage(streamID:topicID:query:)`, `getConsumerGroupsPage(streamID:topicID:query:)` and `getUsersPage(_:)` return one page. To read the next page, send the same query with the `next` of the page as its `cursor`. A page can be empty and still have a `next`:
+
+```swift
+func printStreams(_ client: IggyClient) async throws {
+    var query = NamedPageQuery()
+    while true {
+        let page = try await client.getStreamsPage(query)
+        for stream in page.items {
+            print(stream.id, stream.name)
+        }
+        guard let next = page.next else {
+            return
+        }
+        query.page.cursor = next
+    }
+}
+```
+
+A `PageQuery` holds `order`, `descending`, `limit` and `cursor`. `order` selects `.id` or `.created`, and `descending` reverses it. The stream, topic, consumer group and user page methods take a `NamedPageQuery`, which holds a `PageQuery` in `page` and an optional `name`. `name` keeps the entries whose name holds the text, case-sensitive. The partitions page method takes a `PageQuery`, which has no name.
+
+The client refuses a query that breaks the page rules with `invalidCommand`, before it sends anything. Examples are a limit outside 1 to 1000 and a name that is empty or longer than 255 bytes. A `PageCursor` prints as the `pg1_` text form that the HTTP API and the CLI use, and `PageCursor(text:)` reads it back. The client does not read the bytes of a cursor. The server refuses a cursor that it cannot use, also with `invalidCommand`.
 
 ### Metadata changes
 
@@ -520,7 +549,7 @@ can duplicate the earlier write. See the server's
 Each node counts the messages in its stream, topic and system stats. After a
 successful send, a node that is not the partition primary shows the new count
 only after the next prepare or commit broadcast. When no other write follows,
-this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+this delay is at most `cluster.commit_busy_heartbeat_interval` (500 ms by default).
 See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
 
 ## Testing
@@ -562,7 +591,7 @@ The hash, error-code, model, request, reply, and consensus header tests compare 
 cargo run --manifest-path Tools/golden-vectors/Cargo.toml -- Tests/IggyTests/Fixtures/golden.json
 ```
 
-The resource options tests compare against `Tests/IggyTests/Fixtures/resource_options.json`, the fixture every SDK shares, generated by `core/common/examples/resource_options_fixtures.rs`. Never edit the copy. The metadata changes tests do the same with `Tests/IggyTests/Fixtures/metadata_changes.json`, generated by `core/common/examples/metadata_changes_fixtures.rs`.
+The resource options tests compare against `Tests/IggyTests/Fixtures/resource_options.json`, the fixture every SDK shares, generated by `core/common/examples/resource_options_fixtures.rs`. Never edit the copy. The metadata changes tests do the same with `Tests/IggyTests/Fixtures/metadata_changes.json`, generated by `core/common/examples/metadata_changes_fixtures.rs`. The list page tests do the same with `Tests/IggyTests/Fixtures/list_pages.json`, generated by `core/common/examples/list_pages_fixtures.rs`.
 
 The metadata changes scenario that churns the change log past its capacity runs only when `IGGY_METADATA_CHANGE_LOG_RESOURCE_CAPACITY` is set for both the server and the test run, for example to 64.
 

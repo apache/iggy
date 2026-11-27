@@ -107,6 +107,11 @@ pub trait Pipeline {
     fn pop_request(&mut self) -> Option<Self::Request> {
         None
     }
+
+    /// Give back queue capacity that holds no entry. The primary calls it at
+    /// a commit heartbeat when nothing entered the pipeline since the
+    /// previous one. Default: holds no such capacity.
+    fn shrink_to_fit(&mut self) {}
 }
 
 pub type RequestMessage<C> = <C as Consensus>::Message<<C as Consensus>::RoutedRequestHeader>;
@@ -220,4 +225,4 @@ pub use replica_set::{ReplicaSet, ReplicaSetError};
 mod vsr_state;
 pub use vsr_state::{AdoptedView, HistoryCertificate, HistoryRecovery, VsrState, VsrStateError};
 mod vsr_timeout;
-pub use vsr_timeout::{TICK_INTERVAL, TimeoutManager};
+pub use vsr_timeout::{HeartbeatSchedule, TICK_INTERVAL, TickClock, TimeoutManager};

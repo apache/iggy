@@ -17,7 +17,9 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { deserializeBaseTopic, deserializePartition, deserializeTopic } from './topic.utils.js';
+import {
+  deserializeBaseTopic, deserializePartition, deserializeTopic, GeoMode, TopicType
+} from './topic.utils.js';
 import { serializeOptions } from '../options.utils.js';
 import { HeaderValue } from '../message/header.utils.js';
 import { DeserializeError } from '../error.utils.js';
@@ -119,6 +121,65 @@ describe('deserializeBaseTopic', () => {
     assert.equal(topic.tieredStorage, false);
     assert.equal(topic.localRetentionAge, 86_400_000_000n);
     assert.equal(topic.localRetentionSize, 0xffff_ffff_ffff_ffffn);
+    assert.equal(topic.topicType, TopicType.Normal);
+    assert.equal(topic.geoMode, null);
+  });
+
+  it('reads the topic type and the geo mode of a geo topic from either options block', () => {
+    const fixed = Buffer.alloc(34);
+    fixed.writeUInt32LE(4, 0);
+    fixed.writeUInt32LE(1, 12);
+    fixed.writeUInt8(1, 32);
+    fixed.write('g', 33);
+    const prefix = (block: Buffer) => {
+      const len = Buffer.alloc(4);
+      len.writeUInt32LE(block.length, 0);
+      return Buffer.concat([len, block]);
+    };
+    const explicit = serializeOptions([{ key: 'topic_type', value: HeaderValue.String('geo') }]);
+    const derived = serializeOptions([{ key: 'geo_mode', value: HeaderValue.String('geo_tiered') }]);
+    const data = Buffer.concat([fixed, prefix(explicit), prefix(derived)]);
+
+    const { bytesRead, data: topic } = deserializeBaseTopic(data);
+
+    assert.equal(bytesRead, data.length);
+    assert.equal(topic.topicType, TopicType.Geo);
+    assert.equal(topic.geoMode, GeoMode.GeoTiered);
+    assert.deepEqual(topic.options, { topic_type: 'geo' });
+    assert.deepEqual(topic.derivedOptions, { geo_mode: 'geo_tiered' });
+  });
+});
+
+describe('deserializeBaseTopic durations', () => {
+  const topicWith = (topicType: string) => {
+    const fixed = Buffer.alloc(34);
+    fixed.writeUInt32LE(4, 0);
+    fixed.writeUInt8(1, 32);
+    fixed.write('g', 33);
+    const explicit = serializeOptions([
+      { key: 'consumer_offset_upload_interval', value: HeaderValue.Uint64(0n) },
+      { key: 'tombstone_grace', value: HeaderValue.Uint64(3_600_000_000n) },
+      { key: 'topic_type', value: HeaderValue.String(topicType) }
+    ]);
+    const length = Buffer.alloc(4);
+    length.writeUInt32LE(explicit.length, 0);
+    return deserializeBaseTopic(Buffer.concat([fixed, length, explicit, Buffer.alloc(4)])).data;
+  };
+
+  it('reads the durations a geo topic sets, 0n included, and null for the unset ones', () => {
+    const topic = topicWith('geo');
+    assert.equal(topic.consumerOffsetUploadInterval, 0n);
+    assert.equal(topic.tombstoneGrace, 3_600_000_000n);
+    assert.equal(topic.freshUploadInterval, null);
+    assert.equal(topic.positionsPublishInterval, null);
+    assert.equal(topic.positionsResumeTimeout, null);
+    assert.equal(topic.longTermRewriteMaxInterval, null);
+  });
+
+  it('ignores durations stored on a normal topic', () => {
+    const topic = topicWith('normal');
+    assert.equal(topic.consumerOffsetUploadInterval, null);
+    assert.equal(topic.tombstoneGrace, null);
   });
 });
 

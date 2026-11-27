@@ -22,6 +22,7 @@ using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Mappers;
+using Apache.Iggy.Messages;
 using Apache.Iggy.Vsr;
 using Microsoft.Extensions.Logging;
 
@@ -802,6 +803,15 @@ public sealed class PartitionReader : IAsyncDisposable
             {
                 state.Delivered = (checkpoint.Offset, state.Handed?.Context ?? default);
             }
+        }
+    }
+
+    /// <summary>Whether a batch retained by a consumer still belongs to a generation the reader keeps.</summary>
+    internal bool Keeps(PolledMessages batch)
+    {
+        lock (_gate)
+        {
+            return batch.Stamp is { } stamp && stamp.Reader == _id && Keeps(batch.PartitionId, stamp.Generation);
         }
     }
 
@@ -2198,7 +2208,8 @@ public sealed class PartitionReader : IAsyncDisposable
         polled.RequestStart = target.Sent;
         polled.Stamp = new ReaderStamp(_id, target.Generation);
         Enqueue(new Entry(target.Partition, target.Generation, polled, null,
-            polled.Messages.Count, polled.Messages.Sum(message => (long)message.Payload.Length)));
+            polled.Messages.Count, polled.Messages.Sum(message => (long)BatchWireFormat.FRAME_HEADER_SIZE +
+                message.Payload.Length + message.Header.UserHeadersLength)));
     }
 
     /// <summary>A section stored nothing that can be read: its partition reads it again one message at a time.</summary>

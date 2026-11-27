@@ -179,7 +179,7 @@ namespace Iggy {
          * active segment's first batch, at least 10 minutes. 18446744073709551615 and null roll
          * segments by size alone. The server refuses a duration together with
          * `preallocate_segments`. It follows `raw`, so positional calls written before it existed
-         * keep their meaning, and so do the three options below.
+         * keep their meaning, and so do the options below.
          *
          * `tiered_storage` moves sealed segments to the object store. Null leaves it off, and the
          * server refuses true with `Feature is unavailable` until it tiers topics.
@@ -187,6 +187,24 @@ namespace Iggy {
          * disk, one day when null, and `local_retention_size` caps the uploaded segments it keeps
          * there, unlimited when null. The server refuses an age above a finite message expiry and a
          * size above a finite `max_topic_size`.
+         *
+         * `topic_type` is `normal` or `geo`, and null creates a normal topic. A geo topic's messages
+         * also become readable in the other datacenters through the object store. A geo topic needs
+         * an object store on every node of the cluster: while one is not ready, the server refuses
+         * `geo` with `Feature is unavailable`. A geo topic refuses tiered storage and an encrypted
+         * stream, and keeps its name, its partition count and every option but the durations below.
+         * `geo_mode` says how a geo topic writes its messages, `geo` or `geo_tiered`, and null
+         * resolves to `geo` there. The server refuses `geo_tiered` with `Feature is unavailable` for
+         * now, and any mode on a normal topic.
+         *
+         * The six durations after `geo_mode` override, for a geo topic, the server settings of the
+         * same name on each node: `[tiered_storage] fresh_upload_interval` (at most 10 s) and the
+         * `[geo]` settings `consumer_offset_upload_interval` (at most 1 s, 0 answers an offset store
+         * at its local commit), `positions_publish_interval` and `tombstone_grace` (above 0),
+         * `positions_resume_timeout` (0 waits for no peer) and `long_term_rewrite_max_interval` (at
+         * least 1 s). Each takes an int or a decimal string of microseconds. 0 is sent as a value,
+         * and null leaves the server setting in force. The server refuses any of them on a normal
+         * topic with `Invalid option value`.
          *
          * @param mixed $stream
          * @param string $name
@@ -207,9 +225,17 @@ namespace Iggy {
          * @param bool|null $tiered_storage
          * @param mixed $local_retention_age_micros
          * @param mixed $local_retention_size
+         * @param string|null $topic_type
+         * @param string|null $geo_mode
+         * @param mixed $fresh_upload_interval_micros
+         * @param mixed $consumer_offset_upload_interval_micros
+         * @param mixed $positions_publish_interval_micros
+         * @param mixed $tombstone_grace_micros
+         * @param mixed $positions_resume_timeout_micros
+         * @param mixed $long_term_rewrite_max_interval_micros
          * @return void
          */
-        public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, mixed $segment_size = null, ?\Iggy\Durability $durability = null, ?\Iggy\Durability $consumer_offset_durability = null, mixed $messages_required_to_save = null, mixed $size_of_messages_required_to_save = null, ?bool $preallocate_segments = null, ?string $partition_resize_policy = null, mixed $replication_factor = null, ?array $raw = null, mixed $segment_max_age_micros = null, ?bool $tiered_storage = null, mixed $local_retention_age_micros = null, mixed $local_retention_size = null): void {}
+        public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, mixed $segment_size = null, ?\Iggy\Durability $durability = null, ?\Iggy\Durability $consumer_offset_durability = null, mixed $messages_required_to_save = null, mixed $size_of_messages_required_to_save = null, ?bool $preallocate_segments = null, ?string $partition_resize_policy = null, mixed $replication_factor = null, ?array $raw = null, mixed $segment_max_age_micros = null, ?bool $tiered_storage = null, mixed $local_retention_age_micros = null, mixed $local_retention_size = null, ?string $topic_type = null, ?string $geo_mode = null, mixed $fresh_upload_interval_micros = null, mixed $consumer_offset_upload_interval_micros = null, mixed $positions_publish_interval_micros = null, mixed $tombstone_grace_micros = null, mixed $positions_resume_timeout_micros = null, mixed $long_term_rewrite_max_interval_micros = null): void {}
 
         /**
          * Deletes the offset stored on `partition_id` for a standalone consumer, or for a consumer
@@ -302,6 +328,21 @@ namespace Iggy {
         public static function fromConnectionString(string $connection_string): \Iggy\Client {}
 
         /**
+         * Reads one page of the consumer groups of a topic. Group ids follow creation, so both
+         * orders walk by id. The other arguments are those of getStreamsPage().
+         *
+         * @param mixed $stream_id
+         * @param mixed $topic_id
+         * @param \Iggy\PageOrder|null $order
+         * @param bool $descending
+         * @param mixed $limit
+         * @param string|null $cursor
+         * @param string|null $name
+         * @return \Iggy\ConsumerGroupsPage
+         */
+        public function getConsumerGroupsPage(mixed $stream_id, mixed $topic_id, ?\Iggy\PageOrder $order = null, bool $descending = false, mixed $limit = null, ?string $cursor = null, ?string $name = null): \Iggy\ConsumerGroupsPage {}
+
+        /**
          * Returns the offset stored on `partition_id` for a standalone consumer, or for a consumer
          * group when `group` is true, or null when nothing is stored. In a cluster the node of the
          * connection answers from its own replica, which can lag a store that just returned.
@@ -335,7 +376,26 @@ namespace Iggy {
         public function getMetadataChanges(\Iggy\MetadataChangeStart $start, array $groups = [], mixed $since = null, mixed $until = null, mixed $limit = null): \Iggy\MetadataChanges {}
 
         /**
+         * Reads one page of the partitions of a topic. Partition ids follow creation, so both
+         * orders walk by id. The other arguments are those of getStreamsPage() except `name`,
+         * because a partition has no name.
+         *
+         * @param mixed $stream_id
+         * @param mixed $topic_id
+         * @param \Iggy\PageOrder|null $order
+         * @param bool $descending
+         * @param mixed $limit
+         * @param string|null $cursor
+         * @return \Iggy\PartitionsPage
+         */
+        public function getPartitionsPage(mixed $stream_id, mixed $topic_id, ?\Iggy\PageOrder $order = null, bool $descending = false, mixed $limit = null, ?string $cursor = null): \Iggy\PartitionsPage {}
+
+        /**
          * Gets a stream by id or name.
+         *
+         * Over TCP, QUIC and WebSocket, a stream with too many topics for one reply throws
+         * ReplyTooLarge (97), and the connection stays usable. getTopicsPage() reads its topics
+         * page by page.
          *
          * @param mixed $stream_id
          * @return \Iggy\StreamDetails|null
@@ -343,13 +403,68 @@ namespace Iggy {
         public function getStream(mixed $stream_id): ?\Iggy\StreamDetails {}
 
         /**
+         * Reads one page of the streams the caller may read.
+         *
+         * `order` is `Iggy\PageOrder::Id` when null, and `descending` reverses it. `limit` is 1 to
+         * 1000, 100 when null. `cursor` is the `next` of the previous page, null for the first
+         * page. `name` keeps the streams whose name holds the text, case-sensitive, and is 1 to
+         * 255 bytes. A query outside these ranges, or a cursor text that the client cannot read,
+         * throws `Invalid command` (code 3) before anything is sent. The server refuses a cursor
+         * that does not fit the query with the same error, which HTTP reports as code 300. A
+         * `limit` that is not an integer, or that does not fit an unsigned 32-bit integer, throws
+         * `IggyException` with code 0 from the argument check.
+         *
+         * @param \Iggy\PageOrder|null $order
+         * @param bool $descending
+         * @param mixed $limit
+         * @param string|null $cursor
+         * @param string|null $name
+         * @return \Iggy\StreamsPage
+         */
+        public function getStreamsPage(?\Iggy\PageOrder $order = null, bool $descending = false, mixed $limit = null, ?string $cursor = null, ?string $name = null): \Iggy\StreamsPage {}
+
+        /**
          * Gets a topic by stream and topic id/name.
+         *
+         * Over TCP, QUIC and WebSocket, a topic with too many partitions for one reply throws
+         * ReplyTooLarge (97), and the connection stays usable. getPartitionsPage() reads its
+         * partitions page by page.
          *
          * @param mixed $stream_id
          * @param mixed $topic_id
          * @return \Iggy\TopicDetails|null
          */
         public function getTopic(mixed $stream_id, mixed $topic_id): ?\Iggy\TopicDetails {}
+
+        /**
+         * Reads one page of the topics the caller may read in a stream. A missing stream, or one the
+         * caller may read no topic of, gives an empty page without `next`. For a caller with a global
+         * read grant, a page read with a cursor throws code 1009 instead, which HTTP reports as code
+         * 20 (ResourceNotFound), because the stream was deleted during the walk. The other arguments are those of
+         * getStreamsPage().
+         *
+         * @param mixed $stream_id
+         * @param \Iggy\PageOrder|null $order
+         * @param bool $descending
+         * @param mixed $limit
+         * @param string|null $cursor
+         * @param string|null $name
+         * @return \Iggy\TopicsPage
+         */
+        public function getTopicsPage(mixed $stream_id, ?\Iggy\PageOrder $order = null, bool $descending = false, mixed $limit = null, ?string $cursor = null, ?string $name = null): \Iggy\TopicsPage {}
+
+        /**
+         * Reads one page of the users, and `name` matches the username. The other arguments are
+         * those of getStreamsPage().
+         *
+         * @param \Iggy\PageOrder|null $order
+         * @param bool $descending
+         * @param mixed $limit
+         * @param string|null $cursor
+         * @param string|null $name
+         * @return \Iggy\UsersPage
+         */
+        public function getUsersPage(?\Iggy\PageOrder $order = null, bool $descending = false, mixed $limit = null, ?string $cursor = null, ?string $name = null): \Iggy\UsersPage {}
 
         /**
          * Builds a reader of the partitions that a consumer group assigns to this member.
@@ -457,6 +572,19 @@ namespace Iggy {
          * @return void
          */
         public function resolveOperation(string $operation_id, mixed $timeout_micros = null): void {}
+
+        /**
+         * Retires the geo origin of a datacenter that never returns.
+         *
+         * The cluster then follows nothing more of the origin: its shadow topics serve what they
+         * hold until their retention removes it, and a client may delete them. Retiring an origin
+         * that is retired already changes nothing. A datacenter that comes back needs another
+         * origin name. Needs root or the global `manage_servers` permission.
+         *
+         * @param string $origin
+         * @return void
+         */
+        public function retireGeoOrigin(string $origin): void {}
 
         /**
          * Sends a command code with a payload and returns the raw response bytes.
@@ -579,6 +707,11 @@ namespace Iggy {
          * tiered topic keeps on local disk after upload, with the same int or decimal string values
          * and the same refusal of 0 as the expiry and the size cap.
          *
+         * The six durations of a geo topic take the values `createTopic()` takes, 0 included. They
+         * are the only options an update can change on a geo topic, a normal topic refuses them with
+         * `Invalid option value`, and they cannot be reset: a `reset` case or a `raw_reset` name of
+         * one is refused with `Option cannot be reset`.
+         *
          * @param mixed $stream
          * @param mixed $topic
          * @param string|null $name
@@ -590,9 +723,15 @@ namespace Iggy {
          * @param bool|null $tiered_storage
          * @param mixed $local_retention_age_micros
          * @param mixed $local_retention_size
+         * @param mixed $fresh_upload_interval_micros
+         * @param mixed $consumer_offset_upload_interval_micros
+         * @param mixed $positions_publish_interval_micros
+         * @param mixed $tombstone_grace_micros
+         * @param mixed $positions_resume_timeout_micros
+         * @param mixed $long_term_rewrite_max_interval_micros
          * @return void
          */
-        public function updateTopic(mixed $stream, mixed $topic, ?string $name = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, array $reset = [], ?array $raw = null, ?array $raw_reset = null, ?bool $tiered_storage = null, mixed $local_retention_age_micros = null, mixed $local_retention_size = null): void {}
+        public function updateTopic(mixed $stream, mixed $topic, ?string $name = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, array $reset = [], ?array $raw = null, ?array $raw_reset = null, ?bool $tiered_storage = null, mixed $local_retention_age_micros = null, mixed $local_retention_size = null, mixed $fresh_upload_interval_micros = null, mixed $consumer_offset_upload_interval_micros = null, mixed $positions_publish_interval_micros = null, mixed $tombstone_grace_micros = null, mixed $positions_resume_timeout_micros = null, mixed $long_term_rewrite_max_interval_micros = null): void {}
     }
 
     /**
@@ -889,6 +1028,46 @@ namespace Iggy {
          * @return string
          */
         public function topic(): string {}
+    }
+
+    /**
+     * One consumer group of a `ConsumerGroupsPage`.
+     */
+    class ConsumerGroup {
+        public readonly int $id;
+
+        public readonly int $members_count;
+
+        public readonly string $name;
+
+        public readonly int $partitions_count;
+
+        public function __construct() {}
+    }
+
+    /**
+     * One page of the consumer groups of a topic, as `Client::getConsumerGroupsPage()` returns it.
+     */
+    class ConsumerGroupsPage {
+        /**
+         * The consumer groups of the page, each an `Iggy\ConsumerGroup`.
+         *
+         * The items are rebuilt on each getter call, so cache the array in PHP if you read it
+         * more than once.
+         *
+         * @var array
+         */
+        public readonly array $items;
+
+        /**
+         * The `cursor` of the next page of the same query, null on the last page. A page can be
+         * empty and still have one.
+         *
+         * @var string|null
+         */
+        public readonly ?string $next;
+
+        public function __construct() {}
     }
 
     /**
@@ -1693,7 +1872,7 @@ namespace Iggy {
       case Logout = 'logout';
       case Expired = 'expired';
     /**
-     * The user was deactivated or deleted.
+     * A user delete, deactivation, password change, or delete of the session's token.
      */
       case Revoked = 'revoked';
     }
@@ -2146,6 +2325,14 @@ namespace Iggy {
     }
 
     /**
+     * The order of a list page. Values are the HTTP API names.
+     */
+    enum PageOrder: string {
+      case Id = 'id';
+      case Created = 'created';
+    }
+
+    /**
      * One partition of a topic.
      */
     class Partition {
@@ -2291,6 +2478,31 @@ namespace Iggy {
          * @return void
          */
         public function seek(int $partition_id, \Iggy\PollingStrategy $start): void {}
+    }
+
+    /**
+     * One page of the partitions of a topic, as `Client::getPartitionsPage()` returns it.
+     */
+    class PartitionsPage {
+        /**
+         * The partitions of the page, each an `Iggy\Partition`.
+         *
+         * The items are rebuilt on each getter call, so cache the array in PHP if you read it
+         * more than once.
+         *
+         * @var array
+         */
+        public readonly array $items;
+
+        /**
+         * The `cursor` of the next page of the same query, null on the last page. A page can be
+         * empty and still have one.
+         *
+         * @var string|null
+         */
+        public readonly ?string $next;
+
+        public function __construct() {}
     }
 
     /**
@@ -2637,6 +2849,77 @@ namespace Iggy {
         public function __construct() {}
     }
 
+    /**
+     * One stream of a `StreamsPage`.
+     */
+    class Stream {
+        /**
+         * Creation time in microseconds.
+         *
+         * @var int
+         */
+        public readonly int $created_at;
+
+        /**
+         * Options the server filled in, including the read-only encryption projections.
+         *
+         * @var array
+         */
+        public readonly array $derived_options;
+
+        /**
+         * Fingerprints of the server keys that wrap the stream's key, comma-separated: one
+         * outside a server key rotation. Null for a plaintext stream.
+         *
+         * @var string|null
+         */
+        public readonly ?string $encryption_kek_fingerprint;
+
+        /**
+         * Fingerprint of the stream's key, 16 lowercase hex characters. Compare it with
+         * `Client::encryptionKeyFingerprint()` of a key you hold. Null for a plaintext stream.
+         *
+         * @var string|null
+         */
+        public readonly ?string $encryption_key_fingerprint;
+
+        /**
+         * Who chose the stream's at-rest key: `stream`, `server`, or `none` for a plaintext
+         * stream. A source a newer server reports is returned as its text.
+         *
+         * @var string|null
+         */
+        public readonly ?string $encryption_key_source;
+
+        public readonly int $id;
+
+        public readonly int $messages_count;
+
+        public readonly string $name;
+
+        /**
+         * Options the creating client set, as option name to scalar value. Key material is
+         * never returned.
+         *
+         * @var array
+         */
+        public readonly array $options;
+
+        /**
+         * The geo origin whose topics this shadow stream serves, such as `dc-a`. Null for any
+         * stream that is not a shadow stream.
+         *
+         * @var string|null
+         */
+        public readonly ?string $shadow_origin;
+
+        public readonly int $size_bytes;
+
+        public readonly int $topics_count;
+
+        public function __construct() {}
+    }
+
     class StreamDetails {
         /**
          * Options the server filled in, including the read-only encryption projections.
@@ -2683,6 +2966,14 @@ namespace Iggy {
          */
         public readonly array $options;
 
+        /**
+         * The geo origin whose topics this shadow stream serves, such as `dc-a`. Null for any
+         * stream that is not a shadow stream.
+         *
+         * @var string|null
+         */
+        public readonly ?string $shadow_origin;
+
         public readonly int $topics_count;
 
         public function __construct() {}
@@ -2692,7 +2983,8 @@ namespace Iggy {
      * Stream option keys, as the cases an update's reset list takes.
      *
      * No stream option is resettable in this release, so `Client::updateStream()` refuses every
-     * case with the error the server would return.
+     * case with the error the server would return. The source, fingerprint and shadow origin keys
+     * are read-only.
      */
     enum StreamOptionKey: string {
       case Name = 'name';
@@ -2700,9 +2992,54 @@ namespace Iggy {
       case EncryptionKeySource = 'encryption_key_source';
       case EncryptionKeyFingerprint = 'encryption_key_fingerprint';
       case EncryptionKekFingerprint = 'encryption_kek_fingerprint';
+      case ShadowOrigin = 'shadow_origin';
     }
 
-    class TopicDetails {
+    /**
+     * One page of the streams, as `Client::getStreamsPage()` returns it.
+     */
+    class StreamsPage {
+        /**
+         * The streams of the page, each an `Iggy\Stream`.
+         *
+         * The items are rebuilt on each getter call, so cache the array in PHP if you read it
+         * more than once.
+         *
+         * @var array
+         */
+        public readonly array $items;
+
+        /**
+         * The `cursor` of the next page of the same query, null on the last page. A page can be
+         * empty and still have one.
+         *
+         * @var string|null
+         */
+        public readonly ?string $next;
+
+        public function __construct() {}
+    }
+
+    /**
+     * One topic of a `TopicsPage`.
+     */
+    class Topic {
+        /**
+         * The shortest time between two uploads of the positions that stored consumer group
+         * offsets wait for, in microseconds (a decimal string above `PHP_INT_MAX`). Null when the
+         * topic sets none, and each node applies its own `[geo] consumer_offset_upload_interval`.
+         *
+         * @var mixed
+         */
+        public readonly mixed $consumer_offset_upload_interval_micros;
+
+        /**
+         * Creation time in microseconds.
+         *
+         * @var int
+         */
+        public readonly int $created_at;
+
         /**
          * Options the server filled in from its catalog defaults.
          *
@@ -2710,7 +3047,132 @@ namespace Iggy {
          */
         public readonly array $derived_options;
 
+        /**
+         * The longest time a send waits for its upload to start, in microseconds (a decimal
+         * string above `PHP_INT_MAX`). Null when the topic sets none, and each node applies its own
+         * `[tiered_storage] fresh_upload_interval`.
+         *
+         * @var mixed
+         */
+        public readonly mixed $fresh_upload_interval_micros;
+
+        /**
+         * How a geo topic writes its messages, `geo` or `geo_tiered`, fixed at creation. Null
+         * for a normal topic.
+         *
+         * @var string|null
+         */
+        public readonly ?string $geo_mode;
+
         public readonly int $id;
+
+        /**
+         * The longest wait between two long-term rewrites of a partition, in microseconds (a
+         * decimal string above `PHP_INT_MAX`). Null when the topic sets none, and each node applies
+         * its own `[geo] long_term_rewrite_max_interval`.
+         *
+         * @var mixed
+         */
+        public readonly mixed $long_term_rewrite_max_interval_micros;
+
+        public readonly int $messages_count;
+
+        public readonly string $name;
+
+        /**
+         * Options the creating or updating client set, as option name to scalar value.
+         * Integers above `PHP_INT_MAX`, such as never-expire and unlimited
+         * (18446744073709551615), are decimal strings.
+         *
+         * @var array
+         */
+        public readonly array $options;
+
+        public readonly int $partitions_count;
+
+        /**
+         * How often a node uploads the changed positions of the topic's consumer groups, in
+         * microseconds (a decimal string above `PHP_INT_MAX`). Null when the topic sets none, and
+         * each node applies its own `[geo] positions_publish_interval`.
+         *
+         * @var mixed
+         */
+        public readonly mixed $positions_publish_interval_micros;
+
+        /**
+         * How long, after a node starts, the group polls of the topic's partitions wait for the
+         * positions of the geo peers, in microseconds (a decimal string above `PHP_INT_MAX`). Null
+         * when the topic sets none, and each node applies its own `[geo] positions_resume_timeout`.
+         *
+         * @var mixed
+         */
+        public readonly mixed $positions_resume_timeout_micros;
+
+        public readonly int $size_bytes;
+
+        /**
+         * How long the tombstone and the objects of the deleted topic stay in the object store, in
+         * microseconds (a decimal string above `PHP_INT_MAX`). Null when the topic sets none, and
+         * each node applies its own `[geo] tombstone_grace`.
+         *
+         * @var mixed
+         */
+        public readonly mixed $tombstone_grace_micros;
+
+        /**
+         * What the topic is, `normal` or `geo`, fixed at creation.
+         *
+         * @var string
+         */
+        public readonly string $topic_type;
+
+        public function __construct() {}
+    }
+
+    class TopicDetails {
+        /**
+         * The shortest time between two uploads of the positions that stored consumer group
+         * offsets wait for, in microseconds (a decimal string above `PHP_INT_MAX`). Null when the
+         * topic sets none, and each node applies its own `[geo] consumer_offset_upload_interval`.
+         *
+         * @var mixed
+         */
+        public readonly mixed $consumer_offset_upload_interval_micros;
+
+        /**
+         * Options the server filled in from its catalog defaults.
+         *
+         * @var array
+         */
+        public readonly array $derived_options;
+
+        /**
+         * The longest time a send waits for its upload to start, in microseconds (a decimal
+         * string above `PHP_INT_MAX`). Null when the topic sets none, and each node applies its own
+         * `[tiered_storage] fresh_upload_interval`.
+         *
+         * @var mixed
+         */
+        public readonly mixed $fresh_upload_interval_micros;
+
+        /**
+         * How a geo topic writes its messages, `geo` or `geo_tiered`, fixed at creation. Null
+         * for a normal topic.
+         *
+         * @var string|null
+         */
+        public readonly ?string $geo_mode;
+
+        public readonly int $id;
+
+        /**
+         * The longest wait between two long-term rewrites of a partition, in microseconds (a
+         * decimal string above `PHP_INT_MAX`). Null when the topic sets none, and each node applies
+         * its own `[geo] long_term_rewrite_max_interval`.
+         *
+         * @var mixed
+         */
+        public readonly mixed $long_term_rewrite_max_interval_micros;
 
         public readonly int $messages_count;
 
@@ -2737,6 +3199,40 @@ namespace Iggy {
 
         public readonly int $partitions_count;
 
+        /**
+         * How often a node uploads the changed positions of the topic's consumer groups, in
+         * microseconds (a decimal string above `PHP_INT_MAX`). Null when the topic sets none, and
+         * each node applies its own `[geo] positions_publish_interval`.
+         *
+         * @var mixed
+         */
+        public readonly mixed $positions_publish_interval_micros;
+
+        /**
+         * How long, after a node starts, the group polls of the topic's partitions wait for the
+         * positions of the geo peers, in microseconds (a decimal string above `PHP_INT_MAX`). Null
+         * when the topic sets none, and each node applies its own `[geo] positions_resume_timeout`.
+         *
+         * @var mixed
+         */
+        public readonly mixed $positions_resume_timeout_micros;
+
+        /**
+         * How long the tombstone and the objects of the deleted topic stay in the object store, in
+         * microseconds (a decimal string above `PHP_INT_MAX`). Null when the topic sets none, and
+         * each node applies its own `[geo] tombstone_grace`.
+         *
+         * @var mixed
+         */
+        public readonly mixed $tombstone_grace_micros;
+
+        /**
+         * What the topic is, `normal` or `geo`, fixed at creation.
+         *
+         * @var string
+         */
+        public readonly string $topic_type;
+
         public function __construct() {}
     }
 
@@ -2744,7 +3240,8 @@ namespace Iggy {
      * Topic option keys, as the cases an update's reset list takes.
      *
      * Only `MessageExpiry`, `MaxTopicSize`, `LocalRetentionAge` and `LocalRetentionSize` are
-     * resettable in this release. The server refuses every other case with its own category.
+     * resettable in this release. The server refuses every other case with its own category. The
+     * durations of a geo topic, from `FreshUploadInterval` on, have no default to return to.
      */
     enum TopicOptionKey: string {
       case Name = 'name';
@@ -2763,6 +3260,103 @@ namespace Iggy {
       case TieredStorage = 'tiered_storage';
       case LocalRetentionAge = 'local_retention_age';
       case LocalRetentionSize = 'local_retention_size';
+      case TopicType = 'topic_type';
+      case GeoMode = 'geo_mode';
+      case FreshUploadInterval = 'fresh_upload_interval';
+      case ConsumerOffsetUploadInterval = 'consumer_offset_upload_interval';
+      case PositionsPublishInterval = 'positions_publish_interval';
+      case TombstoneGrace = 'tombstone_grace';
+      case PositionsResumeTimeout = 'positions_resume_timeout';
+      case LongTermRewriteMaxInterval = 'long_term_rewrite_max_interval';
+    }
+
+    /**
+     * One page of the topics of a stream, as `Client::getTopicsPage()` returns it.
+     */
+    class TopicsPage {
+        /**
+         * The topics of the page, each an `Iggy\Topic`.
+         *
+         * The items are rebuilt on each getter call, so cache the array in PHP if you read it
+         * more than once.
+         *
+         * @var array
+         */
+        public readonly array $items;
+
+        /**
+         * The `cursor` of the next page of the same query, null on the last page. A page can be
+         * empty and still have one.
+         *
+         * @var string|null
+         */
+        public readonly ?string $next;
+
+        public function __construct() {}
+    }
+
+    /**
+     * One user of a `UsersPage`.
+     */
+    class UserInfo {
+        /**
+         * Creation time in microseconds.
+         *
+         * @var int
+         */
+        public readonly int $created_at;
+
+        /**
+         * Options the server filled in.
+         *
+         * @var array
+         */
+        public readonly array $derived_options;
+
+        public readonly int $id;
+
+        /**
+         * Options the creating client set, as option name to scalar value.
+         *
+         * @var array
+         */
+        public readonly array $options;
+
+        /**
+         * `active` or `inactive`.
+         *
+         * @var string
+         */
+        public readonly string $status;
+
+        public readonly string $username;
+
+        public function __construct() {}
+    }
+
+    /**
+     * One page of the users, as `Client::getUsersPage()` returns it.
+     */
+    class UsersPage {
+        /**
+         * The users of the page, each an `Iggy\UserInfo`.
+         *
+         * The items are rebuilt on each getter call, so cache the array in PHP if you read it
+         * more than once.
+         *
+         * @var array
+         */
+        public readonly array $items;
+
+        /**
+         * The `cursor` of the next page of the same query, null on the last page. A page can be
+         * empty and still have one.
+         *
+         * @var string|null
+         */
+        public readonly ?string $next;
+
+        public function __construct() {}
     }
 }
 

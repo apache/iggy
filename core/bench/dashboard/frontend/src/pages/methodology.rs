@@ -23,9 +23,10 @@
 use crate::components::command_block::CommandBlock;
 use crate::components::page::{Crumb, breadcrumbs, loadable, page_head, page_shell, section_head};
 use crate::components::section_nav::{NavSection, SectionNav};
-use crate::format::runs_text;
 use crate::state::data::{Loadable, use_dashboard_data};
 use bench_dashboard_shared::config::{DashboardConfig, Thresholds};
+use bench_dashboard_shared::format::runs_text;
+use bench_dashboard_shared::head::METHODOLOGY_LEAD;
 use bench_dashboard_shared::identity::KindFamily;
 use bench_dashboard_shared::metrics::Badge;
 use bench_dashboard_shared::omb::compare::OmbComparability;
@@ -137,7 +138,7 @@ enum OptionDefault {
     Unset(&'static str),
 }
 
-const OPTIONS: [BenchOption; 10] = [
+const OPTIONS: [BenchOption; 9] = [
     BenchOption {
         name: "Transport",
         flags: &["tcp", "quic", "http", "websocket"],
@@ -166,17 +167,11 @@ const OPTIONS: [BenchOption; 10] = [
         flags: &["--rate-limit"],
         default: OptionDefault::Unset("no limit"),
         text: "The total rate for all actors together, in bytes per second, for example 800MB. \
-               Each actor gets an equal share. In end-to-end-producing-consumer-group, only the \
-               actors that send share the rate, and an actor that only polls has no limit. \
-               Without a rate limit, each actor runs as fast as it can.",
-    },
-    BenchOption {
-        name: "Consumer rate",
-        flags: &["--read-amplification"],
-        default: OptionDefault::Value("1.05"),
-        text: "Only for Producer + consumer kinds. Each consumer gets this many times its share \
-               of the rate, so it keeps up. It is an option of the kind, so it goes after the \
-               kind.",
+               Each actor gets an equal share. In the Producer + consumer kinds, the consumers \
+               count toward the split, but they have no limit and poll the data as it arrives. \
+               In end-to-end-producing-consumer-group, only the actors that send share the rate, \
+               and an actor that only polls has no limit. Without a rate limit, each actor runs \
+               as fast as it can.",
     },
     BenchOption {
         name: "Warm-up",
@@ -580,11 +575,7 @@ pub fn methodology() -> Html {
                 breadcrumbs(&[Crumb::overview()], "Methodology"),
                 Some("Methodology"),
                 "How the benchmarks work",
-                "Most runs on this dashboard come from iggy-bench, a tool that sends and polls \
-                 messages on an Apache Iggy server and measures the result. This page shows how \
-                 to run it, what the numbers mean, and when a difference is a real change. The \
-                 last section explains the OpenMessaging Benchmark runs, which have pages of \
-                 their own.",
+                METHODOLOGY_LEAD,
                 Html::default(),
             ) }
             <SectionNav sections={&SECTIONS[..]} scroll_ref={scroll_ref.clone()} />
@@ -1178,11 +1169,11 @@ mod tests {
     #[test]
     fn given_flags_in_text_when_split_should_keep_punctuation_outside_the_flags() {
         assert_eq!(
-            spans("consumers get 5 percent more (--read-amplification), so they keep up"),
+            spans("a deferred poll waits (--max-wait), then it returns"),
             [
-                Span::Text("consumers get 5 percent more ("),
-                Span::Flag("--read-amplification"),
-                Span::Text("), so they keep up"),
+                Span::Text("a deferred poll waits ("),
+                Span::Flag("--max-wait"),
+                Span::Text("), then it returns"),
             ]
         );
     }

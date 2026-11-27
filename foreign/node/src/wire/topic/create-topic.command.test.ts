@@ -17,7 +17,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { Durability } from './topic.utils.js';
+import { Durability, GeoMode, TopicType } from './topic.utils.js';
 import { CREATE_TOPIC } from './create-topic.command.js';
 import { deserializeOptions } from '../options.utils.js';
 import { HeaderValue } from '../message/header.utils.js';
@@ -133,6 +133,49 @@ describe('CreateTopic', () => {
       assert.equal(
         CREATE_TOPIC.serialize({ ...t1, localRetentionAge: 0n, localRetentionSize: 0n }).length,
         fixedSize + t1.name.length + defaultPolicySize
+      );
+    });
+
+    it('serialize topicType and geoMode as string options, omitting them when unset', () => {
+      for (const [topicType, geoMode, topicTypeName, geoModeName] of [
+        [TopicType.Normal, GeoMode.Geo, 'normal', 'geo'],
+        [TopicType.Geo, GeoMode.GeoTiered, 'geo', 'geo_tiered']
+      ] as const) {
+        const t = { ...t1, topicType, geoMode };
+        const options = deserializeOptions(CREATE_TOPIC.serialize(t), fixedSize + t.name.length);
+        assert.equal(options.topic_type, topicTypeName);
+        assert.equal(options.geo_mode, geoModeName);
+      }
+      const unset = deserializeOptions(CREATE_TOPIC.serialize(t1), fixedSize + t1.name.length);
+      assert.equal('topic_type' in unset, false);
+      assert.equal('geo_mode' in unset, false);
+    });
+
+    it('serialize the geo topic durations as uint64 options, sending 0n and omitting unset ones', () => {
+      const t = {
+        ...t1,
+        topicType: TopicType.Geo,
+        consumerOffsetUploadInterval: 0n,
+        tombstoneGrace: 3_600_000_000n
+      };
+      const options = deserializeOptions(CREATE_TOPIC.serialize(t), fixedSize + t.name.length);
+      assert.equal(options.consumer_offset_upload_interval, 0n);
+      assert.equal(options.tombstone_grace, 3_600_000_000n);
+      for (const key of [
+        'fresh_upload_interval', 'positions_publish_interval', 'positions_resume_timeout',
+        'long_term_rewrite_max_interval'
+      ])
+        assert.equal(key in options, false, key);
+    });
+
+    it('throw on an unknown topicType or geoMode', () => {
+      assert.throws(
+        () => CREATE_TOPIC.serialize({ ...t1, topicType: 'tiered' as TopicType }),
+        /Invalid topic_type/
+      );
+      assert.throws(
+        () => CREATE_TOPIC.serialize({ ...t1, geoMode: 'local' as GeoMode }),
+        /Invalid geo_mode/
       );
     });
 

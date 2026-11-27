@@ -15,4 +15,5 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub mod list_rows;
 pub mod login_session_expiry;

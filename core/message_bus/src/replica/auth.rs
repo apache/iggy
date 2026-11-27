@@ -30,10 +30,12 @@
 //!    `mac_a` when the status is `Ok` (a nonzero status is a reject, no nonce/MAC);
 //! 3. `ReplicaFinish`    dialer -> acceptor: `mac_d` (dialer direction).
 //!
-//! Each MAC is `keyed_hash(key, DOMAIN_TAG || binary_identity || placement ||
-//! cluster_id || dialer_id || acceptor_id || nonce_d || nonce_a || mode ||
-//! tls_exporter || dir)`, where `placement` is the link count and link index
-//! the hello carries ([`LinkPlacement`]).
+//! Each MAC is `keyed_hash(key, DOMAIN_TAG || hello_hash || binary_identity ||
+//! placement || cluster_id || dialer_id || acceptor_id || nonce_d || nonce_a ||
+//! mode || tls_exporter || dir)`, where `placement` is the link count and link
+//! index the hello carries ([`LinkPlacement`]). `hello_hash` is the BLAKE3
+//! digest of the complete `ReplicaHello` frame and `binary_identity` is the
+//! identity the link runs under.
 //! Binding both nonces, the ordered peer pair, and a direction byte
 //! defeats replay and reflection. The MAC key is a subkey derived from
 //! the configured shared secret, so the raw secret never reaches the
@@ -76,6 +78,10 @@ pub const IDENTITY_LEN: usize = 32;
 pub const PLACEMENT_OFFSET: usize = IDENTITY_OFFSET + IDENTITY_LEN;
 pub const PLACEMENT_LEN: usize = 2 * size_of::<u16>();
 const _: () = assert!(PLACEMENT_OFFSET + PLACEMENT_LEN <= RESERVED_COMMAND_LEN);
+/// Start of the heartbeat timings in the hello and the challenge.
+pub const HEARTBEAT_OFFSET: usize = PLACEMENT_OFFSET + PLACEMENT_LEN;
+pub const HEARTBEAT_LEN: usize = HeartbeatTimings::FIELDS * size_of::<u32>();
+const _: () = assert!(HEARTBEAT_OFFSET + HEARTBEAT_LEN <= RESERVED_COMMAND_LEN);
 
 /// Domain separation tag mixed into every MAC transcript.
 const DOMAIN_TAG: &[u8] = b"apache-iggy replica-auth v1";
@@ -130,6 +136,13 @@ pub fn read_mac(reserved_command: &[u8; RESERVED_COMMAND_LEN]) -> [u8; MAC_LEN] 
     mac
 }
 
+#[must_use]
+pub fn read_identity(reserved_command: &[u8; RESERVED_COMMAND_LEN]) -> [u8; IDENTITY_LEN] {
+    let mut identity = [0; IDENTITY_LEN];
+    identity.copy_from_slice(&reserved_command[IDENTITY_OFFSET..IDENTITY_OFFSET + IDENTITY_LEN]);
+    identity
+}
+
 /// Whether a frame's `reserved_command` carries a handshake nonce (i.e. the
 /// peer speaks the authenticated protocol) versus an all-zero legacy frame.
 #[must_use]
@@ -181,6 +194,101 @@ impl LinkPlacement {
     }
 }
 
+/// The five Commit heartbeat options of a node, in milliseconds.
+///
+/// Every node of a cluster must use the same values. The dialer sends its
+/// values in the hello, and the acceptor sends its values in the challenge.
+/// Each side refuses the link if a value differs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HeartbeatTimings {
+    pub grid_ms: u32,
+    pub busy_interval_ms: u32,
+    pub busy_timeout_ms: u32,
+    pub idle_interval_ms: u32,
+    pub idle_timeout_ms: u32,
+}
+
+impl HeartbeatTimings {
+    const FIELDS: usize = 5;
+    const NAMES: [&'static str; Self::FIELDS] = [
+        "cluster.commit_heartbeat_grid",
+        "cluster.commit_busy_heartbeat_interval",
+        "cluster.commit_busy_heartbeat_timeout",
+        "cluster.commit_idle_heartbeat_interval",
+        "cluster.commit_idle_heartbeat_timeout",
+    ];
+
+    const fn fields(self) -> [u32; Self::FIELDS] {
+        [
+            self.grid_ms,
+            self.busy_interval_ms,
+            self.busy_timeout_ms,
+            self.idle_interval_ms,
+            self.idle_timeout_ms,
+        ]
+    }
+
+    /// Read the values from `reserved_command[HEARTBEAT_OFFSET..]`.
+    #[must_use]
+    pub fn read(reserved_command: &[u8; RESERVED_COMMAND_LEN]) -> Self {
+        let field = |index: usize| {
+            let at = HEARTBEAT_OFFSET + index * size_of::<u32>();
+            let mut bytes = [0u8; size_of::<u32>()];
+            bytes.copy_from_slice(&reserved_command[at..at + size_of::<u32>()]);
+            u32::from_le_bytes(bytes)
+        };
+        Self {
+            grid_ms: field(0),
+            busy_interval_ms: field(1),
+            busy_timeout_ms: field(2),
+            idle_interval_ms: field(3),
+            idle_timeout_ms: field(4),
+        }
+    }
+
+    /// Write the values to `reserved_command[HEARTBEAT_OFFSET..]`.
+    pub fn write(self, reserved_command: &mut [u8; RESERVED_COMMAND_LEN]) {
+        for (index, value) in self.fields().into_iter().enumerate() {
+            let at = HEARTBEAT_OFFSET + index * size_of::<u32>();
+            reserved_command[at..at + size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    /// The first option whose value differs, with the value of this node and
+    /// the value of the peer.
+    #[must_use]
+    pub fn first_mismatch(self, peer: Self) -> Option<HeartbeatMismatch> {
+        self.fields()
+            .into_iter()
+            .zip(peer.fields())
+            .zip(Self::NAMES)
+            .find(|((ours, theirs), _)| ours != theirs)
+            .map(|((ours_ms, peer_ms), option)| HeartbeatMismatch {
+                option,
+                ours_ms,
+                peer_ms,
+            })
+    }
+}
+
+/// A heartbeat option that differs between this node and a peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeartbeatMismatch {
+    pub option: &'static str,
+    pub ours_ms: u32,
+    pub peer_ms: u32,
+}
+
+impl std::fmt::Display for HeartbeatMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is {}ms on this node but {}ms on the peer. All nodes of a cluster must use the same value",
+            self.option, self.ours_ms, self.peer_ms
+        )
+    }
+}
+
 /// Outcome of a replica handshake, carried as the `status` byte of a
 /// `ReplicaChallenge` frame at [`STATUS_OFFSET`].
 ///
@@ -207,11 +315,14 @@ pub enum HandshakeStatus {
     AuthRequired = 4,
     /// The dialer's finish MAC did not verify (log-only).
     MacMismatch = 5,
+    /// Neither peer accepts the other's build identity, or the hello body ends in a partial identity.
     IncompatibleBuild = 6,
     /// The hello names a link count other than the acceptor's.
     LinkCountMismatch = 7,
     /// The hello names a peer or a link other than its placement preamble.
     PlacementMismatch = 8,
+    /// A Commit heartbeat option differs between the two nodes.
+    HeartbeatMismatch = 9,
 }
 
 impl HandshakeStatus {
@@ -228,13 +339,14 @@ impl HandshakeStatus {
             Self::IncompatibleBuild => "incompatible_build",
             Self::LinkCountMismatch => "link_count_mismatch",
             Self::PlacementMismatch => "placement_mismatch",
+            Self::HeartbeatMismatch => "heartbeat_mismatch",
         }
     }
 }
 
 /// Decode the `status` byte of a `ReplicaChallenge` response frame.
 ///
-/// Total: byte `0` is [`HandshakeStatus::Ok`]; `1..=8` map to their reason; any
+/// Total: byte `0` is [`HandshakeStatus::Ok`]; `1..=9` map to their reason; any
 /// other (garbage) byte is treated as [`HandshakeStatus::UnknownCommand`] so the
 /// dialer rejects rather than mistaking it for success. Discriminants must stay
 /// in sync with [`HandshakeStatus`]; the `status_round_trips` test enforces it.
@@ -249,6 +361,7 @@ pub const fn read_status(reserved_command: &[u8; RESERVED_COMMAND_LEN]) -> Hands
         6 => HandshakeStatus::IncompatibleBuild,
         7 => HandshakeStatus::LinkCountMismatch,
         8 => HandshakeStatus::PlacementMismatch,
+        9 => HandshakeStatus::HeartbeatMismatch,
         // 1 and every unrecognised byte: a reject the dialer must not read as Ok.
         _ => HandshakeStatus::UnknownCommand,
     }
@@ -288,6 +401,7 @@ impl ChannelBinding {
 
 /// The fields bound into a handshake MAC. Identical on both peers.
 pub struct Transcript {
+    pub hello_hash: Hash,
     pub binary_identity: [u8; IDENTITY_LEN],
     pub placement: LinkPlacement,
     pub cluster_id: u128,
@@ -388,6 +502,7 @@ impl ReplicaAuth {
     fn mac(key: &[u8; 32], dir: u8, transcript: &Transcript) -> Hash {
         let mut hasher = blake3::Hasher::new_keyed(key);
         hasher.update(DOMAIN_TAG);
+        hasher.update(transcript.hello_hash.as_bytes());
         hasher.update(&transcript.binary_identity);
         hasher.update(&transcript.placement.to_le_bytes());
         hasher.update(&transcript.cluster_id.to_le_bytes());
@@ -409,6 +524,7 @@ mod tests {
 
     fn transcript() -> Transcript {
         Transcript {
+            hello_hash: blake3::hash(b"hello"),
             binary_identity: [0x5a; IDENTITY_LEN],
             placement: LinkPlacement { links: 2, link: 1 },
             cluster_id: 0xDEAD_BEEF,
@@ -494,6 +610,18 @@ mod tests {
         let t = transcript();
         assert!(!auth.verify_dialer_mac(&t, &auth.acceptor_mac(&t)));
         assert!(!auth.verify_acceptor_mac(&t, &auth.dialer_mac(&t)));
+    }
+
+    #[test]
+    fn changed_hello_is_rejected_in_both_directions() {
+        let auth = ReplicaAuth::new(SECRET);
+        let original = transcript();
+        let changed = Transcript {
+            hello_hash: blake3::hash(b"another hello"),
+            ..transcript()
+        };
+        assert!(!auth.verify_dialer_mac(&changed, &auth.dialer_mac(&original)));
+        assert!(!auth.verify_acceptor_mac(&changed, &auth.acceptor_mac(&original)));
     }
 
     #[test]
@@ -629,7 +757,7 @@ mod tests {
 
     #[test]
     fn status_round_trips() {
-        const ALL: [HandshakeStatus; 9] = [
+        const ALL: [HandshakeStatus; 10] = [
             HandshakeStatus::Ok,
             HandshakeStatus::UnknownCommand,
             HandshakeStatus::ClusterMismatch,
@@ -639,6 +767,7 @@ mod tests {
             HandshakeStatus::IncompatibleBuild,
             HandshakeStatus::LinkCountMismatch,
             HandshakeStatus::PlacementMismatch,
+            HandshakeStatus::HeartbeatMismatch,
         ];
         for status in ALL {
             let mut reserved = [0u8; RESERVED_COMMAND_LEN];

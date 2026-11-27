@@ -86,6 +86,12 @@ public enum IggyErrorCode {
      * request again.
      */
     TIERED_READ_FAILED(96),
+    /**
+     * The server sent this error in place of a reply above the reply size limit: a GetClients reply, or a reply to a
+     * read of streams, topics, partitions, consumer groups, users, tokens, options, stats or cluster metadata. The
+     * connection stays open. For a list, the page methods return the same items in smaller replies.
+     */
+    REPLY_TOO_LARGE(97),
 
     // Client errors
     CLIENT_NOT_FOUND(100),
@@ -98,6 +104,7 @@ public enum IggyErrorCode {
     INVALID_STREAM_NAME(1013),
     INVALID_STREAM_ID(1014),
     TOO_MANY_STREAMS(1020),
+    SHADOW_STREAM_READ_ONLY(1021),
 
     // Topic errors
     CANNOT_CREATE_TOPIC_DIRECTORY(2001),

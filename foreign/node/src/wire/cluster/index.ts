@@ -17,3 +17,4 @@
 
 export * from './get-cluster-metadata.command.js';
 export * from './cluster.type.js';
+export * from './retire-geo-origin.command.js';

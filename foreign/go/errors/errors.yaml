@@ -359,6 +359,10 @@
   code: 96
   format: "tiered data cannot be read from the object store; a retry does not help"
   fields: []
+- name: ReplyTooLarge
+  code: 97
+  format: "the reply is larger than the reply size limit"
+  fields: []
 - name: ClientNotFound
   code: 100
   format: "client with id: %d was not found."
@@ -534,6 +538,10 @@
 - name: TooManyStreams
   code: 1020
   format: "too many streams"
+  fields: []
+- name: ShadowStreamReadOnly
+  code: 1021
+  format: "the stream is a shadow of another cluster's stream and takes no writes"
   fields: []
 - name: CannotCreateTopicsDirectory
   code: 2000

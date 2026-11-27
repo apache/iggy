@@ -109,6 +109,7 @@ mod tests {
     use crate::options::{
         BenchmarkClientOptions, BenchmarkConsumerOptions, BenchmarkDurability,
         BenchmarkMaxTopicSize, BenchmarkMessageExpiry, BenchmarkTcpOptions, BenchmarkTopicOptions,
+        BenchmarkTopicStorage,
     };
     use serde_json::{Value, json};
 
@@ -157,13 +158,13 @@ mod tests {
                     messages_required_to_save: Some(128),
                     max_topic_size: BenchmarkMaxTopicSize::Bytes(1_073_741_824),
                     message_expiry: BenchmarkMessageExpiry::AfterUs(3_600_000_000),
+                    storage: BenchmarkTopicStorage::Geo,
                 },
                 consumer: Some(BenchmarkConsumerOptions {
                     consumer_offset_durability: BenchmarkDurability::Persisted,
                     max_wait_us: 250_000,
                     min_count: 10,
                     max_bytes: Some(2_097_152),
-                    read_amplification: Some(1.05),
                 }),
                 client: BenchmarkClientOptions {
                     warmup_time_us: 5_000_000,
@@ -182,7 +183,6 @@ mod tests {
             ..BenchmarkParams::default()
         };
 
-        // Reports are written as text, which keeps `1.05_f32` exact, unlike `to_value`.
         let text = serde_json::to_string(&params).unwrap();
         let json: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(
@@ -192,14 +192,14 @@ mod tests {
                     "durability": "persisted",
                     "messages_required_to_save": 128,
                     "max_topic_size": {"bytes": 1_073_741_824_u64},
-                    "message_expiry": {"after_us": 3_600_000_000_u64}
+                    "message_expiry": {"after_us": 3_600_000_000_u64},
+                    "storage": "geo"
                 },
                 "consumer": {
                     "consumer_offset_durability": "persisted",
                     "max_wait_us": 250_000,
                     "min_count": 10,
-                    "max_bytes": 2_097_152,
-                    "read_amplification": 1.05
+                    "max_bytes": 2_097_152
                 },
                 "client": {"warmup_time_us": 5_000_000, "high_level_api": true, "reuse_streams": true},
                 "tcp": {"nodelay": true, "tls": true}

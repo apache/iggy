@@ -27,8 +27,6 @@
 //! A torn last record is a crash mid-append. Any other record that does not
 //! decode refuses the whole file: read as absent, it would drop a segment from
 //! the chain without a trace.
-//!
-//! No partition enables a chain yet, so nothing in production writes one.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -116,6 +114,16 @@ fn decode_header(header: &[u8; HEADER_SIZE]) -> Option<ObjectPrefix> {
         created_revision: reader.u64(),
     };
     (reader.u64() == state_artifact_checksum(&header[..HEADER_CHECKSUM_AT])).then_some(prefix)
+}
+
+/// What a partition asks of the objects under a prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrefixAccess {
+    /// Ranged gets, as a poll makes them.
+    Read,
+    /// Anything that can change the store: a put, a conditional create or a
+    /// delete.
+    Write,
 }
 
 /// How a segment's hash was taken.
@@ -1171,6 +1179,15 @@ impl SegmentChain {
         }
     }
 
+    /// The sealed segments the store holds exactly as this replica records
+    /// them, in offset order: the run from the front whose hash a floor
+    /// advance matched.
+    pub(crate) fn stored_segments(&self) -> impl Iterator<Item = &SegmentRecord> {
+        self.sealed
+            .values()
+            .take_while(|segment| self.confirmed.contains(&segment.start_offset))
+    }
+
     /// The trim point retention appends before it unlinks the segment ending at
     /// `end_offset`, `None` when the chain already holds one at least as high.
     pub(crate) fn trim(&self, end_offset: u64) -> Option<ChainAppend> {
@@ -1339,8 +1356,41 @@ where
         Ok(())
     }
 
-    /// Whether `prefix` names this partition and its incarnation.
+    /// Whether this partition may send `access` requests for the objects
+    /// under `prefix`: any request under its own incarnation's prefix, and
+    /// reads only under the origin's incarnation that its peer log follows.
+    /// A partition that follows another cluster's log owns no prefix, so it
+    /// writes nothing anywhere.
+    pub(crate) fn admits_prefix(&self, prefix: &ObjectPrefix, access: PrefixAccess) -> bool {
+        self.peer_log.as_deref().map_or_else(
+            || self.names_own_incarnation(prefix),
+            |peer| access == PrefixAccess::Read && peer.prefix() == *prefix,
+        )
+    }
+
+    /// Whether `prefix` names this partition and its incarnation, and the
+    /// partition writes under it: the only prefix its chain may record.
     pub(crate) fn owns_chain_prefix(&self, prefix: &ObjectPrefix) -> bool {
+        self.admits_prefix(prefix, PrefixAccess::Write)
+    }
+
+    /// The prefix that names the objects of this partition's remote
+    /// segments: the one its chain records, or the origin's incarnation that
+    /// its peer log follows.
+    pub(crate) fn read_prefix(&self) -> Option<ObjectPrefix> {
+        let prefix = self
+            .peer_log
+            .as_deref()
+            .map(crate::PeerLog::prefix)
+            .or_else(|| self.object_prefix());
+        debug_assert!(
+            prefix.is_none_or(|prefix| self.admits_prefix(&prefix, PrefixAccess::Read)),
+            "a partition reads only under a prefix it admits"
+        );
+        prefix
+    }
+
+    fn names_own_incarnation(&self, prefix: &ObjectPrefix) -> bool {
         let namespace = self.namespace();
         (prefix.stream_id, prefix.topic_id, prefix.partition_id)
             == (

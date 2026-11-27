@@ -21,13 +21,15 @@ use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
 use iggy_binary_protocol::batch::BatchHeader;
+use iggy_binary_protocol::placement::{self, PLACED_BATCH_SIZE, PlacedBatch};
 use iggy_binary_protocol::{Operation, PrepareHeader};
 use iggy_common::MAX_TOPIC_SEGMENT_SIZE;
-use server_common::iobuf::{Frozen, IOV_MAX};
+use server_common::iobuf::{Frozen, IOV_MAX, Owned};
 use server_common::{DISK_USAGE, DiskCharge, unreserved_bytes};
 
 use super::{
-    JournalState, PartitionPrepareJournal, SegmentReference, StoredPrepare, invalid, segment_path,
+    JournalState, PartitionPrepareJournal, SegmentReference, StoredPrepare, encode_record_into,
+    invalid, segment_path,
 };
 use crate::durable_storage::{DurableFile, DurableStorage, OpenMode};
 
@@ -42,6 +44,12 @@ pub(super) const SEGMENT_AGE_BYTES: usize = 3 * size_of::<u64>();
 pub(super) const SEGMENTS_ABSENT: u8 = 0;
 pub(super) const SEGMENTS_BY_SIZE: u8 = 1;
 pub(super) const SEGMENTS_BY_SIZE_AND_AGE: u8 = 2;
+/// The two layouts whose segments hold placed batches: a batch header and a
+/// placement, with the messages in the object store. A build that only knows
+/// batches refuses both values, so it cannot open such a WAL and walk a
+/// placement as messages.
+pub(super) const PLACED_SEGMENTS_BY_SIZE: u8 = 3;
+pub(super) const PLACED_SEGMENTS_BY_SIZE_AND_AGE: u8 = 4;
 
 const SEGMENT_RECOVERY_EXTENSION: &str = "log.tmp";
 
@@ -66,6 +74,9 @@ pub(super) struct SegmentCursor {
 /// committed segment size, which can advance beyond it within the durable tail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct SegmentState {
+    /// Whether the segments hold placed batches. Fixed when segment storage
+    /// is enabled: a segment never mixes placed batches with whole ones.
+    pub placed: bool,
     pub max_size: u64,
     /// Microseconds a batch's base timestamp may run past the active segment's
     /// first one before that batch starts the next segment.
@@ -98,8 +109,53 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         max_size: u64,
         max_age: Option<u64>,
     ) -> io::Result<()> {
+        self.enable_segment_storage_of(initial, max_size, max_age, false)
+            .await
+    }
+
+    /// [`Self::enable_segment_storage`] for a partition that places its
+    /// batches: every message prepare carries a batch header and a placement,
+    /// and that is what its segments hold.
+    ///
+    /// # Errors
+    /// As [`Self::enable_segment_storage`], and for a layout that already
+    /// holds whole batches.
+    pub async fn enable_placed_segment_storage(
+        &mut self,
+        initial: SegmentPosition,
+        max_size: u64,
+        max_age: Option<u64>,
+    ) -> io::Result<()> {
+        self.enable_segment_storage_of(initial, max_size, max_age, true)
+            .await
+    }
+
+    /// Whether the segments hold placed batches, `None` without segment
+    /// storage.
+    #[must_use]
+    pub fn segments_placed(&self) -> Option<bool> {
+        self.state.segment_storage.map(|segments| segments.placed)
+    }
+
+    /// [`Self::enable_segment_storage`] or
+    /// [`Self::enable_placed_segment_storage`], by what `placed` says the
+    /// segments hold.
+    ///
+    /// # Errors
+    /// As [`Self::enable_segment_storage`], and for a layout that already
+    /// holds the other kind of batch.
+    pub async fn enable_segment_storage_of(
+        &mut self,
+        initial: SegmentPosition,
+        max_size: u64,
+        max_age: Option<u64>,
+        placed: bool,
+    ) -> io::Result<()> {
         self.ensure_healthy()?;
         if let Some(segments) = self.state.segment_storage {
+            if segments.placed != placed {
+                return Err(invalid("segment bodies differ from the durable WAL layout"));
+            }
             if segments.max_size != max_size {
                 return Err(invalid("segment size differs from the durable WAL layout"));
             }
@@ -127,6 +183,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             position: initial,
         };
         let segments = SegmentState {
+            placed,
             max_size,
             max_age,
             next_generation: generation
@@ -279,6 +336,12 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             position: initial,
         };
         let mut segments = SegmentState {
+            // An install replaces the segments of a partition, and what a
+            // partition's segments hold never changes.
+            placed: self
+                .state
+                .segment_storage
+                .is_some_and(|segments| segments.placed),
             max_size,
             max_age,
             next_generation: generation
@@ -322,14 +385,15 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             let header = self.validate_checkpoint_prepare(&prepare)?;
             let reference = if header.operation == Operation::SendMessages {
                 let batch = decode_batch(prepare.as_slice())?;
-                if initial.length >= batch.batch_length
+                let body_length = body_length(prepare.as_slice());
+                if initial.length >= body_length
                     && batch_next_offset(prepare.as_slice())? == initial.next_offset
                 {
                     let reference = SegmentReference {
                         generation,
                         start_offset: initial.start_offset,
-                        position: initial.length - batch.batch_length,
-                        length: batch.batch_length,
+                        position: initial.length - body_length,
+                        length: body_length,
                     };
                     let file = &self
                         .segment_files
@@ -359,7 +423,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 } else {
                     let retained = segments.allocate(SegmentPosition {
                         start_offset: batch.base_offset,
-                        length: batch.batch_length,
+                        length: body_length,
                         next_offset: batch_next_offset(prepare.as_slice())?,
                         first_timestamp: 0,
                     })?;
@@ -367,7 +431,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                         generation: retained.generation,
                         start_offset: batch.base_offset,
                         position: 0,
-                        length: batch.batch_length,
+                        length: body_length,
                     };
                     let mut file = self
                         .storage
@@ -549,6 +613,57 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         self.segment_files_dirty = false;
         self.segment_links_dirty = false;
         Ok(())
+    }
+
+    /// Make the records an open kept past an intact frontier durable, then
+    /// publish them.
+    ///
+    /// The process that wrote them is gone, and a sync through a new handle is
+    /// no barrier for its writes. After a failed writeback the pages can stay
+    /// in the cache, clean and unwritten, and that sync succeeds over them. So
+    /// every kept record and body is written again, the bytes this open
+    /// verified at the positions it found them, and the sync covers writes of
+    /// its own. A crash on the way leaves every file as it was.
+    pub(super) async fn sync_kept_tail(&mut self, published_length: u64) -> io::Result<()> {
+        for index in 0..self.recovered_prepares.len() {
+            let prepare = &self.recovered_prepares[index];
+            let Some(entry) = self
+                .entries
+                .get(&prepare.header().op)
+                .copied()
+                .filter(|entry| entry.position >= published_length)
+            else {
+                continue;
+            };
+            let mut record = Owned::zeroed(entry.length);
+            encode_record_into(
+                prepare.as_slice(),
+                entry.reference,
+                self.state.generation,
+                record.as_mut_slice(),
+            )?;
+            if let Some(reference) = entry.reference {
+                let body = prepare.as_slice()[size_of::<PrepareHeader>()..].to_vec();
+                self.open_segment_file(
+                    reference.generation,
+                    reference.start_offset,
+                    reference.position + reference.length,
+                    None,
+                )
+                .await?;
+                self.segment_files
+                    .get_mut(&(reference.generation, reference.start_offset))
+                    .ok_or_else(|| invalid("kept segment handle is absent"))?
+                    .file
+                    .write(reference.position, body)
+                    .await?;
+                self.segment_files_dirty = true;
+                // The names of a segment the kept records rolled into.
+                self.segment_links_dirty = true;
+            }
+            self.file.write_aligned(entry.position, record).await?;
+        }
+        self.sync().await
     }
 
     pub(super) fn retain_active_segment_file(&mut self) {
@@ -872,6 +987,16 @@ impl SegmentCursor {
 }
 
 impl SegmentState {
+    /// The value of [`SEGMENT_STATE_FLAG`] that names this layout.
+    pub(super) const fn flag(&self) -> u8 {
+        match (self.placed, self.max_age.is_some()) {
+            (false, false) => SEGMENTS_BY_SIZE,
+            (false, true) => SEGMENTS_BY_SIZE_AND_AGE,
+            (true, false) => PLACED_SEGMENTS_BY_SIZE,
+            (true, true) => PLACED_SEGMENTS_BY_SIZE_AND_AGE,
+        }
+    }
+
     pub(super) fn valid(self) -> bool {
         valid_segment_size(self.max_size)
             && valid_segment_age(self.max_age)
@@ -957,6 +1082,11 @@ impl SegmentState {
             return Ok((None, None));
         }
         let batch = decode_batch(prepare)?;
+        if is_placed(prepare) != self.placed {
+            return Err(invalid(
+                "message prepare does not match what the segments hold",
+            ));
+        }
         if batch.base_offset != self.tail.position.next_offset {
             return Err(invalid(
                 "message offsets do not extend the physical segment tail",
@@ -977,7 +1107,7 @@ impl SegmentState {
             generation: self.tail.generation,
             start_offset: self.tail.position.start_offset,
             position: self.tail.position.length,
-            length: batch.batch_length,
+            length: body_length(prepare),
         };
         self.tail.position.length = reference
             .position
@@ -1048,8 +1178,8 @@ impl SegmentState {
     }
 
     /// Decode a layout, with `age` holding the age roll's state when the
-    /// layout rolls by age.
-    pub(super) fn decode(bytes: &[u8], age: Option<&[u8]>) -> io::Result<Self> {
+    /// layout rolls by age, and `placed` saying what its segments hold.
+    pub(super) fn decode(bytes: &[u8], age: Option<&[u8]>, placed: bool) -> io::Result<Self> {
         let mut values = [0; SEGMENT_STATE_BYTES / size_of::<u64>()];
         for (value, field) in values
             .iter_mut()
@@ -1081,6 +1211,7 @@ impl SegmentState {
             (Some(max_age), tail_first, checkpoint_first)
         });
         let state = Self {
+            placed,
             max_size,
             max_age,
             next_generation,
@@ -1130,15 +1261,38 @@ pub(super) fn batch_next_offset(prepare: &[u8]) -> io::Result<u64> {
         .ok_or_else(|| invalid("message offset exhausted"))
 }
 
+/// The batch header of a message prepare, which carries either the whole
+/// batch or a placed one.
 pub(super) fn decode_batch(prepare: &[u8]) -> io::Result<BatchHeader> {
     let body = prepare
         .get(size_of::<PrepareHeader>()..)
         .ok_or_else(|| invalid("short message prepare"))?;
+    if placement::is_placed(body) {
+        let placed =
+            PlacedBatch::decode(body).map_err(|_| invalid("invalid placed segment batch"))?;
+        if body.len() != PLACED_BATCH_SIZE || placed.header.message_count == 0 {
+            return Err(invalid("invalid placed segment batch bounds"));
+        }
+        return Ok(placed.header);
+    }
     let batch = BatchHeader::decode(body).map_err(|_| invalid("invalid segment batch header"))?;
     if batch.batch_length != body.len() as u64 || batch.message_count == 0 {
         return Err(invalid("invalid segment batch bounds"));
     }
     Ok(batch)
+}
+
+/// Whether a message prepare carries a placed batch.
+pub(super) fn is_placed(prepare: &[u8]) -> bool {
+    prepare
+        .get(size_of::<PrepareHeader>()..)
+        .is_some_and(placement::is_placed)
+}
+
+/// Bytes of a message prepare that go into its segment: the whole batch, or
+/// the placed one. Less than the batch's own length for a placed batch.
+const fn body_length(prepare: &[u8]) -> u64 {
+    prepare.len().saturating_sub(size_of::<PrepareHeader>()) as u64
 }
 
 // Off Linux `preallocate_file` reserves nothing, so there is nothing to check.

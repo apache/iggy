@@ -92,6 +92,7 @@ export const translateErrorCode = (code: number): string => {
     case '89': return "The replica is not the partition primary.";
     case '90': return "Deferred poll capacity exceeded; retry after backoff on the same replica";
     case '96': return "Tiered data cannot be read from the object store; a retry does not help";
+    case '97': return "The reply is larger than the reply size limit";
 
     case '100': return "Client with ID: {0} was not found.";
     case '101': return "Invalid client ID";
@@ -130,6 +131,7 @@ export const translateErrorCode = (code: number): string => {
     case '1015': return "Cannot read streams";
     case '1019': return "Max topic size cannot be lower than segment size. Max topic size: {0} < segment size: {1}.";
     case '1020': return "Too many streams";
+    case '1021': return "The stream is a shadow of another cluster's stream and takes no writes";
 
 
     case '2000': return "Cannot create topics directory for stream with ID: {0}, Path: {1}";

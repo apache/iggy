@@ -19,19 +19,18 @@
 //! the links, the compare tray, and the states of the run list. They're defined once, so an OMB run
 //! reads the same on every page.
 
+use bench_dashboard_shared::labels::DAY_FORMAT;
 use bench_dashboard_shared::omb::id::OmbRunId;
+use bench_dashboard_shared::omb::labels::{run_name, version_text};
 use bench_dashboard_shared::omb::result::OmbPercentiles;
-use bench_dashboard_shared::omb::setup::OmbEnvironment;
 use bench_dashboard_shared::omb::summary::{OmbRunList, OmbRunSummary, OmbRunTime, OmbTimeSource};
-use bench_dashboard_shared::omb::workload::OmbWorkloadKey;
 use chrono::SecondsFormat;
 use yew::prelude::*;
 
 use crate::components::compare_tray::{CompareToggleOf, CompareTrayOf, TrayRun};
 use crate::components::framework::omb_banner;
 use crate::components::page::{Crumb, loadable, page_head_with_banner};
-use crate::components::run_labels::{CONDITION_SEPARATOR, nodes_text, version_tag_view};
-use crate::format::group_digits;
+use crate::components::run_labels::version_tag_view;
 use crate::pages::compare::runs::CompareLinkOf;
 use crate::pages::run::change::percent_text;
 use crate::router::AppRoute;
@@ -45,13 +44,10 @@ pub const NOT_MEASURED: &str = "not measured";
 /// What the pages show for a number that the file doesn't hold, such as the publish delay of a file
 /// from an older OMB.
 pub const NOT_RECORDED: &str = "not recorded";
-pub const NO_VALUE: &str = "-";
 /// The breadcrumb and eyebrow of the OMB pages.
 pub const OMB_CRUMB: &str = "OMB";
-/// The labels of [`percentile_values`], in its order. The average isn't a percentile, so it isn't
-/// among them.
-pub const PERCENTILE_LABELS: [&str; 7] = ["P50", "P75", "P95", "P99", "P99.9", "P99.99", "Max"];
-/// Where [`PERCENTILE_LABELS`] has P99, the percentile that the headlines use.
+/// Where [`bench_dashboard_shared::omb::chart::PERCENTILE_LABELS`] has P99, the percentile that the
+/// headlines use.
 pub const P99_INDEX: usize = 3;
 pub const PUBLISH_THROUGHPUT_HINT: &str = "The mean publish rate over the 10 second windows, times \
                                            the message size. 1 MiB is 1,048,576 bytes.";
@@ -72,13 +68,6 @@ const NOT_IN_FILE_NOTE: &str = "The result file of this run holds no end-to-end 
 /// A change that rounds to zero, without a sign.
 const ZERO_PERCENT: &str = "0.0%";
 const RUNS_WHAT: &str = "the OMB runs";
-/// The first half of an OMB run id, which names a run in a breadcrumb, a legend or a column.
-const SHORT_ID_LENGTH: usize = 8;
-const MEBIBYTES_PER_GIBIBYTE: f64 = 1024.0;
-const MEBIBYTES_PER_TEBIBYTE: f64 = 1_048_576.0;
-const SECONDS_PER_MINUTE: u64 = 60;
-/// For example `Nov 6, 2026`, as the iggy-bench pages write a day.
-const DAY_FORMAT: &str = "%b %-d, %Y";
 /// A time from a file name has no zone, so its machine-readable form has none either.
 const LOCAL_TIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
 
@@ -250,32 +239,9 @@ pub fn change_text(percent: f64) -> String {
     }
 }
 
-/// For example `3f2a9c1b`.
-pub fn short_id(id: OmbRunId) -> String {
-    id.to_string().chars().take(SHORT_ID_LENGTH).collect()
-}
-
-/// A run among other runs: its short id, driver and Iggy version, for example
-/// `3f2a9c1b · Iggy-persisted · 0.10.0-rc.1`.
-pub fn run_name(summary: &OmbRunSummary) -> String {
-    let mut parts = vec![short_id(summary.id), summary.driver.clone()];
-    parts.extend(version_text(summary));
-    parts.join(CONDITION_SEPARATOR)
-}
-
 /// The driver configuration, the only label OMB gives it, for example `Iggy-persisted`.
 pub fn driver_tag(driver: &str) -> Html {
     html! { <span class="omb-driver" title={DRIVER_HINT}>{ driver.to_owned() }</span> }
-}
-
-/// The Iggy version from the setup sidecar, as the iggy-bench pages write it: the version of a
-/// build at a commit, which the pages show apart, or the version text. `None` without a version.
-pub fn version_text(summary: &OmbRunSummary) -> Option<String> {
-    let version = summary.version.as_ref()?;
-    Some(match (&version.commit, &summary.version_order.version) {
-        (Some(_), Some(semver)) => semver.to_string(),
-        _ => version.text.clone(),
-    })
 }
 
 /// The version tag, styled as a release or as a build. Empty without a version.
@@ -305,140 +271,6 @@ pub fn day_view(time: &OmbRunTime) -> Html {
     }
 }
 
-/// The sidecar's label, else the machines it names, for example
-/// `i4i.4xlarge, 3 nodes · 2 client hosts of i4i.4xlarge`. `None` for an environment that names
-/// nothing.
-pub fn environment_text(environment: &OmbEnvironment) -> Option<String> {
-    if let Some(label) = &environment.label {
-        return Some(label.clone());
-    }
-    let server = match (&environment.server_instance, environment.server_nodes) {
-        (Some(instance), Some(nodes)) => {
-            Some(format!("{instance}, {}", nodes_text(nodes as usize)))
-        }
-        (Some(instance), None) => Some(instance.clone()),
-        (None, Some(nodes)) => Some(nodes_text(nodes as usize)),
-        (None, None) => None,
-    };
-    let clients = match (&environment.client_instance, environment.client_hosts) {
-        (Some(instance), Some(hosts)) => {
-            Some(format!("{} of {instance}", client_hosts_text(hosts)))
-        }
-        (Some(instance), None) => Some(format!("clients on {instance}")),
-        (None, Some(hosts)) => Some(client_hosts_text(hosts)),
-        (None, None) => None,
-    };
-    let parts: Vec<String> = server.into_iter().chain(clients).collect();
-    (!parts.is_empty()).then(|| parts.join(CONDITION_SEPARATOR))
-}
-
-/// The run's workload in one line: topology, actors, message size and measured length.
-pub fn conditions(summary: &OmbRunSummary) -> String {
-    [
-        topology_text(&summary.workload),
-        actors_text(&summary.workload),
-        message_size_text(summary.workload.message_size),
-        length_text(summary.length_seconds),
-    ]
-    .join(CONDITION_SEPARATOR)
-}
-
-/// For example `12 topics × 1 partition`, with the partitions per topic.
-pub fn topology_text(workload: &OmbWorkloadKey) -> String {
-    format!(
-        "{} × {}",
-        count_text(workload.topics, "topic", "topics"),
-        count_text(workload.partitions, "partition", "partitions")
-    )
-}
-
-/// For example `1 producer and 1 consumer per topic`.
-pub fn actors_text(workload: &OmbWorkloadKey) -> String {
-    format!(
-        "{} and {} per topic",
-        count_text(workload.producers_per_topic, "producer", "producers"),
-        count_text(workload.consumers_per_topic, "consumer", "consumers")
-    )
-}
-
-/// For example `1 producer` or `4 producers`.
-pub fn count_text(count: u32, one: &str, many: &str) -> String {
-    match count {
-        1 => format!("1 {one}"),
-        _ => format!("{} {many}", group_digits(count.into())),
-    }
-}
-
-/// For example `1,000 B messages`. For a workload with a size distribution, OMB records the
-/// weighted average size.
-pub fn message_size_text(bytes: u64) -> String {
-    format!("{} B messages", group_digits(bytes))
-}
-
-/// The measured length, for example `3 min` or `1 min 30 s`. The warm-up isn't in it.
-pub fn length_text(seconds: u64) -> String {
-    let (minutes, rest) = (seconds / SECONDS_PER_MINUTE, seconds % SECONDS_PER_MINUTE);
-    match (minutes, rest) {
-        (0, _) => format!("{rest} s"),
-        (_, 0) => format!("{minutes} min"),
-        _ => format!("{minutes} min {rest} s"),
-    }
-}
-
-/// A throughput in OMB's unit, for example `143 MiB/s` or `1.50 GiB/s`. OMB itself calls the
-/// unit MB/s, but it divides by 1024 twice.
-pub fn mebibytes_text(mebibytes_per_second: f64) -> String {
-    if !mebibytes_per_second.is_finite() || mebibytes_per_second < 0.0 {
-        return NO_VALUE.to_owned();
-    }
-    if mebibytes_per_second >= MEBIBYTES_PER_TEBIBYTE {
-        format!("{:.2} TiB/s", mebibytes_per_second / MEBIBYTES_PER_TEBIBYTE)
-    } else if mebibytes_per_second >= MEBIBYTES_PER_GIBIBYTE {
-        format!("{:.2} GiB/s", mebibytes_per_second / MEBIBYTES_PER_GIBIBYTE)
-    } else if mebibytes_per_second >= 100.0 {
-        format!("{mebibytes_per_second:.0} MiB/s")
-    } else {
-        format!("{mebibytes_per_second:.1} MiB/s")
-    }
-}
-
-/// A latency in microseconds, as OMB records the publish delay, for example `70 µs` or
-/// `1,234 µs`.
-pub fn microseconds(value: f64) -> String {
-    if !value.is_finite() || value < 0.0 {
-        NO_VALUE.to_owned()
-    } else if value >= 100.0 {
-        format!("{} µs", group_digits(value.round() as u64))
-    } else if value >= 10.0 {
-        format!("{value:.1} µs")
-    } else {
-        format!("{value:.2} µs")
-    }
-}
-
-/// The values of `latency` in the order of [`PERCENTILE_LABELS`].
-pub const fn percentile_values(latency: &OmbPercentiles) -> [f64; 7] {
-    [
-        latency.p50,
-        latency.p75,
-        latency.p95,
-        latency.p99,
-        latency.p999,
-        latency.p9999,
-        latency.max,
-    ]
-}
-
-/// One `[seconds since the test started, value]` point per window, for a chart with a time axis.
-/// `window_ends` comes from the series of the run detail.
-pub fn window_points(window_ends: &[u64], values: &[f64]) -> Vec<Vec<f64>> {
-    window_ends
-        .iter()
-        .zip(values)
-        .map(|(end, value)| vec![*end as f64, *value])
-        .collect()
-}
-
 fn machine_time(time: &OmbRunTime) -> String {
     match time.source {
         OmbTimeSource::FileName => time.instant.format(LOCAL_TIME_FORMAT).to_string(),
@@ -448,77 +280,17 @@ fn machine_time(time: &OmbRunTime) -> String {
     }
 }
 
-fn client_hosts_text(hosts: u32) -> String {
-    count_text(hosts, "client host", "client hosts")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::{
-        OMB_ALL, OMB_EDGE8_100_PARTITIONS, OMB_EDGE8_DEFAULT, OMB_NO_CONSUMERS, OMB_PUBLISH_ERRORS,
-        OMB_RC1_DEFAULT, OMB_RC1_PERSISTED, omb_rerun, omb_run_list,
+        OMB_ALL, OMB_EDGE8_DEFAULT, OMB_NO_CONSUMERS, OMB_PUBLISH_ERRORS, OMB_RC1_DEFAULT,
+        OMB_RC1_PERSISTED, omb_rerun, omb_run_list,
     };
+    use bench_dashboard_shared::omb::chart::{PERCENTILE_LABELS, percentile_values};
 
     fn ids(runs: &[&OmbRunSummary]) -> Vec<OmbRunId> {
         runs.iter().map(|run| run.id).collect()
-    }
-
-    #[test]
-    fn given_fixtures_when_named_should_show_short_id_driver_and_known_version() {
-        let rc1 = OMB_RC1_PERSISTED.summary();
-        let no_sidecar = OMB_NO_CONSUMERS.summary();
-
-        assert_eq!(
-            run_name(&rc1),
-            format!("{} · Iggy-persisted · 0.10.0-rc.1", short_id(rc1.id))
-        );
-        assert_eq!(
-            run_name(&no_sidecar),
-            format!("{} · Iggy", short_id(no_sidecar.id))
-        );
-        assert_eq!(short_id(rc1.id).len(), SHORT_ID_LENGTH);
-        assert!(rc1.id.to_string().starts_with(&short_id(rc1.id)));
-        assert_eq!(version_text(&no_sidecar), None);
-    }
-
-    #[test]
-    fn given_fixtures_when_conditions_written_should_name_topology_actors_size_and_length() {
-        assert_eq!(
-            conditions(&OMB_RC1_DEFAULT.summary()),
-            "12 topics × 1 partition · 1 producer and 1 consumer per topic · 1,000 B messages · \
-             3 min"
-        );
-        assert_eq!(
-            conditions(&OMB_EDGE8_100_PARTITIONS.summary()),
-            "1 topic × 100 partitions · 4 producers and 4 consumers per topic · 1,024 B messages \
-             · 5 min"
-        );
-        assert_eq!(
-            actors_text(&OMB_NO_CONSUMERS.summary().workload),
-            "1 producer and 0 consumers per topic"
-        );
-        assert_eq!(length_text(90), "1 min 30 s");
-        assert_eq!(length_text(0), "0 s");
-    }
-
-    #[test]
-    fn given_sidecar_environment_when_labeled_should_prefer_label_and_else_name_machines() {
-        let rc1 = OMB_RC1_DEFAULT.summary();
-        let environment = rc1
-            .environment()
-            .expect("the fixture has a sidecar environment");
-
-        assert_eq!(
-            environment_text(environment).as_deref(),
-            Some("AWS i4i.4xlarge, 3 nodes")
-        );
-        assert_eq!(
-            environment_text(&environment.without_label()).as_deref(),
-            Some("i4i.4xlarge, 3 nodes · 2 client hosts of i4i.4xlarge")
-        );
-        assert_eq!(environment_text(&OmbEnvironment::default()), None);
-        assert_eq!(OMB_PUBLISH_ERRORS.summary().environment(), None);
     }
 
     #[test]
@@ -530,22 +302,6 @@ mod tests {
         assert_eq!(machine_time(&sidecar), "2026-11-06T13:22:01Z");
         assert_eq!(file_name.source, OmbTimeSource::FileName);
         assert_eq!(machine_time(&file_name), "2026-10-22T10:21:15");
-    }
-
-    #[test]
-    fn given_rates_and_latencies_when_written_should_use_omb_units() {
-        let rc1 = OMB_RC1_DEFAULT.summary();
-
-        assert_eq!(
-            mebibytes_text(rc1.publish_mebibytes_per_second),
-            "143 MiB/s"
-        );
-        assert_eq!(mebibytes_text(1536.0), "1.50 GiB/s");
-        assert_eq!(mebibytes_text(42.25), "42.2 MiB/s");
-        assert_eq!(mebibytes_text(f64::NAN), NO_VALUE);
-        assert_eq!(microseconds(70.0), "70.0 µs");
-        assert_eq!(microseconds(1234.4), "1,234 µs");
-        assert_eq!(microseconds(-1.0), NO_VALUE);
     }
 
     #[test]
@@ -629,21 +385,6 @@ mod tests {
 
         assert_eq!(ids(&tray), [older.id, newer.id]);
         assert_eq!(ids(&oldest_first([&newer, &older])), [older.id, newer.id]);
-    }
-
-    #[test]
-    fn given_fixture_detail_when_charted_should_give_one_point_per_window() {
-        let detail = OMB_RC1_DEFAULT.detail();
-        let series = &detail.series;
-
-        let points = window_points(&series.window_ends(), &series.publish_mebibytes_per_second);
-
-        assert_eq!(points.len(), detail.summary.windows);
-        assert_eq!(points[0][0], 10.0);
-        assert_eq!(
-            points.last().map(|point| point[0]),
-            Some(detail.summary.length_seconds as f64)
-        );
     }
 
     #[test]

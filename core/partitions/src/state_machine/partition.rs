@@ -33,6 +33,9 @@ use super::{
     state_machine_pipeline_slots,
 };
 use crate::IggyPartition;
+use crate::geo_positions::GeoPositions;
+use crate::long_term::LongTermLog;
+use crate::peer_manifests::{FOLLOW_PEER_MANIFEST, PeerManifests};
 use crate::tiered_floor::TieredFloor;
 use crate::types::FatalCommit;
 
@@ -68,7 +71,10 @@ where
     /// Returns an error when called twice, or after the partition restored or
     /// applied an op.
     pub fn register_builtin_state_machines(&mut self) -> Result<(), RegistrationError> {
-        self.register_state_machine(Box::new(TieredFloor::default()))
+        self.register_state_machine(Box::new(TieredFloor::default()))?;
+        self.register_state_machine(Box::new(LongTermLog::default()))?;
+        self.register_state_machine(Box::new(PeerManifests::default()))?;
+        self.register_state_machine(Box::new(GeoPositions::default()))
     }
 
     #[must_use]
@@ -164,11 +170,10 @@ where
                 "state machines have not applied the view's history",
             ));
         }
-        // A command never waits in the request queue, so the slots it takes
-        // are the ones counted here.
-        if self.local_request_must_queue()
-            || self.uncommitted_commands() >= self.command_pipeline_slots()
-        {
+        // A command waits in the request queue behind the requests admitted
+        // before it, and its promotion does not check the share again, so the
+        // queued commands count toward it.
+        if self.uncommitted_commands() + self.queued_commands() >= self.command_pipeline_slots() {
             return Some((
                 IggyError::TransientNotAccepted,
                 "state-machine commands hold their share of the pipeline",
@@ -190,6 +195,17 @@ where
             .journal()
             .inner
             .commands_in(commit_min.saturating_add(1)..)
+    }
+
+    fn queued_commands(&self) -> usize {
+        self.consensus().with_pipeline(|pipeline| {
+            pipeline
+                .pending_requests()
+                .filter(|request| {
+                    request.message.header().operation == Operation::StateMachineCommand
+                })
+                .count()
+        })
     }
 
     /// Check a replicated command before journaling it. Ownership is not
@@ -234,10 +250,20 @@ where
         let advance = (command.kind == crate::tiered_floor::ADVANCE_TIERED_FLOOR)
             .then(|| crate::tiered_floor::AdvanceTieredFloor::try_from(command.payload).ok())
             .flatten();
+        let long_term_before = self.long_term_progress();
+        let long_term_at_stake = self.long_term_objects_at_stake(command);
+        let long_term_floor = self.long_term_floor();
         match self.state_machines.apply(header.op, command) {
             Ok(Applied::Changed) => {
                 if let Some(advance) = advance {
                     self.note_tiered_advance(advance);
+                }
+                self.note_long_term_command(long_term_before);
+                self.note_long_term_registration(command.kind);
+                self.queue_dead_long_term_objects(&long_term_at_stake);
+                self.note_long_term_advance(long_term_floor);
+                if command.kind == FOLLOW_PEER_MANIFEST {
+                    self.follow_committed_peer_manifest();
                 }
                 true
             }
@@ -312,6 +338,8 @@ where
         snapshot: Option<&StateMachineSnapshot>,
         op: u64,
     ) -> Result<(), StateMachineError> {
+        // The long-term floor and the log under it may both change here.
+        self.long_term_backlog.forget();
         let Some(snapshot) = snapshot else {
             self.state_machines.reset();
             self.state_machines.advance_applied(op);

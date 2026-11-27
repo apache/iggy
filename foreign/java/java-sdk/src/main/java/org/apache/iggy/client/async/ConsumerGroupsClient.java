@@ -25,6 +25,8 @@ import org.apache.iggy.consumergroup.ConsumerGroupDetails;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.system.NamedPageQuery;
+import org.apache.iggy.system.Page;
 
 import java.util.List;
 import java.util.Optional;
@@ -99,11 +101,29 @@ public interface ConsumerGroupsClient {
     /**
      * Gets all consumer groups for a topic asynchronously.
      *
+     * <p>The client reads the list in pages of up to 1000 groups, so the list is not one
+     * consistent read. All pages share the sign-in and the request timeout of the
+     * call, so a new sign-in during the read fails it. The call fails with
+     * {@link org.apache.iggy.exception.IggyMalformedResponseException} when
+     * the server answers the page cursor it was sent.
+     *
      * @param streamId The stream identifier
      * @param topicId The topic identifier
      * @return A CompletableFuture containing list of consumer groups
      */
     CompletableFuture<List<ConsumerGroup>> getConsumerGroups(StreamId streamId, TopicId topicId);
+
+    /**
+     * Gets one page of the consumer groups of a topic asynchronously.
+     *
+     * @param streamId The stream identifier
+     * @param topicId The topic identifier
+     * @param query The order, limit, cursor and name filter of the page
+     * @return A CompletableFuture that completes with the page, or fails with an invalid
+     *         command error when the query breaks the page rules
+     */
+    CompletableFuture<Page<ConsumerGroup>> getConsumerGroupsPage(
+            StreamId streamId, TopicId topicId, NamedPageQuery query);
 
     /**
      * Creates a consumer group asynchronously.

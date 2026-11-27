@@ -17,6 +17,11 @@
 
 name: Stale PRs
 
+# After labelling, the stale comment gets a hidden marker with the PR's head
+# commit. pr-triage-reconcile.yml compares it with the live head to find a
+# push that pr-triage-collect.yml never saw, because the PR had a merge
+# conflict.
+
 on:
   schedule:
     - cron: "17 0 * * *"
@@ -31,6 +36,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/stale@v11.0.0
+        id: stale
         with:
           days-before-pr-stale: 7
           days-before-pr-close: 7
@@ -58,3 +64,35 @@ jobs:
           exempt-draft-pr: true
           days-before-issue-stale: -1
           days-before-issue-close: -1
+
+      - name: Record the head of each newly stale PR
+        if: steps.stale.outputs.staled-issues-prs != '' && steps.stale.outputs.staled-issues-prs != '[]'
+        uses: actions/github-script@v9
+        env:
+          STALED: ${{ steps.stale.outputs.staled-issues-prs }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const MARKER = '<!-- iggy-stale-head:';
+            for (const { number } of JSON.parse(process.env.STALED)) {
+              try {
+                const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+                const comments = await github.paginate(github.rest.issues.listComments, {
+                  owner, repo, issue_number: number, per_page: 100,
+                });
+                const stale = comments
+                  .filter(c => c.user && c.user.login === 'github-actions[bot]'
+                    && (c.body || '').startsWith('This pull request has been automatically marked as stale'))
+                  .pop();
+                if (!stale || stale.body.includes(MARKER)) continue;
+                await github.rest.issues.updateComment({
+                  owner, repo, comment_id: stale.id,
+                  body: `${stale.body}\n\n${MARKER}${pr.head.sha} -->`,
+                });
+                core.info(`#${number}: recorded head ${pr.head.sha}`);
+              } catch (e) {
+                // Without the marker, pr-triage-reconcile.yml leaves S-stale
+                // for the push and comment paths to clear.
+                core.warning(`#${number}: could not record the head: ${e.message}`);
+              }
+            }

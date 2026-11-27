@@ -22,6 +22,8 @@ package org.apache.iggy.client.async;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.HeaderValue;
+import org.apache.iggy.system.NamedPageQuery;
+import org.apache.iggy.system.Page;
 import org.apache.iggy.topic.Topic;
 import org.apache.iggy.topic.TopicDetails;
 import org.apache.iggy.topic.TopicOptions;
@@ -70,12 +72,34 @@ public interface TopicsClient {
     CompletableFuture<Optional<TopicDetails>> getTopic(StreamId streamId, TopicId topicId);
 
     /**
-     * Gets a list of all topics within a stream.
+     * Gets a list of the topics the caller may read within a stream.
+     *
+     * <p>The client reads the list in pages of up to 1000 topics, so the list is not one
+     * consistent read. All pages share the sign-in and the request timeout of the
+     * call, so a new sign-in during the read fails it. If the stream goes missing
+     * after the first page, the call fails as {@link #getTopicsPage} does for a
+     * caller with a global read grant, and ends there for any other caller. The
+     * call fails with {@link org.apache.iggy.exception.IggyMalformedResponseException}
+     * when the server answers the page cursor it was sent.
      *
      * @param streamId the stream identifier
      * @return a {@link CompletableFuture} that completes with a list of {@link Topic} objects
      */
     CompletableFuture<List<Topic>> getTopics(StreamId streamId);
+
+    /**
+     * Gets one page of the topics the caller may read within a stream. For a stream
+     * that does not exist, or one the caller may read no topic of, the first page is
+     * empty and has no next cursor. For a caller with a global read grant, a page read
+     * with a cursor fails with a stream not found error instead, because the stream was
+     * deleted during the walk.
+     *
+     * @param streamId the stream identifier
+     * @param query    the order, limit, cursor and name filter of the page
+     * @return a {@link CompletableFuture} that completes with the page, or fails with an
+     *         invalid command error when the query breaks the page rules
+     */
+    CompletableFuture<Page<Topic>> getTopicsPage(StreamId streamId, NamedPageQuery query);
 
     /**
      * Creates a new topic within a stream with the server's default settings.

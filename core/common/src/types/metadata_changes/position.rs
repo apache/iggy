@@ -177,7 +177,7 @@ impl FromStr for MetadataCurrentPageToken {
 }
 
 /// Strip `prefix` and decode canonical unpadded Base64url.
-fn decode_canonical(text: &str, prefix: &str) -> Result<Vec<u8>, IggyError> {
+pub(crate) fn decode_canonical(text: &str, prefix: &str) -> Result<Vec<u8>, IggyError> {
     let encoded = text.strip_prefix(prefix).ok_or(IggyError::InvalidCommand)?;
     let bytes = URL_SAFE_NO_PAD
         .decode(encoded)

@@ -45,6 +45,7 @@ public final class VsrOperation {
     public static final int UPDATE_TOPIC_RESOLVED = 73;
     public static final int UPDATE_USER_RESOLVED = 74;
     public static final int REWRAP_STREAM_KEYS = 75;
+    public static final int SHADOW_TOPIC = 76;
 
     public static final int CREATE_STREAM = 128;
     // 129 was UpdateStream. Never reuse it.
@@ -67,6 +68,7 @@ public final class VsrOperation {
     public static final int JOIN_CONSUMER_GROUP = 148;
     public static final int LEAVE_CONSUMER_GROUP = 149;
     public static final int UPDATE_RESOURCE = 150;
+    public static final int RETIRE_GEO_ORIGIN = 151;
 
     public static final int SEND_MESSAGES = 160;
     public static final int STORE_CONSUMER_OFFSET = 161;
@@ -89,6 +91,7 @@ public final class VsrOperation {
     private static final Map<Integer, Integer> REPLICATED_OPERATIONS = Map.ofEntries(
             Map.entry(33, CREATE_USER),
             Map.entry(16, UPDATE_RESOURCE),
+            Map.entry(18, RETIRE_GEO_ORIGIN),
             Map.entry(34, DELETE_USER),
             Map.entry(36, UPDATE_PERMISSIONS),
             Map.entry(37, CHANGE_PASSWORD),
@@ -116,13 +119,13 @@ public final class VsrOperation {
     static {
         KNOWN_OPERATIONS.set(RESERVED, LOGOUT + 1);
         KNOWN_OPERATIONS.set(CREATE_TOPIC_WITH_ASSIGNMENTS, TRUNCATE_PARTITION + 1);
-        KNOWN_OPERATIONS.set(UPDATE_STREAM_RESOLVED, REWRAP_STREAM_KEYS + 1);
+        KNOWN_OPERATIONS.set(UPDATE_STREAM_RESOLVED, SHADOW_TOPIC + 1);
         KNOWN_OPERATIONS.set(CREATE_STREAM);
         KNOWN_OPERATIONS.set(DELETE_STREAM);
         KNOWN_OPERATIONS.set(CREATE_TOPIC);
         KNOWN_OPERATIONS.set(DELETE_TOPIC);
         KNOWN_OPERATIONS.set(CREATE_PARTITIONS, CREATE_USER + 1);
-        KNOWN_OPERATIONS.set(DELETE_USER, UPDATE_RESOURCE + 1);
+        KNOWN_OPERATIONS.set(DELETE_USER, RETIRE_GEO_ORIGIN + 1);
         KNOWN_OPERATIONS.set(SEND_MESSAGES);
         KNOWN_OPERATIONS.set(STORE_CONSUMER_OFFSET);
         KNOWN_OPERATIONS.set(DELETE_CONSUMER_OFFSET);
@@ -158,7 +161,7 @@ public final class VsrOperation {
         if (operation == DELETE_SEGMENTS) {
             return false;
         }
-        return operation >= METADATA_START && operation <= UPDATE_RESOURCE;
+        return operation >= METADATA_START && operation <= RETIRE_GEO_ORIGIN;
     }
 
     /**

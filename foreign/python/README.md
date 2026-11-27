@@ -179,10 +179,9 @@ asyncio.run(main())
 transport. `examples/python/getting-started/producer.py` shows each swap in
 context.
 
-Established binary sessions survive transport loss. Password/PAT changes and
-PAT expiry do not end these sessions; logout, session lease expiry and account
-deactivation do. Reconnection binds the retained session before attempting a
-fresh login.
+Binary sessions survive transport loss. Reconnection binds the retained session before attempting a fresh login.
+
+With server 0.10.1-edge.2, a password change keeps the binary session that submitted it and ends the account's other sessions. Deleting or expiring a personal access token ends access for the sessions opened with it. A valid personal access token can open a new session after a password change. Logout, lease expiry and account deactivation also end session access.
 
 `HttpConfig` differs from TCP in two ways. There is no reconnection policy and no
 `AutoLogin`: `connect()` does not dial over HTTP, but it does start the
@@ -213,6 +212,14 @@ asyncio.run(main())
 `create_stream`, `create_topic` and `create_user` take typed options: `StreamOptions`, `TopicOptions` and `UserOptions`. Updates are patches: `update_stream`, `update_topic` and `update_user` change only the fields you pass, and `reset` returns keys to their server defaults.
 
 A topic's `message_expiry`, `max_topic_size`, `local_retention_age` and `local_retention_size` are the only resettable keys. `tiered_storage` can only be turned on by an update, never off. Settings such as the compression algorithm are fixed at creation and have no update field. `describe_options("stream" | "topic" | "user")` reports which keys are updatable, resettable, secret or read-only.
+
+A geo topic (`topic_type=TopicType.Geo`) also takes six durations as `datetime.timedelta`:
+`fresh_upload_interval`, `consumer_offset_upload_interval`, `positions_publish_interval`,
+`tombstone_grace`, `positions_resume_timeout` and `long_term_rewrite_max_interval`. Each overrides
+the server setting of the same name on every node. Zero is a value, and a topic that does not set
+one reads it as `None`. `update_topic` can change them, they are the only options it changes on a
+geo topic, and none of them can be reset. A normal topic refuses them with an `OptionError` of kind
+`"invalid_option_value"`.
 
 The update methods also take `options` and `raw_reset`, which send keys and reset names verbatim, so a key newer than this build can be set or reset. The server decides those. A refused option raises `OptionError`, a `RuntimeError` whose `code` and `kind` name the refusal, for example `4103` and `"option_not_updatable"`, the same on every transport.
 
@@ -266,6 +273,43 @@ asyncio.run(main())
 A stream encryption key must be 32 random bytes, given as `bytes` or as their canonical base64 text. The key travels inside the create request over whatever transport the client uses, so protecting it in transit with TLS is your responsibility.
 
 The server never returns the key, only `encryption_key_source`, `encryption_key_fingerprint` and `encryption_kek_fingerprints`. Without a key, a server with encryption enabled generates one for the stream and reports the source `"server"`. An invalid key raises `ValueError` before anything is sent, and no repr or error message contains it.
+
+## List Pages
+
+`get_streams`, `get_topics`, `get_consumer_groups` and `get_users` return a whole list in id order. The list is read in pages of 1,000 items, so the result is not one consistent read. An entity that someone creates or deletes during the read can appear or not appear.
+
+`get_streams_page`, `get_topics_page`, `get_partitions_page`, `get_consumer_groups_page` and `get_users_page` return one page. To read the next page, call the method again with the same arguments and the `next` of the page as `cursor`. A page can be empty and still have a `next`.
+
+```python
+import asyncio
+
+from apache_iggy import IggyClient, PageOrder
+
+
+async def main():
+    client = IggyClient.from_connection_string("iggy+tcp://iggy:iggy@127.0.0.1:8090")
+    await client.connect()
+
+    cursor = None
+    while True:
+        page = await client.get_streams_page(
+            order=PageOrder.Created, name="orders", cursor=cursor
+        )
+        for stream in page.items:
+            print(stream.id, stream.name)
+        if page.next is None:
+            break
+        cursor = page.next
+
+
+asyncio.run(main())
+```
+
+`order` selects `PageOrder.Id`, the default, or `PageOrder.Created`, and `descending=True` reverses it. `limit` sets the size of a page, from 1 to 1000, and is 100 by default. `name` keeps the entries whose name holds the text, case-sensitive. A partition has no name, so `get_partitions_page` takes no `name`.
+
+A cursor is the `pg1_` text that the HTTP API and the CLI use. Before it sends anything, the client refuses a cursor or a query that breaks the page rules. It raises `IggyError` with the invalid command code (3). Examples are a bad cursor text, a limit of 0 or above 1000, and a name that is empty or longer than 255 bytes. A `limit` outside the unsigned 32-bit range raises `OverflowError` instead.
+
+The server refuses a cursor that it cannot use, such as the cursor of another order, also with invalid command. Over HTTP, a refusal from the server raises `IggyError` with code 300 (HTTP response error), and its message holds the server error body.
 
 ## Metadata Changes
 
@@ -426,7 +470,7 @@ that operation.
 Each node counts the messages in its stream, topic and system stats. After a
 successful send, a node that is not the partition primary shows the new count
 only after the next prepare or commit broadcast. When no other write follows,
-this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+this delay is at most `cluster.commit_busy_heartbeat_interval` (500 ms by default).
 See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
 
 Every error that the Rust SDK reports reaches Python as `IggyError`, a `RuntimeError` subclass. Its `code` is the numeric Iggy error code, the same code that the other SDKs report, and its message is the SDK's error text, so branch on `code` rather than on the message. Three codes tell what happened to a request that did not complete:

@@ -226,6 +226,13 @@ pub enum IggyError {
     /// Clients must not send the request again.
     #[error("Tiered data cannot be read from the object store; a retry does not help")]
     TieredReadFailed = 96,
+    /// The reply frame of `GetClients` or of a metadata read is larger than
+    /// the reply cap of a client, so the server sent this error in its place.
+    /// The metadata reads are those of streams, topics, partitions, consumer
+    /// groups, users, options, stats and cluster metadata. The connection
+    /// stays open. A paged read returns the same data in smaller replies.
+    #[error("The reply is larger than the reply size limit")]
+    ReplyTooLarge = 97,
     #[error("Client with ID: {0} was not found.")]
     ClientNotFound(u32) = 100,
     #[error("Invalid client ID")]
@@ -296,6 +303,8 @@ pub enum IggyError {
     InvalidTopicSize(MaxTopicSize, IggyByteSize) = 1019,
     #[error("Too many streams")]
     TooManyStreams = 1020,
+    #[error("The stream is a shadow of another cluster's stream and takes no writes")]
+    ShadowStreamReadOnly = 1021,
     #[error("Cannot create topics directory for stream with ID: {0}, Path: {1}")]
     CannotCreateTopicsDirectory(Identifier, String) = 2000,
     #[error("Failed to create directory for topic with ID: {0} for stream with ID: {1}, Path: {2}")]

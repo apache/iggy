@@ -18,34 +18,42 @@
 mod args;
 mod artifacts;
 mod cache;
+mod card;
 mod config;
 mod dedicated_thread;
+mod embed_cache;
 mod error;
 mod github;
 mod handlers;
 mod omb;
+mod public_url;
 mod render;
 
 use crate::cache::CacheWatcher;
 use actix_cors::Cors;
-use actix_files::{self as fs, NamedFile};
+use actix_files as fs;
 use actix_web::{
     App, HttpServer,
     http::header,
-    middleware::{Compress, Logger},
+    middleware::{Compress, Logger, from_fn},
     web,
 };
 use args::IggyBenchDashboardServerArgs;
 use bench_dashboard_shared::config::DashboardConfig;
 use cache::{BenchmarkCache, SeriesBuilder};
+use embed_cache::{BYTES_PER_GIB, EMBED_CACHE_DIR, EmbedCache};
 use github::StarCount;
 use handlers::AppState;
 use handlers::omb::OmbState;
+use handlers::pages::SiteState;
+use handlers::{crawl, pages};
 use omb::OmbCache;
+use public_url::PublicUrl;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{error, info};
+use tokio::sync::Semaphore;
+use tracing::{error, info, warn};
 use tracing_subscriber::{
     EnvFilter,
     fmt::{self, format::Format},
@@ -53,21 +61,24 @@ use tracing_subscriber::{
     util::SubscriberInitExt,
 };
 
+/// The frontend build, relative to the working directory, as the image and the README place it.
+const FRONTEND_DIST_DIR: &str = "frontend/dist";
+
 #[derive(Clone)]
 struct ServerState {
     cache: Arc<BenchmarkCache>,
     _watcher: Arc<CacheWatcher>,
     series_builder: Arc<SeriesBuilder>,
     render_pool: Arc<render::PngRenderPool>,
+    embed_cache: Arc<EmbedCache>,
     cache_dir: PathBuf,
     config: Arc<DashboardConfig>,
     omb_cache: Option<Arc<OmbCache>>,
     _omb_watcher: Option<Arc<CacheWatcher>>,
     github_stars: Arc<StarCount>,
-}
-
-async fn index() -> actix_web::Result<NamedFile> {
-    Ok(NamedFile::open("frontend/dist/index.html")?)
+    public_url: Option<PublicUrl>,
+    /// Built once, outside the factory of the app, so the workers share one bound.
+    render_slots: Arc<Semaphore>,
 }
 
 #[actix_web::main]
@@ -125,10 +136,30 @@ async fn main() -> Result<(), std::io::Error> {
         }
     };
 
-    let render_pool = match render::PngRenderPool::default_pool() {
+    let render_pool = match render::PngRenderPool::new() {
         Ok(pool) => Arc::new(pool),
         Err(e) => {
             error!("Failed to start the PNG render thread: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let build = embed_cache::build_stamp().unwrap_or_else(|e| {
+        let stamp = embed_cache::start_stamp();
+        warn!(
+            "Failed to hash the server binary for the embed cache: {e}. The cache uses the stamp \
+             {stamp} of this start, so after a restart every embed file is built again"
+        );
+        stamp
+    });
+    let embed_cache = match EmbedCache::open(
+        args.cache_dir.join(EMBED_CACHE_DIR),
+        args.embed_cache_max_gib.saturating_mul(BYTES_PER_GIB),
+        build,
+    ) {
+        Ok(cache) => Arc::new(cache),
+        Err(e) => {
+            error!("Failed to open the embed cache: {}", e);
             std::process::exit(1);
         }
     };
@@ -141,11 +172,14 @@ async fn main() -> Result<(), std::io::Error> {
         _watcher: Arc::clone(&watcher),
         series_builder,
         render_pool,
+        embed_cache,
         cache_dir: args.cache_dir.clone(),
         config,
         omb_cache,
         _omb_watcher: omb_watcher,
         github_stars,
+        public_url: args.public_url.clone(),
+        render_slots: pages::render_slots(),
     };
 
     info!("Starting server on {}", addr);
@@ -155,9 +189,17 @@ async fn main() -> Result<(), std::io::Error> {
         None => info!("OMB results directory: not set"),
     }
     info!("Cache directory: {}", args.cache_dir.display());
+    info!("Embed cache limit: {} GiB", args.embed_cache_max_gib);
     info!("Config file: {}", args.config.display());
     info!("Log level: {}", args.log_level);
     info!("CORS origins: {}", args.cors_origins);
+    match &args.public_url {
+        Some(public_url) => info!("Public URL: {public_url}"),
+        None => warn!(
+            "Public URL: not set. robots.txt names no sitemap, /sitemap.xml answers 404, and the \
+             pages have no canonical link and no preview image. Set --public-url on a public host"
+        ),
+    }
 
     let server = HttpServer::new(move || {
         let state = state.clone();
@@ -189,10 +231,12 @@ async fn main() -> Result<(), std::io::Error> {
                 r#"%a "%r" %s %b "%{Referer}i" "%{User-Agent}i" %T"#,
             ))
             .wrap(Compress::default())
+            .wrap(from_fn(crawl::noindex_api_and_embeds))
             .app_data(web::Data::new(AppState {
                 cache: Arc::clone(&state.cache),
                 series_builder: Arc::clone(&state.series_builder),
                 render_pool: Arc::clone(&state.render_pool),
+                embed_cache: Arc::clone(&state.embed_cache),
                 cache_dir: state.cache_dir.clone(),
                 config: Arc::clone(&state.config),
             }))
@@ -200,6 +244,14 @@ async fn main() -> Result<(), std::io::Error> {
                 cache: state.omb_cache.clone(),
             }))
             .app_data(web::Data::from(Arc::clone(&state.github_stars)))
+            .app_data(web::Data::new(SiteState {
+                index_html: Path::new(FRONTEND_DIST_DIR).join("index.html"),
+                public_url: state.public_url.clone(),
+                config: Arc::clone(&state.config),
+                runs: Arc::clone(&state.cache),
+                omb_runs: state.omb_cache.clone(),
+                render_slots: Arc::clone(&state.render_slots),
+            }))
             .service(handlers::health_check)
             .service(handlers::list_benchmark_summaries)
             .service(handlers::get_dashboard_config)
@@ -208,7 +260,14 @@ async fn main() -> Result<(), std::io::Error> {
             .service(handlers::get_benchmark_report_light)
             .service(handlers::get_benchmark_series)
             .service(handlers::get_test_artifacts_zip)
+            // Only `/embed/omb/chart.png` and `/embed/omb/card.png` match an OMB and an iggy-bench
+            // embed route. Both answer 400 for them, and this order names the missing OMB run id
+            // in the error.
+            .service(handlers::omb::embed_omb_chart_png)
+            .service(handlers::omb::embed_omb_card_png)
+            .service(handlers::omb::embed_omb_chart)
             .service(handlers::embed_chart_png)
+            .service(handlers::embed_card_png)
             .service(handlers::embed_chart)
             .service(handlers::omb::list_omb_runs)
             .service(handlers::omb::get_omb_run)
@@ -217,12 +276,17 @@ async fn main() -> Result<(), std::io::Error> {
             // Keep this after every /api handler: actix matches services in registration order,
             // so the scope hides an /api handler registered after it.
             .service(web::scope("/api").default_service(web::to(handlers::unknown_api_path)))
+            .service(crawl::robots_txt)
+            .service(crawl::sitemap_xml)
+            // Before the static files, which match every path and fall back to the default
+            // service.
+            .configure(pages::configure)
             .service(
-                fs::Files::new("/", "frontend/dist")
+                fs::Files::new("/", FRONTEND_DIST_DIR)
                     .index_file("index.html")
                     .use_last_modified(true),
             )
-            .default_service(web::route().to(index))
+            .default_service(web::to(pages::not_found))
     })
     .bind(&addr)?
     .run();

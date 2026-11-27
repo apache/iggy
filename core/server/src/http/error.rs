@@ -28,6 +28,7 @@ use axum::response::{IntoResponse, Response};
 use configs::cluster::ResolvedClusterNode;
 use iggy_binary_protocol::Operation;
 use iggy_common::IggyError;
+use serde::de::IntoDeserializer;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::error;
@@ -166,8 +167,9 @@ impl ErrorResponse {
 pub(in crate::http) enum AuthError {
     Unauthenticated(IggyError),
     /// The Register provably never entered the consensus pipeline (not
-    /// primary, not caught up, or the prepare queue was full), so the request
-    /// is safe to re-issue anywhere. Rendered with the `TransientNotAccepted`
+    /// primary, not caught up, or the prepare queue was full), or this node
+    /// has not applied the account revision the bearer was issued at, so the
+    /// request is safe to re-issue anywhere. Rendered with the `TransientNotAccepted`
     /// body so a forwarding follower recognizes it as retryable against a
     /// re-resolved primary; a plain client sees the same retryable 503 either
     /// way.
@@ -480,6 +482,33 @@ pub(in crate::http) enum Consistency {
 pub(in crate::http) struct ConsistencyQuery {
     #[serde(default)]
     pub(in crate::http) consistency: Consistency,
+}
+
+const CONSISTENCY_KEY: &str = "consistency";
+
+/// The page keys of a list query, for the strict parser of `PageQuery`.
+pub(in crate::http) type PagePairs<'a> = Vec<(&'a str, &'a str)>;
+
+/// Split the query of a list route into its read consistency and its page
+/// keys. A repeated or unknown `consistency` value is refused.
+pub(in crate::http) fn split_list_query(
+    pairs: &[(String, String)],
+) -> Result<(Consistency, PagePairs<'_>), IggyError> {
+    let mut consistency = None;
+    let mut page_pairs = Vec::with_capacity(pairs.len());
+    for (key, value) in pairs {
+        if key != CONSISTENCY_KEY {
+            page_pairs.push((key.as_str(), value.as_str()));
+            continue;
+        }
+        if consistency.is_some() {
+            return Err(IggyError::InvalidCommand);
+        }
+        let parsed: Result<Consistency, serde::de::value::Error> =
+            Consistency::deserialize(value.as_str().into_deserializer());
+        consistency = Some(parsed.map_err(|_| IggyError::InvalidCommand)?);
+    }
+    Ok((consistency.unwrap_or_default(), page_pairs))
 }
 
 /// Produce acknowledgement selected by the `?ack=` query param.

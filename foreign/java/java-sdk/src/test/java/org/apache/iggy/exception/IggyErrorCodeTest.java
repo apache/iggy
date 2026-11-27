@@ -194,6 +194,7 @@ class IggyErrorCodeTest {
         "89, NOT_PRIMARY",
         "90, DEFERRED_POLL_CAPACITY_EXCEEDED",
         "96, TIERED_READ_FAILED",
+        "97, REPLY_TOO_LARGE",
 
         // Client errors
         "100, CLIENT_NOT_FOUND",
@@ -206,6 +207,7 @@ class IggyErrorCodeTest {
         "1013, INVALID_STREAM_NAME",
         "1014, INVALID_STREAM_ID",
         "1020, TOO_MANY_STREAMS",
+        "1021, SHADOW_STREAM_READ_ONLY",
 
         // Topic errors
         "2001, CANNOT_CREATE_TOPIC_DIRECTORY",

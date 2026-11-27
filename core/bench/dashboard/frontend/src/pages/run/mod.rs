@@ -29,7 +29,13 @@ mod related;
 use bench_dashboard_shared::BenchmarkReportLight;
 use bench_dashboard_shared::config::DashboardConfig;
 use bench_dashboard_shared::delta::Metric;
+use bench_dashboard_shared::embed::ChartType;
+use bench_dashboard_shared::history::HistoryLine;
 use bench_dashboard_shared::identity::KindFamily;
+use bench_dashboard_shared::labels::{
+    conditions, messages_text, metric_name, metric_value_text, milliseconds, short_id,
+    version_detail, version_tag,
+};
 use bench_dashboard_shared::metrics::GroupMetrics;
 use bench_dashboard_shared::series::{SeriesMetric, SeriesScope};
 use bench_dashboard_shared::summary::BenchmarkSummary;
@@ -39,21 +45,18 @@ use yew::prelude::*;
 use yew_router::prelude::Link;
 
 use self::advanced::Advanced;
-use self::change::{
-    Change, Headline, HistoryLine, change, headlines, metric_name, metric_value_text,
-    regression_text,
-};
+use self::change::{Change, Headline, change, headlines, regression_text};
 use self::chart::{LATENCY_CHART_NOTE, SERIES_COLOR_VARS, SeriesChart};
 use self::facts::{
-    Command, Fact, FactGroup, NO_OPTIONS_NOTE, bench_host, conditions, environment, ladder,
-    ladder_side, option_groups, parameters, topic_note,
+    Command, Fact, FactGroup, NO_OPTIONS_NOTE, bench_host, environment, ladder, ladder_side,
+    option_groups, parameters, topic_note,
 };
 use self::history::{History, history_view};
-use self::related::{RelatedGroup, related_runs, related_view};
+use self::related::{RelatedGroup, related_field, related_runs, related_view};
 use crate::api::{artifacts_url, fetch_benchmark_by_uuid, report_url};
 use crate::components::chart::series_color;
 use crate::components::command_block::CommandBlock;
-use crate::components::embed_code::{EmbedCode, MeasurementType};
+use crate::components::embed::{EmbedButton, EmbedCard, EmbedChart, EmbedProvider, EmbedRun};
 use crate::components::framework::{Framework, framework_chip};
 use crate::components::headline::{change_chip, compact_change_chip, headline_card, metric_hint};
 use crate::components::ladder::{Rung, percentile_ladder};
@@ -61,14 +64,13 @@ use crate::components::page::{
     Crumb, breadcrumbs, data_status, loadable, page_head, page_shell, section_head,
 };
 use crate::components::run_labels::{
-    DayLabel, END_TO_END_THROUGHPUT_NOTE, NO_RATE_LIMIT_NOTE, messages_text, milliseconds,
-    short_id, version_detail, version_tag, version_tag_view,
+    DayLabel, END_TO_END_THROUGHPUT_NOTE, NO_RATE_LIMIT_NOTE, version_tag_view,
 };
 use crate::components::section_nav::{NavSection, SectionNav};
 use crate::components::share_button::ShareButton;
 use crate::pages::explore::family_query;
 use crate::router::AppRoute;
-use crate::state::data::{DashboardData, Loadable, fetch_into, use_dashboard_data};
+use crate::state::data::{DashboardData, Loadable, fetch_into, use_run_data};
 
 const RUN_CRUMB: &str = "Run";
 const REBUILT_LABEL: &str = "rebuilt";
@@ -158,9 +160,9 @@ pub struct RunPageProps {
 
 #[function_component(RunPage)]
 pub fn run_page(props: &RunPageProps) -> Html {
-    let data = use_dashboard_data();
-    let scroll_ref = use_node_ref();
     let id = Uuid::parse_str(&props.uuid).ok();
+    let data = use_run_data(id);
+    let scroll_ref = use_node_ref();
     let report = use_state_eq(|| Loadable::Loading);
     let load_report = {
         let report = report.clone();
@@ -187,6 +189,12 @@ pub fn run_page(props: &RunPageProps) -> Html {
         Lookup::Found(view) => found_view(view, &report, &load_report, &scroll_ref),
     };
     page_shell(&scroll_ref, content)
+}
+
+/// Whether the page of `run` reads `other`: a run of its history, or a related run. The server sends
+/// only these runs with the page, so this covers every run that [`RunView::new`] reads.
+pub fn reads(run: &BenchmarkSummary, other: &BenchmarkSummary) -> bool {
+    other.history_key() == run.history_key() || related_field(run, other).is_some()
 }
 
 /// The URL's run in the loaded list.
@@ -322,7 +330,7 @@ fn found_view(
         loadable(report, "the report of the run", reload, ready)
     };
     html! {
-        <>
+        <EmbedProvider run={EmbedRun::IggyBench(run.uuid)} charts={embed_charts(view, report)}>
             { head(view) }
             { headline_strip(view) }
             <SectionNav {sections} scroll_ref={scroll_ref.clone()} />
@@ -332,6 +340,7 @@ fn found_view(
                     { section_head(LATENCY.label, "Every window", LATENCY_NOTE) }
                     <article class="card run-chart-card">
                         <h3>{"Average latency"}</h3>
+                        <EmbedButton chart={EmbedChart::IggyBench(ChartType::Latency)} />
                         <SeriesChart
                             uuid={run.uuid}
                             metric={SeriesMetric::Latency}
@@ -357,6 +366,7 @@ fn found_view(
                 <div class="chart-with-card">
                     <article class="card run-chart-card">
                         <h3>{"Throughput"}</h3>
+                        <EmbedButton chart={EmbedChart::IggyBench(ChartType::Throughput)} />
                         <SeriesChart
                             uuid={run.uuid}
                             metric={SeriesMetric::Throughput}
@@ -421,7 +431,7 @@ fn found_view(
                     ARTIFACTS.label,
                     "Files of this run",
                     "The stored report, the files with the server logs, and the code to show this \
-                     run's chart on another page.",
+                     run's charts on another page.",
                 ) }
                 { artifacts(view) }
             </section>
@@ -439,8 +449,26 @@ fn found_view(
                     reload={reload.clone()}
                 />
             </section>
-        </>
+        </EmbedProvider>
     }
+}
+
+/// The charts of the run that an embed can draw, in the order of the page. A run without a rate
+/// limit shows its throughput first, and a report without a histogram has no distribution.
+fn embed_charts(view: &RunView, report: &Loadable<BenchmarkReportLight>) -> Vec<EmbedChart> {
+    let over_time = if view.rate_limited() {
+        [ChartType::Latency, ChartType::Throughput]
+    } else {
+        [ChartType::Throughput, ChartType::Latency]
+    };
+    let distribution =
+        matches!(report, Loadable::Ready(report) if report.has_latency_distribution())
+            .then_some(ChartType::Distribution);
+    over_time
+        .into_iter()
+        .chain(distribution)
+        .map(EmbedChart::IggyBench)
+        .collect()
 }
 
 fn head(view: &RunView) -> Html {
@@ -669,11 +697,6 @@ fn configuration(run: &BenchmarkSummary, report: &BenchmarkReportLight) -> Html 
 
 fn artifacts(view: &RunView) -> Html {
     let uuid = view.run.uuid;
-    let chart = if view.rate_limited() {
-        MeasurementType::Latency
-    } else {
-        MeasurementType::Throughput
-    };
     html! {
         <div class="card-grid">
             <article class="card">
@@ -688,46 +711,8 @@ fn artifacts(view: &RunView) -> Html {
                 <p>{"A zip archive of the run's files, including the server logs."}</p>
                 <a class="run-action" href={artifacts_url(&uuid)}>{"Download artifacts"}</a>
             </article>
-            <EmbedCard {uuid} {chart} />
+            <EmbedCard />
         </div>
-    }
-}
-
-#[derive(Properties, PartialEq)]
-struct EmbedCardProps {
-    uuid: Uuid,
-    chart: MeasurementType,
-}
-
-#[function_component(EmbedCard)]
-fn embed_card(props: &EmbedCardProps) -> Html {
-    let is_dark = use_context::<(bool, Callback<()>)>().is_some_and(|(is_dark, _)| is_dark);
-    let open = use_state_eq(|| false);
-    let toggle = {
-        let open = open.clone();
-        Callback::from(move |_: MouseEvent| open.set(!*open))
-    };
-    html! {
-        <article class="card">
-            <h3>{"Embed"}</h3>
-            <p>{"The code to show this run's chart on another page, as an iframe or as an image \
-                 that links here."}</p>
-            <button
-                type="button"
-                class="run-action"
-                aria-expanded={(*open).to_string()}
-                onclick={toggle}
-            >
-                { if *open { "Hide embed code" } else { "Show embed code" } }
-            </button>
-            if *open {
-                <EmbedCode
-                    uuid={props.uuid.to_string()}
-                    measurement_type={props.chart.clone()}
-                    {is_dark}
-                />
-            }
-        </article>
     }
 }
 

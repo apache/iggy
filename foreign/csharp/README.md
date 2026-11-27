@@ -28,7 +28,7 @@ The package installation and API examples target server/SDK 0.9.0. For source bu
 from the same checkout. The SDK targets .NET 8 and .NET 10. Repository examples require .NET 10.
 `0.9.0` includes the independent message and consumer-offset durability options.
 
-This checkout uses binary protocol 0.12.2. Servers and applicable SDKs must deploy together. Mixed versions and
+This checkout uses binary protocol 0.12.3. Servers and applicable SDKs must deploy together. Mixed versions and
 rolling upgrades are unsupported. This checkout requires fresh storage and refuses older data directories
 without modification. `--fresh` deletes existing data in the configured directory.
 See the [server recovery guide](../../core/server/README.md#upgrade-recovery).
@@ -237,7 +237,8 @@ await client.ConnectAsync();
 
 - **Login registers a shared session in this checkout.** `LoginUserAsync` / `LoginWithPersonalAccessTokenAsync`
   authenticate Register. Auxiliary and reconnected transports bind the retained identity and proof without another Register.
-  Disconnecting removes only that binding. Logout, committed lease expiry or user deactivation ends the session.
+  Disconnecting removes only that binding. Logout, committed lease expiry, a user delete or deactivation, a password
+  change from another session, or a delete of the token the session was opened with ends the session.
   A `StaleClient` eviction also removes only the binding of that link. The reconnect binds the same session
   again, so its consumer-group memberships stay.
   A committed `StaleClient` result means that the server ended the session, for example because the user was
@@ -247,7 +248,7 @@ await client.ConnectAsync();
   table. The client closes that link and binds the session again on a new link. If the session ended, that bind
   fails with `Unauthenticated` and the client signs in again. Otherwise the session, its retained operations and
   its consumer-group memberships stay.
-  Password changes and PAT changes or expiry do not end an established session.
+  With server 0.10.1-edge.2, a password change keeps only the binary session that submitted it. A valid PAT can open a new session after a password change. Deleting or expiring it ends access for sessions opened with it.
   A terminal BindSession refusal (`Unauthenticated` or `StaleClient`) permits a fresh login. A transient refusal
   retains the identity while that replica's background reconnect retries the bind. An unresolved mutation
   cannot be replayed under a fresh session. The older 0.9.0 connection-lifetime rule does not apply to this checkout.
@@ -293,7 +294,7 @@ that operation.
 Each node counts the messages in its stream, topic and system stats. After a
 successful send, a node that is not the partition primary shows the new count
 only after the next prepare or commit broadcast. When no other write follows,
-this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+this delay is at most `cluster.commit_busy_heartbeat_interval` (500 ms by default).
 See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
 
 Within one call deadline, the SDK retries an unresolved replicated mutation using its original session,
@@ -542,6 +543,13 @@ await client.UpdateUserAsync(Identifier.String("alice"), new UserUpdate { Status
 ```
 
 Settings fixed at creation, such as compression, cannot be updated. `DescribeOptionsAsync(OptionsScope.Topic)` lists every key the server knows with its kind and whether it can be updated or reset. For a key newer than this SDK, set it through `Options` and reset it through `RawReset`, and the server decides whether the change is allowed.
+
+A geo topic also takes six durations: `FreshUploadInterval`, `ConsumerOffsetUploadInterval`,
+`PositionsPublishInterval`, `TombstoneGrace`, `PositionsResumeTimeout` and
+`LongTermRewriteMaxInterval`. Each one overrides the server setting of the same name on every node.
+Zero is a value for them, so the SDK sends it. On a geo topic, an update can set them, and they are
+the only options that it can change there. An update cannot reset them. The server refuses them on a
+normal topic. When the topic does not set a duration, its property on `TopicResponse` is null.
 
 Note: Stream and topic names use hyphens instead of spaces. Iggy automatically replaces spaces with hyphens.
 
@@ -1021,6 +1029,37 @@ Available compression methods: `Stored`, `Deflated`, `Bzip2`, `Zstd`, `Lzma`, `X
 Available snapshot types: `FilesystemOverview`, `ProcessList`, `ResourceUsage`, `Test`, `ServerLogs`, `ServerConfig`,
 `All`.
 
+### List Pages
+
+`GetStreamsAsync`, `GetTopicsAsync`, `GetConsumerGroupsAsync` and `GetUsersAsync` return a whole list. Over TCP, each of them reads the list in pages of at most 1,000 items, so the result is not one consistent read. An entity that someone creates or deletes during the walk can appear or not appear. Every page keeps the sign-in and the call deadline that the walk started with. If the server answers a page with the same cursor that the client sent, the walk fails with a `MalformedResponseException`.
+
+Over HTTP, they read the whole list in one reply. The server builds that reply from pages of 1,000 items, so it is not one consistent read either.
+
+`GetStreamsPageAsync`, `GetTopicsPageAsync`, `GetPartitionsPageAsync`, `GetConsumerGroupsPageAsync` and `GetUsersPageAsync` return one page. To read the next page, send the same query with the `Next` of the page as its cursor. A page can be empty and still have a `Next`.
+
+```c#
+var query = new NamedPageQuery();
+while (true)
+{
+    var page = await client.GetStreamsPageAsync(query);
+    foreach (var stream in page.Items)
+    {
+        Console.WriteLine($"{stream.Id} {stream.Name}");
+    }
+
+    if (page.Next is null)
+    {
+        break;
+    }
+
+    query = query with { Page = query.Page with { Cursor = page.Next } };
+}
+```
+
+A `PageQuery` holds `Order`, `Descending`, `Limit` and `Cursor`. `Order` selects `PageOrder.Id` or `PageOrder.Created`, and `Descending` reverses it. The stream, topic, consumer group and user page methods take a `NamedPageQuery`, which holds a `PageQuery` as `Page` and an optional `Name`. `Name` keeps the entries whose name holds the text, case-sensitive. `GetPartitionsPageAsync` takes a `PageQuery`, which has no name.
+
+The client refuses a query that breaks the page rules with an `IggyInvalidStatusCodeException` for invalid command (code 3), before it sends anything. Examples are a limit outside 1 to 1000 and a name that is empty or longer than 255 bytes. A `PageCursor` prints and parses as the `pg1_` text form that the HTTP API and the CLI use. The client does not read the bytes of a cursor. The server refuses a cursor that it cannot use, also with invalid command.
+
 ### Metadata Changes
 
 `GetMetadataChangesAsync` reads the node's change log: one record per public result of a committed metadata operation, such as a stream created, a topic renamed, a user's permissions changed or a session closed. A mirror keeps a cursor, asks for the records after it, and stores the returned `Next` cursor. The call needs root or the global `ManageServers` permission and works over TCP and HTTP.
@@ -1250,6 +1289,11 @@ await consumer.ConsumeAsync(async (message, token) =>
 });
 ```
 
+Breaking out of a receive loop keeps the unread remainder of its batch. A later receive loop or `ConsumeAsync`
+continues with the next message. This also applies to typed and rented messages. Use one receive or handler loop
+at a time. An overlapping loop throws `InvalidOperationException`. A successful seek discards the remainder of the sought
+partition's batch.
+
 If the create of the group or the join has an unknown outcome, the consumer abandons it in the client at once.
 Then `InitAsync` throws `VsrRequestOutcomeUnknownException`, and the next `InitAsync` can create the group and join.
 A join that landed keeps the member in the group until the session ends.
@@ -1267,8 +1311,8 @@ A join that landed keeps the member in the group until the session ends.
 - `CommitPolicy.Auto`: the consumer counts each message and stores the latest counted position at the interval
   or the event of the policy, before a rebalance takes a partition away, and on shutdown. With
   `CommitAfter.Delivery` a message counts when it is handed over. With `CommitAfter.Processing` it counts once
-  `ReceiveAsync` is read again, or once the handler of `ConsumeAsync` returns with success. A handler that throws
-  ends `ConsumeAsync` with its error, and its message does not count, so it is delivered again. With
+  the receive stream advances, a later loop starts, or the handler of `ConsumeAsync` returns with success. A handler
+  that throws ends `ConsumeAsync` with its error, and its message does not count, so it is delivered again. With
   `CommitAfter.Marked` only `Mark(checkpoint)` counts.
 
 A read error that the reader retries by itself does not end the loop, it reaches `SubscribeToErrorEvents`. An error

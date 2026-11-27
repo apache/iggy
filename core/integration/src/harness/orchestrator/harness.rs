@@ -19,12 +19,13 @@ use super::builder::TestHarnessBuilder;
 use crate::harness::config::{ClientConfig, JWKS_ISSUER_USERNAME, JwksConfig};
 use crate::harness::context::TestContext;
 use crate::harness::error::TestBinaryError;
+use crate::harness::fake_gcs::{self, FakeGcsBucket};
 use crate::harness::floci::{self, FlociBucket};
 use crate::harness::handle::{
     ClientBuilder, ClientHandle, ConnectorsRuntimeHandle, McpClient, McpHandle, ServerHandle,
     ServerLogs,
 };
-use crate::harness::peer_relay::PeerRelays;
+use crate::harness::peer_relay::{PeerRelays, PeerTraffic};
 use crate::harness::traits::{Restartable, TestBinary};
 use futures::executor::block_on;
 use iggy::prelude::{ClientWrapper, IggyClient};
@@ -58,6 +59,7 @@ pub struct TestHarness {
     pub(super) jwks_config: Option<JwksConfig>,
     pub(super) jwks_server: Option<MockServer>,
     pub(super) floci_bucket: Option<FlociBucket>,
+    pub(super) gcs_bucket: Option<FakeGcsBucket>,
     pub(super) started: bool,
     pub(super) peer_relays: Option<PeerRelays>,
 }
@@ -176,6 +178,21 @@ impl TestHarness {
                 }
             }
             self.floci_bucket = Some(bucket);
+        }
+        if self.servers.iter().any(|server| {
+            server
+                .env(TIERED_STORAGE_BACKEND)
+                .is_some_and(|backend| backend.eq_ignore_ascii_case("gcs"))
+        }) {
+            let bucket = fake_gcs::new_bucket().await?;
+            for server in &mut self.servers {
+                for (key, value) in bucket.server_envs() {
+                    if server.env(key).is_none() {
+                        server.add_env(key, value);
+                    }
+                }
+            }
+            self.gcs_bucket = Some(bucket);
         }
 
         // Cluster startup can hit a transient replica-handshake blip that
@@ -650,6 +667,12 @@ impl TestHarness {
         self.peer_relays()?.drop_connection(from, to)
     }
 
+    /// The frames that crossed every replica link from node `from` to node
+    /// `to` since the cluster started. Needs [`TestHarnessBuilder::peer_relays`].
+    pub fn peer_traffic(&self, from: usize, to: usize) -> Result<PeerTraffic, TestBinaryError> {
+        Ok(self.peer_relays()?.traffic(from, to))
+    }
+
     fn peer_relays(&self) -> Result<&PeerRelays, TestBinaryError> {
         self.peer_relays
             .as_ref()
@@ -663,6 +686,12 @@ impl TestHarness {
     /// tiered storage backend, `None` for any other server.
     pub fn tiered_storage_bucket(&self) -> Option<&FlociBucket> {
         self.floci_bucket.as_ref()
+    }
+
+    /// The fake-gcs-server bucket that the harness made for a server with
+    /// the `gcs` tiered storage backend, `None` for any other server.
+    pub fn gcs_bucket(&self) -> Option<&FakeGcsBucket> {
+        self.gcs_bucket.as_ref()
     }
 
     /// Number of requests the trusted-issuer JWKS mock has served, or 0 when no

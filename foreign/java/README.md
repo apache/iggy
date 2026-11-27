@@ -38,7 +38,7 @@ See [Maven Central](https://central.sonatype.com/artifact/org.apache.iggy/iggy) 
 
 ### Snapshot Versions
 
-Development builds of the next release carry the version `0.9.6-SNAPSHOT`. Get them from the ASF snapshot repository:
+This checkout builds `0.10.2-SNAPSHOT`. After a snapshot is published, use the following configuration to resolve it from the ASF snapshot repository.
 
 **Gradle:**
 
@@ -51,7 +51,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'org.apache.iggy:iggy:0.9.6-SNAPSHOT'
+    implementation 'org.apache.iggy:iggy:0.10.2-SNAPSHOT'
 }
 ```
 
@@ -72,14 +72,14 @@ dependencies {
     <dependency>
         <groupId>org.apache.iggy</groupId>
         <artifactId>iggy</artifactId>
-        <version>0.9.6-SNAPSHOT</version>
+        <version>0.10.2-SNAPSHOT</version>
     </dependency>
 </dependencies>
 ```
 
-### Unreleased 0.11.1 protocol
+### Source checkout
 
-The source checkout uses protocol 0.11.1. Build it with a matching server.
+The source checkout uses client protocol 0.12.3. Build it with a matching server.
 `CommandCode.System.ATTACH_CONSUMER_SESSION` (code 14) was removed. Use
 `CommandCode.System.BIND_SESSION` (code 15), which requires the registered
 session's private bind secret. Auxiliary poll connections reuse that session
@@ -89,10 +89,9 @@ Transport loss retains the logical identity and reconnect uses `BindSession`.
 A definitive stale or unauthenticated bind reply permits a fresh Register, and
 transient replies retain the identity. A stale-client eviction during the bind
 is a lost connection, so the next connection binds the same session again. An
-unauthenticated eviction during the bind ends the session. The bind proof is an
-independent session credential: password/PAT changes or expiry do not end an
-established session. Logout, lease expiry and user deactivation end session
-access.
+unauthenticated eviction during the bind ends the session.
+
+With server 0.10.1-edge.2, a password change keeps the binary session that submitted it and ends the account's other sessions. Deleting or expiring a personal access token ends access for the sessions opened with it. A valid personal access token can open a new session after a password change. Logout, lease expiry and account deactivation also end session access.
 
 A reply with status 30 (`STALE_CLIENT`) means that the server no longer attaches
 the connection to the session. The client closes that connection, and the next
@@ -371,6 +370,14 @@ The stream key is 32 random bytes. It travels inside the create request over the
 
 The typed builders refuse an update the server would refuse for its shape before anything is sent, with the server's error code. `raw(key, value)` and `rawReset(key)` reach keys this build has no field for, and the server decides whether they are allowed.
 
+A geo topic also takes six durations in microseconds: `freshUploadInterval`,
+`consumerOffsetUploadInterval`, `positionsPublishInterval`, `tombstoneGrace`,
+`positionsResumeTimeout` and `longTermRewriteMaxInterval`. Each one overrides the server setting of
+the same name on every node. Zero is a value for them, so the SDK sends it. On a geo topic, an
+update can set them, and they are the only options that it can change there. An update cannot reset
+them. The server refuses them on a normal topic. When the topic does not set a duration, a topic
+read returns an empty `Optional` for it.
+
 ### Metadata Changes
 
 `getMetadataChanges` reads the node's change log: one record per public result of a committed metadata operation, such as a stream created, a topic renamed, a user's permissions changed or a session closed. A mirror keeps a cursor, asks for the records after it, and stores the returned `next` cursor. The call needs root or the global `manageServers` permission and works on blocking TCP, async TCP and HTTP.
@@ -434,6 +441,35 @@ static MetadataChangeStart rebuild(IggyBaseClient client, List<MetadataChangeGro
 Current pages need the parent groups of every selected group, for example `TOPICS` with `STREAMS`. Keep a rebuilt state private until a change page answers `OK` with `hasMore()` false and a `headOp()` at or above the last current page's.
 
 A cursor's `toString()` is its `mc1_` text, which `MetadataChangeCursor.parse` reads back, so a mirror can store it. A query the rules refuse fails with an `IggyValidationException` for invalid command before anything is sent, and a record of a kind this SDK does not know arrives as `MetadataChangeBody.Unknown` or `MetadataChangeBody.UnknownJson`.
+
+### List Pages
+
+`getStreams`, `getTopics`, `getConsumerGroups` and `getUsers` return a whole list. Over TCP, each of them reads the list in pages of at most 1,000 items, so the result is not one consistent read. All pages share the sign-in and the request timeout of the call, so a new sign-in during the walk fails it. An entity that someone creates or deletes during the walk can appear or not appear. The walk fails with `IggyMalformedResponseException` when the server answers the page cursor it was sent.
+
+Over HTTP, they read the whole list in one reply. The server builds that reply from pages of 1,000 items, so it is not one consistent read either.
+
+`getStreamsPage`, `getTopicsPage`, `getPartitionsPage`, `getConsumerGroupsPage` and `getUsersPage` return one page. The page methods of streams, topics, consumer groups and users take a `NamedPageQuery`, which holds a `PageQuery` and an optional name. `getPartitionsPage` takes a `PageQuery`, which has no name. To read the next page, send the same query with the `next()` of the page as its cursor. A page can be empty and still have a `next()`.
+
+```java
+import org.apache.iggy.system.NamedPageQuery;
+import org.apache.iggy.system.Page;
+import org.apache.iggy.system.PageQuery;
+import org.apache.iggy.stream.StreamBase;
+
+NamedPageQuery query = new NamedPageQuery(PageQuery.builder().build());
+while (true) {
+    Page<StreamBase> page = client.streams().getStreamsPage(query);
+    page.items().forEach(stream -> System.out.println(stream.id() + " " + stream.name()));
+    if (page.next().isEmpty()) {
+        break;
+    }
+    query = query.withCursor(page.next().get());
+}
+```
+
+`order` selects `PageOrder.ID` or `PageOrder.CREATED`, and `descending` reverses it. The `name` of a `NamedPageQuery` keeps the entries whose name holds the text, case-sensitive. For example, `new NamedPageQuery(PageQuery.builder().build(), Optional.of("orders"))` reads the entries whose name holds `orders`.
+
+The client refuses a query that breaks the page rules with an `IggyValidationException` for invalid command, before it sends anything. Examples are a limit outside 1 to 1000 and a name that is empty or longer than 255 bytes. A `PageCursor` prints and parses as the `pg1_` text form that the HTTP API and the CLI use. The client does not read the bytes of a cursor. The server refuses a cursor that it cannot use, also with invalid command.
 
 ## Polling
 
@@ -608,7 +644,7 @@ that operation.
 Each node counts the messages in its stream, topic and system stats. After a
 successful send, a node that is not the partition primary shows the new count
 only after the next prepare or commit broadcast. When no other write follows,
-this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+this delay is at most `cluster.commit_busy_heartbeat_interval` (500 ms by default).
 See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
 
 Replicated mutations serialize within their metadata or partition lane. If a sent mutation's
