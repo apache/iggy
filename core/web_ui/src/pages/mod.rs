@@ -18,6 +18,7 @@
 mod layout;
 mod messages;
 mod not_found;
+mod overview;
 mod sign_in;
 mod streams;
 mod topic;
@@ -25,6 +26,7 @@ mod topic;
 pub use layout::DashboardLayout;
 pub use messages::Messages;
 pub use not_found::NotFound;
+pub use overview::Overview;
 pub use sign_in::SignIn;
 pub use streams::{StreamPage, Streams};
 pub use topic::TopicPage;
