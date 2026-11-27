@@ -26,15 +26,25 @@
 //!
 //! What the node knows about a peer's identity is one [`SharedPeerStatus`]
 //! for the whole node. Shard 0 reads the peer's store identity object at
-//! boot and on a timer, and every shard sees the result. The node remembers
-//! the cluster that the first claim of another cluster names. A later check
-//! that finds another claim latches the peer as changed, and the node reads
-//! nothing from it again while it runs.
+//! boot and on a timer, and every shard sees the result. A claim counts only
+//! when committed metadata expects its cluster of the peer: one that the
+//! peer's shadow streams came from, or one that recovery records prove the
+//! successor of such a cluster. While the node holds no shadow stream of the
+//! peer, the first claim of another cluster counts. A later check that finds
+//! another claim latches the peer as changed, and the node reads nothing
+//! from it again while it runs.
 //!
 //! Once committed metadata retires a peer's origin, shard 0 marks its status
-//! retired. The node then checks it no more and runs no job on its store.
-//! Only the polls of consumers still read the segments that its shadow
-//! partitions committed, until their retention removes them.
+//! retired, and runs no job on its store. Only the polls of consumers still
+//! read the segments that its shadow partitions committed, until their
+//! retention removes them, and only once a check in this process accepted
+//! the claim on the root. Shard 0 checks a retired peer until it does, and
+//! then no more.
+//!
+//! A pass that commits what it read of a peer, its manifests or its
+//! positions, reads the identity object before and after it, see
+//! [`IdentityBracket`]. A pass that finds another claim than the one the
+//! node reads commits nothing and asks shard 0 to check the peer at once.
 
 #![allow(
     clippy::future_not_send,
@@ -43,17 +53,22 @@
 
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use consensus::PartitionsHandle;
 use futures::FutureExt;
 use futures::future::LocalBoxFuture;
-use iggy_object_store::{KeyLayout, ObjectRange, ObjectStoreError, ReadOnlyStore, TierJobClass};
+use iggy_object_store::{
+    IdentityRead, KeyLayout, MAX_IDENTITY_LEN, ObjectRange, ObjectStoreError, ReadOnlyStore,
+    TierJobClass,
+};
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
 use partitions::{ExecutorObjects, ReadCache, ReadGate, RemoteObjects, RemoteSegments, StoreSlot};
 
 use crate::IggyShard;
+use crate::peer_manifest_follows::PeerManifestSource;
 use crate::shards_table::ShardsTable;
 use crate::tier_service::{TierService, TierServiceConfig};
 
@@ -69,11 +84,17 @@ pub enum PeerIdentity {
     #[default]
     Unverified,
     /// The root belongs to `cluster_uid`, which the first claim that a check
-    /// read names, and the last check that got an answer read it again.
+    /// accepted names, and the last check that got an answer read it again.
     Verified { cluster_uid: u128 },
-    /// An earlier check verified `cluster_uid`, but the last answer was no
-    /// identity object or a refusal. The node reads nothing until a check
-    /// finds `cluster_uid` again.
+    /// The root is claimed by `found`, which committed metadata does not
+    /// expect of the peer: the peer's shadow streams came from `recorded`,
+    /// and no recovery record leads from it to `found`. The node reads
+    /// nothing from the peer until a check finds a cluster that it expects.
+    Mismatched { recorded: u128, found: u128 },
+    /// An earlier check verified `cluster_uid`, but the last check found no
+    /// identity object, got a refusal or did not finish proving the claim it
+    /// found, or committed metadata no longer expects `cluster_uid`. The node
+    /// reads nothing until a check accepts a claim again.
     Unconfirmed { cluster_uid: u128 },
     /// A check found a claim other than `cluster_uid`: another cluster's,
     /// this cluster's own, or, as `None`, bytes that no cluster wrote. The
@@ -88,8 +109,24 @@ pub enum PeerIdentity {
 /// What one read of a peer's store identity object found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerRead {
-    /// The object names the cluster with this id.
+    /// The object names the cluster with this id, which committed metadata
+    /// expects of the peer: one its shadow streams came from, or any while
+    /// it holds none.
     Found(u128),
+    /// The object names `cluster_uid`, which recovery records prove the
+    /// successor of `of`, a cluster that committed metadata expects of the
+    /// peer.
+    Successor { of: u128, cluster_uid: u128 },
+    /// The object names `found`, which committed metadata does not expect of
+    /// the peer, and no recovery record leads to it from `recorded`, one
+    /// that it does.
+    Unknown { recorded: u128, found: u128 },
+    /// The object names `found`, which committed metadata does not expect of
+    /// the peer, and the check stopped following the recovery records under
+    /// the root before they proved or refuted it: a read of one got no
+    /// answer, as `unreachable`, or the check read as many as one check
+    /// reads.
+    Unproven { found: u128, unreachable: bool },
     /// The object names this cluster, so the peer's root is this cluster's
     /// own.
     OwnCluster(u128),
@@ -100,8 +137,9 @@ pub enum PeerRead {
     /// The store did not answer, or failed in a way that a retry can get
     /// past.
     Unreachable,
-    /// The store refused the read in a way that only an operator can fix,
-    /// such as rejected credentials or a missing bucket.
+    /// The store refused a read of the check, of the identity object or of a
+    /// recovery record, in a way that only an operator can fix, such as
+    /// rejected credentials or a missing bucket.
     Refused,
 }
 
@@ -113,10 +151,9 @@ pub struct PeerStatus {
     /// The last check got no answer. A verified peer stays verified through
     /// an outage, and the node still reads what the store returns.
     pub unreachable: bool,
-    /// Committed metadata retired the peer's origin. The node checks it no
-    /// more and runs no job on its store. Only a consumer's poll still reads
-    /// the segments that its shadow partitions committed, see
-    /// [`PeerStatus::serves_polls`].
+    /// Committed metadata retired the peer's origin. The node runs no job on
+    /// its store. Only a consumer's poll still reads the segments that its
+    /// shadow partitions committed, see [`PeerStatus::serves_polls`].
     pub retired: bool,
 }
 
@@ -125,6 +162,26 @@ pub struct PeerStatus {
 #[derive(Debug, Clone, Default)]
 pub struct SharedPeerStatus {
     status: Arc<Mutex<PeerStatus>>,
+    /// A shard found another claim on the peer's root than the one the node
+    /// reads, and asks shard 0 to check the peer at once. Shard 0 alone
+    /// moves the status, so a pass on any shard sees one writer's view.
+    check_requested: Arc<AtomicBool>,
+}
+
+/// What the two reads of a peer's identity object around one pass found.
+///
+/// The pass commits what it read only when both reads name the cluster that
+/// the node reads the peer as, see [`SharedPeerStatus::adopts`]. A root
+/// that moves away and back within one pass is not caught.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityBracket {
+    /// Both reads named this cluster.
+    Held(u128),
+    /// The reads named different clusters, or one found no claim or bytes
+    /// that no cluster wrote.
+    Moved,
+    /// A read got no answer, so the pass tells nothing of the root.
+    Unread,
 }
 
 /// One peer on one shard: its origin name, the layout of its root, its tier
@@ -172,7 +229,9 @@ where
             status.serves_jobs()
         };
         if !served {
-            let unread = ObjectStoreError::Unavailable(if status.retired {
+            // A poll of a retired peer waits for the check that accepts the
+            // claim on its root.
+            let unread = ObjectStoreError::Unavailable(if status.retired && !self.polls {
                 format!(
                     "geo peer {} retired, so this node follows nothing of it",
                     self.origin
@@ -194,20 +253,44 @@ impl PeerIdentity {
     #[must_use]
     pub const fn after(self, read: PeerRead) -> Self {
         match (self, read) {
-            // Only an operator ends a change, and an outage changes nothing.
-            (Self::Changed { .. }, _) | (_, PeerRead::Unreachable) => self,
-            (Self::Unverified, PeerRead::Found(cluster_uid)) => Self::Verified { cluster_uid },
+            // Only an operator ends a change, an outage changes nothing, and
+            // neither does a claim that recovery records did not prove yet.
+            (Self::Changed { .. }, _)
+            | (_, PeerRead::Unreachable)
+            | (Self::Unverified | Self::Mismatched { .. }, PeerRead::Unproven { .. }) => self,
+            // A recovery of the cluster that owned the root replaces its
+            // claim and keeps every key, also while the node reads the peer.
             (
-                Self::Unverified,
+                Self::Unverified | Self::Mismatched { .. },
+                PeerRead::Found(cluster_uid) | PeerRead::Successor { cluster_uid, .. },
+            )
+            | (
+                Self::Verified { .. } | Self::Unconfirmed { .. },
+                PeerRead::Successor { cluster_uid, .. },
+            ) => Self::Verified { cluster_uid },
+            (Self::Unverified | Self::Mismatched { .. }, PeerRead::Unknown { recorded, found }) => {
+                Self::Mismatched { recorded, found }
+            }
+            (
+                Self::Unverified | Self::Mismatched { .. },
                 PeerRead::OwnCluster(_) | PeerRead::Invalid | PeerRead::Missing | PeerRead::Refused,
             ) => Self::Unverified,
             (
                 Self::Verified { cluster_uid } | Self::Unconfirmed { cluster_uid },
                 PeerRead::Found(found),
             ) if found == cluster_uid => Self::Verified { cluster_uid },
+            // Committed metadata no longer expects the cluster the node
+            // reads, such as on a replica that accepted it before it held the
+            // peer's shadow streams.
             (
                 Self::Verified { cluster_uid } | Self::Unconfirmed { cluster_uid },
-                PeerRead::Found(found) | PeerRead::OwnCluster(found),
+                PeerRead::Unknown { recorded, found },
+            ) if found == cluster_uid => Self::Mismatched { recorded, found },
+            (
+                Self::Verified { cluster_uid } | Self::Unconfirmed { cluster_uid },
+                PeerRead::Found(found)
+                | PeerRead::OwnCluster(found)
+                | PeerRead::Unknown { found, .. },
             ) => Self::Changed {
                 cluster_uid,
                 found: Some(found),
@@ -219,9 +302,11 @@ impl PeerIdentity {
                 cluster_uid,
                 found: None,
             },
+            // A claim that the check could not prove stops the reads until a
+            // check proves or refutes it.
             (
                 Self::Verified { cluster_uid } | Self::Unconfirmed { cluster_uid },
-                PeerRead::Missing | PeerRead::Refused,
+                PeerRead::Missing | PeerRead::Refused | PeerRead::Unproven { .. },
             ) => Self::Unconfirmed { cluster_uid },
         }
     }
@@ -232,7 +317,10 @@ impl PeerIdentity {
     pub const fn readable(&self) -> Option<u128> {
         match self {
             Self::Verified { cluster_uid } => Some(*cluster_uid),
-            Self::Unverified | Self::Unconfirmed { .. } | Self::Changed { .. } => None,
+            Self::Unverified
+            | Self::Mismatched { .. }
+            | Self::Unconfirmed { .. }
+            | Self::Changed { .. } => None,
         }
     }
 }
@@ -243,7 +331,14 @@ impl PeerStatus {
     pub const fn after(self, read: PeerRead) -> Self {
         Self {
             identity: self.identity.after(read),
-            unreachable: matches!(read, PeerRead::Unreachable),
+            unreachable: matches!(
+                read,
+                PeerRead::Unreachable
+                    | PeerRead::Unproven {
+                        unreachable: true,
+                        ..
+                    }
+            ),
             retired: self.retired,
         }
     }
@@ -255,15 +350,44 @@ impl PeerStatus {
         !self.retired && self.identity.readable().is_some()
     }
 
-    /// Whether a consumer's poll may read the peer's store. A retired peer
-    /// is checked no more, so a node that restarted since it retired never
-    /// verified it, and its polls read what its partitions committed unless
-    /// a check found another cluster first.
+    /// Whether a consumer's poll may read the peer's store: a check in this
+    /// process accepted the claim on its root, also of a retired peer.
     #[must_use]
     pub const fn serves_polls(&self) -> bool {
         self.identity.readable().is_some()
-            || (self.retired && !matches!(self.identity, PeerIdentity::Changed { .. }))
     }
+}
+
+impl IdentityBracket {
+    /// The bracket of a pass whose reads of the identity object, before and
+    /// after the pass, answered `before` and `after`.
+    #[must_use]
+    pub const fn of(
+        before: &Result<IdentityRead, ObjectStoreError>,
+        after: &Result<IdentityRead, ObjectStoreError>,
+    ) -> Self {
+        match (before, after) {
+            (Err(_), _) | (_, Err(_)) => Self::Unread,
+            (Ok(IdentityRead::Found(before)), Ok(IdentityRead::Found(after)))
+                if before.cluster_uid == after.cluster_uid =>
+            {
+                Self::Held(before.cluster_uid)
+            }
+            (Ok(_), Ok(_)) => Self::Moved,
+        }
+    }
+}
+
+/// One read of the identity object under `identity_key` through `objects`,
+/// for a pass that reads the peer's store through them.
+///
+/// # Errors
+/// Any error of the read but a missing object.
+pub async fn read_identity(
+    objects: &dyn RemoteObjects,
+    identity_key: &str,
+) -> Result<IdentityRead, ObjectStoreError> {
+    IdentityRead::of(objects.get_range(identity_key, 0..MAX_IDENTITY_LEN).await)
 }
 
 impl SharedPeerStatus {
@@ -275,6 +399,37 @@ impl SharedPeerStatus {
 
     pub fn set(&self, status: PeerStatus) {
         *self.status.lock().unwrap_or_else(PoisonError::into_inner) = status;
+    }
+
+    /// Ask shard 0 to check the peer at once.
+    pub fn request_check(&self) {
+        self.check_requested.store(true, Ordering::Release);
+    }
+
+    /// Whether a shard asked for a check since the last call.
+    #[must_use]
+    pub fn take_check_request(&self) -> bool {
+        self.check_requested.swap(false, Ordering::AcqRel)
+    }
+
+    /// Whether a pass may commit what it read between the two reads of
+    /// `bracket`: both named the cluster that the node reads the peer as.
+    /// A pass that found another claim while the node still reads the peer
+    /// asks shard 0 to check it at once, so the polls stop too.
+    #[must_use]
+    pub fn adopts(&self, bracket: IdentityBracket) -> bool {
+        let status = self.get();
+        let reads = status.identity.readable().filter(|_| status.serves_jobs());
+        match bracket {
+            IdentityBracket::Held(cluster_uid) if reads == Some(cluster_uid) => true,
+            IdentityBracket::Unread => false,
+            IdentityBracket::Held(_) | IdentityBracket::Moved => {
+                if reads.is_some() {
+                    self.request_check();
+                }
+                false
+            }
+        }
     }
 }
 
@@ -392,6 +547,12 @@ where
         })
     }
 
+    /// What the node knows about the peer, shared by every shard.
+    #[must_use]
+    pub const fn shared_status(&self) -> &SharedPeerStatus {
+        &self.status
+    }
+
     /// The reads of the polls of this peer's shadow partitions, in `class`
     /// of the peer's tier service: demand fetches for what a poll waits
     /// for, speculative fetches for readahead.
@@ -414,12 +575,7 @@ struct PeerGate {
 
 impl ReadGate for PeerGate {
     fn admit(&self) -> Option<u128> {
-        let status = self.status.get();
-        // A retired peer whose identity this process never verified serves
-        // the polls of what its shadow partitions committed, under no uid.
-        status
-            .serves_polls()
-            .then(|| status.identity.readable().unwrap_or(0))
+        self.status.get().identity.readable()
     }
 }
 
@@ -483,7 +639,16 @@ where
         self.set_peer_manifest_objects(
             stores
                 .iter()
-                .map(|peer| (peer.origin().to_owned(), peer.manifest_objects()))
+                .map(|peer| {
+                    (
+                        peer.origin().to_owned(),
+                        PeerManifestSource {
+                            objects: peer.manifest_objects(),
+                            identity_key: peer.layout().identity_key(),
+                            status: peer.status.clone(),
+                        },
+                    )
+                })
                 .collect(),
         );
         *self.peer_stores.borrow_mut() = Rc::new(stores);
@@ -515,6 +680,31 @@ mod tests {
 
     type Bus = Rc<IggyMessageBus>;
 
+    /// A claim of `found`, which metadata does not expect: it recorded
+    /// [`PEER`].
+    const fn unknown(found: u128) -> PeerRead {
+        PeerRead::Unknown {
+            recorded: PEER,
+            found,
+        }
+    }
+
+    const fn mismatched(found: u128) -> PeerIdentity {
+        PeerIdentity::Mismatched {
+            recorded: PEER,
+            found,
+        }
+    }
+
+    /// A claim of `cluster_uid`, which recovery records prove the successor
+    /// of [`PEER`].
+    const fn successor(cluster_uid: u128) -> PeerRead {
+        PeerRead::Successor {
+            of: PEER,
+            cluster_uid,
+        }
+    }
+
     /// The cache serves the polls of a peer's shadow partitions only while
     /// a read of its store would go out, and keeps the bytes of each
     /// identity apart.
@@ -524,6 +714,11 @@ mod tests {
             status: SharedPeerStatus::default(),
         };
         let set = |status: PeerStatus| gate.status.set(status);
+        let retired = |identity| PeerStatus {
+            identity,
+            unreachable: false,
+            retired: true,
+        };
 
         assert_eq!(gate.admit(), None, "not verified yet");
         set(PeerStatus::default().after(PeerRead::Found(PEER)));
@@ -532,11 +727,24 @@ mod tests {
         assert_eq!(gate.admit(), Some(PEER), "an outage changes nothing");
         set(gate.status.get().after(PeerRead::Found(OTHER)));
         assert_eq!(gate.admit(), None, "another cluster owns the root now");
-        set(PeerStatus {
-            retired: true,
-            ..PeerStatus::default()
-        });
-        assert_eq!(gate.admit(), Some(0), "a retired peer serves its history");
+        set(PeerStatus::default().after(unknown(OTHER)));
+        assert_eq!(
+            gate.admit(),
+            None,
+            "a cluster the shadows do not know claims the root"
+        );
+        set(retired(PeerIdentity::Unverified));
+        assert_eq!(
+            gate.admit(),
+            None,
+            "a retired peer whose claim this process did not accept"
+        );
+        set(retired(PeerIdentity::Verified { cluster_uid: PEER }));
+        assert_eq!(
+            gate.admit(),
+            Some(PEER),
+            "a retired peer serves its history"
+        );
     }
 
     #[test]
@@ -614,6 +822,162 @@ mod tests {
         }
     }
 
+    /// Rows of claims that a check judged against what committed metadata
+    /// recorded of the peer: a successor that recovery records prove, and a
+    /// cluster it does not know.
+    #[test]
+    fn given_each_judged_claim_when_moving_the_identity_should_follow_a_successor_and_refuse_an_unknown_cluster()
+     {
+        let unverified = PeerIdentity::Unverified;
+        let verified = PeerIdentity::Verified { cluster_uid: PEER };
+        let unconfirmed = PeerIdentity::Unconfirmed { cluster_uid: PEER };
+        let changed = |found| PeerIdentity::Changed {
+            cluster_uid: PEER,
+            found,
+        };
+        // (row, identity before, read, identity after)
+        for (row, before, read, after) in [
+            (
+                "first claim of a successor",
+                unverified,
+                successor(OTHER),
+                PeerIdentity::Verified { cluster_uid: OTHER },
+            ),
+            (
+                "first claim of an unknown cluster",
+                unverified,
+                unknown(OTHER),
+                mismatched(OTHER),
+            ),
+            (
+                "an unknown cluster again",
+                mismatched(OTHER),
+                unknown(OWN),
+                mismatched(OWN),
+            ),
+            (
+                "a mismatch through an outage",
+                mismatched(OTHER),
+                PeerRead::Unreachable,
+                mismatched(OTHER),
+            ),
+            (
+                "a mismatch ends with a claim that metadata expects",
+                mismatched(OTHER),
+                PeerRead::Found(OTHER),
+                PeerIdentity::Verified { cluster_uid: OTHER },
+            ),
+            (
+                "a mismatch ends with a proven successor",
+                mismatched(OTHER),
+                successor(OTHER),
+                PeerIdentity::Verified { cluster_uid: OTHER },
+            ),
+            (
+                "a mismatched claim gone",
+                mismatched(OTHER),
+                PeerRead::Missing,
+                unverified,
+            ),
+            (
+                "a recovery replaced the claim",
+                verified,
+                successor(OTHER),
+                PeerIdentity::Verified { cluster_uid: OTHER },
+            ),
+            (
+                "a recovery replaced a claim that was gone",
+                unconfirmed,
+                successor(OTHER),
+                PeerIdentity::Verified { cluster_uid: OTHER },
+            ),
+            (
+                "metadata no longer expects the cluster read",
+                verified,
+                PeerRead::Unknown {
+                    recorded: OTHER,
+                    found: PEER,
+                },
+                PeerIdentity::Mismatched {
+                    recorded: OTHER,
+                    found: PEER,
+                },
+            ),
+            (
+                "an unknown cluster replaced the claim",
+                verified,
+                unknown(OTHER),
+                changed(Some(OTHER)),
+            ),
+            (
+                "a change holds through a successor",
+                changed(Some(OTHER)),
+                successor(OTHER),
+                changed(Some(OTHER)),
+            ),
+        ] {
+            assert_eq!(before.after(read), after, "{row}");
+        }
+    }
+
+    /// A claim of another cluster that a check could not prove stops the
+    /// reads of a verified peer, and only a check that proves or refutes it
+    /// decides what comes next.
+    #[test]
+    fn given_an_unproven_claim_when_moving_the_status_should_read_nothing_until_a_check_proves_it()
+    {
+        let verified = PeerStatus::default().after(PeerRead::Found(PEER));
+        let unconfirmed = PeerIdentity::Unconfirmed { cluster_uid: PEER };
+        let unanswered = PeerRead::Unproven {
+            found: OTHER,
+            unreachable: true,
+        };
+        let walking = PeerRead::Unproven {
+            found: OTHER,
+            unreachable: false,
+        };
+
+        let suspended = verified.after(unanswered);
+        assert_eq!(suspended.identity, unconfirmed);
+        assert!(suspended.unreachable);
+        assert!(!suspended.serves_polls() && !suspended.serves_jobs());
+        assert!(!verified.after(walking).unreachable);
+        assert_eq!(verified.after(walking).identity, unconfirmed);
+        // (row, identity before, read, identity after)
+        for (row, before, read, after) in [
+            ("still unproven", unconfirmed, walking, unconfirmed),
+            (
+                "proven at last",
+                unconfirmed,
+                successor(OTHER),
+                PeerIdentity::Verified { cluster_uid: OTHER },
+            ),
+            (
+                "refuted at last",
+                unconfirmed,
+                unknown(OTHER),
+                PeerIdentity::Changed {
+                    cluster_uid: PEER,
+                    found: Some(OTHER),
+                },
+            ),
+            (
+                "nothing verified yet",
+                PeerIdentity::Unverified,
+                walking,
+                PeerIdentity::Unverified,
+            ),
+            (
+                "a mismatch holds",
+                mismatched(OWN),
+                walking,
+                mismatched(OWN),
+            ),
+        ] {
+            assert_eq!(before.after(read), after, "{row}");
+        }
+    }
+
     #[test]
     fn given_each_identity_when_asking_should_read_only_a_verified_peer() {
         assert_eq!(
@@ -622,6 +986,10 @@ mod tests {
         );
         for identity in [
             PeerIdentity::Unverified,
+            PeerIdentity::Mismatched {
+                recorded: PEER,
+                found: OTHER,
+            },
             PeerIdentity::Unconfirmed { cluster_uid: PEER },
             PeerIdentity::Changed {
                 cluster_uid: PEER,
@@ -823,7 +1191,7 @@ mod tests {
     }
 
     #[test]
-    fn given_a_retired_peer_when_asking_should_run_no_job_and_serve_polls_unless_another_cluster_claimed_it()
+    fn given_a_retired_peer_when_asking_should_run_no_job_and_serve_polls_only_once_its_claim_was_accepted()
      {
         let retired = |identity| PeerStatus {
             identity,
@@ -834,17 +1202,20 @@ mod tests {
 
         assert!(!retired(verified).serves_jobs());
         assert!(retired(verified).serves_polls());
-        assert!(
-            retired(PeerIdentity::Unverified).serves_polls(),
-            "a node that restarted since the retirement checks no more"
-        );
-        assert!(
-            !retired(PeerIdentity::Changed {
+        for unaccepted in [
+            PeerIdentity::Unverified,
+            PeerIdentity::Mismatched {
+                recorded: PEER,
+                found: OTHER,
+            },
+            PeerIdentity::Unconfirmed { cluster_uid: PEER },
+            PeerIdentity::Changed {
                 cluster_uid: PEER,
                 found: Some(OTHER),
-            })
-            .serves_polls()
-        );
+            },
+        ] {
+            assert!(!retired(unaccepted).serves_polls(), "{unaccepted:?}");
+        }
         assert!(
             PeerStatus::default()
                 .after(PeerRead::Found(PEER))
@@ -874,8 +1245,9 @@ mod tests {
         let calls = provider.calls();
         let peer = peer("dc-b", provider);
         peer.status.set(PeerStatus {
+            identity: PeerIdentity::Verified { cluster_uid: PEER },
+            unreachable: false,
             retired: true,
-            ..PeerStatus::default()
         });
 
         assert!(peer.service().is_none());
@@ -894,5 +1266,89 @@ mod tests {
             .unwrap();
         assert_eq!(polled.bytes.as_ref(), b"bytes");
         assert_eq!(calls.all().len(), 1);
+    }
+
+    #[test]
+    fn given_each_pair_of_identity_reads_when_bracketing_a_pass_should_hold_only_one_claim_read_twice()
+     {
+        let found = |cluster_uid| Ok(IdentityRead::Found(StoreIdentity { cluster_uid }));
+        let outage = || Err(ObjectStoreError::Transport("reset".to_owned()));
+        // (row, before, after, bracket)
+        for (row, before, after, bracket) in [
+            (
+                "the same claim",
+                found(PEER),
+                found(PEER),
+                IdentityBracket::Held(PEER),
+            ),
+            (
+                "another claim after the pass",
+                found(PEER),
+                found(OTHER),
+                IdentityBracket::Moved,
+            ),
+            (
+                "the claim gone after the pass",
+                found(PEER),
+                Ok(IdentityRead::Missing),
+                IdentityBracket::Moved,
+            ),
+            (
+                "bytes no cluster wrote",
+                Ok(IdentityRead::Invalid),
+                found(PEER),
+                IdentityBracket::Moved,
+            ),
+            (
+                "no answer before",
+                outage(),
+                found(PEER),
+                IdentityBracket::Unread,
+            ),
+            (
+                "no answer after",
+                found(PEER),
+                outage(),
+                IdentityBracket::Unread,
+            ),
+        ] {
+            assert_eq!(IdentityBracket::of(&before, &after), bracket, "{row}");
+        }
+    }
+
+    /// A pass adopts what it read only under the cluster the node reads the
+    /// peer as. One that saw the root move while the node reads the peer
+    /// asks shard 0 for a check, and one that got no answer asks nothing.
+    #[test]
+    fn given_each_bracket_when_a_pass_asks_to_adopt_should_take_only_the_cluster_read_and_ask_for_a_check_on_a_move()
+     {
+        let status = SharedPeerStatus::default();
+        status.set(PeerStatus::default().after(PeerRead::Found(PEER)));
+        // (row, bracket, adopted, check asked)
+        for (row, bracket, adopted, asked) in [
+            ("the cluster read", IdentityBracket::Held(PEER), true, false),
+            ("another cluster", IdentityBracket::Held(OTHER), false, true),
+            ("a move", IdentityBracket::Moved, false, true),
+            ("no answer", IdentityBracket::Unread, false, false),
+        ] {
+            assert_eq!(status.adopts(bracket), adopted, "{row}");
+            assert_eq!(status.take_check_request(), asked, "{row}");
+        }
+
+        status.set(PeerStatus::default());
+        assert!(!status.adopts(IdentityBracket::Held(PEER)));
+        assert!(
+            !status.take_check_request(),
+            "a peer the node reads nothing from has no gate to close"
+        );
+        status.set(PeerStatus {
+            identity: PeerIdentity::Verified { cluster_uid: PEER },
+            unreachable: false,
+            retired: true,
+        });
+        assert!(
+            !status.adopts(IdentityBracket::Held(PEER)),
+            "a retired peer has no passes"
+        );
     }
 }

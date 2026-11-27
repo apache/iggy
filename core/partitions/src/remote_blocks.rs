@@ -228,6 +228,11 @@ impl ReadCache {
         }
     }
 
+    /// Drop every block and object kept of the store in `store`.
+    fn forget_store(&self, store: StoreSlot) {
+        self.cache.borrow_mut().retain(|key| key.store() != store);
+    }
+
     /// A batch of `namespace` in the fresh object `object_id` committed, its
     /// last message at `end_offset`.
     pub(crate) fn note_fresh_commit(
@@ -456,6 +461,9 @@ pub struct RemoteBlocks {
     /// Reads for readahead, which no read may wait for: their class starts
     /// only while no demand fetch waits.
     ahead: Rc<dyn RemoteObjects>,
+    /// The identity that the gate admitted last, `None` before it admitted
+    /// one or once it refused.
+    admitted: Cell<Option<u128>>,
 }
 
 impl RemoteBlocks {
@@ -474,6 +482,7 @@ impl RemoteBlocks {
             gate,
             demand,
             ahead,
+            admitted: Cell::new(None),
         }
     }
 
@@ -728,11 +737,18 @@ impl RemoteBlocks {
         self.cache.counted.set(counted);
     }
 
-    /// The identity under which the store is read now.
+    /// The identity under which the store is read now. Once it moves, no
+    /// read reaches the blocks kept under the last one, so they go.
     fn admit(&self) -> Result<u128, DiskFault> {
+        let admitted = self.gate.admit();
+        if let Some(last) = self.admitted.replace(admitted)
+            && admitted != Some(last)
+        {
+            self.cache.forget_store(self.store);
+        }
         // A store that refuses reads now fails them as a store that does not
         // answer, which a later poll can get past.
-        self.gate.admit().ok_or(DiskFault::Retryable)
+        admitted.ok_or(DiskFault::Retryable)
     }
 
     /// The blocks of `object` that hold `range`, from the first of them on,
@@ -1132,6 +1148,14 @@ impl ObjectId {
 enum CacheKey {
     Block { object: ObjectId, index: u64 },
     Whole(ObjectId),
+}
+
+impl CacheKey {
+    const fn store(&self) -> StoreSlot {
+        match self {
+            Self::Block { object, .. } | Self::Whole(object) => object.store,
+        }
+    }
 }
 
 /// What one GET fetches of an object.
@@ -3039,6 +3063,30 @@ mod tests {
 
         assert_eq!(read(&peer, 100..200).await, Err(DiskFault::Retryable));
         assert_eq!(store.asked(), [(0, BLOCK)]);
+    }
+
+    /// No read reaches what a peer's blocks were kept under once its gate
+    /// moves, so they leave the cache, and the blocks of other stores stay.
+    #[compio::test]
+    async fn given_a_peer_whose_gate_moved_when_read_again_should_drop_its_blocks_and_keep_the_others()
+     {
+        let cache = ReadCache::new(settings(CACHE_BYTES, 0));
+        let own = RemoteSegments::new(Store::holding(OBJECT_LEN) as _, layout())
+            .with_cache(Rc::new(Silent), &cache);
+        let gate = Rc::new(Gate(Cell::new(Some(7))));
+        let peer = peer(&Store::holding(OBJECT_LEN), &cache, &gate);
+        assert_eq!(read(&own, 100..200).await, Ok(expected(100..200)));
+        assert_eq!(read(&peer, 100..200).await, Ok(expected(100..200)));
+        assert_eq!(cache.take_metrics().cached_bytes, 2 * BLOCK);
+
+        gate.0.set(None);
+
+        assert_eq!(read(&peer, 100..200).await, Err(DiskFault::Retryable));
+        assert_eq!(
+            cache.take_metrics().cached_bytes,
+            BLOCK,
+            "the own store's block"
+        );
     }
 
     /// A root that another cluster owns now can name other bytes under the

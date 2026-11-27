@@ -38,7 +38,7 @@ const MESSAGES: u32 = 30;
 /// How long a cluster may take to list a message in a manifest.
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a retirement may take to reach the gauges: the identity checks
-/// of shard 0 look for it every 5 s.
+/// of shard 0 look for it every second.
 const RETIRE_TIMEOUT: Duration = Duration::from_secs(20);
 /// Four manifest listings and four passes of the shadow topics, in each of
 /// which a cluster that follows its peer reads the peer's bucket.

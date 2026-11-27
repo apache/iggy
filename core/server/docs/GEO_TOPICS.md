@@ -814,8 +814,10 @@ node keeps it across restarts. A retirement of an origin that is retired already
 
 After the command:
 
-- The nodes send the origin's bucket no request but the reads of polls. They check its identity
-  no more, and list none of its topic objects, manifests or consumer group positions.
+- The nodes send the origin's bucket no request but the reads of polls, and after each start
+  one read of its identity object, which the polls wait for. A node serves the polls only when
+  that object names a cluster that the retirement recorded, or a successor that recovery records
+  prove. They list none of its topic objects, manifests or consumer group positions.
   `geo_peer_retired` is 1 for that origin.
 - After a node starts, its group polls wait for the positions of the other peers only.
 - The shadow topics of the origin stop growing. A poll reads the messages that the last
@@ -937,7 +939,13 @@ Then it replaces `<prefix>/meta/identity` with the rebuilt cluster's own. A node
 cluster that comes back finds another cluster there at its next check, within a minute, and
 stops writing. A peer that follows the lost cluster's fresh objects takes its batches only
 below each partition's cutover in the record: from there on the partition's log is the
-rebuilt cluster's.
+rebuilt cluster's. A peer whose shadow streams came from the lost cluster follows the record
+from it to the rebuilt cluster, and reads the bucket as that cluster's. It reads no record of a
+bucket whose identity object names a cluster that its shadow streams came from. When the lost
+cluster is the only one that the peer's metadata records of the origin, those shadow streams
+also follow the rebuilt cluster's topic objects: a tombstone detaches its topic, and a new topic
+of a shadowed stream gets a shadow topic. A stream that has no shadow stream gets none, and the
+peer logs it.
 
 The report lists, per partition:
 
@@ -966,7 +974,12 @@ when a poll of a shadow topic reads them from the peer's bucket. The cross-datac
 per peer:
 
 - each node reads the peer's store identity object once a minute, and every 5 seconds while the
-  check does not pass;
+  check does not pass, and a recovery record under the peer's root only when the object names a
+  cluster that the shadow streams did not come from;
+- each manifest or positions pass that reads an object of the peer reads the identity object
+  before and after it: two more gets at most every `[geo] manifest_poll_interval` per shard for
+  each 16 changed manifests that it reads, and every `[geo] positions_poll_interval` per node
+  while the peer's positions change;
 - the metadata primary lists the peer's topic objects every 5 seconds, reads each new object,
   and reads each known object again every 30 seconds;
 - every `[geo] positions_poll_interval`, shard 0 of each node that leads a partition of a geo or
@@ -1023,12 +1036,12 @@ the `_total` suffix, and histograms the `_bucket`, `_sum` and `_count` suffixes.
 | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `object_store_identity_verified`        | 1 while the node passes the store identity check of its own bucket.                                                                                                            |
 | `object_store_unreachable`              | 1 while its own bucket does not answer the check.                                                                                                                              |
-| `geo_peer_identity_verified`            | Per `origin`: 1 while the node reads the peer's bucket.                                                                                                                        |
+| `geo_peer_identity_verified`            | Per `origin`: 1 while the node reads the peer's bucket, whose identity object names a cluster that the shadow streams came from or a proven successor.                         |
 | `geo_peer_unreachable`                  | Per `origin`: 1 while the peer's bucket does not answer the check.                                                                                                             |
-| `geo_peer_retired`                      | Per `origin`: 1 once this cluster retired the origin. The node then sends its bucket only the reads of polls.                                                                  |
+| `geo_peer_retired`                      | Per `origin`: 1 once this cluster retired the origin. The node then sends its bucket only the reads of polls, and one identity read after a start.                             |
 | `geo_shadow_topics_stale`               | Per `origin`: stale shadow topics, counted on the metadata primary.                                                                                                            |
 | `geo_peer_manifest_requests_total`      | Per `origin` and `request`, `list` or `get`: requests for the peer's manifests.                                                                                                |
-| `geo_peer_manifest_failures_total`      | The same requests that failed.                                                                                                                                                 |
+| `geo_peer_manifest_failures_total`      | The same requests that failed, and the manifest reads of a pass that found another claim on the bucket.                                                                        |
 | `geo_peer_manifests_refused_total`      | Per `origin`: manifests that this cluster refused.                                                                                                                             |
 | `geo_peer_manifest_commands_total`      | Per `origin`: commands that committed a manifest to a shadow partition.                                                                                                        |
 | `geo_peer_manifest_listed_seconds`      | Per `origin`: Unix time of the last listing that succeeded, on shard 0.                                                                                                        |

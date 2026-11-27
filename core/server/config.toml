@@ -1780,11 +1780,14 @@ handshake_grace = "10 s"
 # Shard 0 reads each peer's store identity object, "<prefix>/meta/identity",
 # at boot and every minute after that. While the node reads nothing from the
 # peer, or the peer's store does not answer, it reads the object every 5
-# seconds. The node remembers the first cluster that the object names, until
-# the node restarts. If the object names another cluster later, the node reads
-# nothing from the peer until it restarts. A peer that does not answer never
-# stops the boot. The gauges geo_peer_identity_verified and
-# geo_peer_unreachable show each peer by its origin.
+# seconds. The node reads the peer when the object names a cluster that its
+# shadow streams of the peer came from, or a successor of one that the
+# recovery records under the peer's root prove. While it holds no shadow
+# stream of the peer, the first cluster that the object names counts. If the
+# object names another cluster later, the node reads nothing from the peer
+# until it restarts. A peer that does not answer never stops the boot. The
+# gauges geo_peer_identity_verified and geo_peer_unreachable show each peer by
+# its origin.
 #[[geo.peers]]
 # The peer's own geo.origin.
 #origin = "dc-b"
