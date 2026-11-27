@@ -439,9 +439,17 @@ runs:
           # desync silently, which pre-pulls the superseded image and puts the real one back
           # inside the budget this block exists to avoid. The failover suite runs the same
           # clients against a cluster. `KAFKA_4_0_IMAGE` and `KAFKA_3_9_IMAGE` match too.
-          E2E_IMAGES=$(grep -ohP '^const (KCAT|KAFKA)\w*_IMAGE: &str = "\K[^"]+' \
-            gateways/kafka/tests/kafka_client_e2e_tests.rs \
-            gateways/kafka/tests/cluster_failover_tests.rs | sort -u)
+          # The client compatibility matrix runs its own images: the oracle, the smoke clients,
+          # and the toolchains that build the probes. Its constants are `pub`, unlike the e2e
+          # suite's.
+          E2E_IMAGES=$( {
+            grep -ohP '^const (KCAT|KAFKA)\w*_IMAGE: &str = "\K[^"]+' \
+              gateways/kafka/tests/kafka_client_e2e_tests.rs \
+              gateways/kafka/tests/cluster_failover_tests.rs
+            grep -ohP '^pub const (KCAT_MATRIX|PYTHON|GOLANG|JAVA_\d+|KAFKA_ORACLE)\w*_IMAGE: &str = "\K[^"]+' \
+              gateways/kafka/tests/client_matrix_tests.rs \
+              gateways/kafka/tests/common/oracle.rs
+          } | sort -u)
           if [[ -z "$E2E_IMAGES" ]]; then
             echo "::warning::could not read client image tags from the Kafka client suites; skipping pre-pull"
           fi
