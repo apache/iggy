@@ -4,15 +4,15 @@
 - Start Date: 2026-09-29
 - RFC PR: [apache/iggy#4404](https://github.com/apache/iggy/pull/4404)
 - Discussion: [apache/iggy#4685](https://github.com/apache/iggy/discussions/4685)
-- Iggy Issue: [apache/iggy#0000](https://github.com/apache/iggy/issues/0000)
+- Iggy Issue: [apache/iggy#4686](https://github.com/apache/iggy/issues/4686)
 
 ## Summary
 
 [summary]: #summary
 
 Move sealed segment files from a partition's local directory to an object store (S3 and compatible
-stores first, GCS and Azure Blob behind the same abstraction) and serve them back through a local
-chunk cache, without changing what clients see. The partition primary uploads a segment once it
+stores first, GCS and Azure Blob behind the same abstraction) and serve them back through an
+in-memory read cache, without changing what clients see. The partition primary uploads a segment once it
 seals and commits a `tiered_up_to_offset` floor to the partition's state-machine log, a second log
 of the partition's consensus group that shares the data log's op sequence but holds no messages,
 where a small state machine applies it on every replica. Each replica
@@ -48,8 +48,8 @@ does not propose a diskless architecture. Object-storage-first systems were surv
 worth borrowing (see [Prior art](#prior-art)). The write path they use is rejected here because the
 VSR log already sequences and replicates, which is the job their coordinators exist for. A topic mode
 with the semantics of Redpanda's cloud topics, where a write is acknowledged once its data is in
-object storage and the VSR log still orders it, is a planned follow-up built on this RFC, together
-with partitions that follow another cluster's bucket (see
+object storage and the VSR log still orders it, is a follow-up built on this RFC, together with
+partitions that follow another cluster's bucket. Both have since shipped as geo topics (see
 [Forward compatibility](#forward-compatibility)). The README
 advertises "data backups and archiving to disk or S3", and no archiver exists on master. This RFC
 is what makes that sentence true.
@@ -60,24 +60,21 @@ is what makes that sentence true.
 
 ### For operators
 
-Tiered storage is enabled per node in `config.toml` and switched on per topic. A node needs a
-backend and, for the object store backends, credentials:
+Tiered storage is enabled per node by choosing a backend in `config.toml`, and switched on per
+topic. A node needs a backend and, for the object store backends, credentials:
 
 ```toml
 [tiered_storage]
-enabled = true
-backend = "s3"                # "s3" | "fs"; "gcs" | "azure" once their providers ship
-
-[tiered_storage.s3]
+backend = "s3"                # "none" (default) | "fs" | "s3" | "gcs"
 bucket = "iggy-prod"
 endpoint = ""                 # empty = AWS; set for MinIO, Ceph, R2
-prefix = "iggy"               # credentials from the config or IGGY_TIERED_STORAGE_S3_*
+prefix = "iggy"               # credentials from the config, the environment or the node's role
 ```
 
 At boot the node probes the bucket once and refuses to start only on a deterministic
-misconfiguration, such as rejected credentials or a missing bucket. A transient failure boots the
-node with `upload_stalled` raised, so a restart during a store outage never costs the cluster a
-replica. The credentials need list, get, put and delete on the prefix, and the prefix must have no
+misconfiguration, such as rejected credentials, a missing bucket, or a store that ignores
+conditional creates. A transient failure boots the node with `object_store_unreachable` raised, so
+a restart during a store outage never costs the cluster a replica. The credentials need list, get, put and delete on the prefix, and the prefix must have no
 lifecycle rule that deletes or archives objects: Iggy deletes them itself, and an archived object
 cannot be read without a restore. The `fs` backend points at a directory on another filesystem. It
 is what tests use and what "archive to disk" means.
@@ -85,12 +82,12 @@ is what tests use and what "archive to disk" means.
 Every node must reach the same store, and matching configuration cannot prove it: per-node `fs`
 directories at one path, or a MinIO on each node's `localhost`, look identical. The cluster writes a
 store identity object carrying its `cluster_uid` (see [Object layout](#object-layout)) under its
-prefix once, and a node uploads, evicts or reads remote segments
-only after reading that object back through its own backend since it booted. Enabling tiering on a
-topic is refused while any node cannot. A store that becomes unreachable later is an outage, during
-which eviction of floored segments continues, while an identity found missing or different stops
-the node's uploads, eviction and remote reads and answers `TieredReadFailed`. A node booted during
-an outage evicts nothing until the store returns. A node that finds tiered segments on disk with no
+prefix, and a node uploads, evicts or deletes objects only after reading that object back through
+its own backend since it booted. Enabling tiering on a topic is refused while any node cannot. A
+store that becomes unreachable later is an outage, during which eviction of floored segments
+continues, while an identity found missing or different stops the node's uploads, eviction and
+deletions. Remote reads of the node's own store are not gated by the identity. A node booted
+during an outage evicts nothing until the store returns. A node that finds tiered segments on disk with no
 backend configured refuses to boot.
 
 A topic opts in with options, at creation or later:
@@ -108,8 +105,8 @@ From then on `message_expiry` and `max_topic_size` mean total data, local and re
 in the store. Enabling `tiered_storage` is one-way until rehydration exists: an update or reset
 that turns it off is refused with `OptionNotUpdatable`.
 
-Each node exports local and remote bytes, upload and fetch counts, cache hits and misses, a
-per-partition upload lag and an `upload_stalled` gauge. A store outage affects neither producers
+Each node exports read cache and fetch counters, the store identity and reachability gauges, the
+shard's oldest segment upload lag, and the anomalies the verify pass and the orphan sweep find. A store outage affects neither producers
 nor consumers of warm data while the disk has room: uploads retry, the floor stops, and cold reads
 have their own admission cap. Segments uploaded before the outage keep being evicted, so local disk
 passes the local envelope only once data written during the outage fills it. An outage that
@@ -137,12 +134,11 @@ of external consumer groups, which never hold retention.
 A tiered segment is a normal segment whose location is `Remote` instead of `Local`: its `.log` is
 gone, its `.index` is kept or fetched on first use, and a marker in the partition's chain file lets
 boot rebuild it without the network. The poll plan resolves a local or remote source per segment.
-Remote segments are read through a chunk cache that the shard's own tier tasks fill with ranged
+Remote segments are read through a read cache that the shard's own tier tasks fill with ranged
 GETs, and a walk crosses into the next segment at byte zero, whatever its source.
 
-All object store I/O lives in a new `core/tiered_storage` crate behind an `ObjectStore` trait, with
-`s3`, `fs` and `sim` implementations first and `gcs` and `azure` later, behind the same contract
-tests. Object store requests run as cooperative tasks on the shard that owns the partition and
+All object store I/O lives in a new `core/object_store` crate behind an `ObjectStore` trait, with
+`fs`, `s3`, `gcs` and in-memory implementations behind the same contract tests, and `azure` later. Object store requests run as cooperative tasks on the shard that owns the partition and
 never block it.
 
 ## Reference-level explanation
@@ -151,7 +147,8 @@ never block it.
 
 ### Facts about master this design depends on
 
-Verified on `master @ 6ce2f92a9`.
+Verified on `master @ 6ce2f92a9`, before this RFC was implemented. The partition plane has since
+gained the state-machine facility this RFC adds.
 
 - Sealed segments hold only committed data and are byte-identical across replicas: the primary
   alone assigns offsets, checksums and timestamps, and encrypts payloads once. The sparse `.index`
@@ -204,8 +201,9 @@ Verified on `master @ 6ce2f92a9`.
 Stream, topic and partition ids are reused after deletion, so `created_revision`, unique across the
 cluster, identifies the partition incarnation. Offsets never restart within an incarnation, so keys
 never repeat within one cluster lifetime, and a prefix belongs to exactly one. The cluster claims
-its prefix through the store identity object, which carries `cluster_uid`, a random 128-bit id the
-metadata plane mints once when its log is created. Master's `cluster_id` cannot serve, since it is
+its prefix through the store identity object, which carries `cluster_uid`, the id of the metadata
+change log: the checksum of its first committed operation, which differs between two clusters of
+the same name. Master's `cluster_id` cannot serve, since it is
 a hash of the cluster name, whose default every cluster shares. A node whose `cluster_uid` differs
 from the identity object's neither uploads, evicts, deletes nor reads remote segments under that
 prefix, so a second cluster, or a cluster rebuilt empty, pointed at an occupied prefix is refused
@@ -227,7 +225,8 @@ A tiered segment leaves a marker, a small fixed-size record holding its offsets,
 incarnation and commit-path checksum, with a checksum of its own. Markers live in one file per
 partition, `remote.chain`, rather than one per segment, which halves the files a remote segment
 leaves for the install backup to link under its deadline. The chain file records the partition's
-object prefix once, when the file is created, and holds the markers plus a trim point: the front
+object prefix once, when the file is created, and holds each sealed segment's hash, the advances
+whose check is pending, the markers and a trim point: the front
 the replica's own retention left, recorded when it applies the enable of
 `tiered_storage` and raised before any later front move unlinks anything. A partition created on a
 tiered topic gets the file with its directory. Writes to the file are crash-safe, and eviction
@@ -251,9 +250,11 @@ Boot rules:
   The check is local on purpose: metadata at boot can trail the last truncation this replica
   enforced, so comparing with `deleted_up_to_offset` would refuse healthy replicas.
 - A missing chain file is not a refusal by itself, since boot cannot tell it from a crash between
-  the enable and the file's creation. The replica rebuilds its markers from the store and refuses
-  the partition when a front stays unaccounted for. A rebuilt trim point is unverified until no
-  replica holds data below it.
+  the enable and the file's creation. A replica whose local log starts where nothing can be missing
+  starts a new chain. Otherwise it rebuilds its markers from the store, only below its first local
+  segment and never above the floor, and refuses the partition when a front stays unaccounted for.
+  The rebuilt trim point is the truncation metadata already committed, so a rebuild drives no new
+  truncation or deletion. A partition with no local data is never rebuilt from the store.
 - A marker of another incarnation is quarantined with the partition. Quarantine, converge and the
   install sweep handle the chain file beside the other partition files.
 
@@ -293,8 +294,7 @@ hash with the commit-path hash, so a primary's media fault fails the upload and 
 instead of reaching the store. The store verifies a body checksum, and the upload counts only when
 it matches. A `.log` key that already exists counts as uploaded only after a HEAD shows the same
 size and checksum, and a difference raises a divergence alarm and leaves the floor. An existing
-`.index` key needs only to be a valid index for that `.log`, since sparse indexes differ per
-replica. If the primary's barrier-clamped removal retired the segment during the upload, its objects
+`.index` key needs only to hold whole index entries, since sparse indexes differ per replica. If the primary's barrier-clamped removal retired the segment during the upload, its objects
 are scheduled for deletion and no advance covers it. The watermark alone never deletes an object.
 
 On success the primary commits `AdvanceTieredFloor { start, up_to, hash }` through the partition's
@@ -334,8 +334,8 @@ Tiered storage must never turn a store outage or a stalled floor into a full dis
 free-space reserve large enough for reclaim to run, producers get the retryable error before it is
 crossed, and a shortfall on one node alone must not stop the cluster. The reserve exists because a
 stalled floor frees nothing on any replica, every reclaim step writes before it frees, and master
-stops a node whose WAL write fails. A partition whose ingest outruns its uploads is throttled the
-same way, so it writes at its upload pace rather than spending the reserve.
+stops a node whose WAL write fails. A partition whose ingest outruns its uploads is not throttled
+on its own: it is bounded by the node's reserve like every other partition.
 
 #### Partition state machines
 
@@ -364,11 +364,13 @@ The facility provides:
   bounded time on the pump, and leaves slow work, such as eviction, to side effects staged after
   it. A command its machine refuses commits as a no-op, so a refusal never stops a replica, while a
   failure to persist the log stops it, as for data ops.
-- **Its own checkpoint.** A snapshot of every machine at one op is the state-machine log's replay
-  point, independent of the data log's checkpoint. Boot restores both checkpoints and replays each
-  log above its own, and the state-machine journal drops commands only below its checkpoint.
-- **State transfer.** An install carries the machines' snapshot as one artifact at the transfer's
-  commit point.
+- **A shared checkpoint.** The data log's checkpoint is the group's one replay point. A snapshot of
+  every machine at that op is durable before the data log publishes it, and rides as an optional
+  tail of the checkpoint, written only when some machine holds state, so a partition with no
+  machine state keeps its checkpoint unchanged. Boot restores both and replays the merged sequence
+  above it, and the state-machine journal drops commands only below it.
+- **State transfer.** An install carries the machines' snapshot with the data checkpoint at the
+  transfer's commit point.
 - **A share of the pipeline.** Commands share the group's pipeline with message batches under a cap
   on the slots they may hold, so a busy machine never stalls producers.
 - **Primacy.** A new primary acts on a machine's state only after applying every command committed
@@ -387,8 +389,8 @@ incarnation of its own and is removed with the incarnation. `AdvanceTieredFloor`
 follows:
 
 - A `start` above `floor + 1` is refused, so the floor never jumps over a segment nobody uploaded.
-  An empty floor counts as `floor + 1 = 0`.
-- Otherwise the floor becomes `max(floor, up_to)`, and a repeated advance is a no-op.
+  An empty floor counts as `floor + 1 = 0`. A `start` above `up_to` is refused.
+- Otherwise the floor becomes `max(floor, up_to)`, so a repeated or lower advance changes nothing.
 
 The state holds no per-segment data: keys and markers carry the segment list, so the snapshot stays
 a few bytes, and each replica checks the hash outside the machine. The floor is monotone for the
@@ -448,22 +450,21 @@ location. The plan stops where the poll's byte budget runs out rather than at th
 remote segments make the chain as long as total retention. A walk that finds a segment planned as
 local already evicted re-plans it as remote instead of failing the poll.
 
-#### Chunk cache
+#### Read cache
 
-A directory under the node's data path holds chunks of remote `.log` objects under their full object
-key, so the prefix and `created_revision` are part of every path and no incarnation ever reads
-another's chunks. Chunk boundaries snap to batch boundaries through the sparse index, so a batch
-never costs two GETs. A miss reserves cache space before it downloads. Chunks need no fsync: a
-chunk whose length or batch checksums do not match is dropped and fetched again.
+Each shard keeps an in-memory cache of fixed-size blocks of remote objects, keyed by the full object
+key, so the prefix and `created_revision` are part of every key and no incarnation ever reads
+another's blocks. A poll's range maps to the blocks it overlaps, adjacent missing blocks are fetched
+in one GET, and readers of the same block share one fetch. A fetch fills the cache even when its
+poll stopped waiting, so the retry hits it.
 
-A cold poll does not wait for a whole chunk. It fetches exactly the walk's range first, serves the
-walk from the response and hydrates the surrounding chunk in the background. Readers of the same
-cold segment share one fetch per chunk, readahead adapts to sequential readers, and a poll further
-behind the head than the cache could hold streams without admitting chunks, so a backfill cannot
-evict the working set near the head. Each shard has its own slice of the cache budget, with no
-cross-shard coordination, because a partition's chunks are only ever read by the shard that owns
-it. The cache persists across restarts, and chunks of a retired incarnation are removed with its
-directory.
+Eviction is scan-resistant: a long sequential read turns over only a small part of the budget and
+cannot evict blocks several consumers share. Readahead adapts to sequential readers, runs in a job
+class that never competes with a waiting poll, and keeps what it fetched apart until its reader
+arrives. Each shard has its own budget, with no cross-shard coordination, because a partition's
+blocks are only ever read by the shard that owns it. A topic may limit what its partitions hold, as
+a limit drawn from the shard's budget rather than a reservation, and may set its readahead. The
+cache is lost on restart, and a cache of zero size reads each walk's range straight from the store.
 
 #### Indexes for remote segments
 
@@ -483,10 +484,9 @@ a completion-lane slot, so a store outage never refuses a warm poll. A failed fe
 with backoff, so client retries reply at once and cost the store nothing.
 
 Transient store errors (throttling, timeouts, transport errors, a full cache) reply 58. Permanent
-ones (rejected credentials, an archived object, an object missing above what total retention
-removed, a malformed response, a store identity mismatch) reply a new non-retryable code,
-`TieredReadFailed`, which every SDK learns. The Java SDK's poll path, which retries 58 every 50 ms,
-gains the backoff the Rust SDK has. Batch-checksum validation is always on for remote chunks. Only
+ones (rejected credentials, an archived or missing object, a failed precondition, a malformed
+response) reply a new non-retryable code, `TieredReadFailed`, which every SDK learns. The Java SDK's poll path, which retries 58 every 50 ms,
+gains the backoff the Rust SDK has. Batch-checksum validation is always on for remote reads. Only
 the primary serves polls, so cold reads and uploads happen on the same node, and after a rebalance
 the new primary's cache is cold.
 
@@ -530,8 +530,9 @@ bounded per pass. The partition's size statistic keeps meaning total retained by
 
 ### Tier service and backends
 
-All tier work runs on the shard that owns the partition, as cooperative compio tasks, with no extra
-threads. Each shard has one tier service owning its HTTP client, its slice of the cache and its
+All tier work runs on the shard that owns the partition, as cooperative compio tasks, with no
+thread pool. Only calls that would block a shard, name resolution and `fs` directory listings, run
+on short-lived threads. Each shard has one tier service owning its HTTP client, its slice of the cache and its
 per-class caps. Every job runs as a detached task, the way disk polls do, never inline in a frame
 handler, so the pump, including the consensus tick, keeps running between the task's awaits. Two
 rules keep a 1 GiB upload from delaying the pump:
@@ -551,19 +552,22 @@ store I/O, and a hung mount affects only the provider, which sees it as a store 
 
 #### The abstraction
 
-The `ObjectStore` trait has five operations: a streamed PUT of exact length with an optional
-conditional create, a ranged GET, HEAD, batch DELETE and a paged LIST. Keys are plain strings,
-errors are typed (not found, precondition failed, throttled, transport, auth, archived, malformed),
-and retries and timeouts live above the trait. A segment is one streamed PUT, since Iggy never
-produces an object above the single-PUT limit, and no provider holds a whole segment in memory.
+The `ObjectStore` trait has a streamed PUT of exact length with an optional conditional create, a
+ranged GET, HEAD, batch DELETE, a paged LIST, and an upload in parts that becomes one object only
+when it completes. Keys are plain strings, errors are typed, and retries and timeouts live above
+the trait. A tiered segment is one streamed PUT, since Iggy never produces a tiered segment above
+the single-PUT limit, and no provider holds a whole tiered segment in memory. A put whose outcome
+is unknown may be sent again: an attempt that finds its own object already there counts as a
+success, so a slow put can get a second attempt without risking a duplicate.
 Each provider is a sans-I/O signer, URL layout and response parser, unit-tested against recorded
 fixtures, over one compio-native HTTP client per shard (`cyper` over rustls) whose hostname
 resolution never blocks the shard.
 
-The `s3` provider (AWS S3, MinIO, Ceph RGW, R2, GCS interoperability), `fs` (a directory on another
-filesystem, used by Docker-free tests) and `sim` (the deterministic simulator, with fault injection)
-ship first. `gcs`, for GCS without HMAC keys, and `azure`, for Azure Blob including hierarchical
-namespaces, follow in phase 6. Every provider uses the store's conditional create and a
+The `s3` provider (AWS S3, MinIO, Ceph RGW, R2), `fs` (a directory on another filesystem, used by
+Docker-free tests) and in-memory stores for tests and benchmarks ship first. `gcs`, over the GCS
+JSON API, followed in phase 6, since GCS's S3 interoperability does not honour conditional creates.
+`azure`, for Azure Blob including hierarchical namespaces, and `sim`, a store for the deterministic
+simulator with fault injection, remain to be built. Every provider uses the store's conditional create and a
 store-verified body checksum where the store offers them, and `fs` publishes atomically, so a crash
 never leaves a torn object under a final key. Credentials are refreshed once per node and shared
 with every shard: static first, then instance metadata, web identity and the GCS and Azure workload
@@ -576,30 +580,35 @@ shard loses primacy or whose incarnation retires is cancelled for good.
 - **State transfer.** The chain file travels as one artifact rather than one entry per segment,
   since the transfer manifest's entry count is capped. The receiver installs it, trim point
   included, with the machines' snapshot, and fetches indexes lazily. No segment bytes cross between
-  replicas for tiered data.
+  replicas for data the store holds, including a stored segment the sender still keeps on disk once
+  the store confirms it.
 - **Delete.** The history fence of a two-phase delete is an op of the same sequence, so no floor
   command commits after it, and the next incarnation starts with an empty floor. When metadata
-  completes the delete, the reconciler removes the directory and the
-  incarnation's cache chunks, and the metadata primary queues its prefix for object deletion. An
-  orphan sweep lists `{prefix}/` at incarnation granularity under a metadata
-  revision snapshot and deletes incarnations absent from metadata, as a safety net.
+  completes the delete, the reconciler removes the directory, and the metadata primary queues its
+  prefix for object deletion. An orphan sweep lists `{prefix}/` at incarnation granularity under a
+  metadata revision snapshot, as a safety net. It deletes an incarnation only after two sweeps in a
+  row found it absent from metadata and its newest object is past a grace period, and never touches
+  objects older than the cluster's claim of the prefix.
 - **Manifest object.** The primary uploads `manifest.bin` under `meta/` when the remote set changes,
-  rate-limited. It is derived, never the source of truth for a live cluster, and exists so a
-  partition can be restored into an empty cluster by reading one object and planting markers. Its
-  format is versioned and documented, and it is written after every object it names, because a
-  restore or a follower reads it as the source of truth.
-- **Verify pass.** Housekeeping HEADs keys below the floor within a quota and compares each object's
-  checksum with the marker's, so a missing or divergent object is reported as an anomaly rather than
-  found by a reader. Such an object above what total retention removed is data loss, never
-  repaired automatically.
+  rate-limited. It is derived, never the source of truth for a live cluster, and serves followers in
+  other clusters and the cross-check of a chain file rebuilt from the store. Its format is versioned
+  and documented, and it is written after every object it names, because a follower reads it as the
+  source of truth. A plain tiered topic is never restored from the bucket alone: it acknowledges a
+  send before upload, so the bucket holds only a prefix of the log, and a restore would present a
+  shorter log as the whole one.
+- **Verify pass.** Housekeeping on the primary HEADs the stored segments once a day within a quota
+  and compares each object's size and checksum with the partition's record, so a missing or
+  divergent object is reported as an anomaly rather than found by a reader. Such an object above
+  what total retention removed is data loss, never repaired automatically.
 
 ### Forward compatibility
 
-Two follow-ups are planned on top of this RFC: partitions that follow another cluster's bucket, so
-a cluster in another datacenter serves that data from object storage, and a topic mode with the
-semantics of Redpanda's cloud topics: a write is acknowledged once its data is in object storage,
-the VSR log still orders it, and any cluster that can read the bucket can serve it. Neither is
-designed here, and neither commits to Redpanda's mechanism.
+Two follow-ups build on this RFC: partitions that follow another cluster's bucket, so a cluster in
+another datacenter serves that data from object storage, and a topic mode with the semantics of
+Redpanda's cloud topics: a write is acknowledged once its data is in object storage, the VSR log
+still orders it, and any cluster that can read the bucket can serve it. Neither is designed here,
+and neither commits to Redpanda's mechanism. Both have since shipped as geo topics and the shadow
+topics that follow them.
 
 The first is settled as far as it constrains this RFC. Each cluster has a bucket of its own and is
 the only writer under its prefix. A cluster that follows another reads that cluster's prefix, and
@@ -637,11 +646,14 @@ and manifest, or in a format of its own.
 
 ### Configuration
 
-The server section names the backend and its location (bucket, prefix and endpoint for `s3`, a path
-for `fs`), the credentials and the chunk cache's size. It joins the server configuration with
-defaults, so existing files keep working, and credentials follow the pattern of the cluster secrets,
-so they never appear in printed or serialized configuration. Concurrency, bandwidth, timeouts, the
-poll deadline, deletion pacing and the grace period are tuning knobs settled in implementation.
+The server section names the backend and its location (bucket, prefix and endpoint for `s3` and
+`gcs`, a path for `fs`), the credentials, and the read cache's size and readahead, which topics can
+override. It joins the server configuration with defaults, so existing files keep working, and
+credentials follow the pattern of the cluster secrets, so they never appear in printed or
+serialized configuration. Concurrency, bandwidth, timeouts, retries, the poll deadline, deletion
+pacing and the orphan sweep's grace are tuning knobs settled in implementation. The free-space
+reserve is a node setting, since it protects every partition on the disk. The defaults are
+provisional until measured under load.
 
 Topic options are catalog keys. Their defaults are catalog constants, not server configuration, so
 there are no server-level local retention defaults.
@@ -685,9 +697,10 @@ admission records explicitly set critical keys as well.
 8. The consumer barrier applies to total retention and to nothing else.
 9. A segment with a local `.log` is read locally. The store is consulted only for segments whose
    local copy is gone.
-10. Correctness never depends on object store conditional writes. A conditional PUT is a cost
-    optimization, and neither a precondition failure nor an existing `.log` key is success without
-    a size and checksum match.
+10. The store must honour conditional creates, which the boot probe and the identity check
+    enforce, since the identity object depends on them. A segment upload still never trusts one
+    alone: neither a precondition failure nor an existing `.log` key is success without a size and
+    checksum match.
 11. Every tier wait of a poll runs under one deadline inside the read timeout, and cold polls never
     hold more completion-lane slots than their own cap, so a store outage never refuses a warm poll.
 12. Tiering never fills a data disk. Producers are refused before a node crosses its free-space
@@ -697,8 +710,8 @@ admission records explicitly set critical keys as well.
 
 | Failure | Behaviour |
 | --- | --- |
-| Store unreachable during upload | Uploads retry with backoff, the floor stays and eviction waits. Producers and consumers are unaffected while the disk has room, and the stalled gauge rises. Producers are refused before the free-space reserve, and eviction frees the space once the store returns. |
-| Store unreachable during a cold poll | The poll returns what it read within its deadline, or 58. Failed chunks are remembered, so retries cost no GETs, and the cold admission cap keeps warm polls serving. |
+| Store unreachable during upload | Uploads retry with backoff, the floor stays and eviction waits. Producers and consumers are unaffected while the disk has room, and the upload lag gauge rises. Producers are refused before the free-space reserve, and eviction frees the space once the store returns. |
+| Store unreachable during a cold poll | The poll returns what it read within its deadline, or 58. Fetches keep running past the deadline, so retries hit the cache, and the cold admission cap keeps warm polls serving. |
 | Store refuses for a permanent reason | `TieredReadFailed`, which no SDK retries, and an alarm naming the cause. |
 | Primary dies or is moved mid-upload | The old primary cancels its uploads. The new one starts from the latest committed floor, lists the prefix, truncates to a verified trim point if needed and re-uploads. An existing `.log` key counts only after a size and checksum match, and an existing `.index` only needs to be valid. |
 | Upload lands after its segment was deleted | The uploader schedules the object's deletion. The listing on becoming primary catches what a lost primary left. |
@@ -710,13 +723,14 @@ admission records explicitly set critical keys as well.
 | Single-replica re-anchor gap | The `.anchor` stays beside the segment, and the segment's advance carries `start = floor + 1`, so the floor and eviction keep moving. |
 | Object missing on GET | Below what the primary's removal reached: retire locally. A primary whose metadata trails the latest watermark treats it as transient. Otherwise data loss: `TieredReadFailed` and a metric. |
 | Replica behind in the partition's op sequence | It evicts less until it applies the latest floor. Reads are unaffected. |
-| Replica restarts or is rebuilt by state transfer | Markers rebuild segment metadata and the cache survives. The floor comes back from the state-machine checkpoint and the commands above it, or with the install's snapshot. |
+| Replica restarts or is rebuilt by state transfer | Markers rebuild segment metadata, fetched indexes stay on disk and the read cache starts empty. The floor comes back from the machines' snapshot at the checkpoint and the commands above it, or with the install's snapshot. |
 | State-machine log or checkpoint unreadable | Boot refuses the partition and it is rebuilt from its peers, as for the data log. |
 | Topic or partition deleted during an upload | No floor command commits after the delete's history fence, and the metadata primary queues the prefix for deletion. |
 | WAL still hard-links an evicted segment | Eviction never touches the WAL tail or checkpoint-cursor segment. Below them, unlinking the public name is what retention does today. |
 | Cache full | The cache trims on the failed reservation. A fetch that still finds no room fails as transient, and the poll replies 58. |
-| Node boots during a store outage | It boots with `upload_stalled` raised and evicts nothing until it has read the store identity. Only a deterministic misconfiguration refuses boot. |
-| Node finds the store identity missing or different | The node neither uploads, evicts nor reads remote segments, and answers `TieredReadFailed`. Enabling tiering is refused until every node reads it. |
+| Node boots during a store outage | It boots with `object_store_unreachable` raised and evicts nothing until it has read the store identity. Only a deterministic misconfiguration refuses boot. |
+| Node finds the store identity missing or different | The node neither uploads, evicts nor deletes objects. Enabling tiering is refused until every node reads it. |
+| Chain file present but the store lost or replaced an object | The verify pass reports it once found and once cleared. Nothing is repaired. |
 | Clock skew against the store | One re-sign with the offset the store's rejection reports. A second failure is a hard error. |
 
 ### Implementation plan
@@ -732,14 +746,15 @@ Each phase is one reviewable PR or a short stack. The phases form a graph, not a
 | 5. Age roll | the master fix that unlinks rolled `.log` files on WAL truncation |
 | 6. The bucket as an archive | phase 4; the GCS and Azure providers need only phase 3 |
 
-Phases 1, 2, 3 and 5 can proceed in parallel, and phase 4 is where the branches join. Every phase that changes what is on disk (1, 2 and 5) bumps
-`STORAGE_FORMAT`, so an older binary refuses the directory instead of unlinking kept indexes and
-accepting a missing tiered prefix as a front trim.
+Phases 1, 2, 3 and 5 can proceed in parallel, and phase 4 is where the branches join. The on-disk
+changes landed behind one `STORAGE_FORMAT` bump when tiering was enabled, so an older binary refuses
+the directory instead of unlinking kept indexes and accepting a missing tiered prefix as a front
+trim.
 
 1. **Local model without a network.** The `ObjectStore` trait, the `fs` provider, the provider
    contract tests and the counting semaphore. On top of them the segment location and commit-path
    hash, the chain file with its boot rules and its rebuild from the store, eviction driven by a
-   test-set floor, remote sources in the poll plan and the chunk cache, all against `fs`.
+   test-set floor, remote sources in the poll plan and the read cache, all against `fs`.
 2. **Partition state machines and the floor.** The state-machine log in the partition's consensus
    group with its journal, checkpoint, recovery, repair, state transfer and pipeline share, the
    machine registry, then the floor machine and the per-replica hash check.
@@ -755,14 +770,19 @@ accepting a missing tiered prefix as a front trim.
    tick latency, which settles the tuning defaults.
 5. **Age roll.** `segment_max_age` as a general topic option, the roll rule in materialization and
    the WAL, and the WAL format change. Independent of tiering, so it can land first.
-6. **The bucket as an archive.** Manifests under `meta/`, shallow restore, the verify pass, and the
-   GCS and Azure providers. Anything that watches manifests detects change by ETag: one LIST of a
-   `meta/` prefix, then a conditional GET.
+6. **The bucket as an archive.** Manifests under `meta/`, the verify pass, the orphan sweep, the
+   rebuild of a lost chain file, and the GCS and Azure providers. Anything that watches manifests
+   detects change by ETag: one LIST of a `meta/` prefix, then a conditional GET. Shallow restore of
+   a plain tiered topic was dropped (see [Cluster interactions](#cluster-interactions)).
 
 Tests per phase: crash-point and boot tests against `fs` and the simulator's storage harness for
 phases 1 and 5, simulator scenarios with view changes, repair and restarts across both logs for
-phase 2, provider contract tests against `fs` and MinIO for
-phase 3, and three-node integration scenarios under `--features vsr` for phase 4.
+phase 2, provider contract tests against `fs` and S3 and GCS emulators for phase 3, and three-node
+integration scenarios under `--features vsr` for phase 4.
+
+Status: phases 1 to 5 and phase 6 without Azure are done. Still to be done: the `sim` store with
+fault injection and the simulator scenarios that use it, the Azure provider, and defaults measured
+under load.
 
 ## Drawbacks
 
@@ -773,7 +793,7 @@ phase 3, and three-node integration scenarios under `--features vsr` for phase 4
   message batches. The floor adds one command per uploaded segment, negligible at the default 1 GiB
   segment size but chatty with a short `segment_max_age` on many slow partitions.
 - A new crate with its own HTTP client, signers and provider parsers is code the project has to own
-  and keep correct against three providers' quirks, where a vendor SDK would have absorbed them.
+  and keep correct against each provider's quirks, where a vendor SDK would have absorbed them.
 - Tier work shares the shard's thread with producers and consumers, and compio has no scheduling
   groups to cap its CPU share. Piece-wise work with explicit yields and per-class caps bound how
   long the pump waits, but a shard with many cold readers and a large upload backlog gives tiering
@@ -948,9 +968,6 @@ not exist.
 
 Open design decisions:
 
-- **Total retention's watermark.** `TruncatePartition` stays in the metadata plane. As a partition
-  machine it would be ordered with the data and share the floor's log, and `DeleteSegments`
-  resolution would move with it.
 - **Master's control ops as machines.** Consumer offsets, fences, session retirement and producer
   state could move into machines. The shared sequence keeps their order, so only their storage,
   checkpoint and transfer format would change.
@@ -960,20 +977,25 @@ Open design decisions:
   of GETs after each move.
 - **The idle-partition roll and an updatable age.** Both need a roll ordered with the batches, a
   data-log operation. Whether either is worth one is open.
-- **Self-healing from local copies.** Re-uploading a missing object from a backup's local copy is
-  cheap because segments are byte-identical, where Redpanda only records the anomaly.
 - **Encryption at rest for unencrypted streams.** Bucket-side encryption headers, or plaintext
   objects documented as such. Encrypted streams already yield ciphertext objects.
-- **The segment checksum in the object key.** It turns a byte-identity violation into two objects
-  instead of a precondition failure, at the price of finding an object by offset alone.
 - **A `segment_size` floor for tiered topics** above the catalog's 1 MiB, settled by measurement.
-- **Eager WAL checkpoints.** A lagging checkpoint holds local data past the envelope, since eviction
-  stops at the checkpoint-cursor segment. Whether eviction should request one is open.
 - **Placement and store identity.** Whether the rebalance should avoid giving primacy to a node that
   cannot read the store identity, rather than letting that node refuse the partition.
-- **Indexes in the cache.** Whether a remote segment's `.index` should move into the chunk cache, so
-  the files the install backup links stop growing with total retention, at the price of an index
-  fetch on a cold poll.
+- **Identity and remote reads.** Remote reads of a node's own store are not gated by the store
+  identity today. Whether a node whose identity check fails should also stop serving them is open.
+- **Self-healing from local copies.** Re-uploading a missing object from a backup's local copy is
+  cheap because segments are byte-identical. The verify pass only reports a missing object today.
+
+Settled in implementation:
+
+- **Total retention's watermark.** `TruncatePartition` stays in the metadata plane for tiered
+  topics.
+- **The segment checksum in the object key.** Not added: keys hold offsets only.
+- **Eager WAL checkpoints.** Eviction that stops at the checkpoint-cursor segment requests a new
+  checkpoint.
+- **Indexes in the cache.** A remote segment's `.index` stays on disk once fetched and is not moved
+  into the read cache.
 
 Out of scope for this RFC: the two follow-ups in [Forward compatibility](#forward-compatibility),
 which build on it, and, addressable later independently of it, restore and mount from the manifest,
@@ -985,6 +1007,6 @@ Simulator versus integration coverage: the deterministic simulator covers the pr
 across view changes, restarts and slot reuse, the eviction rules, the chain file in state transfer,
 the orphan sweep, the `sim` store with injected faults), and its storage harness covers the chain
 file's crash points and boot rules and the two roll sites agreeing. Simulator partitions have no
-directory, so byte-level reads, the chunk cache and cold-read latency need integration tests against
+directory, so byte-level reads, the read cache and cold-read latency need integration tests against
 `fs` and MinIO, and the three-node scenarios need the `--features vsr` cluster harness. Real
 provider quirks and cloud credential chains rely on the contract tests and manual verification.
