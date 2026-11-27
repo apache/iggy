@@ -36,9 +36,9 @@ The [prototype](#prototype) found these differences, among others:
 | --- | --- |
 | Go | `GetStream` returns error 1009 (`stream_id_not_found`) for a missing stream. Rust and Java return no stream. |
 | Python | `create_topic` and `create_consumer_group` return `None`, where the Rust SDK returns the new resource. |
-| C++ | Errors carry no Iggy code, so an application cannot tell `unauthenticated` (code 40) from other errors. |
+| C++ | Some read calls, such as `GetStreams`, drop the Iggy code of an error, so an application cannot tell `unauthenticated` (code 40) from other errors. |
 | Node.js | `stream.get` returns a stream without its list of topics. |
-| Swift | No call resolves an operation with an unknown outcome. A committing deferred poll uses a connection of its own. An uncertain join fails with error 57, not 14006. |
+| Swift | A write with an unknown outcome fails with error 57, not 14006, and no call resolves it. A committing deferred poll uses a connection of its own. |
 | PHP | `createStream` and `createTopic` return nothing. A received message has no `origin_timestamp` and no headers. |
 
 An application that moves to another SDK finds these differences at run time.
@@ -51,8 +51,9 @@ consumer groups have no member list.
 Go, Java, C#, Node.js and Swift implement the binary protocol themselves, with the 256-byte consensus header of
 `core/binary_protocol/src/consensus/header.rs`.
 They also implement a client contract that the public API does not show.
-The contract works on lanes. A lane is the ordered queue of writes to one resource, such as a partition or a consumer
-group.
+The contract works on lanes. A lane admits one write at a time, in order.
+A client has one lane for metadata writes, such as a consumer group join, and one lane per partition.
+Offset operations and committing polls share a separate progress gate per partition.
 When the network loses the reply to a send, the contract works like this:
 
 1. The call fails with `operation_uncertain` (code 14006) and names the request number of the lost request.
@@ -148,8 +149,8 @@ tests:
 
 `client0` is a client of the SDK under test, signed in as root by default.
 `$$capture` stores the id of the new stream, and `$$ref` uses it in later calls.
-`outcome` runs after the operations with the orchestrator's own client, so the final state does not depend on the SDK
-under test.
+`outcome` runs after the agent resets, with the orchestrator's own client, so the final state does not depend on the
+SDK under test.
 
 The Go SDK fails the last operation:
 
@@ -164,11 +165,13 @@ The skip list names the failure until the Go SDK changes or the discussion of th
 [[divergence]]
 sdk = "go"
 test = "streams/stream_crud.yaml#Delete a stream."
+operation = 2
+answer = {error = {code = 1009}}
 issue = "https://github.com/apache/iggy/issues/NNNN"
 reason = "GetStream returns ErrStreamIdNotFound (1009) for a missing stream, where Rust and Java return no stream"
 ```
 
-A listed divergence does not fail the run.
+The run accepts error 1009 at operation 2, but any other failure of the test still fails the run.
 Once the Go SDK passes the test, the run fails until someone removes the entry.
 
 ### A fault test
@@ -185,7 +188,6 @@ description: >-
   resolves it. The resolution replays the send, and the server stores the messages once.
 run_on:
   - transports: [tcp]
-    capabilities: [resolve_operation]
 initial_data:
   - name: create_stream
     arguments: {name: orders}
@@ -223,6 +225,13 @@ tests:
         name: resolve_operation
         arguments: {operation_id: {$$ref: lost}}
       - object: client0
+        name: send_messages
+        arguments:
+          stream_id: orders
+          topic_id: events
+          partitioning: {partition_id: 0}
+          messages: [{id: "3", payload: after}]
+      - object: client0
         name: poll_messages
         arguments:
           stream_id: orders
@@ -231,33 +240,39 @@ tests:
           strategy: first
           count: 10
         expect_result:
-          count: 1
-          messages: [{offset: 0, id: "1", payload: once}]
+          count: 2
+          messages:
+            - {offset: 0, id: "1", payload: once}
+            - {offset: 1, id: "3", payload: after}
     expect_frames:
       - client: client0
         commands: [message.send]
         frames:
           - {direction: request, request: {$$ref: lost}, outcome: forwarded}
-          - {direction: reply, request: {$$ref: lost}, outcome: dropped}
+          - {direction: reply, request: {$$ref: lost}, outcome: dropped, committed: true}
           - {direction: request, request: {$$ref: lost}, outcome: forwarded}
           - {direction: reply, request: {$$ref: lost}, outcome: forwarded}
+          - {direction: request, request: {$$not: {$$ref: lost}}, outcome: forwarded}
+          - {direction: reply, outcome: forwarded}
 ```
 
 The proxy forwards the first send and drops its reply, so the server stores the message, but the SDK never learns it.
-The test asserts three facts that the public API does not show:
+The test asserts four facts that the public API does not show:
 
-- The error names the request number of the lost send.
-- The second send sends no frame, because `expect_frames` allows exactly two send requests.
+- The error names the request number of the lost send, and the dropped reply has `committed: true`.
+- The blocked send sends no frame, because `expect_frames` lists every send request.
 - The resolution replays the send with the same request number, and the partition holds the message once.
+- The send after the resolution gets a new request number, so the lane is free.
 
-The Swift SDK has no call that resolves an operation, so the Swift agent does not announce `resolve_operation`.
-Swift then skips the test, and the report gives the reason.
+The file does not require `resolve_operation`, so an SDK without that call runs the first two sends and skips at the
+replay.
+Swift fails the first send with error 57, not 14006, so the skip list names a divergence.
 
 ### A cluster test
 
-`scripts/run-conformance-tests.sh` starts a two-node cluster whose nodes advertise a proxy host.
-The orchestrator listens on that host, on the port of each node, for the whole run.
-Every cluster client then stays behind the proxy, also after the SDK follows a redirect to the leader.
+`scripts/run-conformance-tests.sh` starts a two-node cluster whose nodes advertise a proxy host to the proxy.
+The orchestrator listens on that host, on the port of each node, for the whole run, and dials the nodes from it.
+Every SDK client then stays behind the proxy, also after the SDK follows a redirect to the leader.
 `conformance/tests/cluster/leader_redirection.yaml` restates `bdd/scenarios/leader_redirection.feature`.
 This is one of its four tests:
 
@@ -330,8 +345,7 @@ The rules in [Skips and divergences](#skips-and-divergences) keep the list down 
 
 A change under `conformance/tests/`, `conformance/skips.toml` or `core/conformance/` needs a maintainer review.
 An expected value changes only with a reason in the pull request.
-Look hardest at a pull request that changes an SDK, its agent and an expected value together.
-It can weaken a test to fit the SDK.
+CI refuses a pull request that changes an SDK and also changes an existing test or adds a skip-list entry.
 
 ## Reference-level explanation
 
@@ -339,19 +353,25 @@ It can weaken a test to fit the SDK.
 
 - The result types in `iggy_common` derive `Serialize`, and the HTTP API returns them as JSON.
   An example is `Json<StreamDetails>` in `core/server/src/http/handlers.rs`.
-- Every frame starts with the 256-byte consensus header, which carries the command, the request number, the client
-  and the session.
-  A proxy can label each frame from the header alone.
+- Every frame starts with the 256-byte consensus header.
+  A request header gives the command, the request number, the client and the session, but both sign-in commands
+  share the operation `Register`.
+  A reply header gives the request number and the client, but not the command or the session.
+  With status zero, a reply to a metadata or consumer-offset operation can still hold a rejection in its result section
+  (`Operation::is_result_framed`).
 - `iggy_binary_protocol::codes::command_name` names each command code, for example `message.send`.
 - Each cluster node advertises the address in `IGGY_CLUSTER_NODES_<n>_ADVERTISED_ADDRESS`, and an SDK follows a
   redirect to the advertised address of the leader.
-  A cluster that advertises the proxy host keeps every client behind the proxy, with no server change.
+  A node can pick the address by the network of the client, with `advertised_addresses` and `client_cidr`.
+  A cluster that advertises the proxy host only to the proxy keeps every SDK client behind the proxy.
+  The admin client stays direct, and the server needs no change.
 - `core/common/fixtures/` holds the shared codec fixtures for resource options, metadata changes and deferred polling.
   All eight foreign SDKs copy them, and the canonical forms reuse their HTTP JSON form.
 - `IggyError` has the retained-operation errors 14006 to 14010, and the native SDKs implement them.
-  Swift has the errors and `abandonOperation`, but no call that resolves an operation.
+  Swift does not retain writes, so a write with an unknown outcome fails with error 57 (`transient_not_committed`).
+  It raises 14010 for a committing read, and `abandonOperation` frees that read.
 - Python, C++ and PHP wrap the Rust SDK through pyo3, cxx and ext-php-rs.
-  For them, the suite tests the binding: names, types, error codes and async behavior.
+  For them, the suite tests the binding: types, error codes and async behavior.
   Go, Java, C#, Node.js and Swift implement the protocol themselves, so the suite tests their whole client contract.
 
 The design changes no wire format, no on-disk format and no server code.
@@ -381,7 +401,8 @@ The orchestrator does these jobs:
 
 - It loads each test file into Rust types that reject unknown keys.
 - It runs `initial_data` before each test and `outcome` after it with its own Rust SDK client.
-  This admin client connects to the server directly, not through the proxy.
+  This admin client connects to the server directly, not through the proxy, because the nodes advertise the proxy
+  host only to the proxy.
 - It starts the agent as a child process and sends it the operations of each test.
 - It decodes the arguments of each call into strict types first, so a mistake in a test file never reaches an agent.
 - It decodes each answer into its canonical form and compares it with the expectation.
@@ -443,7 +464,7 @@ The types in `core/conformance/src/format.rs` reject unknown keys, so a misspell
 | `create_entities` | The clients that the agent creates before the first operation. |
 | `operations` | The calls, in order. The first failed call ends the test. |
 | `expect_frames` | Optional. The frames that the fault proxy recorded. See [Fault proxy](#fault-proxy). |
-| `outcome` | Optional. Calls that the orchestrator makes with its own client after the operations, each with `expect_result`. |
+| `outcome` | Optional. Calls that the orchestrator makes with its own client after the agent resets, each with `expect_result`. |
 
 #### Requirements
 
@@ -466,7 +487,7 @@ A client entity has these fields:
 | `id` | The name that operations use. `orchestrator`, `proxy` and `admin` are reserved. |
 | `login` | `root` (the default), `none`, or `{username, password}`. |
 | `node` | `default` (the single node), `no_quorum`, `leader` or `follower`. |
-| `through_proxy` | `true` connects the client through a fault proxy listener of its own. |
+| `through_proxy` | `true` connects the client through a fault proxy listener of its own. `check` refuses it with a `node` other than `default`, because a cluster client moves to the addresses that the nodes advertise. |
 
 A call such as `build_reader` creates an entity of another kind, and its `save_result_as` names the new entity.
 
@@ -475,14 +496,14 @@ A call such as `build_reader` creates an entity of another kind, and its `save_r
 | Key | Meaning |
 | --- | --- |
 | `object` | An entity id, or `admin`, `orchestrator` or `proxy`. |
-| `name` | The method. For an entity, it is the Rust SDK method name. |
-| `arguments` | The arguments, named after the Rust parameters. |
+| `name` | The method. For an entity, it is the Rust SDK method name, but `build_reader` and `build_consumer` stand for the builders of `reader` and `consumer_group`. |
+| `arguments` | The Rust parameters, with the fields of an options struct inline. The builders also take `stream_id` and `topic_id`, and `build_consumer` takes `group` for the group name. Bytes take a `_hex` suffix, milliseconds take a `_ms` suffix, and `op` is `operation_id`. |
 | `expect_result` | The expected result. Without it, the call must still succeed. |
 | `expect_error` | The expected error, as `{name: unauthenticated}` or `{code: 40}`, and optionally `operation_id`. |
 | `save_result_as` | The id of the entity that the call creates. |
 | `background` | Starts the call as a task with this name. An `await` collects its answer later. |
 | `within`, `not_before` | Time bounds such as `2s` or `200ms`. For an `await`, they count from the start of the task. |
-| `eventually` | Repeats a read every 100 milliseconds until the answer matches, for at most this time. It needs an expectation, and it takes no time bounds and no saved entity. |
+| `eventually` | Repeats a read every 100 milliseconds until the answer matches, for at most this time. It needs an expectation, and it takes no time bounds and no saved entity. `check` refuses it on a write, and a poll that stores an offset counts as a write. |
 
 An error name is the snake_case name of the `IggyError` variant, as in the shared codec fixtures.
 The orchestrator maps each name to its code.
@@ -557,12 +578,13 @@ prototype branch lists the arguments and the result of each method.
 Every agent returns results in one JSON form.
 The orchestrator decodes each result into the types in `core/conformance/src/canonical.rs` before it compares values.
 A missing or unknown field fails the test, also for a field that the test does not name.
+So a new canonical field lands in the orchestrator and in every agent in one pull request.
 
 The forms follow these rules:
 
 - Field names follow the Rust SDK types.
 - Sizes are byte counts in `size_bytes`, and timestamps are microseconds.
-- A message id is decimal text.
+- Every u64 and u128 value is decimal text, such as an offset or a `checksum`.
 - A message has `payload_hex`. If the payload is valid UTF-8, the message also has `payload` as text.
 - An option map uses the HTTP JSON form of `core/common/fixtures/resource_options.json`.
   The form is `{key: {value, kind, explicit}}`, with the value as reversible text. User headers use the same text form.
@@ -604,7 +626,7 @@ Then it writes requests, each with an `id`:
 {"id":1,"op":"create","kind":"client","entity":"client0","args":{"transport":"tcp","address":"127.0.0.1:8090","login":{"username":"iggy","password":"iggy"}}}
 {"id":2,"op":"call","entity":"client0","method":"get_stream","args":{"stream_id":1}}
 {"id":3,"op":"call","entity":"client0","method":"build_reader","args":{"stream_id":"orders","topic_id":"events"},"save_as":"reader0"}
-{"id":4,"op":"start","task":"poll0","entity":"client0","method":"poll_messages","args":{...}}
+{"id":4,"op":"start","task":"poll0","entity":"client0","method":"poll_messages","args":{"stream_id":"orders","topic_id":"events","partition_id":0,"strategy":{"offset":"9007199254740993"},"count":10}}
 {"id":5,"op":"await","task":"poll0"}
 {"id":6,"op":"cancel","task":"poll0"}
 {"id":7,"op":"close","entity":"reader0"}
@@ -616,7 +638,7 @@ The agent answers each request with exactly one of these lines:
 ```text
 {"id":2,"result":{...}}
 {"id":2,"error":{"code":40,"message":"Unauthenticated"}}
-{"id":2,"error":{"code":14006,"operation_id":7}}
+{"id":2,"error":{"code":14006,"operation_id":"7"}}
 {"id":2,"unsupported":"the SDK has no partition reader"}
 {"id":2,"failure":"cannot decode the arguments"}
 ```
@@ -624,11 +646,17 @@ The agent answers each request with exactly one of these lines:
 `login` is null for a client that stays signed out.
 `start` answers at once with a null result, and `await` answers at the end of the task.
 
+Both sides write every u64 and u128 value as decimal text, such as the offset of `poll0` and the `operation_id`
+of 14006.
+The orchestrator turns this text into numbers and back, so tests and captures keep a u64 as a number.
+
 Rules for every agent:
 
 1. Answer requests concurrently, and tag each answer with the `id` of its request.
+   Write each answer as one whole line, so that two answers never mix.
 2. Return an SDK error as its numeric code.
    For the errors 14006 to 14010, add `operation_id`, and for 14009 add `partition_id`.
+   The `operation_id` of 14010 is a local recovery id, so it never matches a frame `request`.
    If the SDK reports an error that has no Iggy code, return code 0 with its message.
    No `IggyError` has code 0, so the test fails, and the skip list can name the divergence.
 3. Answer `unsupported` for a method, an argument value, a transport or an entity kind that the SDK does not have.
@@ -641,8 +669,10 @@ Rules for every agent:
 
 A client with `through_proxy: true` connects through a proxy listener of its own, so every frame on the listener
 belongs to that client.
-The proxy reads the 256-byte consensus header of each frame, records the frame and forwards the bytes unchanged, so
-checksums stay valid.
+The proxy reads the 256-byte consensus header of each frame, and the result section of a reply that has one.
+It records the frame and forwards the bytes unchanged, so checksums stay valid.
+A reply takes its command and its session from the request with the same request number on its connection.
+A deferred-poll cancel reuses the request number of its poll and gets no reply, so it does not replace the poll.
 The proxy covers plain TCP only, so a test that uses it declares `transports: [tcp]`.
 
 The `proxy` object has these calls:
@@ -662,7 +692,7 @@ The `proxy` object has these calls:
 | `drop_reply` | The server applies the request, and the reply never arrives. | A reply lost after the commit |
 | `close_before_forward` | The proxy closes the connection instead of forwarding. | A network failure before the server |
 | `close_after_forward` | The proxy forwards the frame, then closes the connection. | A failure with an unknown outcome |
-| `delay` | The proxy holds the frame for `delay_ms`. | A slow network or a slow primary |
+| `delay` | The proxy holds the frame for `delay_ms`. Later frames in the same direction wait behind it. | A slow network or a slow primary |
 
 `expect_frames` matches the recorded frames of a client as a list.
 `commands` and `direction` select the frames, and pings stay out unless `include_pings` is `true`.
@@ -674,14 +704,18 @@ Each recorded frame has these fields:
 | `direction` | `request` or `reply`. |
 | `command` | The name from `iggy_binary_protocol::codes::command_name`, such as `message.send`. A frame without a request has the consensus command, such as `ping_client`. |
 | `code` | The command code. A reply has the code of its request. |
-| `request`, `client`, `session` | The request number, the client id as text, and the session. A reply repeats the request number. |
-| `status` | The status of a reply. Zero means success. |
+| `request`, `client`, `session` | The request number, the client id as decimal text, and the session. A reply has the session of its request. |
+| `status` | The status in the reply header: zero, or the code of an error before the commit. Zero alone does not prove a commit. |
+| `result` | For a reply to a metadata or consumer-offset operation, the code in its result section, such as 57 (`transient_not_committed`). Success needs a zero `status` and a zero or absent `result`. |
+| `committed` | For a reply, whether the header marks a committed result (`ReplyHeader::has_committed_result`). |
 | `size`, `at_ms` | The frame size, and the milliseconds since the listener started. |
 | `outcome` | `forwarded`, `dropped`, `delayed`, `closed_before` or `closed_after`. |
 
 With `--cluster-proxy-host`, the clients of a test share the listeners that the orchestrator holds for each cluster
 node (see [A cluster test](#a-cluster-test)).
 The proxy calls and `expect_frames` name them `@leader` and `@follower` in place of a client.
+`@leader` is the metadata primary at the start of the run.
+A partition primary can be on either node, so a fault test on a partition arms both listeners.
 
 ### Skips and divergences
 
@@ -689,32 +723,43 @@ The proxy calls and `expect_frames` name them `@leader` and `@follower` in place
 
 ```toml
 [[skip]]
-sdk = "swift"
-test = "faults/lost_send_reply.yaml#The replay of a send that the server committed stores its messages once."
+sdk = "python"
+test = "cluster/leader_redirection.yaml#A client of the follower moves to the leader."
 issue = "https://github.com/apache/iggy/issues/NNNN"
 
 [[divergence]]
 sdk = "go"
 test = "streams/stream_crud.yaml#Delete a stream."
+operation = 2
+answer = {error = {code = 1009}}
 issue = "https://github.com/apache/iggy/issues/NNNN"
 reason = "GetStream returns an error for a missing stream"
 ```
 
-With `--skips`, the orchestrator applies three rules:
+With `--skips`, the orchestrator applies four rules:
 
-- A skip that the list does not name fails the run.
-- A listed divergence does not fail the run.
+- A skip for a missing capability or an `unsupported` answer fails the run, unless the list names it.
+  A skip for a missing topology or transport never fails the run.
+- A listed divergence names the `operation` where the test fails, counted from 0, and the `answer` of the SDK there.
+  That failure does not fail the run, but a failure at another operation or with another answer does.
 - A listed test that passes fails the run, so the list can only shrink.
+- A run without `--filter` fails on an entry whose test does not exist.
 
 Test ids are relative to the corpus directory.
 To run part of the corpus, use `--filter`, not a narrower corpus directory.
 
 ### Isolation, time limits and failures
 
+A run needs a server of its own.
+At the start of a run, the orchestrator refuses a server that holds a stream or a user other than root.
 Before each test, the orchestrator deletes every stream and every user except root, with its own client.
-After each test, it sends `reset` to the agent.
+After `initial_data`, it polls each new partition until a poll succeeds, because the teardown of a deleted partition
+runs after the delete commits.
+After the operations and `expect_frames`, it sends `reset` to the agent and then runs `outcome`.
 If the reset fails or takes more than 30 seconds, the orchestrator stops the agent and starts a new one for the next
 test.
+At the end of each test, it closes the proxy connections of the test and drops the frames that `delay` holds.
+It also clears the rules and the recording of each shared listener, and restarts its connection count and its clock.
 
 The orchestrator waits up to 300 seconds for the hello, because the start of the agent counts toward it.
 It waits up to 90 seconds for an answer that has no time bound in the test.
@@ -731,16 +776,15 @@ Each test ends with one of four verdicts:
 
 The run fails in three cases:
 
-- A test fails, and the skip list names no divergence for it.
+- A test fails, and no listed divergence names that failure.
 - A test errors.
 - A rule of the skip list does not hold.
 
 ### Versioning
 
 Every test file has `schema_version: "1.0"`.
-The orchestrator refuses a file with another major version and skips a file with a newer minor version.
-This RFC proposes that a new optional key raises the minor version, and a key that changes meaning raises the major
-version.
+The orchestrator refuses a file with any other version.
+The corpus and the orchestrator come from the same commit, so a format change updates both in one pull request.
 The agent protocol has its own version, which the hello names.
 
 ### CI
@@ -792,8 +836,9 @@ Three rules keep the assertions in one place:
 1. The matcher and the canonical forms live only in the orchestrator.
 2. People write the expected values, and `record` output is only a starting point (see
    [Why people write the expected values](#why-people-write-the-expected-values)).
-3. Changes under `conformance/tests/`, `conformance/skips.toml` and `core/conformance/` need a maintainer review.
+3. A CI check refuses a pull request that changes an SDK and also changes an existing test or adds a skip-list entry.
    A coding agent that ports an SDK change then cannot weaken a test in the same pull request.
+   The prototype does not have this check yet.
 
 Two more safeguards are not built yet:
 
@@ -892,12 +937,15 @@ The canonical form also pays for itself, because it makes the shape of each resu
 
 The Rust SDK lives next to the server in `core/sdk/`, and Python, C++ and PHP wrap it.
 Its result types already derive `Serialize`, and the HTTP API already returns them as JSON.
-A form that follows them needs no second description of each type.
+The forms live in one place, `core/conformance/src/canonical.rs`.
+Each conversion destructures its Rust type, so a new field fails the build until the form takes it or drops it by name.
+The forms drop some fields, such as `Partition.members`, `Partition.in_sync_members` and `OptionSpec.default_value`.
 
-The prototype departs from the raw serde form in three places:
+The forms depart from the raw serde form in three places:
 
 - Sizes are byte counts in `size_bytes`, so every SDK reports the same number.
-- A u128 value is decimal text, because no JSON number holds it exactly in every language.
+- Every u64 and u128 value is decimal text, because JavaScript and PHP round a JSON number above 2^53.
+  The metadata changes form keeps the exact encoding of its fixture, with a u128 as 32 hex characters.
 - Options and headers use the HTTP JSON form of the shared codec fixtures, which all eight foreign SDKs already copy.
 
 This RFC rejects two alternatives:
@@ -905,7 +953,7 @@ This RFC rejects two alternatives:
 - The names and the bodies of the HTTP API.
   They do not depend on a language, but the HTTP API has no readers, no consumers and no retained operations.
 - A neutral schema, written for the suite.
-  It is a second description of every type, and it can drift from the code.
+  It is a second description of every type, and no compiler ties it to the Rust types.
 
 ### Why a proxy and not server failpoints
 
@@ -989,16 +1037,18 @@ port them to a real server.
    Each divergence then becomes an issue for its SDK, unless the discussion changes the expected answer.
    The first cases are the Go error for a missing stream, the Python create calls that return `None`, and the C++ errors
    without codes.
+   To accept two answers for one call, the format needs an expectation that matches a result or an error.
 2. The canonical names.
-   The prototype uses the names of the Rust methods and their parameters, and the names of the HTTP API are the main
-   alternative.
+   The prototype uses the names of the Rust methods and their parameters, with the exceptions in
+   [Operations](#operations).
+   The names of the HTTP API are the main alternative.
 3. Where the agents live and who owns them.
    The prototype puts every agent under `conformance/agents/<sdk>/`.
    Node.js and C# keep their BDD code inside their SDK trees, and their agents can do the same.
    The maintainers of each SDK must accept its agent.
 4. Errors without an Iggy code.
    Agents answer them as code 0, so a test that expects a named error fails.
-   The C++ SDK reports its errors this way today.
+   Some read calls of the C++ SDK, such as `GetStreams`, report their errors this way today.
 5. Three choices of the prototype agents:
    - The Node.js SDK reads an option without its kind, so the Node.js agent takes the kind from the JavaScript type of
      the value.
@@ -1009,12 +1059,22 @@ port them to a real server.
 6. A deadline for fault tests.
    A fault test waits for the operation deadline of the SDK, about 30 seconds in Rust.
    With one configuration key for that deadline in every SDK, these tests take a few seconds.
+   An alternative is an optional deadline per call in agent protocol 1.
+   The Rust SDK has `with_binary_deadline` for this, but it is `#[doc(hidden)]`.
 7. The deletion rule and gaps that last.
    Under the rule, a feature stays in `bdd/` until every SDK that ran it passes its YAML file.
    PHP blocks all five remaining features, and it alone blocks `metadata_changes`.
    If the skip list names such a gap with an issue, can the feature leave?
-8. Format versions across releases.
-   Agents can announce the format versions that they support, or the orchestrator can support one version per release.
+8. Agent protocol versions across releases.
+   The orchestrator can accept only its own protocol version, or also older ones to run the agent of an older SDK
+   release.
+9. The error of an uncertain join.
+   Rust fails the join with `operation_uncertain` (14006) and abandons it at once, but 14006 names a retained operation.
+   Swift fails it with `transient_not_committed` (57).
+10. Background calls.
+    `start` answers before the SDK sends, so the corpus orders background calls with `wait`, and a slow agent can flip
+    a test.
+    A proxy call that waits for a matching frame can replace `wait`.
 
 ### Out of scope
 
