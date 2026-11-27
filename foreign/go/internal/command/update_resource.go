@@ -82,6 +82,17 @@ var optionCatalog = []optionRule{
 	{key: string(iggcon.TopicOptionTieredStorage), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}, updatable: true, enableOnly: true},
 	{key: string(iggcon.TopicOptionLocalRetentionAge), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}, updatable: true, resettable: true},
 	{key: string(iggcon.TopicOptionLocalRetentionSize), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}, updatable: true, resettable: true},
+	{key: string(iggcon.TopicOptionTopicType), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}},
+	{key: string(iggcon.TopicOptionGeoMode), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}},
+	{key: string(iggcon.TopicOptionFreshUploadInterval), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}, updatable: true},
+	{key: string(iggcon.TopicOptionConsumerOffsetUploadInterval), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}, updatable: true},
+	{key: string(iggcon.TopicOptionPositionsPublishInterval), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}, updatable: true},
+	{key: string(iggcon.TopicOptionTombstoneGrace), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}, updatable: true},
+	{key: string(iggcon.TopicOptionPositionsResumeTimeout), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}, updatable: true},
+	{key: string(iggcon.TopicOptionLongTermRewriteMaxInterval), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}, updatable: true},
+	{key: string(iggcon.TopicOptionReadCacheSize), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}, updatable: true},
+	{key: string(iggcon.TopicOptionReadAhead), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}, updatable: true},
+	{key: string(iggcon.StreamOptionShadowOrigin), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeStream}, readOnly: true},
 	{key: "critical_keys", scopes: []iggcon.OptionsScope{iggcon.OptionsScopeStream, iggcon.OptionsScopeTopic, iggcon.OptionsScopeUser}, readOnly: true},
 }
 

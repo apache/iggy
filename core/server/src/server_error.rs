@@ -19,7 +19,7 @@ use crate::shard_allocator::ShardingError;
 use consensus::VsrStateError;
 use iggy_binary_protocol::Operation;
 use metadata::impls::recovery::RecoveryError;
-use partitions::PartitionRecoveryError;
+use partitions::{PartitionRecoveryError, StoreViewRequest};
 use server_common::log::LogError;
 use shard::ShardCtorError;
 use std::error::Error as _;
@@ -324,6 +324,42 @@ pub enum ServerError {
         partition_id: usize,
         namespace_raw: u64,
     },
+    /// The partition of a tiered topic found no chain file, and something
+    /// below its local front may have left the disk. Boot leaves it unbuilt,
+    /// and the reconciler loads it again with what `request` reads from the
+    /// store.
+    #[error(
+        "partition {stream_id}/{topic_id}/{partition_id} found no segment chain, and the offsets \
+         {} to {} below its local log wait for the object store",
+        request.from,
+        request.front.saturating_sub(1)
+    )]
+    PartitionChainMissing {
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        request: Box<StoreViewRequest>,
+    },
+    /// The loader wrote the chain it rebuilt from the store. Its caller loads
+    /// the partition once more over that chain, so recovery checks it by the
+    /// rules of any other chain.
+    #[error(
+        "partition {stream_id}/{topic_id}/{partition_id} rebuilt its segment chain from the \
+         object store"
+    )]
+    PartitionChainRebuilt {
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    },
+    #[error(
+        "the rebuild of the segment chain at {dir} could not read an anchor or write the chain"
+    )]
+    PartitionChainRebuildIo {
+        dir: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error(
         "shard {shard_id} aborted while waiting for shard-0 to broadcast the metadata \
          factory bundle; shard 0 dropped its sender (most likely it failed to recover)"
@@ -463,24 +499,45 @@ pub enum ServerError {
         #[source]
         source: iggy_object_store::ObjectStoreError,
     },
+    #[error(
+        "tiered storage cannot start: the object store took a create-only put over the \
+         existing store identity object {key:?}, so it ignores conditional creates, which \
+         uploads rely on. Point tiered_storage.backend ({backend}) and tiered_storage.endpoint \
+         at a store that refuses a create over an existing object"
+    )]
+    TieredStorageConditionalCreate {
+        key: String,
+        backend: configs::tiered_storage::TieredStorageBackend,
+        #[source]
+        source: iggy_object_store::ObjectStoreError,
+    },
     #[error("tiered storage cannot start: no runtime for the boot probe")]
     TieredStorageProbeRuntime {
         #[source]
         source: std::io::Error,
     },
     #[error(
-        "tiered storage cannot start: the {source_name} of the s3 backend handed out no credentials"
+        "tiered storage cannot start: the {source_name} of {subject} handed out no credentials"
     )]
     TieredStorageCredentials {
+        subject: String,
         source_name: &'static str,
         #[source]
-        source: iggy_object_store::s3::credentials::CredentialError,
+        source: iggy_object_store::credentials::CredentialError,
     },
-    #[error("tiered storage cannot start: the credentials refresher of the s3 backend")]
+    #[error("tiered storage cannot start: the credentials refresher of {subject}")]
     TieredStorageCredentialsThread {
+        subject: String,
         #[source]
         source: std::io::Error,
     },
+    #[error("tiered storage cannot start: the gcs backend has no access token")]
+    TieredStorageGcsKeyFile {
+        #[source]
+        source: iggy_object_store::gcs::credentials::KeyFileError,
+    },
+    #[error("geo peer {origin:?} can never be read: {reason}")]
+    GeoPeer { origin: String, reason: String },
 }
 
 /// Per-shard outcome captured by [`crate::boot::ShardHandles::join_all`]

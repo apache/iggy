@@ -36,6 +36,8 @@ import org.apache.iggy.partition.Partition;
 import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.stream.EncryptionKeySource;
 import org.apache.iggy.system.CacheMetricsKey;
+import org.apache.iggy.topic.GeoMode;
+import org.apache.iggy.topic.TopicType;
 import org.apache.iggy.user.UserStatus;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -93,6 +95,18 @@ class BytesDeserializerTest {
     }
 
     private static void writeTopicData(ByteBuf buffer, int partitionsCount) {
+        writeTopicData(
+                buffer,
+                partitionsCount,
+                Map.of(HeaderKey.fromString("max_topic_size"), HeaderValue.fromUint64(BigInteger.TEN)),
+                Map.of(HeaderKey.fromString("segment_size"), HeaderValue.fromString("1 GiB")));
+    }
+
+    private static void writeTopicData(
+            ByteBuf buffer,
+            int partitionsCount,
+            Map<HeaderKey, HeaderValue> options,
+            Map<HeaderKey, HeaderValue> derivedOptions) {
         buffer.writeIntLE(10); // topic ID
         writeU64(buffer, BigInteger.valueOf(1000)); // created at
         buffer.writeIntLE(partitionsCount);
@@ -100,9 +114,8 @@ class BytesDeserializerTest {
         writeU64(buffer, BigInteger.valueOf(50)); // messages count
         buffer.writeByte(4); // name length
         buffer.writeBytes("test".getBytes());
-        writeOptionsBlock(
-                buffer, Map.of(HeaderKey.fromString("max_topic_size"), HeaderValue.fromUint64(BigInteger.TEN)));
-        writeOptionsBlock(buffer, Map.of(HeaderKey.fromString("segment_size"), HeaderValue.fromString("1 GiB")));
+        writeOptionsBlock(buffer, options);
+        writeOptionsBlock(buffer, derivedOptions);
     }
 
     private static void writeTopicDataWithUnknownOptionKind(ByteBuf buffer) {
@@ -291,6 +304,102 @@ class BytesDeserializerTest {
             var topic = readTopic(buffer);
 
             assertThat(topic.options()).containsOnlyKeys("max_topic_size");
+        }
+
+        @Test
+        void shouldReadTheTypeAndModeOfAGeoTopic() {
+            ByteBuf buffer = Unpooled.buffer();
+            writeTopicData(
+                    buffer,
+                    1,
+                    Map.of(HeaderKey.fromString("topic_type"), HeaderValue.fromString("geo")),
+                    Map.of(HeaderKey.fromString("geo_mode"), HeaderValue.fromString("geo_tiered")));
+            writePartitionData(buffer);
+            ByteBuf topicOnly = buffer.copy();
+
+            var topic = readTopic(topicOnly);
+            var topicDetails = readTopicDetails(buffer);
+
+            assertThat(topic.topicType()).contains(TopicType.GEO);
+            assertThat(topic.geoMode()).contains(GeoMode.GEO_TIERED);
+            assertThat(topicDetails.topicType()).contains(TopicType.GEO);
+            assertThat(topicDetails.geoMode()).contains(GeoMode.GEO_TIERED);
+        }
+
+        @Test
+        void shouldReadNoGeoModeOnANormalTopic() {
+            ByteBuf buffer = Unpooled.buffer();
+            writeTopicData(
+                    buffer, 4, Map.of(), Map.of(HeaderKey.fromString("topic_type"), HeaderValue.fromString("normal")));
+
+            var topic = readTopic(buffer);
+
+            assertThat(topic.topicType()).contains(TopicType.NORMAL);
+            assertThat(topic.geoMode()).isEmpty();
+        }
+
+        @Test
+        void shouldReadTheDurationsAGeoTopicSetsAndNoneItLeavesUnset() {
+            ByteBuf buffer = Unpooled.buffer();
+            writeTopicData(
+                    buffer,
+                    1,
+                    Map.of(
+                            HeaderKey.fromString("topic_type"),
+                            HeaderValue.fromString("geo"),
+                            HeaderKey.fromString("consumer_offset_upload_interval"),
+                            HeaderValue.fromUint64(BigInteger.ZERO),
+                            HeaderKey.fromString("tombstone_grace"),
+                            HeaderValue.fromUint64(BigInteger.valueOf(3_600_000_000L))),
+                    Map.of(HeaderKey.fromString("geo_mode"), HeaderValue.fromString("geo")));
+            writePartitionData(buffer);
+            ByteBuf topicOnly = buffer.copy();
+
+            var topic = readTopic(topicOnly);
+            var topicDetails = readTopicDetails(buffer);
+
+            assertThat(topic.consumerOffsetUploadInterval()).contains(BigInteger.ZERO);
+            assertThat(topic.tombstoneGrace()).contains(BigInteger.valueOf(3_600_000_000L));
+            assertThat(topic.freshUploadInterval()).isEmpty();
+            assertThat(topic.positionsPublishInterval()).isEmpty();
+            assertThat(topic.positionsResumeTimeout()).isEmpty();
+            assertThat(topic.longTermRewriteMaxInterval()).isEmpty();
+            assertThat(topicDetails.consumerOffsetUploadInterval()).contains(BigInteger.ZERO);
+            assertThat(topicDetails.tombstoneGrace()).contains(BigInteger.valueOf(3_600_000_000L));
+            assertThat(topicDetails.freshUploadInterval()).isEmpty();
+            assertThat(topicDetails.positionsPublishInterval()).isEmpty();
+            assertThat(topicDetails.positionsResumeTimeout()).isEmpty();
+            assertThat(topicDetails.longTermRewriteMaxInterval()).isEmpty();
+        }
+
+        @Test
+        void shouldReadTheReadCacheSizesATopicSetsAndNoneItLeavesUnset() {
+            ByteBuf buffer = Unpooled.buffer();
+            writeTopicData(
+                    buffer,
+                    1,
+                    Map.of(
+                            HeaderKey.fromString("read_cache_size"),
+                            HeaderValue.fromUint64(BigInteger.ZERO),
+                            HeaderKey.fromString("read_ahead"),
+                            HeaderValue.fromUint64(BigInteger.valueOf(2_097_152L))),
+                    Map.of(HeaderKey.fromString("topic_type"), HeaderValue.fromString("normal")));
+            writePartitionData(buffer);
+            ByteBuf topicOnly = buffer.copy();
+            ByteBuf unset = Unpooled.buffer();
+            writeTopicData(
+                    unset, 1, Map.of(), Map.of(HeaderKey.fromString("topic_type"), HeaderValue.fromString("normal")));
+
+            var topic = readTopic(topicOnly);
+            var topicDetails = readTopicDetails(buffer);
+            var topicWithoutSizes = readTopic(unset);
+
+            assertThat(topic.readCacheSize()).contains(BigInteger.ZERO);
+            assertThat(topic.readAhead()).contains(BigInteger.valueOf(2_097_152L));
+            assertThat(topicDetails.readCacheSize()).contains(BigInteger.ZERO);
+            assertThat(topicDetails.readAhead()).contains(BigInteger.valueOf(2_097_152L));
+            assertThat(topicWithoutSizes.readCacheSize()).isEmpty();
+            assertThat(topicWithoutSizes.readAhead()).isEmpty();
         }
 
         @Test

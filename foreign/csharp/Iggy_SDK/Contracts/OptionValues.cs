@@ -17,6 +17,7 @@
 
 using Apache.Iggy.Enums;
 using Apache.Iggy.Headers;
+using Apache.Iggy.Utils;
 
 namespace Apache.Iggy.Contracts;
 
@@ -59,6 +60,24 @@ internal static class OptionValues
         return Find(explicitOptions, derivedOptions, key) is { Kind: HeaderKind.Uint64 } value
             ? value.ToUInt64()
             : ulong.MaxValue;
+    }
+
+    /// <summary>A duration in microseconds that has no default, null when absent.</summary>
+    internal static TimeSpan? Duration(Dictionary<HeaderKey, HeaderValue>? explicitOptions,
+        Dictionary<HeaderKey, HeaderValue>? derivedOptions, TopicOptionKey key)
+    {
+        return Find(explicitOptions, derivedOptions, key) is { Kind: HeaderKind.Uint64 } value
+            ? DurationHelpers.FromDuration(value.ToUInt64())
+            : null;
+    }
+
+    /// <summary>A size in bytes that has no default, null when absent.</summary>
+    internal static ulong? Size(Dictionary<HeaderKey, HeaderValue>? explicitOptions,
+        Dictionary<HeaderKey, HeaderValue>? derivedOptions, TopicOptionKey key)
+    {
+        return Find(explicitOptions, derivedOptions, key) is { Kind: HeaderKind.Uint64 } value
+            ? value.ToUInt64()
+            : null;
     }
 
     private static HeaderValue? Find(Dictionary<HeaderKey, HeaderValue>? explicitOptions,

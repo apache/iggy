@@ -54,6 +54,13 @@ it('translates the reply size refusal', () => {
   assert.equal(translateErrorCode(97), 'The reply is larger than the reply size limit');
 });
 
+it('translates the shadow stream write refusal', () => {
+  assert.equal(
+    translateErrorCode(1021),
+    "The stream is a shadow of another cluster's stream and takes no writes"
+  );
+});
+
 it('translates the consumer-offset capacity error', () => {
   assert.equal(translateErrorCode(3024), 'Consumer offset limit reached for partition, raise [partition] consumer_offsets_max');
 });

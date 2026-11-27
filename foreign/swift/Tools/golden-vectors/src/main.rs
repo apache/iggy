@@ -100,11 +100,11 @@ use iggy_binary_protocol::{
     WireIdentifier, WireName, WirePartitioning, WirePollingStrategy,
 };
 use iggy_common::{
-    CompressionAlgorithm, DeferredPollOptions, Durability, IggyByteSize, IggyDuration, IggyError,
-    IggyExpiry, MaxTopicSize, NO_ASSIGNED_PARTITION, OptionKey, OptionsPatch,
-    RESYNC_REQUIRED_PARTITION_SENTINEL, StreamCreateOptions, StreamEncryptionKey,
-    StreamUpdateOptions, TopicCreateOptions, TopicUpdateOptions, UserStatus, UserUpdateOptions,
-    stream_key_fingerprint,
+    CompressionAlgorithm, DeferredPollOptions, Durability, GeoMode, GeoTopicDurations,
+    IggyByteSize, IggyDuration, IggyError, IggyExpiry, MaxTopicSize, NO_ASSIGNED_PARTITION,
+    OptionKey, OptionsPatch, RESYNC_REQUIRED_PARTITION_SENTINEL, StreamCreateOptions,
+    StreamEncryptionKey, StreamUpdateOptions, TopicCreateOptions, TopicReadCache, TopicType,
+    TopicUpdateOptions, UserStatus, UserUpdateOptions, stream_key_fingerprint,
 };
 use secrecy::SecretString;
 use serde::Serialize;
@@ -1901,7 +1901,20 @@ fn main() {
         },
     );
 
-    // Domain option blocks.
+    // Domain option blocks. The zero duration of a geo topic and the zero
+    // readahead are values, sent rather than dropped as a default.
+    let geo_durations = GeoTopicDurations {
+        fresh_upload_interval: Some(IggyDuration::from(50_000u64)),
+        consumer_offset_upload_interval: Some(IggyDuration::from(0u64)),
+        positions_publish_interval: Some(IggyDuration::new_from_secs(2)),
+        tombstone_grace: Some(IggyDuration::new_from_secs(3_600)),
+        positions_resume_timeout: Some(IggyDuration::new_from_secs(30)),
+        long_term_rewrite_max_interval: Some(IggyDuration::new_from_secs(20)),
+    };
+    let read_cache = TopicReadCache {
+        size: Some(IggyByteSize::from(16_777_216)),
+        read_ahead: Some(IggyByteSize::from(0)),
+    };
     let create_options = TopicCreateOptions {
         partitions_count: Some(3),
         compression_algorithm: Some(CompressionAlgorithm::Gzip),
@@ -1925,6 +1938,10 @@ fn main() {
             1_800,
         ))),
         local_retention_size: Some(MaxTopicSize::Custom(IggyByteSize::from(536_870_912))),
+        topic_type: Some(TopicType::Geo),
+        geo_mode: Some(GeoMode::GeoTiered),
+        geo_durations,
+        read_cache,
         raw: BTreeMap::new(),
     };
     add(
@@ -1940,6 +1957,8 @@ fn main() {
             1_800,
         ))),
         local_retention_size: Some(MaxTopicSize::Custom(IggyByteSize::from(536_870_912))),
+        geo_durations,
+        read_cache,
         ..Default::default()
     };
     add(

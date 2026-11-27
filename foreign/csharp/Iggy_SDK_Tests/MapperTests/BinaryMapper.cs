@@ -419,6 +419,81 @@ public sealed class BinaryMapper
         Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapTopic(payload));
     }
 
+    [Fact]
+    public void MapTopic_ReadsTheTypeAndModeOfAGeoTopic()
+    {
+        const byte stringKind = 2;
+        var (topicId, _, topicName, _, sizeBytes, messagesCount, createdAt, _) =
+            TopicFactory.CreateTopicResponseFields();
+        var payload = BinaryFactory.CreateTopicPayload(topicId, 0, topicName, sizeBytes, messagesCount, createdAt,
+            BinaryFactory.CreateOptionEntry(stringKind, "topic_type", stringKind, "geo"u8.ToArray()),
+            BinaryFactory.CreateOptionEntry(stringKind, "geo_mode", stringKind, "geo_tiered"u8.ToArray()));
+
+        var response = Mappers.BinaryMapper.MapTopic(payload);
+
+        Assert.Equal(TopicType.Geo, response.TopicType);
+        Assert.Equal(GeoMode.GeoTiered, response.GeoMode);
+    }
+
+    [Fact]
+    public void MapTopic_ReadsNoGeoModeOnANormalTopic()
+    {
+        const byte stringKind = 2;
+        var (topicId, _, topicName, _, sizeBytes, messagesCount, createdAt, _) =
+            TopicFactory.CreateTopicResponseFields();
+        var payload = BinaryFactory.CreateTopicPayload(topicId, 0, topicName, sizeBytes, messagesCount, createdAt,
+            derivedOptions: BinaryFactory.CreateOptionEntry(stringKind, "topic_type", stringKind, "normal"u8.ToArray()));
+
+        var response = Mappers.BinaryMapper.MapTopic(payload);
+
+        Assert.Equal(TopicType.Normal, response.TopicType);
+        Assert.Null(response.GeoMode);
+    }
+
+    [Fact]
+    public void MapTopic_ReadsTheDurationsAGeoTopicSetsAndNullForTheOthers()
+    {
+        const byte stringKind = 2;
+        const byte uint64Kind = 12;
+        var (topicId, _, topicName, _, sizeBytes, messagesCount, createdAt, _) =
+            TopicFactory.CreateTopicResponseFields();
+        byte[] options =
+        [
+            ..BinaryFactory.CreateOptionEntry(stringKind, "topic_type", stringKind, "geo"u8.ToArray()),
+            ..BinaryFactory.CreateOptionEntry(stringKind, "consumer_offset_upload_interval", uint64Kind,
+                BitConverter.GetBytes(0UL)),
+            ..BinaryFactory.CreateOptionEntry(stringKind, "tombstone_grace", uint64Kind,
+                BitConverter.GetBytes(3_600_000_000UL))
+        ];
+        var payload = BinaryFactory.CreateTopicPayload(topicId, 0, topicName, sizeBytes, messagesCount, createdAt,
+            options, BinaryFactory.CreateOptionEntry(stringKind, "geo_mode", stringKind, "geo"u8.ToArray()));
+
+        var response = Mappers.BinaryMapper.MapTopic(payload);
+
+        Assert.Equal(TimeSpan.Zero, response.ConsumerOffsetUploadInterval);
+        Assert.Equal(TimeSpan.FromHours(1), response.TombstoneGrace);
+        Assert.Null(response.FreshUploadInterval);
+        Assert.Null(response.PositionsPublishInterval);
+        Assert.Null(response.PositionsResumeTimeout);
+        Assert.Null(response.LongTermRewriteMaxInterval);
+    }
+
+    [Fact]
+    public void MapTopic_ReadsAZeroReadCacheAsZeroAndAnUnsetReadAheadAsNull()
+    {
+        const byte stringKind = 2;
+        const byte uint64Kind = 12;
+        var (topicId, _, topicName, _, sizeBytes, messagesCount, createdAt, _) =
+            TopicFactory.CreateTopicResponseFields();
+        var payload = BinaryFactory.CreateTopicPayload(topicId, 0, topicName, sizeBytes, messagesCount, createdAt,
+            BinaryFactory.CreateOptionEntry(stringKind, "read_cache_size", uint64Kind, BitConverter.GetBytes(0UL)));
+
+        var response = Mappers.BinaryMapper.MapTopic(payload);
+
+        Assert.Equal(0UL, response.ReadCacheSize);
+        Assert.Null(response.ReadAhead);
+    }
+
     private static byte[] PinnedTopicHeader(uint partitionsCount)
     {
         return BinaryFactory.CreateTopicPayload(7, partitionsCount, "replicated", 2048, 300, 1_710_000_000_000);

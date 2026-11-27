@@ -17,6 +17,7 @@
 
 use crate::http::http_client::HttpClient;
 use crate::http::http_transport::HttpTransport;
+use crate::http::path::encode_segment;
 use async_trait::async_trait;
 use iggy_common::ClusterClient;
 use iggy_common::{ClusterMetadata, IggyError};
@@ -30,5 +31,14 @@ impl ClusterClient for HttpClient {
             .await
             .map_err(|_| IggyError::InvalidJsonResponse)?;
         Ok(metadata)
+    }
+
+    async fn retire_geo_origin(&self, origin: &str) -> Result<(), IggyError> {
+        self.post(
+            &format!("/geo/origins/{}/retire", encode_segment(origin)),
+            &serde_json::json!({}),
+        )
+        .await?;
+        Ok(())
     }
 }

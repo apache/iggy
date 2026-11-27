@@ -19,8 +19,8 @@
 //! take OMB run ids only, so an iggy-bench run id gives 400 here.
 
 use super::{
-    AppState, EmbedPage, EmbedQuery, PngQuery, Result, embed_response, get_client_addr,
-    page_file_name, png_file_name, render_png,
+    AppState, EmbedPage, EmbedQuery, PngQuery, Result, cached_card, card_file_name, embed_response,
+    get_client_addr, page_file_name, png_file_name, render_png,
 };
 use crate::error::IggyBenchDashboardServerError;
 use crate::omb::embed::setup_line_hash;
@@ -29,6 +29,7 @@ use crate::render::EmbedChart;
 use actix_web::error::BlockingError;
 use actix_web::http::header::{ContentDisposition, ContentType};
 use actix_web::{HttpRequest, HttpResponse, get, mime, web};
+use bench_dashboard_shared::card::RunCard;
 use bench_dashboard_shared::embed::OmbChartType;
 use bench_dashboard_shared::omb::detail::OmbRunDetail;
 use bench_dashboard_shared::omb::id::OmbRunId;
@@ -227,6 +228,28 @@ pub async fn embed_omb_chart_png(
     Ok(embed_response(mime::IMAGE_PNG, png, OMB_EMBED_MAX_AGE_SECS))
 }
 
+/// The preview card of an OMB run, the link preview image of its page. It takes no query, as the
+/// iggy-bench card.
+#[get("/embed/omb/{id}/card.png")]
+pub async fn embed_omb_card_png(
+    app: web::Data<AppState>,
+    data: web::Data<OmbState>,
+    id: web::Path<String>,
+    req: HttpRequest,
+) -> Result<HttpResponse> {
+    let id = run_id(&id)?;
+    // The log names the parsed id, because a `%0A` in the path decodes to a line break.
+    info!(
+        "{}: Embed card request for OMB run '{id}'",
+        get_client_addr(&req)
+    );
+    let run = data.run(id)?;
+    let card = RunCard::omb_run(&run.summary);
+    let name = card_file_name(cache_file_prefix(&run.summary), &card);
+    let png = cached_card(&app, &name, card).await?;
+    Ok(embed_response(mime::IMAGE_PNG, png, OMB_EMBED_MAX_AGE_SECS))
+}
+
 impl OmbState {
     fn run(&self, id: OmbRunId) -> Result<OmbRun> {
         self.cache
@@ -395,7 +418,7 @@ mod tests {
         app_state_with_cache_dir, cached_path, fixture_file_prefix, header, png_name,
         render_pool_without_renderer,
     };
-    use crate::handlers::{embed_chart, embed_chart_png, unknown_api_path};
+    use crate::handlers::{embed_card_png, embed_chart, embed_chart_png, unknown_api_path};
     use crate::omb::test_fixtures::{
         FIXTURE_OMB_RESULTS_DIR, FixtureRun, NEWEST_FIRST, NO_CONSUMERS, PUBLISH_ERRORS,
         RC1_DEFAULT, RC1_PERSISTED,
@@ -407,8 +430,11 @@ mod tests {
         CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_SECURITY_POLICY, CONTENT_TYPE, X_FRAME_OPTIONS,
     };
     use actix_web::{App, test};
+    use bench_dashboard_shared::card::CARD_SIZE;
     use bench_dashboard_shared::embed::PngSize;
+    use bench_dashboard_shared::head::PageHead;
     use bench_dashboard_shared::omb::setup::OMB_SETUP_FILE_NAME;
+    use resvg::tiny_skia::Pixmap;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -470,12 +496,53 @@ mod tests {
                     )))
                     .app_data(web::Data::new($omb_state))
                     .service(embed_omb_chart_png)
+                    .service(embed_omb_card_png)
                     .service(embed_omb_chart)
                     .service(embed_chart_png)
+                    .service(embed_card_png)
                     .service(embed_chart),
             )
             .await
         };
+    }
+
+    #[actix_web::test]
+    async fn given_omb_runs_when_requesting_image_of_their_heads_should_answer_card_png() {
+        let cache_dir = tempfile::tempdir().expect("a temporary directory is created");
+        let state = omb_state(Some(Path::new(FIXTURE_OMB_RESULTS_DIR)));
+        let paths: Vec<String> = NEWEST_FIRST
+            .iter()
+            .map(|fixture| {
+                let run = state.run(fixture.id()).expect("every fixture run loads");
+                PageHead::omb_run(&run.summary)
+                    .image
+                    .expect("an OMB run page has an image")
+                    .path
+            })
+            .collect();
+        let app = embed_app!(cache_dir.path(), state);
+
+        for path in &paths {
+            let response =
+                test::call_service(&app, test::TestRequest::get().uri(path).to_request()).await;
+
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                header(&response, CONTENT_TYPE.as_str()),
+                Some(PNG_CONTENT_TYPE)
+            );
+            let body = test::read_body(response).await;
+            let card = Pixmap::decode_png(&body).expect("the card is a PNG");
+            assert_eq!(
+                (card.width(), card.height()),
+                (CARD_SIZE.width(), CARD_SIZE.height()),
+                "{path}"
+            );
+        }
+        let unknown = format!("/embed/omb/{UNKNOWN_ID}/card.png");
+        let response =
+            test::call_service(&app, test::TestRequest::get().uri(&unknown).to_request()).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     fn embed_uri(id: &str, query: &str) -> String {

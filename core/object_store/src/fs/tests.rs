@@ -175,6 +175,46 @@ fn given_body_longer_than_the_sync_interval_when_putting_should_store_every_piec
 }
 
 #[test]
+fn given_a_body_in_small_pieces_when_writing_should_join_them_into_writes_of_the_write_size() {
+    let small = 64 * 1024;
+    let pieces: Vec<io::Result<Bytes>> = (0..(2 * WRITE_LEN + small) / small)
+        .map(|index| Ok(Bytes::from(vec![u8::try_from(index % 251).unwrap(); small])))
+        .collect();
+    let large = Bytes::from(vec![9; WRITE_LEN + 1]);
+    let whole: Vec<u8> = pieces
+        .iter()
+        .flat_map(|piece| piece.as_ref().unwrap().to_vec())
+        .chain(large.iter().copied())
+        .collect();
+
+    let writes: Vec<Bytes> = shard_runtime().block_on(
+        coalesced(stream::iter(pieces).chain(stream::iter([Ok(large)])))
+            .map(Result::unwrap)
+            .collect(),
+    );
+
+    let lens: Vec<usize> = writes.iter().map(Bytes::len).collect();
+    assert_eq!(lens, [WRITE_LEN, WRITE_LEN, small + WRITE_LEN + 1]);
+    assert_eq!(writes.concat(), whole);
+}
+
+#[test]
+fn given_a_body_that_fails_when_joining_pieces_should_end_with_its_error() {
+    let pieces = stream::iter([
+        Ok(Bytes::from_static(b"first")),
+        Err(io::Error::other("read failed")),
+        Ok(Bytes::from_static(b"never")),
+    ]);
+
+    let joined: Vec<io::Result<Bytes>> = shard_runtime().block_on(coalesced(pieces).collect());
+
+    let [Err(error)] = joined.as_slice() else {
+        panic!("{joined:?}");
+    };
+    assert_eq!(error.to_string(), "read failed");
+}
+
+#[test]
 fn given_failed_puts_when_reading_directory_should_find_no_scratch_files() {
     let (directory, store) = store();
 
@@ -707,6 +747,23 @@ fn given_stale_scratch_file_when_listing_should_remove_only_it() {
             "object".to_owned()
         ]
     );
+}
+
+#[test]
+fn given_stale_scratch_file_when_a_foreign_store_lists_should_keep_it() {
+    let (directory, owner) = store();
+    let parent = directory.path().join("a");
+    shard_runtime().block_on(put(&owner, "a/object", b"x"));
+    let scratch = ".stale.0123456789abcdef0123456789abcdef".to_owned();
+    let file = std::fs::File::create(parent.join(&scratch)).expect("file");
+    file.set_modified(SystemTime::now() - Duration::from_hours(2))
+        .expect("modification time");
+    let foreign = FsStore::foreign(directory.path());
+
+    let listed = shard_runtime().block_on(list_keys(&foreign, "a/", 1000));
+
+    assert_eq!(listed, ["a/object"]);
+    assert_eq!(names(&parent), [scratch, "object".to_owned()]);
 }
 
 #[cfg(unix)]

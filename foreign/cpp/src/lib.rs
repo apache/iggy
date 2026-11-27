@@ -73,6 +73,13 @@ mod ffi {
         message_expiry: u64,
         compression_algorithm: String,
         max_topic_size: u64,
+        topic_type: TopicType,
+        /// False on a normal topic, which has no geo mode.
+        has_geo_mode: bool,
+        geo_mode: GeoMode,
+        /// Each one unset on a normal topic.
+        geo_durations: GeoTopicDurations,
+        read_cache: TopicReadCache,
         messages_count: u64,
         partitions_count: u32,
         /// Options the creating client set explicitly. Carried as
@@ -119,6 +126,13 @@ mod ffi {
         message_expiry: u64,
         compression_algorithm: String,
         max_topic_size: u64,
+        topic_type: TopicType,
+        /// See [`Topic::has_geo_mode`].
+        has_geo_mode: bool,
+        geo_mode: GeoMode,
+        /// See [`Topic::geo_durations`].
+        geo_durations: GeoTopicDurations,
+        read_cache: TopicReadCache,
         messages_count: u64,
         partitions_count: u32,
         partitions: Vec<Partition>,
@@ -148,6 +162,10 @@ mod ffi {
         /// One per server key that wraps the stream's key, empty for a
         /// plaintext stream.
         encryption_kek_fingerprints: Vec<String>,
+        /// True only on a shadow stream, the stream that serves the geo topics
+        /// of another datacenter.
+        has_shadow_origin: bool,
+        shadow_origin: String,
     }
 
     /// Who chose a stream's at-rest data key.
@@ -156,6 +174,51 @@ mod ffi {
         None = 0,
         Stream = 1,
         Server = 2,
+    }
+
+    /// What a topic is, fixed at creation.
+    #[repr(u8)]
+    enum TopicType {
+        Normal = 0,
+        Geo = 1,
+    }
+
+    /// How a geo topic writes its messages, fixed at creation.
+    #[repr(u8)]
+    enum GeoMode {
+        Geo = 0,
+        GeoTiered = 1,
+    }
+
+    /// The durations of a geo topic in microseconds, each overriding the
+    /// server setting of the same name on every node. A `has_` flag is false
+    /// when the topic leaves its duration to that setting. Zero is a value.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct GeoTopicDurations {
+        has_fresh_upload_interval: bool,
+        fresh_upload_interval_micros: u64,
+        has_consumer_offset_upload_interval: bool,
+        consumer_offset_upload_interval_micros: u64,
+        has_positions_publish_interval: bool,
+        positions_publish_interval_micros: u64,
+        has_tombstone_grace: bool,
+        tombstone_grace_micros: u64,
+        has_positions_resume_timeout: bool,
+        positions_resume_timeout_micros: u64,
+        has_long_term_rewrite_max_interval: bool,
+        long_term_rewrite_max_interval_micros: u64,
+    }
+
+    /// The read cache settings of a topic in bytes, each overriding the
+    /// `[tiered_storage]` server setting of the same name on every node. A
+    /// `has_` flag is false when the topic leaves its setting to that node
+    /// setting. Zero is a value that turns the setting off.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct TopicReadCache {
+        has_read_cache_size: bool,
+        read_cache_size: u64,
+        has_read_ahead: bool,
+        read_ahead: u64,
     }
 
     #[repr(u8)]
@@ -451,6 +514,9 @@ mod ffi {
         has_encryption_key_fingerprint: bool,
         encryption_key_fingerprint: String,
         encryption_kek_fingerprints: Vec<String>,
+        /// See [`Stream::has_shadow_origin`].
+        has_shadow_origin: bool,
+        shadow_origin: String,
     }
 
     struct ConsumerGroupMember {
@@ -688,6 +754,7 @@ mod ffi {
         pending_max_bytes: u64,
     }
 
+    #[derive(Default)]
     struct TopicCreateOptions {
         has_partitions_count: bool,
         partitions_count: u32,
@@ -724,12 +791,19 @@ mod ffi {
         local_retention_size: String,
         has_partition_resize_policy: bool,
         partition_resize_policy: String,
+        has_topic_type: bool,
+        topic_type: String,
+        has_geo_mode: bool,
+        geo_mode: String,
+        geo_durations: GeoTopicDurations,
+        read_cache: TopicReadCache,
         raw_options: Vec<HeaderEntry>,
     }
 
     /// Reset keys travel as catalog names and are validated against the
     /// scope's catalog before anything is sent. Raw reset names are left to
     /// the server.
+    #[derive(Default)]
     struct TopicUpdateOptions {
         has_name: bool,
         name: String,
@@ -745,6 +819,10 @@ mod ffi {
         local_retention_age_value: u64,
         has_local_retention_size: bool,
         local_retention_size: String,
+        /// Set-only: none of the durations can be reset.
+        geo_durations: GeoTopicDurations,
+        /// Set-only, as the durations are.
+        read_cache: TopicReadCache,
         reset: Vec<String>,
         raw_reset: Vec<String>,
         raw_options: Vec<HeaderEntry>,
@@ -1041,8 +1119,8 @@ mod ffi {
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn get_streams(self: &Client) -> Result<Vec<Stream>>;
-        /// Reads one page of the streams. An invalid query fails with
-        /// InvalidCommand (3) before anything is sent, as on the other page calls.
+        /// Reads one page of the streams the caller may read. An invalid query fails
+        /// with InvalidCommand (3) before anything is sent, as on the other page calls.
         fn get_streams_page(
             self: &Client,
             query: NamedPageQuery,
@@ -1523,6 +1601,10 @@ mod ffi {
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn get_cluster_metadata(self: &Client) -> Result<ClusterMetadata>;
+        /// Retires the geo origin of a datacenter that never returns. Needs
+        /// root or the global manage_servers permission.
+        fn retire_geo_origin(self: &Client, origin: &str, error_info: &mut ErrorInfo)
+        -> Result<()>;
         fn get_personal_access_tokens(self: &Client) -> Result<Vec<PersonalAccessTokenInfo>>;
         fn create_personal_access_token(
             self: &Client,

@@ -59,6 +59,8 @@ pub fn sample(
                 topic: shadow.fabricate_absent_name("topic"),
             })
         }
+        // The sim cluster has no geo peers, so it holds no shadow stream.
+        Outcome::ShadowStreamReadOnly => None,
     }
 }
 

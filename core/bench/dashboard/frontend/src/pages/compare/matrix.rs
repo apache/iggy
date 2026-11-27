@@ -22,13 +22,16 @@
 use bench_dashboard_shared::BenchmarkReportLight;
 use bench_dashboard_shared::config::Thresholds;
 use bench_dashboard_shared::delta::{DeltaVerdict, Metric};
+use bench_dashboard_shared::labels::{
+    messages_text, metric_name, metric_value_text, milliseconds, short_id,
+};
 use bench_dashboard_shared::summary::{BenchmarkSummary, Comparability};
 use bench_report::group_metrics_summary::BenchmarkGroupMetricsSummary;
 
 use super::report_of;
 use crate::components::headline::{Judgment, metric_hint};
-use crate::components::run_labels::{NO_RATE_LIMIT_NOTE, messages_text, milliseconds, short_id};
-use crate::pages::run::change::{metric_name, metric_value_text, percent_change, percent_text};
+use crate::components::run_labels::NO_RATE_LIMIT_NOTE;
+use crate::pages::run::change::{percent_change, percent_text};
 use crate::pages::run::facts::{AVERAGE_LABEL, MAX_LABEL, MIN_LABEL, P9999_LABEL, is_recorded};
 
 const MESSAGES_LABEL: &str = "Messages per second";

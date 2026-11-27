@@ -20,7 +20,7 @@
 use crate::boot::topology::{RosterCells, TcpTopology, build_cluster_roster};
 use crate::consumer_group::lease::ConsumerGroupLiveness;
 use crate::dispatch::host::ServerHost;
-use crate::partition_helpers::load_partition_or_fence;
+use crate::partition_helpers::{ChainRecovery, load_partition_or_fence};
 use crate::server_error::ServerError;
 use crate::session_manager::SessionManager;
 use crate::shell::{
@@ -43,12 +43,14 @@ use message_bus::IggyMessageBus;
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
 use metadata::stm::snapshot::Snapshot;
 use metadata::stm::stream::{Partition, Streams};
-use partitions::{IggyPartitions, PartitionsConfig, RepairRingBudget, StreamKeyIdentity};
+use partitions::{
+    IggyPartitions, PartitionsConfig, RepairRingBudget, StoreViewRequest, StreamKeyIdentity,
+};
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use shard::builder::IggyShardBuilder;
 use shard::config::DeferredPollConfig;
 use shard::metrics::ShardMetrics;
-use shard::shards_table::{PapayaShardsTable, ShardsTable, calculate_shard_assignment};
+use shard::shards_table::{PapayaShardsTable, PartitionShards, ShardsTable};
 use shard::{
     CoordinatorConfig, PartitionConsensusConfig, Receiver as ShardReceiver, ShardFrame,
     ShardIdentity, TaggedSender,
@@ -58,7 +60,7 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// A partition this shard owns, with what building it needs from metadata.
 struct OwnedPartition {
@@ -67,6 +69,8 @@ struct OwnedPartition {
     stats: Arc<PartitionStats>,
     metadata: Partition,
     runtime: TopicRuntimeOptions,
+    /// The peer's log that a partition of a shadow topic follows.
+    peer_log: Option<(String, iggy_object_store::ObjectPrefix)>,
     identity: StreamKeyIdentity,
     encryption: StreamEncryption,
 }
@@ -92,6 +96,9 @@ pub(in crate::boot) struct ShardBuild {
     /// Owned namespaces left unbuilt, for the reconciler to clean up if their
     /// delete commits before they build.
     pub unbuilt: Vec<IggyNamespace>,
+    /// The unbuilt partitions whose segment chain is gone, with what each
+    /// asks of the object store, for the reconciler to read.
+    pub chain_rebuilds: Vec<(IggyNamespace, StoreViewRequest)>,
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -148,15 +155,23 @@ pub(in crate::boot) async fn build_shard_for_thread(
             .sum::<usize>()
     });
 
+    let partition_shards = PartitionShards::new(
+        total_shards,
+        config.cluster.coordinator.skip_shard_zero_for_partitions,
+    );
     // IggyPartitions holds only the partitions owned by this shard
     // (see the filter below at insert time), so the server-wide total
-    // is an N-fold overshoot. `ceil(total / shards) * 2` is a coarse
+    // is an N-fold overshoot. `ceil(total / owning shards) * 2` is a coarse
     // upper bound that absorbs hash skew without paying the full
     // multiplier. PapayaShardsTable below stays sized to the server-wide
     // total because every shard routes every namespace.
-    let owned_partitions_capacity = total_partitions
-        .div_ceil(usize::from(total_shards).max(1))
-        .saturating_mul(2);
+    let owned_partitions_capacity = if shard_id < partition_shards.first_owner() {
+        0
+    } else {
+        total_partitions
+            .div_ceil(usize::from(partition_shards.owner_count()))
+            .saturating_mul(2)
+    };
     // Each encrypted stream holds its own key, wrapped under the server key.
     // The shards owning its partitions open it below, shard 0 opens the keys of
     // streams that own no partition.
@@ -191,20 +206,16 @@ pub(in crate::boot) async fn build_shard_for_thread(
         owned_partitions_capacity,
     )
     .with_repair_memory(repair_memory)
-    .with_repair_rings(Rc::new(RepairRingBudget::new(
-        // A share past the address space bounds nothing, as `usize::MAX` does.
-        usize::try_from(
-            config
-                .partition
-                .journal_memory_shard_bytes_max(total_shards),
-        )
-        .unwrap_or(usize::MAX),
-    )))
     .with_checkpoint_delays(partitions::CheckpointDelays::new(
         config.partition.checkpoint_idle_delay.get_duration(),
         config.partition.checkpoint_max_delay.get_duration(),
-    ))
-    .with_wal_reload_budget(config.partition.wal_reload_shard_bytes_max(total_shards));
+    ));
+    let partitions = match partition_budget_shares(config, partition_shards, shard_id) {
+        Some((repair_ring_bytes, wal_reload_bytes)) => partitions
+            .with_repair_rings(Rc::new(RepairRingBudget::new(repair_ring_bytes)))
+            .with_wal_reload_budget(wal_reload_bytes),
+        None => partitions,
+    };
     let shards_table = PapayaShardsTable::with_capacity(total_partitions);
 
     // Stream-filter inside the `read()` closure: only partitions owned by
@@ -230,8 +241,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
                         continue;
                     }
                     let namespace = IggyNamespace::new(stream.id, topic_id, partition.id);
-                    let owning_shard =
-                        calculate_shard_assignment(&namespace, u32::from(total_shards));
+                    let owning_shard = partition_shards.shard_for(&namespace);
                     if owning_shard == shard_id {
                         // Shared per-partition stats from the registry: the
                         // same `Arc` backs every shard's `get_topic` reply.
@@ -247,6 +257,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
                             stats,
                             metadata: partition.clone(),
                             runtime: TopicRuntimeOptions::from_resource_options(&topic.options),
+                            peer_log: crate::shadow_topics::peer_log_of(stream, topic, namespace),
                             identity,
                             encryption: encryption
                                 .get_or_insert_with(|| StreamEncryption::from(&stream.options))
@@ -273,12 +284,14 @@ pub(in crate::boot) async fn build_shard_for_thread(
     // `Arc<TopicStats>` atomics race only against other atomic adds.
     let mut deferred_streams = BTreeSet::new();
     let mut unbuilt = Vec::new();
+    let mut chain_rebuilds = Vec::new();
     for OwnedPartition {
         stream_id,
         topic_id,
         stats: partition_stats,
         metadata: partition_metadata,
         runtime: topic_runtime,
+        peer_log,
         identity,
         encryption,
     } in owned
@@ -309,11 +322,31 @@ pub(in crate::boot) async fn build_shard_for_thread(
             partition_metadata.replica_set(topology.replica_count),
             Rc::clone(&bus),
             &partitions,
+            None,
         )
         .await;
+        if let Ok((_, ChainRecovery::Refused)) = &loaded {
+            metrics.record_chain_rebuild_refusal();
+        }
         let partition = match loaded {
-            Ok(Some(partition)) => partition,
-            Ok(None) => continue,
+            Ok((Some(partition), _)) => partition,
+            Ok((None, _)) => continue,
+            // The store is out of reach until the node passes its identity
+            // check, so the reconciler rebuilds the chain.
+            Err(ServerError::PartitionChainMissing { request, .. }) => {
+                debug!(
+                    stream_id,
+                    topic_id,
+                    partition_id = partition_metadata.id,
+                    from = request.from,
+                    front = request.front,
+                    "skipping this partition at boot; the segment chain is gone, and the \
+                     reconciler reads the object store for it"
+                );
+                chain_rebuilds.push((namespace, *request));
+                unbuilt.push(namespace);
+                continue;
+            }
             // A refused claim is a failed superblock write, not damage: the
             // namespace stays materialisable, so skipping it here costs one
             // partition its start instead of the whole shard, and the
@@ -334,6 +367,21 @@ pub(in crate::boot) async fn build_shard_for_thread(
         };
         let mut partition = partition;
         partition.set_encryptor(encryptor);
+        // A shadow partition holds none of its peer's messages on disk, so
+        // it follows the peer's log again after every start.
+        if let Some((origin, prefix)) = peer_log
+            && let Err(error) = partition.follow_peer_log(origin, prefix)
+        {
+            error!(
+                stream_id,
+                topic_id,
+                partition_id = partition_metadata.id,
+                %error,
+                "skipping this partition at boot; a partition of a shadow topic cannot follow its peer's log"
+            );
+            unbuilt.push(namespace);
+            continue;
+        }
         partitions.insert(namespace, partition);
         shards_table.insert(
             namespace,
@@ -381,6 +429,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
         CoordinatorConfig {
             skip_shard_zero_for_clients: config.cluster.coordinator.skip_shard_zero_for_clients,
         },
+        partition_shards.skip_shard_zero(),
         metrics,
     )
     .with_partition_io_limits(super::threads::partition_io_limits(&config.sharding)?)
@@ -426,6 +475,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
         consumer_group_liveness,
         shard_handle,
         unbuilt,
+        chain_rebuilds,
     })
 }
 
@@ -517,6 +567,11 @@ const _: () = assert!(
         == shard::SERVED_SEGMENT_CACHE_BYTES_DEFAULT
 );
 const _: () = assert!(configs::cluster::DEFAULT_REPAIR_CHUNK_MAX as u64 == shard::REPAIR_CHUNK_MAX);
+const _: () = assert!(iggy_common::READ_CACHE_BLOCK_SIZE_MIN == partitions::DISK_POLL_CHUNK_MIN);
+const _: () =
+    assert!(configs::tiered_storage::READ_CACHE_BLOCK_SIZE_MAX == partitions::DISK_POLL_CHUNK_MAX);
+const _: () = assert!(iggy_common::READ_AHEAD_CACHE_SHARE == iggy_object_store::AHEAD_SHARE as u64);
+const _: () = assert!(iggy_common::READ_AHEAD_BLOCKS_MIN == partitions::READ_AHEAD_START_BLOCKS);
 const _: () = assert!(
     configs::cluster::STATE_CHUNK_HEADER_LEN
         == size_of::<iggy_binary_protocol::consensus::StateChunkHeader>() as u64
@@ -628,6 +683,26 @@ fn refuse_unreadable_topics(streams: &Streams) -> Result<(), ServerError> {
         }),
         None => Ok(()),
     }
+}
+
+/// The shares of `shard_id` in the repair ring budget and in the WAL reload
+/// budget of the node. The shards that own partitions divide both, so a shard
+/// that owns none takes no share: it has nothing to charge, and its gauges
+/// would add a share that the node budget does not hold.
+fn partition_budget_shares(
+    config: &ServerConfig,
+    partition_shards: PartitionShards,
+    shard_id: u16,
+) -> Option<(usize, u64)> {
+    (shard_id >= partition_shards.first_owner()).then(|| {
+        let owners = partition_shards.owner_count();
+        (
+            // A share past the address space bounds nothing, as `usize::MAX` does.
+            usize::try_from(config.partition.journal_memory_shard_bytes_max(owners))
+                .unwrap_or(usize::MAX),
+            config.partition.wal_reload_shard_bytes_max(owners),
+        )
+    })
 }
 
 /// The `[sharding]` deferred poll limits in the units the shard compares.
@@ -964,6 +1039,41 @@ mod tests {
         );
     }
     const OTHER_CONFIG_KEY: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
+
+    #[test]
+    fn given_a_shard_that_owns_no_partition_when_dividing_the_partition_budgets_should_take_no_share()
+     {
+        const SHARDS: u16 = 4;
+        let config = ServerConfig::default();
+        let node_budgets = (
+            config
+                .partition
+                .journal_memory_node_bytes_max
+                .as_bytes_u64(),
+            config.partition.wal_reload_node_bytes_max.as_bytes_u64(),
+        );
+        for skip_shard_zero in [false, true] {
+            let partition_shards = PartitionShards::new(SHARDS, skip_shard_zero);
+            let shares: Vec<_> = (0..SHARDS)
+                .map(|shard_id| partition_budget_shares(&config, partition_shards, shard_id))
+                .collect();
+            assert_eq!(shares[0].is_none(), skip_shard_zero);
+            let taken = shares.iter().flatten().fold((0, 0), |taken, share| {
+                (taken.0 + u64::try_from(share.0).unwrap(), taken.1 + share.1)
+            });
+            let owners = partition_shards.owner_count();
+            assert_eq!(shares.iter().flatten().count(), usize::from(owners));
+            let owners = u64::from(owners);
+            assert!(
+                taken.0 <= node_budgets.0 && taken.0 + owners > node_budgets.0,
+                "the repair ring shares add up to the node budget: {taken:?}"
+            );
+            assert!(
+                taken.1 <= node_budgets.1 && taken.1 + owners > node_budgets.1,
+                "the WAL reload shares add up to the node budget: {taken:?}"
+            );
+        }
+    }
 
     #[test]
     fn given_topic_with_unknown_critical_option_when_booting_should_refuse_it() {

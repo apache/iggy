@@ -22,12 +22,13 @@
 //! agrees on what it may evict.
 //!
 //! Every partition registers the machine, so enabling tiered storage on a topic
-//! later needs no registration. Nothing proposes an advance yet, so the floor
-//! stays empty and adds nothing to a partition's checkpoint or transfer.
+//! later needs no registration. Only the primary of a tiered partition proposes
+//! an advance, once an upload stored a segment, so the floor of any other
+//! partition stays empty and adds nothing to its checkpoint or transfer.
 
 use std::fmt;
 
-use iggy_binary_protocol::RoutedRequestHeader;
+use iggy_binary_protocol::{HEADER_SIZE, RoutedRequestHeader};
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
 use server_common::Message;
@@ -204,6 +205,34 @@ where
     pub fn tiered_floor(&self) -> Option<u64> {
         self.state_machine::<TieredFloor>(TIERED_FLOOR_MACHINE)
             .and_then(TieredFloor::tiered_up_to_offset)
+    }
+
+    /// [`Self::tiered_floor`] with the advances applied that a recovered WAL
+    /// holds as committed past its checkpoint. The commit path applies those
+    /// only once the partition runs, and a replica may evict on an advance
+    /// that no checkpoint covers yet.
+    #[must_use]
+    pub fn recovered_tiered_floor(&self) -> Option<u64> {
+        let mut floor = *self.state_machine::<TieredFloor>(TIERED_FLOOR_MACHINE)?;
+        let journal = &self.log.journal().inner;
+        let consensus = self.consensus();
+        let committed = consensus.commit_min().saturating_add(1)..=consensus.commit_max();
+        for op in journal.command_ops_in(committed) {
+            let Some(prepare) = journal.repair_entry(op) else {
+                continue;
+            };
+            let Some(Ok(command)) = prepare
+                .as_slice()
+                .get(HEADER_SIZE..)
+                .map(MachineCommand::decode)
+            else {
+                continue;
+            };
+            if command.kind == ADVANCE_TIERED_FLOOR {
+                floor.apply(op, command);
+            }
+        }
+        floor.tiered_up_to_offset()
     }
 
     /// A request committing `advance`, for the primary's `on_request`.

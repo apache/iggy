@@ -63,6 +63,7 @@ pub mod dispatch;
 pub mod error;
 pub mod framing;
 pub mod namespace;
+pub mod placement;
 pub mod primitives;
 pub mod requests;
 pub mod responses;

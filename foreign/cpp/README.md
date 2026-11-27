@@ -42,6 +42,23 @@ See [metadata freshness and counters](../../core/server/README.md#metadata-fresh
 
 Streams, topics and users take typed create and update options. Unset settings use the server default on create and keep their stored value on update. `SetRawEntries()` and `RawReset()` name keys newer than this SDK build and leave the decision to the server. `DescribeOptions()` serves each scope's catalog. A topic update can change `MessageExpiry`, `MaxTopicSize`, `LocalRetentionAge` and `LocalRetentionSize`, reset each of them, and turn `TieredStorage` on, never off.
 
+A geo topic also takes six durations, each a `std::chrono::microseconds` that overrides the server
+setting of the same name on every node: `SetFreshUploadInterval`, `SetConsumerOffsetUploadInterval`,
+`SetPositionsPublishInterval`, `SetTombstoneGrace`, `SetPositionsResumeTimeout` and
+`SetLongTermRewriteMaxInterval`. Zero is a value and is sent as zero. A normal topic refuses them
+with `invalid_option_value`. An update can set them on a geo topic, where it changes only these and
+the read cache settings below, and cannot reset them. `Topic` and `TopicDetails` read each one back.
+If the topic leaves a duration to the server setting, its getter returns `std::nullopt`.
+
+Any topic also takes two byte sizes, each a `std::uint64_t` that overrides the `[tiered_storage]`
+server setting of the same name on every node. `SetReadCacheSize` sets the memory each node keeps
+for what the topic's reads fetch from the object store, divided between its partitions.
+`SetReadAhead` sets the most bytes that readahead fetches in front of a sequential reader. Zero is a
+value that turns each one off and is sent as zero. Otherwise the read cache size is at least
+512 KiB and the readahead at least 128 KiB. An update can change them on any topic, geo included,
+but cannot reset them. `Topic` and `TopicDetails` read each one back, and return `std::nullopt`
+when the topic leaves it to the server setting.
+
 ```cpp
 const std::string key_base64 = LoadStreamKey();
 const auto stream = client.CreateStream("payments", iggy::StreamCreateOptions().SetEncryptionKeyBase64(key_base64));

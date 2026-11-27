@@ -23,9 +23,10 @@
 use crate::components::command_block::CommandBlock;
 use crate::components::page::{Crumb, breadcrumbs, loadable, page_head, page_shell, section_head};
 use crate::components::section_nav::{NavSection, SectionNav};
-use crate::format::runs_text;
 use crate::state::data::{Loadable, use_dashboard_data};
 use bench_dashboard_shared::config::{DashboardConfig, Thresholds};
+use bench_dashboard_shared::format::runs_text;
+use bench_dashboard_shared::head::METHODOLOGY_LEAD;
 use bench_dashboard_shared::identity::KindFamily;
 use bench_dashboard_shared::metrics::Badge;
 use bench_dashboard_shared::omb::compare::OmbComparability;
@@ -574,11 +575,7 @@ pub fn methodology() -> Html {
                 breadcrumbs(&[Crumb::overview()], "Methodology"),
                 Some("Methodology"),
                 "How the benchmarks work",
-                "Most runs on this dashboard come from iggy-bench, a tool that sends and polls \
-                 messages on an Apache Iggy server and measures the result. This page shows how \
-                 to run it, what the numbers mean, and when a difference is a real change. The \
-                 last section explains the OpenMessaging Benchmark runs, which have pages of \
-                 their own.",
+                METHODOLOGY_LEAD,
                 Html::default(),
             ) }
             <SectionNav sections={&SECTIONS[..]} scroll_ref={scroll_ref.clone()} />

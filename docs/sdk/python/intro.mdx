@@ -1,0 +1,139 @@
+---
+title: Python SDK
+description: "The Python SDK, a PyO3 wrapper around the Rust SDK, and how to install it."
+---
+
+The Iggy Python SDK is a client library that allows you to interact with the Iggy API from your Python application. It is built as a PyO3 wrapper around the Rust SDK, which means it supports TCP, QUIC, HTTP, and WebSocket transports via connection strings. The package is available on [PyPI](https://pypi.org/project/apache-iggy/) and the source code can be found on [GitHub](https://github.com/apache/iggy/tree/server-0.10.0/foreign/python).
+
+The wheel bundles the Rust SDK, whose binary transports speak the current Iggy wire protocol without falling back to older formats. Use an SDK release compatible with your server. For unreleased changes, build the SDK and server from the same source checkout. The published wheel can lag source API changes.
+
+## Installation
+
+Python 3.11 or newer is required. Install the published package in a virtual environment:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install apache-iggy==0.10.0
+```
+
+For the source version described here, install from the repository root with Rust and Cargo available:
+
+```bash
+pip install ./foreign/python
+```
+
+## Quick start
+
+The samples below target Iggy 0.10.0 on `127.0.0.1:8090`:
+
+```bash
+# Server 0.10.0
+docker run --rm \
+  --cap-add=SYS_NICE --security-opt seccomp=unconfined --ulimit memlock=-1:-1 \
+  -p 8090:8090 \
+  -e IGGY_TCP_ADDRESS=0.0.0.0:8090 \
+  -e IGGY_NODE_ADVERTISED_ADDRESS=localhost \
+  -e IGGY_ROOT_USERNAME=iggy -e IGGY_ROOT_PASSWORD=iggy \
+  apache/iggy:0.10.0
+
+# Or from the same repository root as the SDK
+cargo run --bin iggy-server -- --fresh --with-default-root-credentials
+```
+
+The environment variables make the server reachable through the published port (it binds to `127.0.0.1` inside the container by default) and bootstrap the `iggy`/`iggy` root credentials for new data. Stored credentials are not replaced. Environment credentials override the default-credentials flag, so unset them or set them to match the sample. `--fresh` deletes local replica state. Use disposable development data. A fresh server requires explicit credentials or the development flag.
+
+### Producer
+
+```python
+import asyncio
+
+from apache_iggy import IggyClient, TopicOptions
+from apache_iggy import SendMessage as Message
+
+STREAM_NAME = "sample-stream"
+TOPIC_NAME = "sample-topic"
+PARTITION_ID = 0
+
+
+async def main():
+    client = IggyClient.from_connection_string(
+        "iggy+tcp://iggy:iggy@127.0.0.1:8090"
+    )
+    await client.connect()
+
+    # Re-running this example is fine: only create what is missing.
+    if await client.get_stream(STREAM_NAME) is None:
+        await client.create_stream(name=STREAM_NAME)
+
+    if await client.get_topic(STREAM_NAME, TOPIC_NAME) is None:
+        await client.create_topic(
+            stream=STREAM_NAME,
+            name=TOPIC_NAME,
+            options=TopicOptions(partitions_count=1),
+        )
+
+    messages = [Message(f"message-{i}") for i in range(10)]
+
+    await client.send_messages(
+        stream=STREAM_NAME,
+        topic=TOPIC_NAME,
+        partitioning=PARTITION_ID,
+        messages=messages,
+    )
+    print(f"Sent {len(messages)} message(s)")
+    await client.shutdown()
+
+
+asyncio.run(main())
+```
+
+### Consumer
+
+```python
+import asyncio
+
+from apache_iggy import CommitPolicy, Consumer, IggyClient, PollingStrategy, PollOptions
+
+STREAM_NAME = "sample-stream"
+TOPIC_NAME = "sample-topic"
+PARTITION_ID = 0
+
+
+async def main():
+    client = IggyClient.from_connection_string(
+        "iggy+tcp://iggy:iggy@127.0.0.1:8090"
+    )
+    await client.connect()
+
+    # Next() resumes this named consumer after its stored offset. Auto-commit
+    # can store the offset before application processing finishes.
+    polled_messages = await client.poll_messages(
+        stream=STREAM_NAME,
+        topic=TOPIC_NAME,
+        consumer=Consumer.Single("sample-consumer"),
+        partition_id=PARTITION_ID,
+        polling_strategy=PollingStrategy.Next(),
+        options=PollOptions(count=10, commit=CommitPolicy.OnRead()),
+    )
+
+    for message in polled_messages.messages:
+        payload = message.payload().decode("utf-8")
+        print(f"Offset: {message.offset()}, Payload: {payload}")
+    await client.shutdown()
+
+
+asyncio.run(main())
+```
+
+## Beyond the basics
+
+- **TLS**: use `TcpConfig` with `tls_enabled` and `tls_ca_file`, or the TLS options in a [connection string](/docs/sdk/connection-strings). The certificate must match `tls_domain`, which defaults to the dialed host. The [getting-started example](https://github.com/apache/iggy/tree/server-0.10.0/examples/python/getting-started) shows the full setup.
+- **Consumer groups**: `await client.consumer_group(...)` returns an `IggyConsumer` that creates and joins the group by default and commits offsets according to the `commit` policy in `poll_options`, which defaults to manual commits. Groups require a binary transport. HTTP supports ordinary consumers only.
+- **User headers**: `SendMessage(data, user_headers=...)` accepts a plain `dict` with `str`, `bytes`, `bool`, `int`, or `float` values. `HeaderKey`/`HeaderValue` give explicit control over the wire type. See the [message-headers examples](https://github.com/apache/iggy/tree/server-0.10.0/examples/python/message-headers).
+- **Topic options**: `create_topic(..., options=TopicOptions(...))` accepts typed options. `TopicOptions.raw` accepts extra keys as `dict[str, str]`, validated by the server. `client.describe_options("topic")` lists the keys a server accepts.
+- **Administration**: user and permission management. Personal access tokens can be used for login via `AutoLogin.personal_access_token(...)` in the connection config. PAT management isn't exposed yet.
+
+## Examples
+
+Working examples are available in the [examples/python](https://github.com/apache/iggy/tree/server-0.10.0/examples/python) directory. See [Examples](/docs/sdk/python/examples) for the list and how to run them.

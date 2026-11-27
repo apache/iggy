@@ -30,9 +30,11 @@ namespace Apache.Iggy.Contracts;
 /// <remarks>
 ///     <see cref="MessageExpiry" />, <see cref="MaxTopicSize" />, <see cref="LocalRetentionAge" /> and
 ///     <see cref="LocalRetentionSize" /> can change later through a <see cref="TopicUpdate" />, which can also turn
-///     <see cref="TieredStorage" /> on. Every other setting is fixed at creation. A property left null emits no key,
-///     which leaves the server default in place. <see cref="IIggySystem.DescribeOptionsAsync" /> enumerates the
-///     keys a given server accepts, with the kind, default and mutability of each.
+///     <see cref="TieredStorage" /> on and set <see cref="ReadCacheSize" />, <see cref="ReadAhead" /> and the six
+///     durations of a geo topic again. Every other setting is fixed at creation. A property left null emits no key,
+///     which leaves the server default in place, or for the read cache and a duration of a geo topic the server
+///     setting of each node. <see cref="IIggySystem.DescribeOptionsAsync" /> enumerates the keys a given server
+///     accepts, with the kind, default and mutability of each.
 /// </remarks>
 public sealed class TopicOptions
 {
@@ -114,7 +116,8 @@ public sealed class TopicOptions
     ///     it on and never off.
     /// </summary>
     /// <remarks>
-    ///     Not available yet: the server refuses <c>true</c> with <c>feature_unavailable</c>.
+    ///     Needs an object store on every node of the cluster: while one is not ready, the server refuses
+    ///     <c>true</c> with <c>feature_unavailable</c>.
     /// </remarks>
     public bool? TieredStorage { get; init; }
 
@@ -138,6 +141,90 @@ public sealed class TopicOptions
     public ulong? LocalRetentionSize { get; init; }
 
     /// <summary>
+    ///     Whether the topic is normal or geo. The server default is normal. Fixed at creation.
+    /// </summary>
+    /// <remarks>
+    ///     A geo topic needs an object store on every node of the cluster: while one is not ready, the server
+    ///     refuses <see cref="Enums.TopicType.Geo" /> with <c>feature_unavailable</c>. A geo topic refuses tiered
+    ///     storage and an encrypted stream, and keeps its name, options and partition count.
+    /// </remarks>
+    public TopicType? TopicType { get; init; }
+
+    /// <summary>
+    ///     How a geo topic writes its messages. A geo topic created without one uses
+    ///     <see cref="Enums.GeoMode.Geo" />. Fixed at creation.
+    /// </summary>
+    /// <remarks>
+    ///     The server refuses <see cref="Enums.GeoMode.GeoTiered" /> with <c>feature_unavailable</c> for now.
+    ///     Only a geo topic takes a mode: the server refuses one on a normal topic with error code 4042,
+    ///     <c>invalid_option_value</c>.
+    /// </remarks>
+    public GeoMode? GeoMode { get; init; }
+
+    /// <summary>
+    ///     The longest time a send waits for the upload of its fresh object to start, at most ten seconds. Zero
+    ///     uploads as soon as an upload slot is free. Overrides the server's <c>[tiered_storage]
+    ///     fresh_upload_interval</c>.
+    /// </summary>
+    /// <remarks>
+    ///     This and the five durations below are only on a geo topic: the server refuses them on a normal topic
+    ///     with error code 4042, <c>invalid_option_value</c>. Zero is a value for them and is sent, unlike a zero
+    ///     <see cref="MessageExpiry" />, and a negative span is refused before anything is sent. Null leaves each
+    ///     node to apply its own server setting of the same name.
+    /// </remarks>
+    public TimeSpan? FreshUploadInterval { get; init; }
+
+    /// <summary>
+    ///     The shortest time between two uploads of the positions that the offsets its consumer groups store
+    ///     themselves wait for, at most one second. Zero answers such a store at its local commit. Overrides the
+    ///     server's <c>[geo] consumer_offset_upload_interval</c>.
+    /// </summary>
+    public TimeSpan? ConsumerOffsetUploadInterval { get; init; }
+
+    /// <summary>
+    ///     How often a node uploads the changed positions of the topic's consumer groups, more than zero. Overrides
+    ///     the server's <c>[geo] positions_publish_interval</c>.
+    /// </summary>
+    public TimeSpan? PositionsPublishInterval { get; init; }
+
+    /// <summary>
+    ///     How long the tombstone and the objects of the deleted topic stay in the object store, more than zero.
+    ///     Overrides the server's <c>[geo] tombstone_grace</c>.
+    /// </summary>
+    public TimeSpan? TombstoneGrace { get; init; }
+
+    /// <summary>
+    ///     How long, after a node starts, the group polls of the topic's partitions wait for the positions of the geo
+    ///     peers. Zero does not wait. Overrides the server's <c>[geo] positions_resume_timeout</c>.
+    /// </summary>
+    public TimeSpan? PositionsResumeTimeout { get; init; }
+
+    /// <summary>
+    ///     The longest wait between two rewrites of a partition's committed messages into long-term segments, at
+    ///     least one second. Overrides the server's <c>[geo] long_term_rewrite_max_interval</c>.
+    /// </summary>
+    public TimeSpan? LongTermRewriteMaxInterval { get; init; }
+
+    /// <summary>
+    ///     The memory in bytes that each node keeps for what the topic's reads fetch from the object store, divided
+    ///     between its partitions. Zero keeps nothing that they fetch, otherwise at least 512 KiB. Overrides the
+    ///     server's <c>[tiered_storage] read_cache_size</c>.
+    /// </summary>
+    /// <remarks>
+    ///     This and <see cref="ReadAhead" /> apply to a normal or a geo topic. Zero is a value for them and is sent,
+    ///     unlike a zero <see cref="MaxTopicSize" />. Null leaves each node to apply its own server setting of the
+    ///     same name. The share of a partition is a limit within the read cache of its shard, not a reservation.
+    /// </remarks>
+    public ulong? ReadCacheSize { get; init; }
+
+    /// <summary>
+    ///     The most bytes that readahead fetches from the object store in front of a sequential reader of the topic.
+    ///     Zero turns readahead off, otherwise at least 128 KiB, and at most an eighth of a nonzero
+    ///     <see cref="ReadCacheSize" />. Overrides the server's <c>[tiered_storage] read_ahead</c>.
+    /// </summary>
+    public ulong? ReadAhead { get; init; }
+
+    /// <summary>
     ///     Option keys with no property of their own, keyed by option name, for keys newer than this build. A
     ///     property above wins on collision, and the server refuses a key outside its catalog by name. A raw
     ///     durability is kept unless the matching property asks for persisted durability.
@@ -150,6 +237,7 @@ public sealed class TopicOptions
     /// </summary>
     /// <returns>Option values keyed by option name, including both durability policies.</returns>
     /// <exception cref="ArgumentException">A raw durability is invalid or contradicts a persisted property.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">A duration of a geo topic is negative.</exception>
     public Dictionary<string, HeaderValue> ToDictionary()
     {
         var options = OptionKeys.Raw(Options);
@@ -237,7 +325,57 @@ public sealed class TopicOptions
             options[Name(TopicOptionKey.LocalRetentionSize)] = HeaderValue.FromUInt64(localRetentionSize);
         }
 
+        if (TopicType is { } topicType)
+        {
+            options[Name(TopicOptionKey.TopicType)] = HeaderValue.FromString(topicType switch
+            {
+                Enums.TopicType.Normal => "normal",
+                Enums.TopicType.Geo => "geo",
+                _ => throw new ArgumentOutOfRangeException(nameof(TopicType), topicType, "Unknown topic type")
+            });
+        }
+
+        if (GeoMode is { } geoMode)
+        {
+            options[Name(TopicOptionKey.GeoMode)] = HeaderValue.FromString(geoMode switch
+            {
+                Enums.GeoMode.Geo => "geo",
+                Enums.GeoMode.GeoTiered => "geo_tiered",
+                _ => throw new ArgumentOutOfRangeException(nameof(GeoMode), geoMode, "Unknown geo mode")
+            });
+        }
+
+        AddGeoDuration(options, TopicOptionKey.FreshUploadInterval, FreshUploadInterval, nameof(FreshUploadInterval));
+        AddGeoDuration(options, TopicOptionKey.ConsumerOffsetUploadInterval, ConsumerOffsetUploadInterval,
+            nameof(ConsumerOffsetUploadInterval));
+        AddGeoDuration(options, TopicOptionKey.PositionsPublishInterval, PositionsPublishInterval,
+            nameof(PositionsPublishInterval));
+        AddGeoDuration(options, TopicOptionKey.TombstoneGrace, TombstoneGrace, nameof(TombstoneGrace));
+        AddGeoDuration(options, TopicOptionKey.PositionsResumeTimeout, PositionsResumeTimeout,
+            nameof(PositionsResumeTimeout));
+        AddGeoDuration(options, TopicOptionKey.LongTermRewriteMaxInterval, LongTermRewriteMaxInterval,
+            nameof(LongTermRewriteMaxInterval));
+
+        if (ReadCacheSize is { } readCacheSize)
+        {
+            options[Name(TopicOptionKey.ReadCacheSize)] = HeaderValue.FromUInt64(readCacheSize);
+        }
+
+        if (ReadAhead is { } readAhead)
+        {
+            options[Name(TopicOptionKey.ReadAhead)] = HeaderValue.FromUInt64(readAhead);
+        }
+
         return options;
+    }
+
+    private static void AddGeoDuration(Dictionary<string, HeaderValue> options, TopicOptionKey key,
+        TimeSpan? duration, string property)
+    {
+        if (duration is { } value)
+        {
+            options[Name(key)] = OptionKeys.GeoDuration(value, property);
+        }
     }
 
     private HeaderValue DurabilityValue(TopicOptionKey key, Durability policy)

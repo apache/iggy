@@ -38,7 +38,7 @@ See [Maven Central](https://central.sonatype.com/artifact/org.apache.iggy/iggy) 
 
 ### Snapshot Versions
 
-Development builds of the next release carry the version `0.9.6-SNAPSHOT`. Get them from the ASF snapshot repository:
+This checkout builds `0.10.2-SNAPSHOT`. After a snapshot is published, use the following configuration to resolve it from the ASF snapshot repository.
 
 **Gradle:**
 
@@ -51,7 +51,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'org.apache.iggy:iggy:0.9.6-SNAPSHOT'
+    implementation 'org.apache.iggy:iggy:0.10.2-SNAPSHOT'
 }
 ```
 
@@ -72,14 +72,14 @@ dependencies {
     <dependency>
         <groupId>org.apache.iggy</groupId>
         <artifactId>iggy</artifactId>
-        <version>0.9.6-SNAPSHOT</version>
+        <version>0.10.2-SNAPSHOT</version>
     </dependency>
 </dependencies>
 ```
 
-### Unreleased 0.11.1 protocol
+### Source checkout
 
-The source checkout uses protocol 0.11.1. Build it with a matching server.
+The source checkout uses client protocol 0.12.3. Build it with a matching server.
 `CommandCode.System.ATTACH_CONSUMER_SESSION` (code 14) was removed. Use
 `CommandCode.System.BIND_SESSION` (code 15), which requires the registered
 session's private bind secret. Auxiliary poll connections reuse that session
@@ -89,10 +89,9 @@ Transport loss retains the logical identity and reconnect uses `BindSession`.
 A definitive stale or unauthenticated bind reply permits a fresh Register, and
 transient replies retain the identity. A stale-client eviction during the bind
 is a lost connection, so the next connection binds the same session again. An
-unauthenticated eviction during the bind ends the session. The bind proof is an
-independent session credential: password/PAT changes or expiry do not end an
-established session. Logout, lease expiry and user deactivation end session
-access.
+unauthenticated eviction during the bind ends the session.
+
+With server 0.10.1-edge.2, a password change keeps the binary session that submitted it and ends the account's other sessions. Deleting or expiring a personal access token ends access for the sessions opened with it. A valid personal access token can open a new session after a password change. Logout, lease expiry and account deactivation also end session access.
 
 A reply with status 30 (`STALE_CLIENT`) means that the server no longer attaches
 the connection to the session. The client closes that connection, and the next
@@ -370,6 +369,21 @@ client.system().describeOptions(OptionsScope.Topic);  // keys, kinds, defaults a
 The stream key is 32 random bytes. It travels inside the create request over the client's transport, so protecting it on the network is the job of TLS. The server stores it wrapped under its own key and never returns it, reads report only its source and fingerprints. Without a key, a server with encryption enabled generates one for the stream.
 
 The typed builders refuse an update the server would refuse for its shape before anything is sent, with the server's error code. `raw(key, value)` and `rawReset(key)` reach keys this build has no field for, and the server decides whether they are allowed.
+
+A geo topic also takes six durations in microseconds: `freshUploadInterval`,
+`consumerOffsetUploadInterval`, `positionsPublishInterval`, `tombstoneGrace`,
+`positionsResumeTimeout` and `longTermRewriteMaxInterval`. Each one overrides the server setting of
+the same name on every node. Zero is a value for them, so the SDK sends it. On a geo topic, an
+update can set them. An update cannot reset them. The server refuses them on a normal topic. When the
+topic does not set a duration, a topic read returns an empty `Optional` for it.
+
+Any topic, normal or geo, takes two byte sizes for its reads from the object store.
+`readCacheSize` is the memory each node keeps for what the topic's reads fetch, divided between its
+partitions, and zero keeps nothing. `readAhead` is the most bytes that readahead fetches in front of a
+sequential reader, and zero turns readahead off. Zero is a value for them, so the SDK sends it. Left
+unset, each node applies its `[tiered_storage]` setting of the same name, and a topic read returns an
+empty `Optional`. An update can change them on any topic, geo included, but cannot reset them. They
+and the six durations are the only options that an update can change on a geo topic.
 
 ### Metadata Changes
 

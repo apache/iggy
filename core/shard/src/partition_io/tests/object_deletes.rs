@@ -17,6 +17,8 @@
 
 //! Delete passes on a shard that hosts a tiered primary on disk.
 
+use std::time::SystemTime;
+
 use super::segment_uploads::{
     SEALED_SEGMENTS, floor, namespace, pumped, staged_revision, tiered_owner, until,
 };
@@ -28,25 +30,26 @@ use iggy_object_store::{
     TierJobHandle, TierJobRequest, TierScopeToken,
 };
 use partitions::{
-    ExecutorDeleter, ExecutorUploader, ObjectDeleteDone, ObjectDeleteJob, ObjectDeleteOutcome,
-    ObjectDeleteWork, ObjectDeleter, RETIRED_OBJECT_GRACE, SweptObjects,
+    ClaimReadOutcome, ExecutorDeleter, ExecutorUploader, ObjectDeleteDone, ObjectDeleteJob,
+    ObjectDeleteOutcome, ObjectDeleteWork, ObjectDeleter, RETIRED_OBJECT_GRACE, RootListOutcome,
+    SweptObjects,
 };
 
 /// The last offset the fixture's truncation removes. Every segment holds one
 /// message, so the segments at 0 and 1 go and the one at 2 stays.
-const TRUNCATED_UP_TO: u64 = 1;
+pub(super) const TRUNCATED_UP_TO: u64 = 1;
 
 /// The objects of the fixture's sealed segments, a `.log` and an `.index`
 /// each.
 const UPLOADED_OBJECTS: usize = 6;
 
-fn layout() -> KeyLayout {
+pub(super) fn layout() -> KeyLayout {
     KeyLayout::new("segments").unwrap()
 }
 
 /// One executor for the uploader and the deleter, so both reach one store.
 #[derive(Clone)]
-struct Shared(Rc<InlineTierExecutor<MemoryStore>>);
+pub(super) struct Shared(pub(super) Rc<InlineTierExecutor<MemoryStore>>);
 
 impl TierExecutor for Shared {
     type Store = MemoryStore;
@@ -62,7 +65,7 @@ impl TierExecutor for Shared {
 }
 
 /// Deletes in a memory store, and keeps what every job was asked to do.
-struct RecordingDeleter {
+pub(super) struct RecordingDeleter {
     deleter: ExecutorDeleter<Shared>,
     /// Whether a job never answers, so it stays in flight.
     hangs: Cell<bool>,
@@ -78,7 +81,7 @@ impl RecordingDeleter {
         })
     }
 
-    fn started(&self) -> Vec<ObjectDeleteWork> {
+    pub(super) fn started(&self) -> Vec<ObjectDeleteWork> {
         self.started.borrow().clone()
     }
 }
@@ -96,12 +99,27 @@ impl ObjectDeleter for RecordingDeleter {
             self.deleter.run(job, scope)
         }
     }
+
+    fn read_claim(&self, scope: TierScopeToken) -> LocalBoxFuture<'static, ClaimReadOutcome> {
+        self.deleter.read_claim(scope)
+    }
+
+    fn list_root(
+        &self,
+        after: Option<String>,
+        claimed_at: SystemTime,
+        scope: TierScopeToken,
+    ) -> LocalBoxFuture<'static, RootListOutcome> {
+        self.deleter.list_root(after, claimed_at, scope)
+    }
 }
 
 /// A tiered primary whose three segments are uploaded, and whose first two a
 /// committed truncation removed. The pump is stopped and the inbox is empty.
 #[allow(clippy::future_not_send)]
-async fn truncated_owner(directory: &Path) -> (IoTestShard, Shared, Rc<RecordingDeleter>) {
+pub(super) async fn truncated_owner(
+    directory: &Path,
+) -> (IoTestShard, Shared, Rc<RecordingDeleter>) {
     let owner = tiered_owner(directory).await;
     let executor = Shared(Rc::new(InlineTierExecutor::new(MemoryStore::new())));
     owner.set_segment_uploader(Some(Rc::new(ExecutorUploader::new(
@@ -175,7 +193,7 @@ fn after(moment: IggyTimestamp, grace_periods: u32) -> IggyTimestamp {
 /// Give a task that a pass spawned the time to reach the deleter, and check
 /// that the deleter was asked for `jobs` jobs so far.
 #[allow(clippy::future_not_send)]
-async fn assert_started(owner: &IoTestShard, deleter: &RecordingDeleter, jobs: usize) {
+pub(super) async fn assert_started(owner: &IoTestShard, deleter: &RecordingDeleter, jobs: usize) {
     compio::time::sleep(TASK_POLL_INTERVAL * 10).await;
     assert_eq!(deleter.started().len(), jobs);
     assert_eq!(owner.inbox_len(), 0, "no result is on its way");
@@ -183,7 +201,7 @@ async fn assert_started(owner: &IoTestShard, deleter: &RecordingDeleter, jobs: u
 
 /// The sweep of the fixture's partition: the last sealed segment and the
 /// active one are left, and the bound is the truncation.
-fn sweep() -> ObjectDeleteWork {
+pub(super) fn sweep() -> ObjectDeleteWork {
     ObjectDeleteWork::Sweep {
         segment_starts: vec![TRUNCATED_UP_TO + 1, SEALED_SEGMENTS],
         bound: TRUNCATED_UP_TO,

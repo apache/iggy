@@ -94,6 +94,37 @@ macro_rules! memory_store {
     )*};
 }
 
+macro_rules! mock_s3_store {
+    ($($case:ident),* $(,)?) => {$(
+        #[test]
+        fn $case() {
+            let store = iggy_object_store::MockS3Store::default();
+            futures::executor::block_on(
+                iggy_object_store::contract::$case(&store, stringify!($case)),
+            );
+        }
+    )*};
+}
+
+/// The cases again with a latency on every call, which a put waits out
+/// before it commits.
+macro_rules! slow_mock_s3_store {
+    ($($case:ident),* $(,)?) => {$(
+        #[test]
+        fn $case() {
+            let latency = std::time::Duration::from_millis(1);
+            let store = iggy_object_store::MockS3Store::new(iggy_object_store::MockS3Latency {
+                put: latency,
+                get: latency,
+                other: latency,
+                bytes_per_second: 1024 * 1024 * 1024,
+            });
+            iggy_object_store::contract::shard_runtime()
+                .block_on(iggy_object_store::contract::$case(&store, stringify!($case)));
+        }
+    )*};
+}
+
 macro_rules! without_conditional_create {
     ($($case:ident),* $(,)?) => {$(
         #[test]
@@ -114,6 +145,16 @@ mod fs_store {
 mod memory_store {
     iggy_object_store::contract_cases!(memory_store);
     iggy_object_store::if_absent_contract_cases!(memory_store);
+}
+
+mod mock_s3_store {
+    iggy_object_store::contract_cases!(mock_s3_store);
+    iggy_object_store::if_absent_contract_cases!(mock_s3_store);
+}
+
+mod slow_mock_s3_store {
+    iggy_object_store::contract_cases!(slow_mock_s3_store);
+    iggy_object_store::if_absent_contract_cases!(slow_mock_s3_store);
 }
 
 mod without_conditional_create {

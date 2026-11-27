@@ -29,6 +29,7 @@ use Iggy\PollOptions;
 use Iggy\SendMessage;
 use Iggy\StreamDetails;
 use Iggy\StreamOptionKey;
+use Iggy\Topic;
 use Iggy\TopicDetails;
 use Iggy\TopicOptionKey;
 use PHPUnit\Framework\Assert;
@@ -46,6 +47,7 @@ final class ResourceOptionsTest extends TestCase
         'option_not_updatable' => 'Option cannot be updated after creation',
         'option_not_resettable' => 'Option cannot be reset',
         'read_only_option' => 'Option is read-only',
+        'invalid_option_value' => 'Invalid option value',
     ];
     private const FLAG_UPDATABLE = 1;
     private const FLAG_RESETTABLE = 2;
@@ -58,16 +60,39 @@ final class ResourceOptionsTest extends TestCase
     // The e2e lanes run a single-node server.
     private const SERVER_NODES = 1;
     private const INVALID_REPLICATION_FACTOR = 2018;
+    // A geo topic needs an object store on every node and a stream without encryption.
+    private const FEATURE_UNAVAILABLE = 5;
     // A partition's primary reports who is in sync once it runs, so a read right after the
     // create may list nobody.
     private const IN_SYNC_WAIT_SECONDS = 15.0;
     private const STREAM_DERIVED_KEYS = ['encryption_kek_fingerprint', 'encryption_key_fingerprint', 'encryption_key_source'];
     // Create and update arguments named after the unit they take rather than the option key.
+    // Topic reads name the duration getters the same way.
     private const PARAMETER_NAMES = [
         'message_expiry' => 'message_expiry_micros',
         'segment_max_age' => 'segment_max_age_micros',
         'local_retention_age' => 'local_retention_age_micros',
+        'fresh_upload_interval' => 'fresh_upload_interval_micros',
+        'consumer_offset_upload_interval' => 'consumer_offset_upload_interval_micros',
+        'positions_publish_interval' => 'positions_publish_interval_micros',
+        'tombstone_grace' => 'tombstone_grace_micros',
+        'positions_resume_timeout' => 'positions_resume_timeout_micros',
+        'long_term_rewrite_max_interval' => 'long_term_rewrite_max_interval_micros',
     ];
+    // The durations a geo topic can set, in catalog order. None has a default.
+    private const GEO_DURATION_KEYS = [
+        'fresh_upload_interval',
+        'consumer_offset_upload_interval',
+        'positions_publish_interval',
+        'tombstone_grace',
+        'positions_resume_timeout',
+        'long_term_rewrite_max_interval',
+    ];
+    // Only a geo topic has a mode or durations, so a normal topic reads none.
+    private const GEO_TOPIC_KEYS = ['geo_mode', ...self::GEO_DURATION_KEYS];
+    // The read cache settings any topic can set, in catalog order. Neither has a default, so a
+    // topic reads one only when it sets it.
+    private const READ_CACHE_KEYS = ['read_cache_size', 'read_ahead'];
 
     private array $createdStreams = [];
 
@@ -330,14 +355,19 @@ final class ResourceOptionsTest extends TestCase
             Durability::from($input['durability']),
             Durability::from($input['consumer_offset_durability']),
             partition_resize_policy: 'fixed',
+            topic_type: 'normal',
         );
 
         $expected = self::phpOptions($vector['wire_options']);
         $expected['partition_resize_policy'] = 'fixed';
+        $expected['topic_type'] = 'normal';
         ksort($expected);
         $topic = $client->getTopic($stream->id, $topicName);
         assert_not_null($topic);
         self::assertTopicOptions($topic, $expected);
+        assert_same('normal', $topic->topic_type);
+        assert_null($topic->geo_mode);
+        self::assertGeoDurations($topic, []);
 
         $renamed = unique_name('renamed-topic');
         $client->updateTopic(
@@ -399,6 +429,140 @@ final class ResourceOptionsTest extends TestCase
         assert_same($before->name, $after->name);
         assert_same($before->options, $after->options);
         assert_same($before->derived_options, $after->derived_options);
+    }
+
+    #[DataProvider('transports')]
+    #[TestDox('A zero geo topic duration is sent and refused on a normal topic, a null one is never sent, and none resets on $transport')]
+    public function testGivenGeoDurationsWhenCreatingAndUpdatingNormalTopicShouldSendZeroAndOmitNull(string $transport): void
+    {
+        $client = new_transport_client($transport);
+        $stream = $this->createStream($client, unique_name('geo-durations'));
+        $client->createTopic($stream->id, 'events', 1, null, null, null, null);
+        $before = $client->getTopic($stream->id, 'events');
+        assert_not_null($before);
+        self::assertGeoDurations($before, []);
+
+        foreach (self::GEO_DURATION_KEYS as $key) {
+            $zero = [self::PARAMETER_NAMES[$key] => 0];
+            $name = unique_name('zero');
+            // A dropped zero would create the topic.
+            self::assertRefused(
+                static fn () => $client->createTopic($stream->id, $name, 1, null, null, null, null, ...$zero),
+                'invalid_option_value',
+            );
+            assert_null($client->getTopic($stream->id, $name), $key);
+            // A dropped zero would leave an update that changes nothing, refused as an invalid command.
+            self::assertRefused(static fn () => $client->updateTopic($stream->id, 'events', ...$zero), 'invalid_option_value');
+            self::assertRefused(
+                static fn () => $client->updateTopic($stream->id, 'events', reset: [TopicOptionKey::from($key)]),
+                'option_not_resettable',
+            );
+            self::assertRefused(
+                static fn () => $client->updateTopic($stream->id, 'events', raw_reset: [$key]),
+                'option_not_resettable',
+            );
+        }
+
+        $after = $client->getTopic($stream->id, 'events');
+        assert_not_null($after);
+        assert_same($before->options, $after->options);
+        assert_same($before->derived_options, $after->derived_options);
+        self::assertGeoDurations($after, []);
+    }
+
+    #[DataProvider('transports')]
+    #[TestDox('The read cache vectors set both settings on a normal topic, 0 reads back as a value, and neither resets on $transport')]
+    public function testGivenReadCacheVectorsWhenCreatingAndUpdatingShouldReadZeroBackAndRefuseReset(string $transport): void
+    {
+        $input = self::fixtureCase('create_topic', 'topic_with_read_cache')['input'];
+        $created = self::readCacheValues($input);
+        $updated = self::readCacheValues(self::fixtureCase('update_resource', 'topic_set_read_cache')['input']);
+        assert_same(self::READ_CACHE_KEYS, array_keys($created));
+        assert_same(self::READ_CACHE_KEYS, array_keys($updated));
+        $client = new_transport_client($transport);
+        $stream = $this->createStream($client, unique_name('read-cache'));
+        $client->createTopic($stream->id, 'unset', 1, null, null, null, null);
+        $unset = $client->getTopic($stream->id, 'unset');
+        assert_not_null($unset);
+        self::assertReadCache($unset, []);
+
+        $client->createTopic(
+            $stream->id,
+            $input['name'],
+            $input['partitions_count'],
+            null,
+            null,
+            null,
+            null,
+            Durability::from($input['durability']),
+            Durability::from($input['consumer_offset_durability']),
+            ...$created,
+        );
+
+        $topic = $client->getTopic($stream->id, $input['name']);
+        assert_not_null($topic);
+        self::assertReadCache($topic, $created);
+        $listed = $client->getTopicsPage($stream->id, name: $input['name'])->items;
+        assert_count(1, $listed);
+        self::assertReadCache($listed[0], $created);
+
+        $client->updateTopic($stream->id, $input['name'], ...$updated);
+        $topic = $client->getTopic($stream->id, $input['name']);
+        assert_not_null($topic);
+        self::assertReadCache($topic, $updated);
+        foreach (self::READ_CACHE_KEYS as $key) {
+            self::assertRefused(
+                static fn () => $client->updateTopic($stream->id, $input['name'], reset: [TopicOptionKey::from($key)]),
+                'option_not_resettable',
+            );
+            self::assertRefused(
+                static fn () => $client->updateTopic($stream->id, $input['name'], raw_reset: [$key]),
+                'option_not_resettable',
+            );
+        }
+    }
+
+    #[TestDox('The geo topic vectors set every duration through typed arguments and read back as the response projection')]
+    public function testGivenGeoTopicVectorsWhenCreatingAndUpdatingShouldReadDurationsBack(): void
+    {
+        $input = self::fixtureCase('create_topic', 'geo_topic_with_durations')['input'];
+        $projection = self::fixtureCase('topic_responses', 'geo_topic_with_durations')['expected'];
+        $update = self::fixtureCase('update_resource', 'topic_set_geo_durations')['input'];
+        $client = new_client();
+        $stream = $this->createStream($client, unique_name('geo-topic'));
+
+        try {
+            $client->createTopic(
+                $stream->id,
+                $input['name'],
+                $input['partitions_count'],
+                null,
+                null,
+                null,
+                null,
+                Durability::from($input['durability']),
+                Durability::from($input['consumer_offset_durability']),
+                ...['topic_type' => $input['topic_type'], ...self::durationArguments($input)],
+            );
+        } catch (IggyException $error) {
+            // Admission checks every duration before it asks for an object store, so only the
+            // missing store or the stream's encryption key can refuse these values.
+            assert_same(self::FEATURE_UNAVAILABLE, $error->getCode(), $error->getMessage());
+            $this->markTestSkipped('a geo topic needs an object store and a stream without encryption');
+        }
+
+        $topic = $client->getTopic($stream->id, $input['name']);
+        assert_not_null($topic);
+        assert_same('geo', $topic->topic_type);
+        self::assertGeoDurations($topic, self::durationValues($projection));
+        $listed = $client->getTopicsPage($stream->id)->items;
+        assert_count(1, $listed);
+        self::assertGeoDurations($listed[0], self::durationValues($projection));
+
+        $client->updateTopic($stream->id, $input['name'], ...self::durationArguments($update));
+        $updated = $client->getTopic($stream->id, $input['name']);
+        assert_not_null($updated);
+        self::assertGeoDurations($updated, self::durationValues($update));
     }
 
     #[TestDox('A topic created without options reads the catalog defaults as derived, and never-expire and unlimited travel exactly')]
@@ -586,6 +750,8 @@ final class ResourceOptionsTest extends TestCase
         assert_same($source, $stream->derived_options['encryption_key_source']);
         assert_same($stream->encryption_key_fingerprint, $stream->derived_options['encryption_key_fingerprint']);
         assert_same($stream->encryption_kek_fingerprint, $stream->derived_options['encryption_kek_fingerprint']);
+        // Only a shadow stream, which serves the geo topics of another datacenter, has an origin.
+        assert_null($stream->shadow_origin);
         Assert::assertMatchesRegularExpression(self::FINGERPRINT_PATTERN, (string) $stream->encryption_key_fingerprint);
         Assert::assertNotNull($stream->encryption_kek_fingerprint);
         foreach (explode(',', $stream->encryption_kek_fingerprint) as $kekFingerprint) {
@@ -602,12 +768,68 @@ final class ResourceOptionsTest extends TestCase
         assert_same($explicit, self::sorted($topic->options));
         $mapKeys = [];
         foreach (self::catalogRows('topic') as $key => $row) {
-            if ($row['storage'] === 'map') {
+            if ($row['storage'] === 'map' && !in_array($key, [...self::GEO_TOPIC_KEYS, ...self::READ_CACHE_KEYS], true)) {
                 $mapKeys[] = $key;
             }
         }
         $readKeys = [...array_keys($topic->options), ...array_keys($topic->derived_options)];
         assert_same(self::sorted($mapKeys), self::sorted($readKeys));
+    }
+
+    private static function assertGeoDurations(TopicDetails|Topic $topic, array $expected): void
+    {
+        foreach (self::GEO_DURATION_KEYS as $key) {
+            assert_same($expected[$key] ?? null, $topic->{self::PARAMETER_NAMES[$key]}, $key);
+            assert_same($expected[$key] ?? null, $topic->options[$key] ?? null, "$key option");
+        }
+    }
+
+    // The durations a fixture input sets, as the createTopic() and updateTopic() arguments.
+    private static function durationArguments(array $input): array
+    {
+        $arguments = [];
+        foreach (self::GEO_DURATION_KEYS as $key) {
+            if (array_key_exists($key, $input)) {
+                $arguments[self::PARAMETER_NAMES[$key]] = $input[$key];
+            }
+        }
+
+        return $arguments;
+    }
+
+    // The durations a fixture input or projection sets, as the topic getters read them.
+    private static function durationValues(array $values): array
+    {
+        $durations = [];
+        foreach (self::GEO_DURATION_KEYS as $key) {
+            if (array_key_exists($key, $values)) {
+                $durations[$key] = self::integerOrString($values[$key]);
+            }
+        }
+
+        return $durations;
+    }
+
+    private static function assertReadCache(TopicDetails|Topic $topic, array $expected): void
+    {
+        foreach (self::READ_CACHE_KEYS as $key) {
+            assert_same($expected[$key] ?? null, $topic->$key, $key);
+            assert_same($expected[$key] ?? null, $topic->options[$key] ?? null, "$key option");
+        }
+    }
+
+    // The read cache settings a fixture input sets, both as the createTopic() and updateTopic()
+    // arguments, which share their names, and as the topic getters read them.
+    private static function readCacheValues(array $values): array
+    {
+        $settings = [];
+        foreach (self::READ_CACHE_KEYS as $key) {
+            if (array_key_exists($key, $values)) {
+                $settings[$key] = self::integerOrString($values[$key]);
+            }
+        }
+
+        return $settings;
     }
 
     private static function phpOptions(array $wireOptions): array
@@ -668,10 +890,22 @@ final class ResourceOptionsTest extends TestCase
             ...array_column($fixture['update_resource_errors'], 'error'),
             ...array_column($fixture['stream_key']['invalid_keys'], 'error'),
             ...array_filter(array_column($fixture['create_stream'], 'admission_error')),
+            ...array_filter(array_column($fixture['http_update'], 'error')),
         ];
         $codes = array_column($errors, 'code', 'name');
 
         return $codes;
+    }
+
+    private static function fixtureCase(string $section, string $case): array
+    {
+        foreach (self::fixture()[$section] as $vector) {
+            if ($vector['case'] === $case) {
+                return $vector;
+            }
+        }
+
+        Assert::fail("no $section vector named $case");
     }
 
     private static function catalogRows(string $scope): array

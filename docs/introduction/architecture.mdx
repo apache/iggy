@@ -1,0 +1,135 @@
+---
+title: Architecture
+description: "Inside the Iggy server: how work is scheduled across cores, how requests are routed, and how a message reaches disk."
+---
+
+This page covers the internals of the Iggy server: how work is scheduled across CPU cores, how requests are routed, and how data ends up on disk. If you're looking for the domain model (streams, topics, partitions, consumer groups, message format), see [concepts](/docs/introduction/concepts) first.
+
+## How a message flows through Iggy
+
+Before diving into the architecture details, here's an overview of a message's journey from client to disk:
+
+<MessageFlowDiagram />
+
+## Thread per core (shared nothing) + io_uring
+
+Iggy uses a **thread-per-core shared nothing architecture** combined with `io_uring` for maximum performance. This design has been proven by systems like ScyllaDB and Redpanda, both built on the Seastar framework.
+
+<ShardDiagram />
+
+### How it works
+
+Each configured **shard** (an instance of `IggyShard`) has its own single-threaded `compio` async runtime. With `pin_cores = true`, Linux shard threads are pinned to their selected CPUs via `sched_setaffinity`. NUMA allocation modes also bind memory via `hwlocality`. Setting `pin_cores = false` disables both bindings. Shared metadata and inter-shard communication still require synchronization.
+
+### Shard roles and connection distribution
+
+Shard 0 has a special role: it binds **every listener** - the replica plane and all client transports (TCP, QUIC, WebSocket, HTTP). Connections are then spread across shards at accept time:
+
+- **TCP and WebSocket** connections, plaintext or TLS, are handed off round-robin across the shards. Shard 0's coordinator duplicates the socket's file descriptor, ships a connection-setup frame to the target shard, and drops its own handle, so the owning shard serves the connection from then on - before a single byte is read. For TLS-wrapped TCP and secure WebSocket (WSS), the target shard runs the TLS handshake. Shard 0 is part of the rotation by default. `skip_shard_zero_for_clients = true` under `[cluster.coordinator]` takes it out.
+- **QUIC** connections stay on shard 0, installed through its UDP endpoint. HTTP is also served on shard 0.
+
+By default all shards, **including shard 0**, own partitions and serve partition requests. With `skip_shard_zero_for_partitions = true` under `[cluster.coordinator]`, a node with more than one shard places no partition on shard 0. See [Coordinator placement](/docs/clustering/configuration#coordinator-placement).
+
+### Request routing
+
+Requests are routed between shards using **message passing** (via `crossfire` bounded mpsc channels), so partition state remains on its owning shard. The routing logic splits operations into two planes:
+
+- **Metadata operations** (create/delete stream/topic/user etc.) always execute on **shard 0** - it is the only shard that commits metadata
+- **Partition operations** (send_messages, poll_messages, store_consumer_offset) are routed to the shard owning that partition via a lock-free concurrent map lookup. The request is sent into the owning shard's channel, whichever shard received it
+
+Partition-to-shard assignment is **deterministic**: the packed `IggyNamespace` is hashed with `Murmur3`, and the upper 16 bits of the hash are taken modulo the number of shards that own partitions (the upper bits are used because Murmur3 has weak lower bits for small integer inputs). That number is the shard count by default, and one less with `skip_shard_zero_for_partitions`.
+
+Across nodes, the SDK uses a partition route before this shard-local dispatch. Partition primaries are distributed across eligible nodes and rebalanced by the metadata primary. Each topic selects its own replication factor at creation. See [Multi-leader partitions](/docs/clustering/multi-leader).
+
+### IggyNamespace
+
+The `IggyNamespace` packs stream_id (20 bits), topic_id (12 bits), and partition_id (20 bits) into a single `u64` for efficient hashing and routing. This gives maximums of 1,048,576 streams, 4096 topics per stream, and 1,000,000 partitions per topic.
+
+<NamespacePacking />
+
+### CPU allocation modes
+
+The sharding system supports multiple allocation modes via the `cpu_allocation` config:
+
+- `"all"` - one shard per available CPU core
+- A numeric value (e.g. `4`) - exactly N shards, pinned to the first N CPUs in the process's allowed CPU set when pinning is enabled
+- A range (e.g. `"5..8"`) - shards on CPUs 5, 6 and 7 when pinning is enabled. Those CPUs must be allowed for the process
+- `"numa:auto"` - automatically detect NUMA topology and select physical cores, avoiding sibling hyperthreads
+- `"numa:nodes=0,1;cores=4;no_ht=true"` - explicit NUMA nodes, with the same number of cores taken from each listed node and hyperthread avoidance
+
+### io_uring and compio
+
+Traditional async runtimes like tokio use `epoll` which is **readiness-based** - you ask the kernel "is this file descriptor ready?" and then perform the I/O yourself. [Regular files cannot be registered with epoll](https://man7.org/linux/man-pages/man2/epoll_ctl.2.html). Tokio runs file I/O on a blocking thread pool that grows on demand (up to 512 threads by default, configurable). This does not scale well.
+
+`io_uring` is **completion-based** - you submit I/O requests to a submission queue (SQ), and the kernel completes them and places results in a completion queue (CQ). Both queues are shared ring buffers between user space and kernel. Submissions and completions can be batched to reduce syscalls. This is fundamentally better for disk I/O.
+
+<IoUringComparison />
+
+Iggy uses **compio** as its async runtime, which provides a driver-disaggregated architecture on top of io_uring (Linux) and IOCP (Windows). Each shard gets its own compio executor configured with:
+- Capacity: an io_uring submission queue of 4096 entries (by default)
+- Event interval: poll the I/O driver after 128 scheduler ticks (roughly task polls) by default
+- Cooperative task running enabled
+
+`IGGY_SHARD_RUNTIME_CAPACITY` and `IGGY_SHARD_EVENT_INTERVAL` override the two numeric defaults. On macOS, compio uses its polling driver and a blocking pool for file I/O.
+
+### Performance: Tokio vs Thread-per-Core
+
+The [historical migration benchmarks](https://iggy.apache.org/blogs/2026/02/27/thread-per-core-io_uring/) compared v0.5.0 with v0.7.0 at approximately 1,000 MB/s per node. The chart shows selected latency reductions for 8, 16 and 32 producers, each using its own stream. The 8-producer case also reported higher P95 and P99 latency. These are not measurements of 0.10.0:
+
+<BenchmarkChart />
+
+### Left-right metadata
+
+Shared metadata (streams, topics, consumer groups) uses a **left-right** concurrent data structure. Shard 0 holds the single write handle and is the only shard that commits metadata mutations, while every shard holds a read handle. This provides:
+- Lock-free reads on all shards (no contention on the hot path)
+- Strongly consistent writes serialized through shard 0
+
+## Clustering
+
+The server is built on the **Viewstamped Replication (VSR)** consensus protocol. Metadata operations are committed through the VSR write-ahead log **even on a single node**, which is the default deployment. Multi-node clustering is enabled via the `[cluster]` configuration (a node roster plus `--replica-id` to pick the local entry). See [clustering](/docs/clustering/vsr) for the details and maturity caveats.
+
+## Storage structure
+
+Having in mind that stream consists of topics, which might have one or more partitions assigned, and each partition consists of segments, we can visualize the structure of the Iggy data directory as follows:
+
+```bash
+local_data/
+├── metadata/
+│   └── journal.wal
+├── runtime/
+│   └── current_config.toml
+├── logs/
+│   └── iggy-server.log
+├── state/
+│   └── log
+└── streams/
+    └── 0/
+        └── topics/
+            └── 0/
+                └── partitions/
+                    └── 0/
+                        ├── 00000000000000000000.index
+                        ├── 00000000000000000000.log
+                        ├── superblock.a
+                        └── offsets/
+                            ├── consumers/
+                            └── groups/
+```
+
+This example shows a fresh partition with the default paths. The stream, topic and partition directories are named after their numeric IDs, **assigned from 0**. The `metadata/journal.wal` file is the VSR write-ahead log for metadata operations (stream/topic/user creation, etc.). Its index has 65536 slots by default (`journal_slots` under `[metadata]`). Before they run out, the server checkpoints the metadata into `metadata/snapshot.bin`, records the checkpoint in a superblock under `metadata/`, and drops the checkpointed operations from the log. Root initialization is recorded through metadata replication, and startup checks that journal or checkpoint state proves initialization. The `runtime/current_config.toml` file is rewritten at every boot with the configuration the server booted with and the addresses it actually bound. Secrets (the JWT secrets, the encryption key and the cluster shared secret) are left out. The `state/log` file is empty. The server creates it at boot and does not otherwise use it. Segment files are named by their 20-digit start offset. Recovery can create an empty active segment at a reserved offset beyond the last stored message. Partition superblocks record the recovery frontiers. A superblock is written to two files in turn, `superblock.a` and `superblock.b`. A fresh partition has only `superblock.a`. `superblock.b` appears at the next superblock write, for example after a later persistence operation. The `.index` file is created automatically and speeds up searches by keeping track of the offsets and timestamps of the records. The `offsets/` directory holds the server-side consumer and consumer group offsets.
+
+## Memory pool
+
+Iggy uses a custom memory pool with 28 buckets holding buffer sizes from 4 KiB to 512 MiB. The default pool size is 4 GiB with up to 8192 buffers per bucket. Buffers are allocated on demand and reused. Requests that exceed the pool budget can allocate outside it. Frozen buffers can be shared between components without copying their contents. The pool is page-aligned (4096-byte multiples) and requires a **minimum of 512 MiB**.
+
+## Write pipeline
+
+Messages flow through a multi-stage write pipeline:
+
+1. Messages arrive on the owning shard and are buffered in the partition journal.
+2. Partition VSR replicates prepares. With `durability=persisted`, a multi-replica group requires recoverable prepare-WAL copies at the replication quorum before commit.
+3. Awaited writes apply committed operations before success is returned. A singleton with `durability=persisted` synchronizes local segment state before replying.
+4. Ordinary segment writes use per-topic count and byte thresholds (defaults: 1024 messages, 1 MiB). Required persistence, capacity pressure, and lifecycle work can flush earlier. The `MessagesWriter` uses **vectored I/O** in chunks of up to 1024 buffers. Partial writes can require more than one I/O submission.
+5. When a segment reaches or passes the topic's segment size (default 1 GiB), it is **sealed** and a new segment is created. The batch that crosses the size is written whole, so a sealed segment can exceed it by up to one batch.
+
+Message `durability` and `consumer_offset_durability` default independently to `replicated`. Both policies write data to disk. `persisted` adds a stable-storage requirement at completion. See [Durability](/docs/server/durability).

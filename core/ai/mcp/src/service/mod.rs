@@ -17,12 +17,13 @@
 
 use iggy::prelude::{
     Client, ClusterClient, CommitPolicy, CompressionAlgorithm, Consumer, ConsumerGroupClient,
-    ConsumerOffsetClient, DEFAULT_PAGE_LIMIT, Identifier, IggyClient, IggyError, IggyExpiry,
-    IggyMessage, IggyTimestamp, MAX_PAGE_LIMIT, MaxTopicSize, MessageClient, NamedPageQuery,
-    OptionKey, Page, PageQuery, PartitionClient, Partitioning, PersonalAccessTokenClient,
-    PollOptions, PollingKind, PollingStrategy, SegmentClient, StreamClient, StreamCreateOptions,
-    StreamUpdateOptions, SystemClient, SystemSnapshotType, TopicClient, TopicCreateOptions,
-    TopicUpdateOptions, UserClient, UserCreateOptions, UserStatus, UserUpdateOptions,
+    ConsumerOffsetClient, DEFAULT_PAGE_LIMIT, GeoTopicDurations, Identifier, IggyClient, IggyError,
+    IggyExpiry, IggyMessage, IggyTimestamp, MAX_PAGE_LIMIT, MaxTopicSize, MessageClient,
+    NamedPageQuery, OptionKey, Page, PageQuery, PartitionClient, Partitioning,
+    PersonalAccessTokenClient, PollOptions, PollingKind, PollingStrategy, SegmentClient,
+    StreamClient, StreamCreateOptions, StreamUpdateOptions, SystemClient, SystemSnapshotType,
+    TopicClient, TopicCreateOptions, TopicReadCache, TopicUpdateOptions, UserClient,
+    UserCreateOptions, UserStatus, UserUpdateOptions,
 };
 use requests::*;
 use rmcp::{
@@ -902,6 +903,8 @@ impl TryFrom<UpdateTopic> for TopicUpdateOptions {
             tiered_storage: None,
             local_retention_age: None,
             local_retention_size: None,
+            geo_durations: GeoTopicDurations::default(),
+            read_cache: TopicReadCache::default(),
             reset,
             raw_reset,
             raw: update.options,

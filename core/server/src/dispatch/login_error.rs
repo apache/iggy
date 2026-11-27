@@ -46,9 +46,21 @@ pub enum LoginRegisterError {
     /// The external auth callout failed transiently (timeout, connect error,
     /// 5xx, 429, or overloaded). The SDK retries after backoff.
     ExternalAuthUnavailable,
+    /// The account proof changed during external login. A retry verifies the credential again.
+    CredentialChanged,
 }
 
 impl LoginRegisterError {
+    pub(super) fn after_external_verification(self) -> Self {
+        match self {
+            Self::Transient(MetadataSubmitError::Unauthenticated) => Self::CredentialChanged,
+            Self::Binding(IggyError::Unauthenticated) => {
+                Self::Binding(IggyError::TransientNotCommitted)
+            }
+            error => error,
+        }
+    }
+
     /// `true` for a terminal failure the client cannot fix by retrying (bad
     /// credentials / token / inactive user / session error); `false` for a
     /// transient consensus failure the SDK replays. The handler fast-fails
@@ -65,7 +77,7 @@ impl LoginRegisterError {
                 error,
                 IggyError::TransientNotAccepted | IggyError::TransientNotCommitted
             ),
-            Self::ExternalAuthUnavailable => false,
+            Self::ExternalAuthUnavailable | Self::CredentialChanged => false,
             _ => true,
         }
     }
@@ -83,6 +95,12 @@ impl std::fmt::Display for LoginRegisterError {
             Self::Transient(e) => write!(f, "transient consensus failure: {e}"),
             Self::ExternalAuthUnavailable => {
                 write!(f, "external auth service temporarily unavailable")
+            }
+            Self::CredentialChanged => {
+                write!(
+                    f,
+                    "account credentials changed during external verification"
+                )
             }
         }
     }

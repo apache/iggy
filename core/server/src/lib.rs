@@ -44,6 +44,7 @@ pub const SEMANTIC_VERSION: SemanticVersion = SemanticVersion::parse_const(VERSI
 // boot: process entry, shard threads, recovery orchestration.
 pub mod boot;
 pub(crate) mod config_writer;
+pub(crate) mod release_compatibility;
 pub(crate) mod shard_allocator;
 
 // spine: the request path - shell vocabulary, dispatch funnel, per-domain ops.
@@ -68,19 +69,29 @@ pub(crate) mod wire;
 pub(crate) mod http;
 
 // background: per-shard maintenance loops.
+pub(crate) mod geo_peers;
+pub(crate) mod geo_topics;
 pub(crate) mod incarnation_deletes;
+pub(crate) mod origin_recovery;
+pub(crate) mod orphan_sweep;
 pub(crate) mod partition_reconciler;
+pub(crate) mod peer_manifests;
+pub(crate) mod peer_positions;
 pub use partition_reconciler::{
     GroupOffsetCleanup, LifecycleReports, reconcile_consumer_group_offsets,
     reconcile_partition_lifecycles, reconcile_pending_revocations,
 };
+pub(crate) mod credential_refresh;
+pub(crate) mod gcs_credentials;
 pub(crate) mod personal_access_token_cleaner;
 pub(crate) mod s3_credentials;
 pub(crate) mod segment_cleaner;
+pub(crate) mod shadow_topics;
 pub(crate) mod snapshot;
 pub(crate) mod store_identity;
 pub(crate) mod sysinfo_printer;
 pub(crate) mod tiered_storage;
+pub(crate) mod upload_sweep;
 
 // support: shared plumbing.
 pub(crate) mod cluster_meta;

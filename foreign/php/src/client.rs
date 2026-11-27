@@ -323,7 +323,7 @@ impl IggyClient {
     /// active segment's first batch, at least 10 minutes. 18446744073709551615 and null roll
     /// segments by size alone. The server refuses a duration together with
     /// `preallocate_segments`. It follows `raw`, so positional calls written before it existed
-    /// keep their meaning, and so do the three options below.
+    /// keep their meaning, and so do the options below.
     ///
     /// `tiered_storage` moves sealed segments to the object store. Null leaves it off, and the
     /// server refuses true with `Feature is unavailable` until it tiers topics.
@@ -331,6 +331,35 @@ impl IggyClient {
     /// disk, one day when null, and `local_retention_size` caps the uploaded segments it keeps
     /// there, unlimited when null. The server refuses an age above a finite message expiry and a
     /// size above a finite `max_topic_size`.
+    ///
+    /// `topic_type` is `normal` or `geo`, and null creates a normal topic. A geo topic's messages
+    /// also become readable in the other datacenters through the object store. A geo topic needs
+    /// an object store on every node of the cluster: while one is not ready, the server refuses
+    /// `geo` with `Feature is unavailable`. A geo topic refuses tiered storage and an encrypted
+    /// stream, and keeps its name, its partition count and every option but the durations and the
+    /// read cache settings below. `geo_mode` says how a geo topic writes its messages, `geo` or
+    /// `geo_tiered`, and null resolves to `geo` there. The server refuses `geo_tiered` with
+    /// `Feature is unavailable` for now, and any mode on a normal topic.
+    ///
+    /// The six durations after `geo_mode` override, for a geo topic, the server settings of the
+    /// same name on each node: `[tiered_storage] fresh_upload_interval` (at most 10 s) and the
+    /// `[geo]` settings `consumer_offset_upload_interval` (at most 1 s, 0 answers an offset store
+    /// at its local commit), `positions_publish_interval` and `tombstone_grace` (above 0),
+    /// `positions_resume_timeout` (0 waits for no peer) and `long_term_rewrite_max_interval` (at
+    /// least 1 s). Each takes an int or a decimal string of microseconds. 0 is sent as a value,
+    /// and null leaves the server setting in force. The server refuses any of them on a normal
+    /// topic with `Invalid option value`.
+    ///
+    /// `read_cache_size` and `read_ahead`, after the durations, go on any topic and override the
+    /// `[tiered_storage]` settings of the same name on each node. `read_cache_size` is the memory
+    /// each node keeps for what the topic's reads fetch from the object store, divided between
+    /// its partitions: a limit within the read cache of each partition's shard, not a
+    /// reservation. 0 keeps nothing they fetch, otherwise it is at least 512 KiB. `read_ahead` is
+    /// the most bytes readahead fetches in front of a sequential reader of the topic. 0 turns
+    /// readahead off, otherwise it is at least 128 KiB and at most an eighth of a
+    /// `read_cache_size` above 0. Each takes an int or a decimal string of bytes. 0 is sent as a
+    /// value, and null leaves the server setting in force. The server refuses a value out of
+    /// range with `Invalid option value`.
     #[allow(clippy::too_many_arguments)]
     pub fn create_topic(
         &self,
@@ -353,71 +382,48 @@ impl IggyClient {
         tiered_storage: Option<bool>,
         local_retention_age_micros: Option<&Zval>,
         local_retention_size: Option<&Zval>,
+        topic_type: Option<String>,
+        geo_mode: Option<String>,
+        fresh_upload_interval_micros: Option<&Zval>,
+        consumer_offset_upload_interval_micros: Option<&Zval>,
+        positions_publish_interval_micros: Option<&Zval>,
+        tombstone_grace_micros: Option<&Zval>,
+        positions_resume_timeout_micros: Option<&Zval>,
+        long_term_rewrite_max_interval_micros: Option<&Zval>,
+        read_cache_size: Option<&Zval>,
+        read_ahead: Option<&Zval>,
     ) -> PhpResult {
-        let message_expiry_micros = optional_u64(message_expiry_micros, "message_expiry_micros")?;
-        let max_topic_size = optional_u64(max_topic_size, "max_topic_size")?;
-        let segment_size = optional_u64(segment_size, "segment_size")?;
-        let messages_required_to_save =
-            optional_unsigned::<u32>(messages_required_to_save, "messages_required_to_save")?;
-        let size_of_messages_required_to_save = optional_u64(
+        let options = topic_create_options(
+            partitions_count,
+            compression_algorithm,
+            message_expiry_micros,
+            max_topic_size,
+            segment_size,
+            durability,
+            consumer_offset_durability,
+            messages_required_to_save,
             size_of_messages_required_to_save,
-            "size_of_messages_required_to_save",
+            preallocate_segments,
+            partition_resize_policy,
+            replication_factor,
+            raw,
+            segment_max_age_micros,
+            tiered_storage,
+            local_retention_age_micros,
+            local_retention_size,
+            topic_type,
+            geo_mode,
+            fresh_upload_interval_micros,
+            consumer_offset_upload_interval_micros,
+            positions_publish_interval_micros,
+            tombstone_grace_micros,
+            positions_resume_timeout_micros,
+            long_term_rewrite_max_interval_micros,
+            read_cache_size,
+            read_ahead,
         )?;
-        let replication_factor =
-            optional_unsigned::<u32>(replication_factor, "replication_factor")?;
-        let segment_max_age_micros =
-            optional_u64(segment_max_age_micros, "segment_max_age_micros")?;
-        let local_retention_age_micros =
-            optional_u64(local_retention_age_micros, "local_retention_age_micros")?;
-        let local_retention_size = optional_u64(local_retention_size, "local_retention_size")?;
-        let compression_algorithm = match compression_algorithm {
-            Some(value) => CompressionAlgorithm::from_str(&value).map_err(to_php_exception)?,
-            None => CompressionAlgorithm::default(),
-        };
-        let partition_resize_policy = partition_resize_policy
-            .as_deref()
-            .map(PartitionResizePolicy::from_str)
-            .transpose()
-            .map_err(|_| {
-                to_php_exception("'partition_resize_policy' must be 'mutable' or 'fixed'")
-            })?;
-        let expiry = message_expiry_micros.map_or(IggyExpiry::ServerDefault, IggyExpiry::from);
-        let max_size = max_topic_size.map_or(MaxTopicSize::ServerDefault, MaxTopicSize::from);
-        let segment_max_age =
-            segment_max_age_micros.map_or(IggyExpiry::ServerDefault, IggyExpiry::from);
-        let local_retention_age =
-            local_retention_age_micros.map_or(IggyExpiry::ServerDefault, IggyExpiry::from);
-        let local_retention_size =
-            local_retention_size.map_or(MaxTopicSize::ServerDefault, MaxTopicSize::from);
         let stream: Identifier = stream.try_into()?;
         let inner = self.inner.clone();
-
-        // `None` is what tells admission to resolve the server default, so the
-        // sentinels above must collapse back to it.
-        let options = TopicCreateOptions {
-            partitions_count: Some(partitions_count),
-            compression_algorithm: (compression_algorithm != CompressionAlgorithm::default())
-                .then_some(compression_algorithm),
-            message_expiry: (expiry != IggyExpiry::ServerDefault).then_some(expiry),
-            max_topic_size: (max_size != MaxTopicSize::ServerDefault).then_some(max_size),
-            segment_size: segment_size.map(IggyByteSize::from),
-            durability: durability.unwrap_or_default().into(),
-            consumer_offset_durability: consumer_offset_durability.unwrap_or_default().into(),
-            partition_resize_policy,
-            messages_required_to_save,
-            size_of_messages_required_to_save: size_of_messages_required_to_save
-                .map(IggyByteSize::from),
-            preallocate_segments,
-            replication_factor,
-            segment_max_age: (segment_max_age != IggyExpiry::ServerDefault)
-                .then_some(segment_max_age),
-            tiered_storage,
-            local_retention_age: (local_retention_age != IggyExpiry::ServerDefault)
-                .then_some(local_retention_age),
-            local_retention_size: (local_retention_size != MaxTopicSize::ServerDefault)
-                .then_some(local_retention_size),
-            raw: raw.unwrap_or_default(),
-        };
 
         runtime().block_on(async move {
             inner
@@ -442,6 +448,14 @@ impl IggyClient {
     /// `local_retention_age_micros` and `local_retention_size` change how long and how much a
     /// tiered topic keeps on local disk after upload, with the same int or decimal string values
     /// and the same refusal of 0 as the expiry and the size cap.
+    ///
+    /// The six durations of a geo topic take the values `createTopic()` takes, 0 included. With
+    /// the read cache settings, they are the only options an update can change on a geo topic. A
+    /// normal topic refuses them with `Invalid option value`, and they cannot be reset: a `reset`
+    /// case or a `raw_reset` name of one is refused with `Option cannot be reset`.
+    ///
+    /// `read_cache_size` and `read_ahead` take the values `createTopic()` takes, 0 included, and
+    /// an update can change them on any topic. They cannot be reset either.
     #[allow(clippy::too_many_arguments)]
     #[php(defaults(reset = Vec::<TopicOptionKey>::new()))]
     pub fn update_topic(
@@ -457,36 +471,36 @@ impl IggyClient {
         tiered_storage: Option<bool>,
         local_retention_age_micros: Option<&Zval>,
         local_retention_size: Option<&Zval>,
+        fresh_upload_interval_micros: Option<&Zval>,
+        consumer_offset_upload_interval_micros: Option<&Zval>,
+        positions_publish_interval_micros: Option<&Zval>,
+        tombstone_grace_micros: Option<&Zval>,
+        positions_resume_timeout_micros: Option<&Zval>,
+        long_term_rewrite_max_interval_micros: Option<&Zval>,
+        read_cache_size: Option<&Zval>,
+        read_ahead: Option<&Zval>,
     ) -> PhpResult {
-        let message_expiry = optional_u64(message_expiry_micros, "message_expiry_micros")?
-            .map(|micros| positive_update(micros, "message_expiry_micros").map(IggyExpiry::from))
-            .transpose()?;
-        let max_topic_size = optional_u64(max_topic_size, "max_topic_size")?
-            .map(|bytes| positive_update(bytes, "max_topic_size").map(MaxTopicSize::from))
-            .transpose()?;
-        let local_retention_age =
-            optional_u64(local_retention_age_micros, "local_retention_age_micros")?
-                .map(|micros| {
-                    positive_update(micros, "local_retention_age_micros").map(IggyExpiry::from)
-                })
-                .transpose()?;
-        let local_retention_size = optional_u64(local_retention_size, "local_retention_size")?
-            .map(|bytes| positive_update(bytes, "local_retention_size").map(MaxTopicSize::from))
-            .transpose()?;
+        let options = topic_update_options(
+            name,
+            message_expiry_micros,
+            max_topic_size,
+            reset,
+            raw,
+            raw_reset,
+            tiered_storage,
+            local_retention_age_micros,
+            local_retention_size,
+            fresh_upload_interval_micros,
+            consumer_offset_upload_interval_micros,
+            positions_publish_interval_micros,
+            tombstone_grace_micros,
+            positions_resume_timeout_micros,
+            long_term_rewrite_max_interval_micros,
+            read_cache_size,
+            read_ahead,
+        )?;
         let stream: Identifier = stream.try_into()?;
         let topic: Identifier = topic.try_into()?;
-        let (reset, raw_reset) = reset_names(reset, raw_reset)?;
-        let options = TopicUpdateOptions {
-            name,
-            message_expiry,
-            max_topic_size,
-            tiered_storage,
-            local_retention_age,
-            local_retention_size,
-            reset,
-            raw_reset,
-            raw: raw.unwrap_or_default(),
-        };
         let inner = self.inner.clone();
 
         runtime().block_on(async move {
@@ -552,6 +566,23 @@ impl IggyClient {
         })
     }
 
+    /// Retires the geo origin of a datacenter that never returns.
+    ///
+    /// The cluster then follows nothing more of the origin: its shadow topics serve what they
+    /// hold until their retention removes it, and a client may delete them. Retiring an origin
+    /// that is retired already changes nothing. A datacenter that comes back needs another
+    /// origin name. Needs root or the global `manage_servers` permission.
+    pub fn retire_geo_origin(&self, origin: String) -> PhpResult {
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .retire_geo_origin(&origin)
+                .await
+                .map_err(to_php_exception)
+        })
+    }
+
     /// Gets a topic by stream and topic id/name.
     ///
     /// Over TCP, QUIC and WebSocket, a topic with too many partitions for one reply throws
@@ -575,7 +606,7 @@ impl IggyClient {
         })
     }
 
-    /// Reads one page of the streams.
+    /// Reads one page of the streams the caller may read.
     ///
     /// `order` is `Iggy\PageOrder::Id` when null, and `descending` reverses it. `limit` is 1 to
     /// 1000, 100 when null. `cursor` is the `next` of the previous page, null for the first
@@ -606,8 +637,11 @@ impl IggyClient {
         })
     }
 
-    /// Reads one page of the topics of a stream. A missing stream gives an empty page without
-    /// `next`. The other arguments are those of getStreamsPage().
+    /// Reads one page of the topics the caller may read in a stream. A missing stream, or one the
+    /// caller may read no topic of, gives an empty page without `next`. For a caller with a global
+    /// read grant, a page read with a cursor throws code 1009 instead, which HTTP reports as code
+    /// 20 (ResourceNotFound), because the stream was deleted during the walk. The other arguments are those of
+    /// getStreamsPage().
     #[php(defaults(descending = false))]
     pub fn get_topics_page(
         &self,
@@ -1166,6 +1200,234 @@ impl IggyClient {
     }
 }
 
+/// The options `createTopic()` sends for its arguments after the name.
+#[allow(clippy::too_many_arguments)]
+fn topic_create_options(
+    partitions_count: u32,
+    compression_algorithm: Option<String>,
+    message_expiry_micros: Option<&Zval>,
+    max_topic_size: Option<&Zval>,
+    segment_size: Option<&Zval>,
+    durability: Option<PhpDurability>,
+    consumer_offset_durability: Option<PhpDurability>,
+    messages_required_to_save: Option<&Zval>,
+    size_of_messages_required_to_save: Option<&Zval>,
+    preallocate_segments: Option<bool>,
+    partition_resize_policy: Option<String>,
+    replication_factor: Option<&Zval>,
+    raw: Option<BTreeMap<String, String>>,
+    segment_max_age_micros: Option<&Zval>,
+    tiered_storage: Option<bool>,
+    local_retention_age_micros: Option<&Zval>,
+    local_retention_size: Option<&Zval>,
+    topic_type: Option<String>,
+    geo_mode: Option<String>,
+    fresh_upload_interval_micros: Option<&Zval>,
+    consumer_offset_upload_interval_micros: Option<&Zval>,
+    positions_publish_interval_micros: Option<&Zval>,
+    tombstone_grace_micros: Option<&Zval>,
+    positions_resume_timeout_micros: Option<&Zval>,
+    long_term_rewrite_max_interval_micros: Option<&Zval>,
+    read_cache_size: Option<&Zval>,
+    read_ahead: Option<&Zval>,
+) -> PhpResult<TopicCreateOptions> {
+    let message_expiry_micros = optional_u64(message_expiry_micros, "message_expiry_micros")?;
+    let max_topic_size = optional_u64(max_topic_size, "max_topic_size")?;
+    let segment_size = optional_u64(segment_size, "segment_size")?;
+    let messages_required_to_save =
+        optional_unsigned::<u32>(messages_required_to_save, "messages_required_to_save")?;
+    let size_of_messages_required_to_save = optional_u64(
+        size_of_messages_required_to_save,
+        "size_of_messages_required_to_save",
+    )?;
+    let replication_factor = optional_unsigned::<u32>(replication_factor, "replication_factor")?;
+    let segment_max_age_micros = optional_u64(segment_max_age_micros, "segment_max_age_micros")?;
+    let local_retention_age_micros =
+        optional_u64(local_retention_age_micros, "local_retention_age_micros")?;
+    let local_retention_size = optional_u64(local_retention_size, "local_retention_size")?;
+    let compression_algorithm = match compression_algorithm {
+        Some(value) => CompressionAlgorithm::from_str(&value).map_err(to_php_exception)?,
+        None => CompressionAlgorithm::default(),
+    };
+    let partition_resize_policy = partition_resize_policy
+        .as_deref()
+        .map(PartitionResizePolicy::from_str)
+        .transpose()
+        .map_err(|_| to_php_exception("'partition_resize_policy' must be 'mutable' or 'fixed'"))?;
+    let topic_type = topic_type
+        .as_deref()
+        .map(TopicType::from_str)
+        .transpose()
+        .map_err(|_| to_php_exception("'topic_type' must be 'normal' or 'geo'"))?;
+    let geo_mode = geo_mode
+        .as_deref()
+        .map(GeoMode::from_str)
+        .transpose()
+        .map_err(|_| to_php_exception("'geo_mode' must be 'geo' or 'geo_tiered'"))?;
+    let geo_durations = geo_durations(
+        fresh_upload_interval_micros,
+        consumer_offset_upload_interval_micros,
+        positions_publish_interval_micros,
+        tombstone_grace_micros,
+        positions_resume_timeout_micros,
+        long_term_rewrite_max_interval_micros,
+    )?;
+    let read_cache = read_cache(read_cache_size, read_ahead)?;
+    let expiry = message_expiry_micros.map_or(IggyExpiry::ServerDefault, IggyExpiry::from);
+    let max_size = max_topic_size.map_or(MaxTopicSize::ServerDefault, MaxTopicSize::from);
+    let segment_max_age =
+        segment_max_age_micros.map_or(IggyExpiry::ServerDefault, IggyExpiry::from);
+    let local_retention_age =
+        local_retention_age_micros.map_or(IggyExpiry::ServerDefault, IggyExpiry::from);
+    let local_retention_size =
+        local_retention_size.map_or(MaxTopicSize::ServerDefault, MaxTopicSize::from);
+
+    // `None` is what tells admission to resolve the server default, so the
+    // sentinels above must collapse back to it.
+    Ok(TopicCreateOptions {
+        partitions_count: Some(partitions_count),
+        compression_algorithm: (compression_algorithm != CompressionAlgorithm::default())
+            .then_some(compression_algorithm),
+        message_expiry: (expiry != IggyExpiry::ServerDefault).then_some(expiry),
+        max_topic_size: (max_size != MaxTopicSize::ServerDefault).then_some(max_size),
+        segment_size: segment_size.map(IggyByteSize::from),
+        durability: durability.unwrap_or_default().into(),
+        consumer_offset_durability: consumer_offset_durability.unwrap_or_default().into(),
+        partition_resize_policy,
+        messages_required_to_save,
+        size_of_messages_required_to_save: size_of_messages_required_to_save
+            .map(IggyByteSize::from),
+        preallocate_segments,
+        replication_factor,
+        segment_max_age: (segment_max_age != IggyExpiry::ServerDefault).then_some(segment_max_age),
+        tiered_storage,
+        local_retention_age: (local_retention_age != IggyExpiry::ServerDefault)
+            .then_some(local_retention_age),
+        local_retention_size: (local_retention_size != MaxTopicSize::ServerDefault)
+            .then_some(local_retention_size),
+        topic_type,
+        geo_mode,
+        geo_durations,
+        read_cache,
+        raw: raw.unwrap_or_default(),
+    })
+}
+
+/// The options `updateTopic()` sends for its arguments after the topic.
+#[allow(clippy::too_many_arguments)]
+fn topic_update_options(
+    name: Option<String>,
+    message_expiry_micros: Option<&Zval>,
+    max_topic_size: Option<&Zval>,
+    reset: Vec<TopicOptionKey>,
+    raw: Option<BTreeMap<String, String>>,
+    raw_reset: Option<Vec<String>>,
+    tiered_storage: Option<bool>,
+    local_retention_age_micros: Option<&Zval>,
+    local_retention_size: Option<&Zval>,
+    fresh_upload_interval_micros: Option<&Zval>,
+    consumer_offset_upload_interval_micros: Option<&Zval>,
+    positions_publish_interval_micros: Option<&Zval>,
+    tombstone_grace_micros: Option<&Zval>,
+    positions_resume_timeout_micros: Option<&Zval>,
+    long_term_rewrite_max_interval_micros: Option<&Zval>,
+    read_cache_size: Option<&Zval>,
+    read_ahead: Option<&Zval>,
+) -> PhpResult<TopicUpdateOptions> {
+    let message_expiry = optional_u64(message_expiry_micros, "message_expiry_micros")?
+        .map(|micros| positive_update(micros, "message_expiry_micros").map(IggyExpiry::from))
+        .transpose()?;
+    let max_topic_size = optional_u64(max_topic_size, "max_topic_size")?
+        .map(|bytes| positive_update(bytes, "max_topic_size").map(MaxTopicSize::from))
+        .transpose()?;
+    let local_retention_age =
+        optional_u64(local_retention_age_micros, "local_retention_age_micros")?
+            .map(|micros| {
+                positive_update(micros, "local_retention_age_micros").map(IggyExpiry::from)
+            })
+            .transpose()?;
+    let local_retention_size = optional_u64(local_retention_size, "local_retention_size")?
+        .map(|bytes| positive_update(bytes, "local_retention_size").map(MaxTopicSize::from))
+        .transpose()?;
+    let geo_durations = geo_durations(
+        fresh_upload_interval_micros,
+        consumer_offset_upload_interval_micros,
+        positions_publish_interval_micros,
+        tombstone_grace_micros,
+        positions_resume_timeout_micros,
+        long_term_rewrite_max_interval_micros,
+    )?;
+    let read_cache = read_cache(read_cache_size, read_ahead)?;
+    let (reset, raw_reset) = reset_names(reset, raw_reset)?;
+    Ok(TopicUpdateOptions {
+        name,
+        message_expiry,
+        max_topic_size,
+        tiered_storage,
+        local_retention_age,
+        local_retention_size,
+        geo_durations,
+        read_cache,
+        reset,
+        raw_reset,
+        raw: raw.unwrap_or_default(),
+    })
+}
+
+/// The durations of a geo topic, each an int or a decimal string of microseconds.
+///
+/// Zero is a duration of its own, such as no wait, so unlike the expiry and size sentinels it
+/// is sent, and only null leaves a duration to the server setting.
+fn geo_durations(
+    fresh_upload_interval_micros: Option<&Zval>,
+    consumer_offset_upload_interval_micros: Option<&Zval>,
+    positions_publish_interval_micros: Option<&Zval>,
+    tombstone_grace_micros: Option<&Zval>,
+    positions_resume_timeout_micros: Option<&Zval>,
+    long_term_rewrite_max_interval_micros: Option<&Zval>,
+) -> PhpResult<GeoTopicDurations> {
+    let duration = |value: Option<&Zval>, field: &str| {
+        optional_u64(value, field).map(|micros| micros.map(IggyDuration::from))
+    };
+    Ok(GeoTopicDurations {
+        fresh_upload_interval: duration(
+            fresh_upload_interval_micros,
+            "fresh_upload_interval_micros",
+        )?,
+        consumer_offset_upload_interval: duration(
+            consumer_offset_upload_interval_micros,
+            "consumer_offset_upload_interval_micros",
+        )?,
+        positions_publish_interval: duration(
+            positions_publish_interval_micros,
+            "positions_publish_interval_micros",
+        )?,
+        tombstone_grace: duration(tombstone_grace_micros, "tombstone_grace_micros")?,
+        positions_resume_timeout: duration(
+            positions_resume_timeout_micros,
+            "positions_resume_timeout_micros",
+        )?,
+        long_term_rewrite_max_interval: duration(
+            long_term_rewrite_max_interval_micros,
+            "long_term_rewrite_max_interval_micros",
+        )?,
+    })
+}
+
+/// The read cache settings of a topic, each an int or a decimal string of bytes.
+///
+/// Zero turns a setting off, so like a zero duration it is sent, and only null leaves a setting
+/// to the server.
+fn read_cache(
+    read_cache_size: Option<&Zval>,
+    read_ahead: Option<&Zval>,
+) -> PhpResult<TopicReadCache> {
+    Ok(TopicReadCache {
+        size: optional_u64(read_cache_size, "read_cache_size")?.map(IggyByteSize::from),
+        read_ahead: optional_u64(read_ahead, "read_ahead")?.map(IggyByteSize::from),
+    })
+}
+
 fn build_reader(
     mut builder: ReaderBuilder,
     start: Option<&PollingStrategy>,
@@ -1410,4 +1672,368 @@ fn operation_id_from_decimal(value: &str) -> PhpResult<u64> {
     value
         .parse::<u64>()
         .map_err(|_| to_php_exception("'operation_id' exceeds the unsigned 64-bit range"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy_binary_protocol::requests::system::{ResourceTarget, UpdateResourceRequest};
+    use iggy_binary_protocol::requests::topics::CreateTopicRequest;
+    use iggy_binary_protocol::{WireEncode, WireIdentifier, WireName};
+    use iggy_common::create_topic::CreateTopic;
+    use iggy_common::resource_options_json;
+    use iggy_common::wire_conversions::{identifier_to_wire, resource_options_from_wire};
+    use iggy_common::{DEFAULT_PARTITIONS_COUNT, OptionInputMap};
+    use serde_json::Value;
+
+    const FIXTURE: &str = include_str!("../tests/fixtures/resource_options.json");
+
+    #[test]
+    fn given_create_topic_vectors_when_building_typed_arguments_should_match_wire_and_http_bodies()
+    {
+        for vector in vectors("create_topic") {
+            let case = text(&vector["case"]);
+            let input = &vector["input"];
+            let message_expiry = long_argument(&input["message_expiry"]);
+            let max_topic_size = long_argument(&input["max_topic_size"]);
+            let segment_size = long_argument(&input["segment_size"]);
+            let [fresh, consumer_offset, publish, tombstone, resume, rewrite] = durations(input);
+            let [read_cache_size, read_ahead] = read_cache_settings(input);
+            let options = topic_create_options(
+                number(&input["partitions_count"]),
+                input["compression_algorithm"].as_str().map(str::to_owned),
+                message_expiry.as_ref(),
+                max_topic_size.as_ref(),
+                segment_size.as_ref(),
+                input["durability"].as_str().map(durability),
+                input["consumer_offset_durability"].as_str().map(durability),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                input["topic_type"].as_str().map(str::to_owned),
+                None,
+                fresh.as_ref(),
+                consumer_offset.as_ref(),
+                publish.as_ref(),
+                tombstone.as_ref(),
+                resume.as_ref(),
+                rewrite.as_ref(),
+                read_cache_size.as_ref(),
+                read_ahead.as_ref(),
+            )
+            .expect("typed arguments convert");
+            let stream_id = identifier(&input["stream_id"]);
+            let name = text(&input["name"]);
+            let partitions_count = options.partitions_count.unwrap_or(DEFAULT_PARTITIONS_COUNT);
+            let request = CreateTopicRequest {
+                stream_id: identifier_to_wire(&stream_id).expect("stream id encodes"),
+                partitions_count,
+                name: WireName::new(name).expect("name encodes"),
+                options: options.to_wire().expect("options encode"),
+            };
+
+            assert_eq!(
+                hex(&request.to_bytes()),
+                text(&vector["body_hex"]),
+                "{case}"
+            );
+            assert_eq!(
+                resource_options_from_wire(&request.options, true).expect("options decode"),
+                option_map(&vector["wire_options"]),
+                "{case}"
+            );
+            let http_body = serde_json::to_string(&CreateTopic {
+                stream_id,
+                partitions_count,
+                name: name.to_owned(),
+                options: OptionInputMap(options.to_input_map().expect("options map")),
+            })
+            .expect("HTTP body encodes");
+            assert_eq!(http_body, text(&vector["http_body"]), "{case}");
+        }
+    }
+
+    #[test]
+    fn given_topic_update_vectors_when_building_typed_arguments_should_match_wire_bodies() {
+        for vector in vectors("update_resource") {
+            if vector["scope"] != "topic" {
+                continue;
+            }
+            let case = text(&vector["case"]);
+            let input = &vector["input"];
+            let message_expiry = long_argument(&input["message_expiry"]);
+            let max_topic_size = long_argument(&input["max_topic_size"]);
+            let reset = input["reset"]
+                .as_array()
+                .map_or_else(Vec::new, |names| names.iter().map(reset_case).collect());
+            let [fresh, consumer_offset, publish, tombstone, resume, rewrite] = durations(input);
+            let [read_cache_size, read_ahead] = read_cache_settings(input);
+            let options = topic_update_options(
+                input["name"].as_str().map(str::to_owned),
+                message_expiry.as_ref(),
+                max_topic_size.as_ref(),
+                reset,
+                None,
+                None,
+                None,
+                None,
+                None,
+                fresh.as_ref(),
+                consumer_offset.as_ref(),
+                publish.as_ref(),
+                tombstone.as_ref(),
+                resume.as_ref(),
+                rewrite.as_ref(),
+                read_cache_size.as_ref(),
+                read_ahead.as_ref(),
+            )
+            .expect("typed arguments convert");
+            let patch = options.to_patch().expect("patch encodes");
+            let target = &vector["target"];
+            let request = UpdateResourceRequest {
+                target: ResourceTarget::Topic {
+                    stream_id: wire_identifier(&target["stream_id"]),
+                    topic_id: wire_identifier(&target["topic_id"]),
+                },
+                reset: patch.reset,
+                options: patch.set,
+            };
+
+            assert_eq!(
+                hex(&request.to_bytes()),
+                text(&vector["body_hex"]),
+                "{case}"
+            );
+            assert_eq!(
+                resource_options_from_wire(&request.options, true).expect("set block decodes"),
+                option_map(&vector["wire_set"]),
+                "{case}"
+            );
+            let reset: Vec<&str> = request.reset.iter().map(WireName::as_str).collect();
+            let wire_reset: Vec<&str> = vector["wire_reset"]
+                .as_array()
+                .expect("reset list")
+                .iter()
+                .map(text)
+                .collect();
+            assert_eq!(reset, wire_reset, "{case}");
+        }
+    }
+
+    #[test]
+    fn given_zero_and_null_durations_when_building_options_should_send_zero_and_omit_null() {
+        let zero = long(0);
+        let created = topic_create_options(
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("geo".to_owned()),
+            None,
+            Some(&zero),
+            None,
+            None,
+            None,
+            Some(&zero),
+            None,
+            None,
+            None,
+        )
+        .expect("zero converts")
+        .to_wire()
+        .expect("options encode");
+        let updated = topic_update_options(
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&zero),
+            None,
+            None,
+            None,
+            Some(&zero),
+            None,
+            None,
+            None,
+        )
+        .expect("zero converts")
+        .to_patch()
+        .expect("a zero duration alone is a change")
+        .set;
+
+        let expected = [Some(0), None, None, None, Some(0), None];
+        for sent in [created, updated] {
+            let sent = resource_options_from_wire(&sent, true).expect("options decode");
+            for (key, micros) in GeoTopicDurations::KEYS.into_iter().zip(expected) {
+                let value = sent
+                    .get(&HeaderKey::from(key))
+                    .map(|option| option.value.as_uint64().expect("uint64 micros"));
+                assert_eq!(value, micros, "{key}");
+            }
+        }
+    }
+
+    #[test]
+    fn given_negative_duration_when_building_options_should_refuse_before_sending() {
+        let negative = long(-1);
+
+        let created = topic_create_options(
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("geo".to_owned()),
+            None,
+            None,
+            None,
+            None,
+            Some(&negative),
+            None,
+            None,
+            None,
+            None,
+        );
+        let updated = topic_update_options(
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&negative),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert!(created.is_err());
+        assert!(updated.is_err());
+    }
+
+    fn vectors(section: &str) -> Vec<Value> {
+        let fixture: Value = serde_json::from_str(FIXTURE).expect("fixture parses");
+        fixture[section].as_array().expect("vector list").clone()
+    }
+
+    /// The durations of a fixture input as the ints a PHP caller passes, in catalog order.
+    fn durations(input: &Value) -> [Option<Zval>; 6] {
+        GeoTopicDurations::KEYS.map(|key| {
+            let name: &'static str = key.into();
+            long_argument(&input[name])
+        })
+    }
+
+    /// The read cache settings of a fixture input as the ints a PHP caller passes, in catalog
+    /// order.
+    fn read_cache_settings(input: &Value) -> [Option<Zval>; 2] {
+        TopicReadCache::KEYS.map(|key| {
+            let name: &'static str = key.into();
+            long_argument(&input[name])
+        })
+    }
+
+    /// A decimal fixture value as the int a PHP caller passes, none when the input omits it.
+    fn long_argument(value: &Value) -> Option<Zval> {
+        value
+            .as_str()
+            .map(|number| long(number.parse().expect("value fits a PHP int")))
+    }
+
+    fn long(value: i64) -> Zval {
+        let mut zval = Zval::new();
+        zval.set_long(value);
+        zval
+    }
+
+    fn durability(name: &str) -> PhpDurability {
+        match name {
+            "replicated" => PhpDurability::Replicated,
+            "persisted" => PhpDurability::Persisted,
+            other => panic!("no durability {other}"),
+        }
+    }
+
+    fn reset_case(name: &Value) -> TopicOptionKey {
+        match text(name) {
+            "message_expiry" => TopicOptionKey::MessageExpiry,
+            "max_topic_size" => TopicOptionKey::MaxTopicSize,
+            other => panic!("no reset case for {other}"),
+        }
+    }
+
+    fn identifier(value: &Value) -> Identifier {
+        match value.as_u64() {
+            Some(id) => Identifier::numeric(u32::try_from(id).expect("id fits u32")),
+            None => Identifier::named(text(value)),
+        }
+        .expect("identifier")
+    }
+
+    fn wire_identifier(value: &Value) -> WireIdentifier {
+        identifier_to_wire(&identifier(value)).expect("identifier encodes")
+    }
+
+    fn number(value: &Value) -> u32 {
+        value
+            .as_u64()
+            .and_then(|number| u32::try_from(number).ok())
+            .expect("u32 number")
+    }
+
+    fn option_map(value: &Value) -> ResourceOptions {
+        resource_options_json::deserialize(value.clone()).expect("option map")
+    }
+
+    fn text(value: &Value) -> &str {
+        value.as_str().expect("text")
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
 }

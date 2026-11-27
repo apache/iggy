@@ -28,6 +28,14 @@
 pub const ASYNCIFY_POOL_DISABLED_PANIC_MSG: &str =
     "the thread pool is needed but no worker thread is running";
 
+/// Starts the log line of every partition that recovery refused to serve. The
+/// node boots and exits 0 all the same, so this line is the only sign of it:
+/// an operator greps for it to list the partitions a node left dark, and the
+/// storage compatibility test fails a run whose log holds it.
+///
+/// One fixed word, so that no setting or field name can hold it by accident.
+pub const PARTITION_REFUSED_MARKER: &str = "partition_refused";
+
 #[cfg(target_os = "linux")]
 const DISCORD_SUPPORT_URL: &str = "https://discord.gg/apache-iggy";
 

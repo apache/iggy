@@ -29,12 +29,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use compio::fs::{File, OpenOptions};
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
-use futures::StreamExt;
 use futures::channel::oneshot;
 use futures::lock::Mutex;
+use futures::{Stream, StreamExt};
 
 use crate::error::ObjectStoreError;
 use crate::store::{
@@ -53,6 +53,10 @@ const MAX_DURABLE_DIRECTORIES: usize = 65_536;
 /// A put syncs its scratch file each time it wrote this many body bytes
 /// since the last sync.
 const SYNC_INTERVAL: u64 = 8 * 1024 * 1024;
+/// The fewest bytes of one write of a body but its last. A body held in
+/// memory comes in small pieces, for the deadlines of a remote store, which
+/// would otherwise cost one write each.
+const WRITE_LEN: usize = 1024 * 1024;
 
 // A scratch name adds two dots and the 32 hex digits of an etag to the last
 // segment of a key, and a file name holds 255 bytes.
@@ -72,7 +76,8 @@ const _: () = assert!(MAX_KEY_SEGMENT_LEN + 34 <= 255);
 /// - A listing skips dot-names and shows every other file, so a delete can
 ///   find a damaged one. A file without a valid header shows its file length
 ///   and an empty etag. A listing removes the scratch files of crashed puts
-///   an hour after their last write.
+///   an hour after their last write, unless the store is
+///   [`FsStore::foreign`].
 /// - Directories stay after their objects go.
 /// - `root` must exist. Without it, calls fail with
 ///   [`ObjectStoreError::BucketNotFound`].
@@ -85,6 +90,8 @@ const _: () = assert!(MAX_KEY_SEGMENT_LEN + 34 <= 255);
 #[derive(Debug)]
 pub struct FsStore {
     root: PathBuf,
+    /// Whether a listing removes the scratch files of crashed puts.
+    removes_scratch: bool,
     /// Held by the listing that runs, with what the last page read.
     listing: Arc<Mutex<ListCache>>,
     /// Keys of the directories whose entries a sync made durable.
@@ -135,9 +142,21 @@ impl FsStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
+            removes_scratch: true,
             listing: Arc::default(),
             durable: RefCell::default(),
             leftovers: RefCell::default(),
+        }
+    }
+
+    /// A store in `root`, a directory that another cluster writes. Its
+    /// listings leave every scratch file alone: an old one can still be a
+    /// put of that cluster, and only that cluster may remove it.
+    #[must_use]
+    pub fn foreign(root: impl Into<PathBuf>) -> Self {
+        Self {
+            removes_scratch: false,
+            ..Self::new(root)
         }
     }
 
@@ -492,7 +511,7 @@ impl ObjectStore for FsStore {
     async fn list(&self, request: &ListRequest<'_>) -> Result<ListPage, ObjectStoreError> {
         validate_prefix(request.prefix)?;
         self.clean_up();
-        let walk = Walk::new(&self.root, request);
+        let walk = Walk::new(&self.root, request, self.removes_scratch);
         let mut cache = Arc::clone(&self.listing).lock_owned().await;
         on_thread(move || walk.page(&mut cache)).await
     }
@@ -617,7 +636,7 @@ async fn write_object(
     let mut position = header.len();
     let mut checksum = 0;
     let mut unsynced = 0;
-    let mut pieces = body.into_pieces();
+    let mut pieces = coalesced(body.into_pieces());
     while let Some(piece) = pieces.next().await {
         let piece = piece.map_err(ObjectStoreError::Body)?;
         checksum = crc32c::crc32c_append(checksum, &piece);
@@ -652,6 +671,33 @@ async fn write_object(
         .map_err(|error| io_error(key, "syncing", &error))?;
     note(|| format!("sync scratch of {key}"));
     Ok(())
+}
+
+/// `pieces` joined into pieces of at least [`WRITE_LEN`] bytes, but for the
+/// last one. A piece that long already passes as it is.
+fn coalesced(
+    pieces: impl Stream<Item = io::Result<Bytes>> + Unpin,
+) -> impl Stream<Item = io::Result<Bytes>> + Unpin {
+    Box::pin(futures::stream::unfold(Some(pieces), |pieces| async move {
+        let mut pieces = pieces?;
+        let mut joined = BytesMut::new();
+        loop {
+            match pieces.next().await {
+                Some(Ok(piece)) if joined.is_empty() && piece.len() >= WRITE_LEN => {
+                    return Some((Ok(piece), Some(pieces)));
+                }
+                Some(Ok(piece)) => {
+                    joined.extend_from_slice(&piece);
+                    if joined.len() >= WRITE_LEN {
+                        return Some((Ok(joined.freeze()), Some(pieces)));
+                    }
+                }
+                Some(Err(error)) => return Some((Err(error), None)),
+                None if joined.is_empty() => return None,
+                None => return Some((Ok(joined.freeze()), None)),
+            }
+        }
+    }))
 }
 
 /// Renames the scratch file over the object.

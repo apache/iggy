@@ -16,7 +16,7 @@
 // under the License.
 
 use iggy::prelude::{
-    IggyByteSize, IggyExpiry as RustIggyExpiry, MaxTopicSize as RustMaxTopicSize,
+    IggyByteSize, IggyDuration, IggyExpiry as RustIggyExpiry, MaxTopicSize as RustMaxTopicSize,
     Partition as RustPartition, Topic as RustTopic, TopicDetails as RustTopicDetails,
 };
 
@@ -28,6 +28,7 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen
 use crate::duration::{iggy_duration_to_py_delta, py_delta_to_iggy_duration};
 use crate::options::options_by_provenance;
 use crate::receive_message::PartitionContext;
+use crate::resource_options::{GeoMode, TopicType};
 use crate::user_headers::UserHeaders;
 
 /// The expiry of the messages in a topic.
@@ -244,6 +245,142 @@ impl Topic {
         self.inner.resolved_options().max_topic_size.into()
     }
 
+    /// What the topic is, normal or geo, fixed at creation.
+    #[getter]
+    pub fn topic_type(&self) -> TopicType {
+        self.inner.resolved_options().topic_type.into()
+    }
+
+    /// How a geo topic writes its messages, fixed at creation. `None` on a
+    /// normal topic.
+    #[getter]
+    pub fn geo_mode(&self) -> Option<GeoMode> {
+        self.inner.resolved_options().geo_mode.map(GeoMode::from)
+    }
+
+    /// Longest time a send to the geo topic waits for its upload to start, or
+    /// `None` when the topic leaves it to each node's server setting.
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+    #[getter]
+    pub fn fresh_upload_interval<'a>(
+        &self,
+        py: Python<'a>,
+    ) -> PyResult<Option<Bound<'a, PyDelta>>> {
+        geo_duration(
+            py,
+            self.inner
+                .resolved_options()
+                .geo_durations
+                .fresh_upload_interval,
+        )
+    }
+
+    /// Shortest time between two uploads of the positions the geo topic's
+    /// stored offsets wait for, or `None` when the topic leaves it to each
+    /// node's server setting.
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+    #[getter]
+    pub fn consumer_offset_upload_interval<'a>(
+        &self,
+        py: Python<'a>,
+    ) -> PyResult<Option<Bound<'a, PyDelta>>> {
+        geo_duration(
+            py,
+            self.inner
+                .resolved_options()
+                .geo_durations
+                .consumer_offset_upload_interval,
+        )
+    }
+
+    /// How often a node uploads the geo topic's changed positions, or `None`
+    /// when the topic leaves it to each node's server setting.
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+    #[getter]
+    pub fn positions_publish_interval<'a>(
+        &self,
+        py: Python<'a>,
+    ) -> PyResult<Option<Bound<'a, PyDelta>>> {
+        geo_duration(
+            py,
+            self.inner
+                .resolved_options()
+                .geo_durations
+                .positions_publish_interval,
+        )
+    }
+
+    /// How long the tombstone and the objects of the deleted geo topic stay,
+    /// or `None` when the topic leaves it to each node's server setting.
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+    #[getter]
+    pub fn tombstone_grace<'a>(&self, py: Python<'a>) -> PyResult<Option<Bound<'a, PyDelta>>> {
+        geo_duration(
+            py,
+            self.inner.resolved_options().geo_durations.tombstone_grace,
+        )
+    }
+
+    /// How long the geo topic's group polls wait for the peers' positions
+    /// after a node starts, or `None` when the topic leaves it to each node's
+    /// server setting.
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+    #[getter]
+    pub fn positions_resume_timeout<'a>(
+        &self,
+        py: Python<'a>,
+    ) -> PyResult<Option<Bound<'a, PyDelta>>> {
+        geo_duration(
+            py,
+            self.inner
+                .resolved_options()
+                .geo_durations
+                .positions_resume_timeout,
+        )
+    }
+
+    /// Longest wait between two long-term rewrites of a partition of the geo
+    /// topic, or `None` when the topic leaves it to each node's server
+    /// setting.
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+    #[getter]
+    pub fn long_term_rewrite_max_interval<'a>(
+        &self,
+        py: Python<'a>,
+    ) -> PyResult<Option<Bound<'a, PyDelta>>> {
+        geo_duration(
+            py,
+            self.inner
+                .resolved_options()
+                .geo_durations
+                .long_term_rewrite_max_interval,
+        )
+    }
+
+    /// Memory in bytes each node keeps for what the topic's reads fetch from
+    /// the object store, or `None` when the topic leaves it to each node's
+    /// server setting. Zero keeps nothing they fetch.
+    #[getter]
+    pub fn read_cache_size(&self) -> Option<u64> {
+        self.inner
+            .resolved_options()
+            .read_cache
+            .size
+            .map(|size| size.as_bytes_u64())
+    }
+
+    /// Most bytes readahead fetches in front of a sequential reader of the
+    /// topic, or `None` when the topic leaves it to each node's server
+    /// setting. Zero turns readahead off.
+    #[getter]
+    pub fn read_ahead(&self) -> Option<u64> {
+        self.inner
+            .resolved_options()
+            .read_cache
+            .read_ahead
+            .map(|read_ahead| read_ahead.as_bytes_u64())
+    }
+
     /// Options the creating client set explicitly.
     ///
     /// The same `dict[HeaderKey, HeaderValue]` that `ReceiveMessage.user_headers`
@@ -338,6 +475,142 @@ impl TopicDetails {
     #[getter]
     pub fn max_topic_size(&self) -> MaxTopicSize {
         self.inner.resolved_options().max_topic_size.into()
+    }
+
+    /// What the topic is, normal or geo, fixed at creation.
+    #[getter]
+    pub fn topic_type(&self) -> TopicType {
+        self.inner.resolved_options().topic_type.into()
+    }
+
+    /// How a geo topic writes its messages, fixed at creation. `None` on a
+    /// normal topic.
+    #[getter]
+    pub fn geo_mode(&self) -> Option<GeoMode> {
+        self.inner.resolved_options().geo_mode.map(GeoMode::from)
+    }
+
+    /// Longest time a send to the geo topic waits for its upload to start, or
+    /// `None` when the topic leaves it to each node's server setting.
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+    #[getter]
+    pub fn fresh_upload_interval<'a>(
+        &self,
+        py: Python<'a>,
+    ) -> PyResult<Option<Bound<'a, PyDelta>>> {
+        geo_duration(
+            py,
+            self.inner
+                .resolved_options()
+                .geo_durations
+                .fresh_upload_interval,
+        )
+    }
+
+    /// Shortest time between two uploads of the positions the geo topic's
+    /// stored offsets wait for, or `None` when the topic leaves it to each
+    /// node's server setting.
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+    #[getter]
+    pub fn consumer_offset_upload_interval<'a>(
+        &self,
+        py: Python<'a>,
+    ) -> PyResult<Option<Bound<'a, PyDelta>>> {
+        geo_duration(
+            py,
+            self.inner
+                .resolved_options()
+                .geo_durations
+                .consumer_offset_upload_interval,
+        )
+    }
+
+    /// How often a node uploads the geo topic's changed positions, or `None`
+    /// when the topic leaves it to each node's server setting.
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+    #[getter]
+    pub fn positions_publish_interval<'a>(
+        &self,
+        py: Python<'a>,
+    ) -> PyResult<Option<Bound<'a, PyDelta>>> {
+        geo_duration(
+            py,
+            self.inner
+                .resolved_options()
+                .geo_durations
+                .positions_publish_interval,
+        )
+    }
+
+    /// How long the tombstone and the objects of the deleted geo topic stay,
+    /// or `None` when the topic leaves it to each node's server setting.
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+    #[getter]
+    pub fn tombstone_grace<'a>(&self, py: Python<'a>) -> PyResult<Option<Bound<'a, PyDelta>>> {
+        geo_duration(
+            py,
+            self.inner.resolved_options().geo_durations.tombstone_grace,
+        )
+    }
+
+    /// How long the geo topic's group polls wait for the peers' positions
+    /// after a node starts, or `None` when the topic leaves it to each node's
+    /// server setting.
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+    #[getter]
+    pub fn positions_resume_timeout<'a>(
+        &self,
+        py: Python<'a>,
+    ) -> PyResult<Option<Bound<'a, PyDelta>>> {
+        geo_duration(
+            py,
+            self.inner
+                .resolved_options()
+                .geo_durations
+                .positions_resume_timeout,
+        )
+    }
+
+    /// Longest wait between two long-term rewrites of a partition of the geo
+    /// topic, or `None` when the topic leaves it to each node's server
+    /// setting.
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+    #[getter]
+    pub fn long_term_rewrite_max_interval<'a>(
+        &self,
+        py: Python<'a>,
+    ) -> PyResult<Option<Bound<'a, PyDelta>>> {
+        geo_duration(
+            py,
+            self.inner
+                .resolved_options()
+                .geo_durations
+                .long_term_rewrite_max_interval,
+        )
+    }
+
+    /// Memory in bytes each node keeps for what the topic's reads fetch from
+    /// the object store, or `None` when the topic leaves it to each node's
+    /// server setting. Zero keeps nothing they fetch.
+    #[getter]
+    pub fn read_cache_size(&self) -> Option<u64> {
+        self.inner
+            .resolved_options()
+            .read_cache
+            .size
+            .map(|size| size.as_bytes_u64())
+    }
+
+    /// Most bytes readahead fetches in front of a sequential reader of the
+    /// topic, or `None` when the topic leaves it to each node's server
+    /// setting. Zero turns readahead off.
+    #[getter]
+    pub fn read_ahead(&self) -> Option<u64> {
+        self.inner
+            .resolved_options()
+            .read_cache
+            .read_ahead
+            .map(|read_ahead| read_ahead.as_bytes_u64())
     }
 
     /// Options the creating client set explicitly.
@@ -450,6 +723,16 @@ impl Partition {
     }
 }
 
+/// A duration of a geo topic as a `timedelta`, `None` when the topic sets none.
+fn geo_duration(
+    py: Python<'_>,
+    duration: Option<IggyDuration>,
+) -> PyResult<Option<Bound<'_, PyDelta>>> {
+    duration
+        .map(|duration| iggy_duration_to_py_delta(py, duration))
+        .transpose()
+}
+
 /// A `Vec<u8>` return would convert to `bytes`, so node ids are built as a list of `int`.
 fn node_id_list<'a>(py: Python<'a>, node_ids: &[u8]) -> PyResult<Bound<'a, PyList>> {
     PyList::new(py, node_ids)
@@ -458,7 +741,181 @@ fn node_id_list<'a>(py: Python<'a>, node_ids: &[u8]) -> PyResult<Bound<'a, PyLis
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy::prelude::{IggyTimestamp, PartitionContext as RustPartitionContext};
+    use iggy::prelude::{
+        GeoMode as RustGeoMode, GeoTopicDurations, HeaderKey, HeaderValue, IggyTimestamp,
+        OptionKey, OptionValue, PartitionContext as RustPartitionContext, ResourceOptions,
+        TopicType as RustTopicType,
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn given_geo_topic_options_when_reading_should_expose_topic_type_and_geo_mode() {
+        let geo_tiered = topic_options(&[
+            (OptionKey::TopicType, RustTopicType::Geo.as_ref()),
+            (OptionKey::GeoMode, RustGeoMode::GeoTiered.as_ref()),
+        ]);
+        let geo_without_mode =
+            topic_options(&[(OptionKey::TopicType, RustTopicType::Geo.as_ref())]);
+
+        for (options, topic_type, geo_mode) in [
+            (geo_tiered, TopicType::Geo, Some(GeoMode::GeoTiered)),
+            (geo_without_mode, TopicType::Geo, Some(GeoMode::Geo)),
+            (ResourceOptions::new(), TopicType::Normal, None),
+        ] {
+            let topic = Topic::from(RustTopic {
+                id: 1,
+                created_at: IggyTimestamp::from(11),
+                name: "orders".to_owned(),
+                size: IggyByteSize::from(0),
+                messages_count: 0,
+                partitions_count: 1,
+                options: options.clone(),
+            });
+            let details = TopicDetails::from(RustTopicDetails {
+                id: 1,
+                created_at: IggyTimestamp::from(11),
+                name: "orders".to_owned(),
+                size: IggyByteSize::from(0),
+                messages_count: 0,
+                partitions_count: 0,
+                partitions: Vec::new(),
+                options,
+            });
+
+            assert_eq!(topic.topic_type(), topic_type);
+            assert_eq!(topic.geo_mode(), geo_mode);
+            assert_eq!(details.topic_type(), topic_type);
+            assert_eq!(details.geo_mode(), geo_mode);
+        }
+    }
+
+    fn topic_options(entries: &[(OptionKey, &str)]) -> ResourceOptions {
+        entries
+            .iter()
+            .map(|(key, value)| {
+                (
+                    HeaderKey::from(*key),
+                    OptionValue::explicit(HeaderValue::try_from(*value).expect("header value")),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn given_geo_topic_durations_when_reading_should_return_set_ones_and_none_for_the_rest() {
+        Python::initialize();
+        let set: [(OptionKey, u64); 2] = [
+            (OptionKey::FreshUploadInterval, 0),
+            (OptionKey::TombstoneGrace, 3_600_000_000),
+        ];
+        let mut geo = topic_options(&[(OptionKey::TopicType, RustTopicType::Geo.as_ref())]);
+        for (key, micros) in set {
+            geo.insert(
+                HeaderKey::from(key),
+                OptionValue::explicit(HeaderValue::from(micros)),
+            );
+        }
+
+        for (options, expected) in [(geo, set.as_slice()), (ResourceOptions::new(), &[])] {
+            let topic = Topic::from(RustTopic {
+                id: 1,
+                created_at: IggyTimestamp::from(11),
+                name: "orders".to_owned(),
+                size: IggyByteSize::from(0),
+                messages_count: 0,
+                partitions_count: 1,
+                options: options.clone(),
+            });
+            let details = TopicDetails::from(RustTopicDetails {
+                id: 1,
+                created_at: IggyTimestamp::from(11),
+                name: "orders".to_owned(),
+                size: IggyByteSize::from(0),
+                messages_count: 0,
+                partitions_count: 0,
+                partitions: Vec::new(),
+                options,
+            });
+
+            Python::attach(|py| {
+                let readers = [
+                    Bound::new(py, topic).expect("topic wraps").into_any(),
+                    Bound::new(py, details).expect("details wrap").into_any(),
+                ];
+                for key in GeoTopicDurations::KEYS {
+                    let wanted = expected
+                        .iter()
+                        .find(|(set_key, _)| *set_key == key)
+                        .map(|(_, micros)| Duration::from_micros(*micros));
+                    let name: &str = key.into();
+                    for reader in &readers {
+                        let read = reader
+                            .getattr(name)
+                            .and_then(|value| value.extract::<Option<Duration>>())
+                            .expect("duration reads");
+                        assert_eq!(read, wanted, "{name}");
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn given_read_cache_options_when_reading_should_keep_zero_and_return_none_when_unset() {
+        const MIB: u64 = 1024 * 1024;
+        let sized = |entries: &[(OptionKey, u64)]| -> ResourceOptions {
+            entries
+                .iter()
+                .map(|(key, bytes)| {
+                    (
+                        HeaderKey::from(*key),
+                        OptionValue::explicit(HeaderValue::from(*bytes)),
+                    )
+                })
+                .collect()
+        };
+        let mut geo = topic_options(&[(OptionKey::TopicType, RustTopicType::Geo.as_ref())]);
+        geo.extend(sized(&[(OptionKey::ReadAhead, 0)]));
+
+        for (options, read_cache_size, read_ahead) in [
+            (sized(&[(OptionKey::ReadCacheSize, 0)]), Some(0), None),
+            (
+                sized(&[
+                    (OptionKey::ReadCacheSize, 16 * MIB),
+                    (OptionKey::ReadAhead, 0),
+                ]),
+                Some(16 * MIB),
+                Some(0),
+            ),
+            (geo, None, Some(0)),
+            (ResourceOptions::new(), None, None),
+        ] {
+            let topic = Topic::from(RustTopic {
+                id: 1,
+                created_at: IggyTimestamp::from(11),
+                name: "orders".to_owned(),
+                size: IggyByteSize::from(0),
+                messages_count: 0,
+                partitions_count: 1,
+                options: options.clone(),
+            });
+            let details = TopicDetails::from(RustTopicDetails {
+                id: 1,
+                created_at: IggyTimestamp::from(11),
+                name: "orders".to_owned(),
+                size: IggyByteSize::from(0),
+                messages_count: 0,
+                partitions_count: 0,
+                partitions: Vec::new(),
+                options,
+            });
+
+            assert_eq!(topic.read_cache_size(), read_cache_size);
+            assert_eq!(topic.read_ahead(), read_ahead);
+            assert_eq!(details.read_cache_size(), read_cache_size);
+            assert_eq!(details.read_ahead(), read_ahead);
+        }
+    }
 
     #[test]
     fn given_partition_with_members_when_converting_should_expose_node_ids_as_int_lists() {

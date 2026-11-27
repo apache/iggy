@@ -35,8 +35,10 @@ simulator = ["partitions/simulator"]
 
 [dependencies]
 bytemuck = { workspace = true }
+bytes = { workspace = true }
 compio = { workspace = true }
 consensus = { workspace = true }
+crc32c = { workspace = true }
 crossfire = { workspace = true }
 futures = { workspace = true }
 hash32 = { workspace = true }
@@ -54,7 +56,6 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-bytes = { workspace = true }
 metadata = { workspace = true, features = ["simulator"] }
 tempfile = { workspace = true }
 

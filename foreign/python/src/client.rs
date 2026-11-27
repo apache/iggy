@@ -57,7 +57,9 @@ use crate::poll_options::PollOptions;
 use crate::producer::{IggyProducer, ProducerMode, u32_param as producer_u32_param};
 use crate::reader::PartitionReader;
 use crate::receive_message::{Checkpoint, PolledBatch, PollingStrategy};
-use crate::resource_options::{OptionKey, StreamOptions, TopicOptions, UserOptions};
+use crate::resource_options::{
+    OptionKey, StreamOptions, TopicOptions, UserOptions, geo_topic_durations, topic_read_cache,
+};
 use crate::send_message::{SendMessage, SendMessagesResponse as PySendMessagesResponse};
 use crate::snapshot::{
     SnapshotCompression as PySnapshotCompression, SystemSnapshotType as PySystemSnapshotType,
@@ -492,6 +494,36 @@ impl IggyClient {
                 .await
                 .map_err(to_runtime_error)?;
             Ok(Python::attach(|py| PyBytes::new(py, &snapshot.0).unbind()))
+        })
+    }
+
+    /// Retire the geo origin of a datacenter that never returns.
+    ///
+    /// The cluster then follows nothing more of the origin: its shadow topics
+    /// serve what they hold until their retention removes it, and a client
+    /// may delete them. Retiring an origin that is retired already changes
+    /// nothing. A datacenter that comes back needs another origin name.
+    ///
+    /// Requires root or the global `manage_servers` permission.
+    ///
+    /// Args:
+    ///     origin: The origin name of the lost datacenter, such as `"dc-a"`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` once the cluster committed
+    ///     the retirement.
+    ///
+    /// Raises:
+    ///     IggyError: If the user lacks the permission, the server refuses
+    ///         the origin, or the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn retire_geo_origin<'a>(&self, py: Python<'a>, origin: String) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .retire_geo_origin(&origin)
+                .await
+                .map_err(to_runtime_error)
         })
     }
 
@@ -1093,18 +1125,17 @@ impl IggyClient {
         })
     }
 
-    /// Return all streams, in id order.
+    /// Return the streams the user may read, in id order.
     ///
     /// The list is read in pages of 1,000, so it is not one consistent read.
     /// A stream that someone creates or deletes during the read can appear or
     /// not appear. `get_streams_page` reads one page.
     ///
     /// Returns:
-    ///     A list of `Stream` summaries.
+    ///     A list of `Stream` summaries, the streams the user may read.
     ///
     /// Raises:
-    ///     RuntimeError: If the client is not authenticated, the user lacks global
-    ///         `read_streams` or `manage_streams` permission, or the request fails.
+    ///     RuntimeError: If the client is not authenticated or the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[list[Stream]]", imports=("collections.abc")))]
     fn get_streams<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
@@ -1114,7 +1145,7 @@ impl IggyClient {
         })
     }
 
-    /// Reads one page of the streams.
+    /// Reads one page of the streams the user may read.
     ///
     /// Pass the page's `next` as `cursor`, with the same other arguments, to
     /// read the next page. The read ends at the first page whose `next` is
@@ -1138,9 +1169,9 @@ impl IggyClient {
     ///         anything is sent. The server refuses a cursor that it cannot
     ///         use, such as the cursor of another order, with the same code.
     ///         Over HTTP, a refusal from the server has code 300 (HTTP response
-    ///         error), and its message holds the server error body. A user
-    ///         without the permission to read the streams gets the
-    ///         unauthorized code.
+    ///         error), and its message holds the server error body. The page
+    ///         holds the streams the user may read, so a user without a
+    ///         grant gets an empty page.
     #[pyo3(signature = (*, order=None, descending=false, limit=None, cursor=None, name=None))]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[StreamsPage]", imports=("collections.abc")))]
     fn get_streams_page<'a>(
@@ -1327,11 +1358,14 @@ impl IggyClient {
         })
     }
 
-    /// Get all topics in a stream, in id order.
+    /// Get the topics of a stream, in id order. The list holds only the
+    /// topics the user may read.
     ///
     /// The list is read in pages of 1,000, so it is not one consistent read.
     /// A topic that someone creates or deletes during the read can appear or
-    /// not appear. `get_topics_page` reads one page.
+    /// not appear. If the stream goes missing after the first page, the read
+    /// fails for a user with a global read grant, and ends there for any other
+    /// user. `get_topics_page` reads one page.
     ///
     /// Args:
     ///     stream_id: Stream identifier as `str | int`.
@@ -1359,8 +1393,10 @@ impl IggyClient {
         })
     }
 
-    /// Reads one page of the topics of a stream. A missing stream gives an
-    /// empty page without `next`.
+    /// Reads one page of the topics of a stream. A missing stream, or one the
+    /// user may read no topic of, gives an empty page without `next`. For a
+    /// user with a global read grant, a page read with a cursor raises
+    /// `IggyError` instead, because the stream was deleted during the walk.
     ///
     /// Takes the keyword arguments of `get_streams_page`, with the same
     /// cursor rules.
@@ -1374,8 +1410,8 @@ impl IggyClient {
     /// Raises:
     ///     ValueError: If the identifier is invalid.
     ///     OverflowError: If `limit` is outside the unsigned 32-bit range.
-    ///     IggyError: As for `get_streams_page`. A user without the permission
-    ///         to read the topics gets the unauthorized code.
+    ///     IggyError: As for `get_streams_page`. The page holds the topics
+    ///         the user may read.
     #[pyo3(signature = (stream_id, *, order=None, descending=false, limit=None, cursor=None, name=None))]
     #[allow(clippy::too_many_arguments)]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[TopicsPage]", imports=("collections.abc")))]
@@ -1441,20 +1477,39 @@ impl IggyClient {
     ///         unchanged when `None`. `MaxTopicSize.ServerDefault()` changes
     ///         nothing either, reset `OptionKey.LocalRetentionSize` to return
     ///         to the default.
+    ///     fresh_upload_interval: A duration of a geo topic as
+    ///         `datetime.timedelta | None`, unchanged when `None`. This and
+    ///         the five durations below have the meaning and bounds
+    ///         `TopicOptions` gives them, zero is a value, and none of them
+    ///         can be reset. With `read_cache_size` and `read_ahead` they are
+    ///         the only options an update changes on a geo topic, and the
+    ///         server refuses them on a normal topic.
+    ///     consumer_offset_upload_interval: As `fresh_upload_interval`.
+    ///     positions_publish_interval: As `fresh_upload_interval`.
+    ///     tombstone_grace: As `fresh_upload_interval`.
+    ///     positions_resume_timeout: As `fresh_upload_interval`.
+    ///     long_term_rewrite_max_interval: As `fresh_upload_interval`.
+    ///     read_cache_size: Read cache bytes of the topic as `int | None`,
+    ///         unchanged when `None`. This and `read_ahead` have the meaning
+    ///         and bounds `TopicOptions` gives them, zero is a value, and
+    ///         neither can be reset. An update can change them on any topic.
+    ///     read_ahead: As `read_cache_size`.
     ///
     /// Returns:
     ///     An awaitable that resolves to `None` when the topic is updated.
     ///
     /// Raises:
     ///     ValueError: If `message_expiry`, `max_topic_size`,
-    ///         `local_retention_age` or `local_retention_size` is out of range.
+    ///         `local_retention_age` or `local_retention_size` is out of range,
+    ///         or a duration is negative or longer than `2**64 - 1`
+    ///         microseconds.
     ///     OptionError: A `RuntimeError` carrying the error `code` and
     ///         `kind` when the client or the server refuses an option.
     ///     RuntimeError: Before anything is sent, if the update changes
     ///         nothing, names a key both set and reset, the name does not fit,
     ///         or a reset key cannot be reset. Otherwise if the request fails.
     #[pyo3(
-        signature = (stream_id, topic_id, name = None, message_expiry = None, max_topic_size = None, reset = None, options = None, raw_reset = None, tiered_storage = None, local_retention_age = None, local_retention_size = None)
+        signature = (stream_id, topic_id, name = None, message_expiry = None, max_topic_size = None, reset = None, options = None, raw_reset = None, tiered_storage = None, local_retention_age = None, local_retention_size = None, fresh_upload_interval = None, consumer_offset_upload_interval = None, positions_publish_interval = None, tombstone_grace = None, positions_resume_timeout = None, long_term_rewrite_max_interval = None, read_cache_size = None, read_ahead = None)
     )]
     #[allow(clippy::too_many_arguments)]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
@@ -1484,6 +1539,20 @@ impl IggyClient {
         #[gen_stub(override_type(type_repr = "MaxTopicSize | None"))] local_retention_size: Option<
             &MaxTopicSize,
         >,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        fresh_upload_interval: Option<Py<PyDelta>>,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        consumer_offset_upload_interval: Option<Py<PyDelta>>,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        positions_publish_interval: Option<Py<PyDelta>>,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        tombstone_grace: Option<Py<PyDelta>>,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        positions_resume_timeout: Option<Py<PyDelta>>,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        long_term_rewrite_max_interval: Option<Py<PyDelta>>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] read_cache_size: Option<u64>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] read_ahead: Option<u64>,
     ) -> PyResult<Bound<'a, PyAny>> {
         let update_options = TopicUpdateOptions {
             name,
@@ -1496,6 +1565,15 @@ impl IggyClient {
             local_retention_size: local_retention_size
                 .map(RustMaxTopicSize::try_from)
                 .transpose()?,
+            geo_durations: geo_topic_durations([
+                fresh_upload_interval,
+                consumer_offset_upload_interval,
+                positions_publish_interval,
+                tombstone_grace,
+                positions_resume_timeout,
+                long_term_rewrite_max_interval,
+            ])?,
+            read_cache: topic_read_cache(read_cache_size, read_ahead),
             reset: reset_keys(reset),
             raw_reset: raw_reset.into_iter().flatten().collect(),
             raw: options.unwrap_or_default(),
@@ -3036,6 +3114,28 @@ mod tests {
                     .extract::<u32>()
                     .unwrap(),
                 REPLY_TOO_LARGE_CODE
+            );
+        });
+    }
+
+    // The Rust SDK returns 1021 without a retry, so the binding only has to keep its code.
+    #[test]
+    fn given_shadow_stream_refusal_when_mapping_should_keep_its_code_and_message() {
+        const SHADOW_STREAM_READ_ONLY_CODE: u32 = 1021;
+        Python::initialize();
+        Python::attach(|py| {
+            let raised = to_runtime_error(IggyError::ShadowStreamReadOnly);
+            assert!(raised.is_instance_of::<PyIggyError>(py));
+            assert!(!raised.is_instance_of::<OptionError>(py));
+            assert!(!raised.is_instance_of::<PendingOperationError>(py));
+            let value = raised.value(py);
+            assert_eq!(
+                value.getattr("code").unwrap().extract::<u32>().unwrap(),
+                SHADOW_STREAM_READ_ONLY_CODE
+            );
+            assert_eq!(
+                value.str().unwrap().to_str().unwrap(),
+                IggyError::ShadowStreamReadOnly.to_string()
             );
         });
     }

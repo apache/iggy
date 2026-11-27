@@ -23,11 +23,9 @@ mod sigv4;
 mod xml;
 
 use std::cell::{Cell, RefCell};
-use std::io;
 use std::ops::Range;
 use std::rc::Rc;
-use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -35,23 +33,37 @@ use chrono::{DateTime, TimeDelta, Utc};
 use futures::StreamExt;
 use http::header::{CONTENT_LENGTH, CONTENT_RANGE, DATE, ETAG, LAST_MODIFIED};
 use http::{HeaderMap, Method, StatusCode};
-use send_wrapper::SendWrapper;
 use url::Url;
 
 pub use credentials::SharedCredentials;
 pub use sigv4::Credentials;
 
 use crate::error::ObjectStoreError;
-use crate::resolver::ShardResolver;
+use crate::http::{streamed, transport, within};
+use crate::layout::KeyLayout;
 use crate::store::{
     DeleteFailure, DeleteOutcome, ListPage, ListRequest, ObjectMeta, ObjectRange, ObjectStore,
-    PutBody, PutMode, PutOptions, UserMetadata, validate_delete, validate_key, validate_metadata,
-    validate_prefix, validate_range,
+    PartsLimits, PartsUpload, PutBody, PutMode, PutOptions, StoredPart, SweptUploads, UserMetadata,
+    validate_delete, validate_key, validate_metadata, validate_prefix, validate_range,
 };
 use sigv4::{EMPTY_PAYLOAD_SHA256, SigningRequest, UNSIGNED_PAYLOAD};
 
 const METADATA_HEADER_PREFIX: &str = "x-amz-meta-";
 const CHECKSUM_HEADER: &str = "x-amz-checksum-crc32c";
+const CHECKSUM_TYPE_HEADER: &str = "x-amz-checksum-type";
+/// The checksum type that makes the CRC32C of an object of a multipart upload
+/// the CRC32C of its bytes, which the store checks at completion and reports
+/// on a head, as for an object of one put.
+const FULL_OBJECT: &str = "FULL_OBJECT";
+/// The code of a conditional write that raced another one.
+const CONDITIONAL_CONFLICT: &str = "ConditionalRequestConflict";
+/// The fewest bytes of a part other than the last: 5 MiB.
+const MIN_PART_LEN: u64 = 5 * 1024 * 1024;
+/// The most parts of one multipart upload.
+const MAX_PARTS: u32 = 10_000;
+/// The most uploads that one page of a sweep lists and aborts, so that a page
+/// takes about as long as any other call.
+const SWEEP_PAGE_LEN: usize = 100;
 /// The largest offset that a `Range` header carries: S3 reads offsets as
 /// signed 64-bit numbers. No object is that large.
 const MAX_RANGE_OFFSET: u64 = i64::MAX.unsigned_abs();
@@ -93,7 +105,7 @@ pub struct S3Config {
 /// - The client follows no redirect, because a redirect would resend a body
 ///   that is already sent, under a signature for another host.
 /// - Lookups of the store's host never block the shard, see
-///   [`ShardResolver`].
+///   [`crate::ShardResolver`].
 /// - When the store refuses a request for the skew of the clocks, the store
 ///   learns the offset from the answer's `Date` header and fails the call as
 ///   transient, so a retry signs with the corrected clock. A second refusal
@@ -167,7 +179,7 @@ impl S3Store {
             UrlStyle::VirtualHosted => (format!("{}.{authority}", config.bucket), String::new()),
         };
         Ok(Self {
-            client: http_client(scheme)?,
+            client: crate::http::client(scheme)?,
             origin: format!("{scheme}://{host}"),
             host,
             bucket_path,
@@ -279,6 +291,53 @@ impl S3Store {
         builder.body(body).send().await.map_err(transport)
     }
 
+    /// `AbortMultipartUpload` of `upload_id` under `key`.
+    async fn abort_upload(&self, key: &str, upload_id: &str) -> Result<(), ObjectStoreError> {
+        let request = S3Request {
+            method: Method::DELETE,
+            path: self.object_path(key),
+            query: vec![("uploadId", upload_id)],
+            headers: Vec::new(),
+            payload_sha256: EMPTY_PAYLOAD_SHA256,
+        };
+        let response = self.send(request, &[], cyper::Body::empty()).await?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        let (status, date, error) = read_failure(response).await;
+        Err(self.failure(status, date, &error, &Subject::Object(key)))
+    }
+
+    /// Signs and sends `request` with `body` as an unsigned payload. A
+    /// failure of the body is returned as [`ObjectStoreError::Body`], not as
+    /// the error that the client makes of it.
+    async fn send_body(
+        &self,
+        request: S3Request<'_>,
+        body: PutBody,
+    ) -> Result<cyper::Response, ObjectStoreError> {
+        // An HTTP client sends a body of unknown length chunked, which S3
+        // refuses, so the length goes out as a header.
+        let unsigned = [("content-length", body.len().to_string())];
+        let body_failure = Rc::new(RefCell::new(None));
+        let body = if body.is_empty() {
+            // An empty body has no last byte to hold back, so it must end
+            // without an error before the request goes out.
+            let mut pieces = body.into_pieces();
+            while let Some(piece) = pieces.next().await {
+                piece.map_err(ObjectStoreError::Body)?;
+            }
+            cyper::Body::empty()
+        } else {
+            streamed(body.into_pieces(), Rc::clone(&body_failure))
+        };
+        let sent = self.send(request, &unsigned, body).await;
+        if let Some(error) = body_failure.borrow_mut().take() {
+            return Err(ObjectStoreError::Body(error));
+        }
+        sent
+    }
+
     /// The error of an answer that is not a success. A refusal for the skew
     /// of the clocks corrects the clock once. Expired credentials that a
     /// refresher keeps fresh are an outage that the next refresh ends.
@@ -333,26 +392,8 @@ impl ObjectStore for S3Store {
             PutMode::IfAbsent => headers.push(("if-none-match".to_owned(), "*".to_owned())),
         }
         if let Some(crc32c) = options.crc32c {
-            headers.push((
-                CHECKSUM_HEADER.to_owned(),
-                BASE64.encode(crc32c.to_be_bytes()),
-            ));
+            headers.push((CHECKSUM_HEADER.to_owned(), encode_crc32c(crc32c)));
         }
-        // An HTTP client sends a body of unknown length chunked, which S3
-        // refuses, so the length goes out as a header.
-        let unsigned = [("content-length", body.len().to_string())];
-        let body_failure = Rc::new(RefCell::new(None));
-        let body = if body.is_empty() {
-            // An empty body has no last byte to hold back, so it must end
-            // without an error before the request goes out.
-            let mut pieces = body.into_pieces();
-            while let Some(piece) = pieces.next().await {
-                piece.map_err(ObjectStoreError::Body)?;
-            }
-            cyper::Body::empty()
-        } else {
-            streamed(body, Rc::clone(&body_failure))
-        };
         let request = S3Request {
             method: Method::PUT,
             path: self.object_path(key),
@@ -360,11 +401,7 @@ impl ObjectStore for S3Store {
             headers,
             payload_sha256: UNSIGNED_PAYLOAD,
         };
-        let sent = self.send(request, &unsigned, body).await;
-        if let Some(error) = body_failure.borrow_mut().take() {
-            return Err(ObjectStoreError::Body(error));
-        }
-        let response = sent?;
+        let response = self.send_body(request, body).await?;
         if response.status().is_success() {
             return Ok(());
         }
@@ -546,6 +583,233 @@ impl ObjectStore for S3Store {
         }
         xml::parse_list(&response.bytes().await.map_err(transport)?)
     }
+
+    fn parts_limits(&self) -> Option<PartsLimits> {
+        Some(PartsLimits {
+            min_part_len: MIN_PART_LEN,
+            max_parts: MAX_PARTS,
+        })
+    }
+
+    /// `CreateMultipartUpload` with the user metadata and a full object
+    /// CRC32C. A store that refuses either, or multipart uploads, as not
+    /// implemented or as an invalid argument is
+    /// [`ObjectStoreError::Unsupported`].
+    async fn begin_parts(
+        &self,
+        key: &str,
+        options: &PutOptions,
+        _layout: &KeyLayout,
+    ) -> Result<PartsUpload, ObjectStoreError> {
+        validate_key(key)?;
+        validate_metadata(&options.metadata)?;
+        let mut headers: Vec<(String, String)> = options
+            .metadata
+            .iter()
+            .map(|(name, value)| (format!("{METADATA_HEADER_PREFIX}{name}"), value.clone()))
+            .collect();
+        headers.extend([
+            ("x-amz-checksum-algorithm".to_owned(), "CRC32C".to_owned()),
+            (CHECKSUM_TYPE_HEADER.to_owned(), FULL_OBJECT.to_owned()),
+        ]);
+        let request = S3Request {
+            method: Method::POST,
+            path: self.object_path(key),
+            query: vec![("uploads", "")],
+            headers,
+            payload_sha256: EMPTY_PAYLOAD_SHA256,
+        };
+        let response = self.send(request, &[], cyper::Body::empty()).await?;
+        if !response.status().is_success() {
+            let (status, date, error) = read_failure(response).await;
+            if refuses_multipart(status, &error) {
+                return Err(ObjectStoreError::Unsupported(format!(
+                    "multipart uploads with a full object CRC32C: {}",
+                    detail(status, &error)
+                )));
+            }
+            return Err(self.failure(status, date, &error, &Subject::Object(key)));
+        }
+        let upload_id = xml::parse_initiate(&response.bytes().await.map_err(transport)?)?;
+        Ok(PartsUpload {
+            key: key.to_owned(),
+            id: upload_id,
+        })
+    }
+
+    /// `UploadPart` with the part's CRC32C. The answer's etag goes into the
+    /// completion.
+    async fn put_part(
+        &self,
+        upload: &PartsUpload,
+        number: u32,
+        body: PutBody,
+        crc32c: u32,
+    ) -> Result<StoredPart, ObjectStoreError> {
+        let part_number = number.to_string();
+        let request = S3Request {
+            method: Method::PUT,
+            path: self.object_path(&upload.key),
+            query: vec![
+                ("partNumber", part_number.as_str()),
+                ("uploadId", upload.id.as_str()),
+            ],
+            headers: vec![(CHECKSUM_HEADER.to_owned(), encode_crc32c(crc32c))],
+            payload_sha256: UNSIGNED_PAYLOAD,
+        };
+        let response = self.send_body(request, body).await?;
+        if !response.status().is_success() {
+            let (status, date, error) = read_failure(response).await;
+            return Err(self.failure(status, date, &error, &Subject::Object(&upload.key)));
+        }
+        Ok(StoredPart {
+            number,
+            tag: etag(response.headers())?,
+            crc32c,
+        })
+    }
+
+    /// `CompleteMultipartUpload` with `If-None-Match: *` for a create-only
+    /// put, the full object CRC32C and the object's size, all of which the
+    /// store checks. A 200 succeeds only with a `CompleteMultipartUploadResult`
+    /// that carries an etag. An error in its body is classified by its code,
+    /// and a body that holds neither is [`ObjectStoreError::Unavailable`].
+    /// Both can follow a completion that created the object. A
+    /// `ConditionalRequestConflict` ends the upload for S3, which asks for a
+    /// new one, so it is [`ObjectStoreError::UploadConflict`].
+    async fn complete_parts(
+        &self,
+        upload: &PartsUpload,
+        parts: &[StoredPart],
+        options: &PutOptions,
+        len: u64,
+    ) -> Result<(), ObjectStoreError> {
+        let key = upload.key.as_str();
+        let body = xml::complete_request(parts, encode_crc32c);
+        let payload_sha256 = sigv4::sha256_hex(body.as_bytes());
+        let mut headers = vec![
+            ("content-type".to_owned(), "application/xml".to_owned()),
+            (CHECKSUM_TYPE_HEADER.to_owned(), FULL_OBJECT.to_owned()),
+            ("x-amz-mp-object-size".to_owned(), len.to_string()),
+        ];
+        if let Some(crc32c) = options.crc32c {
+            headers.push((CHECKSUM_HEADER.to_owned(), encode_crc32c(crc32c)));
+        }
+        match options.mode {
+            PutMode::Overwrite => {}
+            PutMode::IfAbsent => headers.push(("if-none-match".to_owned(), "*".to_owned())),
+        }
+        let request = S3Request {
+            method: Method::POST,
+            path: self.object_path(key),
+            query: vec![("uploadId", upload.id.as_str())],
+            headers,
+            payload_sha256: &payload_sha256,
+        };
+        let response = self.send(request, &[], cyper::Body::from(body)).await?;
+        if !response.status().is_success() {
+            let (status, date, error) = read_failure(response).await;
+            if error.code == CONDITIONAL_CONFLICT {
+                return Err(ObjectStoreError::UploadConflict {
+                    key: key.to_owned(),
+                });
+            }
+            return Err(self.failure(status, date, &error, &Subject::Object(key)));
+        }
+        let answer = response.bytes().await.map_err(transport)?;
+        match xml::parse_complete(&answer) {
+            Ok(xml::Completion::Created) => Ok(()),
+            Ok(xml::Completion::Failed(error)) if error.code == CONDITIONAL_CONFLICT => {
+                Err(ObjectStoreError::UploadConflict {
+                    key: key.to_owned(),
+                })
+            }
+            Ok(xml::Completion::Failed(error)) => Err(embedded_failure(
+                &error,
+                &Subject::Object(key),
+                &self.bucket,
+            )),
+            Err(unread) => Err(ObjectStoreError::Unavailable(format!(
+                "a 200 answer to the completion of {key:?} holds neither its result nor an \
+                 error: {unread}"
+            ))),
+        }
+    }
+
+    /// `AbortMultipartUpload`. An upload that is gone, aborted or completed,
+    /// counts as aborted.
+    async fn abort_parts(&self, upload: &PartsUpload, _parts: u32) -> Result<(), ObjectStoreError> {
+        match self.abort_upload(&upload.key, &upload.id).await {
+            Err(ObjectStoreError::NotFound { .. }) => Ok(()),
+            aborted => aborted,
+        }
+    }
+
+    /// Lists the multipart uploads under the root, and aborts those that the
+    /// layout builds the keys of and that began before the cutoff, by the
+    /// store's clock as the answers' `Date` headers corrected it. An abort
+    /// that gets no answer in time counts as failed, and the page goes on.
+    async fn sweep_uploads(
+        &self,
+        layout: &KeyLayout,
+        older_than: Duration,
+        after: Option<&str>,
+        request_timeout: Duration,
+    ) -> Result<SweptUploads, ObjectStoreError> {
+        let prefix = format!("{}/", layout.root());
+        let max_uploads = SWEEP_PAGE_LEN.to_string();
+        let mut query = vec![
+            ("uploads", ""),
+            ("prefix", prefix.as_str()),
+            ("max-uploads", max_uploads.as_str()),
+            ("encoding-type", "url"),
+        ];
+        let markers = after.and_then(|after| after.split_once(' '));
+        if let Some((upload_id, key)) = markers {
+            query.extend([("key-marker", key), ("upload-id-marker", upload_id)]);
+        }
+        let listing = S3Request {
+            method: Method::GET,
+            path: self.bucket_root(),
+            query,
+            headers: Vec::new(),
+            payload_sha256: EMPTY_PAYLOAD_SHA256,
+        };
+        let page = within(request_timeout, "the listing of multipart uploads", async {
+            let response = self.send(listing, &[], cyper::Body::empty()).await?;
+            if !response.status().is_success() {
+                let (status, date, error) = read_failure(response).await;
+                return Err(self.failure(status, date, &error, &Subject::Bucket));
+            }
+            xml::parse_uploads(&response.bytes().await.map_err(transport)?)
+        })
+        .await?;
+        let store_now = SystemTime::from(Utc::now() + self.clock_offset.get());
+        let cutoff = store_now
+            .checked_sub(older_than)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let mut swept = SweptUploads {
+            next: page
+                .next
+                .map(|(key, upload_id)| format!("{upload_id} {key}")),
+            ..SweptUploads::default()
+        };
+        for upload in page.uploads {
+            if !layout.owns_key(&upload.key) {
+                continue;
+            }
+            if upload.initiated >= cutoff {
+                swept.kept += 1;
+                continue;
+            }
+            let abort = self.abort_upload(&upload.key, &upload.upload_id);
+            match within(request_timeout, "an abort of a multipart upload", abort).await {
+                Ok(()) | Err(ObjectStoreError::NotFound { .. }) => swept.removed += 1,
+                Err(_) => swept.failed += 1,
+            }
+        }
+        Ok(swept)
+    }
 }
 
 impl Subject<'_> {
@@ -555,21 +819,6 @@ impl Subject<'_> {
             Self::Bucket => None,
         }
     }
-}
-
-/// The pieces of `body` as a request body. A failure of the body is left in
-/// `failure`, so the put returns the body's own error, not the one that the
-/// client makes of it.
-fn streamed(body: PutBody, failure: Rc<RefCell<Option<io::Error>>>) -> cyper::Body {
-    let pieces = body.into_pieces().map(move |piece| {
-        piece.map_err(|error| {
-            let kind = error.kind();
-            *failure.borrow_mut() = Some(error);
-            cyper::Error::System(io::Error::from(kind))
-        })
-    });
-    // The client polls the body on the shard thread that sends it.
-    cyper::Body::stream(SendWrapper::new(pieces))
 }
 
 /// The status, the `Date` header and the error body of a failed answer.
@@ -639,6 +888,41 @@ fn classify(
         (400..=499, _) => ObjectStoreError::InvalidRequest(detail()),
         _ => ObjectStoreError::Malformed(detail()),
     }
+}
+
+/// Whether a refusal of `CreateMultipartUpload` says that the store does not
+/// take multipart uploads, or not with a full object CRC32C, rather than that
+/// something about this call is wrong.
+fn refuses_multipart(status: StatusCode, error: &xml::ErrorBody) -> bool {
+    matches!(
+        (status.as_u16(), error.code.as_str()),
+        (501, _) | (_, "NotImplemented") | (400, "InvalidArgument" | "InvalidRequest")
+    )
+}
+
+/// The error that the body of a 200 answer to `CompleteMultipartUpload`
+/// holds. The status was sent before the failure, so the code alone decides,
+/// as a server-side failure where it names nothing else.
+fn embedded_failure(
+    error: &xml::ErrorBody,
+    subject: &Subject<'_>,
+    bucket: &str,
+) -> ObjectStoreError {
+    let status = match error.code.as_str() {
+        "PreconditionFailed" => StatusCode::PRECONDITION_FAILED,
+        "NoSuchUpload" | "NoSuchKey" | "NoSuchBucket" => StatusCode::NOT_FOUND,
+        "ConditionalRequestConflict" | "OperationAborted" => StatusCode::CONFLICT,
+        "BadDigest" | "InvalidPart" | "InvalidPartOrder" | "EntityTooSmall" | "InvalidRequest" => {
+            StatusCode::BAD_REQUEST
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    classify(status, error, subject, bucket)
+}
+
+/// The CRC32C of the S3 headers and bodies: the big-endian value in base64.
+fn encode_crc32c(crc32c: u32) -> String {
+    BASE64.encode(crc32c.to_be_bytes())
 }
 
 /// The error of one key that a batch delete refused.
@@ -718,53 +1002,38 @@ fn header_crc32c(headers: &HeaderMap) -> Result<Option<u32>, ObjectStoreError> {
     let Some(value) = headers.get(CHECKSUM_HEADER) else {
         return Ok(None);
     };
+    // A multipart upload without a full object checksum reports a checksum
+    // of the parts' checksums, with a `-` and the number of parts after it,
+    // which no CRC32C of the bytes equals.
+    let composite = headers
+        .get(CHECKSUM_TYPE_HEADER)
+        .is_some_and(|kind| kind.as_bytes().eq_ignore_ascii_case(b"COMPOSITE"));
+    if composite || value.as_bytes().contains(&b'-') {
+        return Ok(None);
+    }
     let malformed = || ObjectStoreError::Malformed(format!("{CHECKSUM_HEADER} {value:?}"));
     let bytes = BASE64.decode(value.as_bytes()).map_err(|_| malformed())?;
     let bytes: [u8; 4] = bytes.try_into().map_err(|_| malformed())?;
     Ok(Some(u32::from_be_bytes(bytes)))
 }
 
-/// A client for a shard: host lookups off the shard thread, no redirects,
-/// and the system's certificate authorities only for `https`.
-fn http_client(scheme: &str) -> Result<cyper::Client, ObjectStoreError> {
-    let builder = cyper::Client::builder()
-        .custom_resolver(ShardResolver::default())
-        .redirect(cyper::redirect::Policy::none());
-    let builder = if scheme == "https" {
-        builder.use_rustls_default()
-    } else {
-        // Without a config, the client loads the system's certificate
-        // authorities when it is built, and fails on a host without them,
-        // although it never dials https.
-        builder.use_rustls(Arc::new(plain_http_tls_config()?))
-    };
-    builder.build().map_err(transport)
-}
-
-/// A TLS config that trusts no authority, for a client that dials only plain
-/// http.
-fn plain_http_tls_config() -> Result<rustls::ClientConfig, ObjectStoreError> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    Ok(rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|error| ObjectStoreError::Transport(error.to_string()))?
-        .with_root_certificates(rustls::RootCertStore::empty())
-        .with_no_client_auth())
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn transport(error: cyper::Error) -> ObjectStoreError {
-    ObjectStoreError::Transport(error.to_string())
-}
-
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use bytes::Bytes;
     use http::HeaderValue;
 
     use super::*;
+    use crate::error::ErrorClass;
+    use crate::http::test_endpoints::{Answer, Recorded, Recorder};
+    use crate::store::PUT_ID_METADATA;
 
     /// Whether an error is the one that a case expects.
     type Expected = fn(&ObjectStoreError) -> bool;
+
+    /// What a fake store answers to the request of a case.
+    type Answers = fn(&Recorded) -> Answer;
 
     fn error_body(code: &str) -> xml::ErrorBody {
         xml::ErrorBody {
@@ -980,6 +1249,577 @@ mod tests {
             "{refreshed:?}"
         );
         assert!(matches!(fixed, ObjectStoreError::Auth(_)), "{fixed:?}");
+    }
+
+    fn static_store(endpoint: &str) -> S3Store {
+        S3Store::new(S3Config {
+            endpoint: endpoint.to_owned(),
+            region: "us-east-1".to_owned(),
+            bucket: "segments".to_owned(),
+            url_style: UrlStyle::Path,
+            credentials: Credentials {
+                access_key_id: "id".to_owned(),
+                secret_access_key: "secret".to_owned(),
+                session_token: None,
+            }
+            .into(),
+        })
+        .unwrap()
+    }
+
+    fn put_to(store: &S3Store) -> Result<(), ObjectStoreError> {
+        let options = PutOptions {
+            mode: PutMode::IfAbsent,
+            ..PutOptions::default()
+        };
+        crate::contract::shard_runtime().block_on(store.put(
+            "a/b",
+            PutBody::from_bytes("segment bytes"),
+            &options,
+        ))
+    }
+
+    /// A refused connection proves that the store never saw the put, so a
+    /// retry needs no check for an object of its own.
+    #[test]
+    fn given_store_that_refuses_the_connection_when_putting_should_fail_as_never_sent() {
+        let store = static_store(&crate::http::test_endpoints::refusing());
+
+        let result = put_to(&store);
+
+        assert!(
+            matches!(&result, Err(ObjectStoreError::NotSent(_))),
+            "{result:?}"
+        );
+        assert!(!result.unwrap_err().put_may_have_stored());
+    }
+
+    #[test]
+    fn given_store_that_hangs_up_after_the_request_when_putting_should_fail_as_unknown() {
+        let store = static_store(&crate::http::test_endpoints::hanging_up());
+
+        let result = put_to(&store);
+
+        assert!(
+            matches!(&result, Err(ObjectStoreError::Transport(_))),
+            "{result:?}"
+        );
+        assert!(result.unwrap_err().put_may_have_stored());
+    }
+
+    /// Drops a put of `body` to `silent` once it ran for a moment, and says
+    /// whether the store then saw the connection close.
+    fn closes_when_dropped(silent: &crate::http::test_endpoints::Silent, body: PutBody) -> bool {
+        let store = static_store(&silent.endpoint);
+        let options = PutOptions::default();
+        crate::contract::shard_runtime().block_on(async {
+            let put = Box::pin(store.put("a/b", body, &options));
+            let wait = std::pin::pin!(compio::time::sleep(Duration::from_millis(200)));
+            let raced = futures::future::select(put, wait).await;
+            let futures::future::Either::Right(((), put)) = raced else {
+                panic!("the store answered a put it never answers");
+            };
+            drop(put);
+            // The connection task runs on this runtime, so it must close the
+            // connection before the runtime goes.
+            compio::time::sleep(Duration::from_millis(200)).await;
+            silent.client_closed(Duration::from_secs(2)).await
+        })
+    }
+
+    /// The first attempt of a put that a second one passed is dropped, and the
+    /// store must not keep waiting for it on an open connection.
+    #[test]
+    fn given_a_put_waiting_for_its_answer_when_dropped_should_close_the_connection() {
+        let silent = crate::http::test_endpoints::Silent::start(true);
+
+        assert!(closes_when_dropped(
+            &silent,
+            PutBody::from_bytes("segment bytes")
+        ));
+    }
+
+    #[test]
+    fn given_a_put_whose_store_stopped_reading_the_body_when_dropped_should_close_the_connection() {
+        let silent = crate::http::test_endpoints::Silent::start(false);
+        // More than the buffers of both sockets hold, so the client waits to
+        // write when it is dropped.
+        let body = PutBody::from_bytes_in_pieces(vec![7_u8; 64 << 20], 1 << 20);
+
+        assert!(closes_when_dropped(&silent, body));
+    }
+
+    const UPLOAD: &str = "VXBsb2FkIElE";
+    const PUT_ID: &str = "0000000000000000000000000000002a";
+
+    fn upload(key: &str) -> PartsUpload {
+        PartsUpload {
+            key: key.to_owned(),
+            id: UPLOAD.to_owned(),
+        }
+    }
+
+    fn run<T>(call: impl std::future::Future<Output = T>) -> T {
+        crate::contract::shard_runtime().block_on(call)
+    }
+
+    fn error_answer(status: u16, code: &str) -> Answer {
+        let body = format!("<Error><Code>{code}</Code><Message>m</Message></Error>");
+        (status, Vec::new(), body.into_bytes())
+    }
+
+    #[test]
+    fn given_an_upload_in_parts_when_beginning_should_ask_for_a_full_object_crc32c_with_the_metadata()
+     {
+        let fake = Recorder::start(|_| {
+            let body = format!(
+                "<InitiateMultipartUploadResult><Bucket>segments</Bucket><Key>a/b</Key>\
+                 <UploadId>{UPLOAD}</UploadId></InitiateMultipartUploadResult>"
+            );
+            (200, Vec::new(), body.into_bytes())
+        });
+        let store = static_store(&fake.endpoint);
+        let options = PutOptions {
+            mode: PutMode::IfAbsent,
+            metadata: UserMetadata::from([(PUT_ID_METADATA.to_owned(), PUT_ID.to_owned())]),
+            crc32c: Some(7),
+            ..PutOptions::default()
+        };
+
+        let begun = run(store.begin_parts("a/b", &options, &KeyLayout::new("iggy").unwrap()));
+
+        assert_eq!(begun.unwrap(), upload("a/b"));
+        let [request] = fake.requests().try_into().unwrap();
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.target, "/segments/a/b?uploads=");
+        assert_eq!(request.headers["x-amz-checksum-algorithm"], "CRC32C");
+        assert_eq!(request.headers["x-amz-checksum-type"], "FULL_OBJECT");
+        assert_eq!(request.headers["x-amz-meta-put-id"], PUT_ID);
+        assert!(!request.headers.contains_key("if-none-match"));
+    }
+
+    #[test]
+    fn given_refusals_of_a_begin_when_classifying_should_fall_back_only_on_what_says_unsupported() {
+        let cases: [(Answers, Expected); 4] = [
+            (
+                |_| error_answer(501, "NotImplemented"),
+                |error| matches!(error, ObjectStoreError::Unsupported(_)),
+            ),
+            (
+                |_| error_answer(400, "InvalidArgument"),
+                |error| matches!(error, ObjectStoreError::Unsupported(_)),
+            ),
+            (
+                |_| error_answer(403, "AccessDenied"),
+                |error| matches!(error, ObjectStoreError::Auth(_)),
+            ),
+            (
+                |_| error_answer(503, "SlowDown"),
+                |error| matches!(error, ObjectStoreError::Throttled(_)),
+            ),
+        ];
+        for (answer, expected) in cases {
+            let fake = Recorder::start(answer);
+            let store = static_store(&fake.endpoint);
+
+            let begun = run(store.begin_parts(
+                "a/b",
+                &PutOptions::default(),
+                &KeyLayout::new("iggy").unwrap(),
+            ));
+
+            let error = begun.unwrap_err();
+            assert!(expected(&error), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn given_a_part_when_putting_should_send_its_number_upload_and_crc32c_and_keep_its_etag() {
+        let fake =
+            Recorder::start(|_| (200, vec![("etag", "\"part-etag\"".to_owned())], Vec::new()));
+        let store = static_store(&fake.endpoint);
+        let bytes = Bytes::from_static(b"part bytes");
+        let crc32c = crc32c::crc32c(&bytes);
+
+        let stored = run(store.put_part(
+            &upload("a/b"),
+            2,
+            PutBody::from_bytes(bytes.clone()),
+            crc32c,
+        ));
+
+        assert_eq!(
+            stored.unwrap(),
+            StoredPart {
+                number: 2,
+                tag: "part-etag".to_owned(),
+                crc32c,
+            }
+        );
+        let [request] = fake.requests().try_into().unwrap();
+        assert_eq!(request.method, "PUT");
+        assert_eq!(
+            request.target,
+            format!("/segments/a/b?partNumber=2&uploadId={UPLOAD}")
+        );
+        assert_eq!(
+            request.headers["x-amz-checksum-crc32c"],
+            encode_crc32c(crc32c)
+        );
+        assert_eq!(request.body, bytes);
+    }
+
+    fn parts() -> Vec<StoredPart> {
+        vec![
+            StoredPart {
+                number: 1,
+                tag: "e1".to_owned(),
+                crc32c: 1,
+            },
+            StoredPart {
+                number: 2,
+                tag: "e2".to_owned(),
+                crc32c: 2,
+            },
+        ]
+    }
+
+    #[test]
+    fn given_parts_when_completing_a_create_only_put_should_send_the_condition_crc32c_size_and_parts()
+     {
+        let fake = Recorder::start(|_| {
+            let body = "<CompleteMultipartUploadResult><Key>a/b</Key><ETag>\"x-2\"</ETag>\
+                        </CompleteMultipartUploadResult>";
+            (200, Vec::new(), body.as_bytes().to_vec())
+        });
+        let store = static_store(&fake.endpoint);
+        let options = PutOptions {
+            mode: PutMode::IfAbsent,
+            crc32c: Some(0xdead_beef),
+            ..PutOptions::default()
+        };
+
+        run(store.complete_parts(&upload("a/b"), &parts(), &options, 12)).unwrap();
+
+        let [request] = fake.requests().try_into().unwrap();
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.target, format!("/segments/a/b?uploadId={UPLOAD}"));
+        assert_eq!(request.headers["if-none-match"], "*");
+        assert_eq!(
+            request.headers["x-amz-checksum-crc32c"],
+            encode_crc32c(0xdead_beef)
+        );
+        assert_eq!(request.headers["x-amz-checksum-type"], "FULL_OBJECT");
+        assert_eq!(request.headers["x-amz-mp-object-size"], "12");
+        assert_eq!(
+            String::from_utf8(request.body).unwrap(),
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?><CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Part><PartNumber>1</PartNumber><ETag>"e1"</ETag><ChecksumCRC32C>{}</ChecksumCRC32C></Part><Part><PartNumber>2</PartNumber><ETag>"e2"</ETag><ChecksumCRC32C>{}</ChecksumCRC32C></Part></CompleteMultipartUpload>"#,
+                encode_crc32c(1),
+                encode_crc32c(2)
+            )
+        );
+    }
+
+    #[test]
+    fn given_an_overwrite_when_completing_should_send_no_condition() {
+        let fake = Recorder::start(|_| {
+            (
+                200,
+                Vec::new(),
+                b"<CompleteMultipartUploadResult><ETag>\"x-2\"</ETag></CompleteMultipartUploadResult>"
+                    .to_vec(),
+            )
+        });
+        let store = static_store(&fake.endpoint);
+
+        run(store.complete_parts(&upload("a/b"), &parts(), &PutOptions::default(), 12)).unwrap();
+
+        let [request] = fake.requests().try_into().unwrap();
+        assert!(!request.headers.contains_key("if-none-match"));
+        assert!(!request.headers.contains_key("x-amz-checksum-crc32c"));
+    }
+
+    #[test]
+    fn given_answers_to_a_completion_when_classifying_should_map_each_and_read_errors_in_a_200() {
+        let cases: [(Answers, Expected); 8] = [
+            (
+                |_| error_answer(412, "PreconditionFailed"),
+                |error| matches!(error, ObjectStoreError::PreconditionFailed { key } if key == "a/b"),
+            ),
+            (
+                |_| error_answer(404, "NoSuchUpload"),
+                |error| matches!(error, ObjectStoreError::NotFound { .. }),
+            ),
+            (
+                |_| error_answer(409, "ConditionalRequestConflict"),
+                |error| matches!(error, ObjectStoreError::UploadConflict { key } if key == "a/b"),
+            ),
+            (
+                |_| {
+                    let body = "<Error><Code>ConditionalRequestConflict</Code></Error>";
+                    (200, Vec::new(), body.as_bytes().to_vec())
+                },
+                |error| matches!(error, ObjectStoreError::UploadConflict { .. }),
+            ),
+            (
+                |_| error_answer(409, "OperationAborted"),
+                |error| matches!(error, ObjectStoreError::Throttled(_)),
+            ),
+            (
+                |_| error_answer(400, "BadDigest"),
+                |error| matches!(error, ObjectStoreError::ChecksumMismatch { .. }),
+            ),
+            (
+                |_| error_answer(200, "InternalError"),
+                |error| matches!(error, ObjectStoreError::Unavailable(_)),
+            ),
+            (
+                |_| {
+                    let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\n<Error>\
+                                <Code>PreconditionFailed</Code></Error>";
+                    (200, Vec::new(), body.as_bytes().to_vec())
+                },
+                |error| matches!(error, ObjectStoreError::PreconditionFailed { .. }),
+            ),
+        ];
+        for (answer, expected) in cases {
+            let fake = Recorder::start(answer);
+            let store = static_store(&fake.endpoint);
+
+            let completed =
+                run(store.complete_parts(&upload("a/b"), &parts(), &PutOptions::default(), 12));
+
+            let error = completed.unwrap_err();
+            assert!(expected(&error), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn given_an_error_root_with_attributes_in_a_200_when_completing_should_classify_its_code() {
+        let fake = Recorder::start(|_| {
+            let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error \
+                        xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                        <Code>PreconditionFailed</Code></Error>";
+            (200, Vec::new(), body.as_bytes().to_vec())
+        });
+        let store = static_store(&fake.endpoint);
+
+        let completed =
+            run(store.complete_parts(&upload("a/b"), &parts(), &PutOptions::default(), 12));
+
+        let error = completed.unwrap_err();
+        assert!(
+            matches!(&error, ObjectStoreError::PreconditionFailed { key } if key == "a/b"),
+            "{error:?}"
+        );
+    }
+
+    /// The store sent its status before it finished, so a 200 that names no
+    /// outcome can follow a completion that created the object, and the
+    /// caller's check of the object under the key settles it.
+    #[test]
+    fn given_a_200_without_a_result_when_completing_should_fail_as_one_that_may_have_created_the_object()
+     {
+        let cases: [Answers; 4] = [
+            |_| (200, Vec::new(), Vec::new()),
+            |_| {
+                (
+                    200,
+                    Vec::new(),
+                    b"<CompleteMultipartUploadResult/>".to_vec(),
+                )
+            },
+            |_| (200, Vec::new(), b"<html>bad gateway</html>".to_vec()),
+            |_| {
+                let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\n   ";
+                (200, Vec::new(), body.as_bytes().to_vec())
+            },
+        ];
+        for answer in cases {
+            let fake = Recorder::start(answer);
+            let store = static_store(&fake.endpoint);
+
+            let completed =
+                run(store.complete_parts(&upload("a/b"), &parts(), &PutOptions::default(), 12));
+
+            let error = completed.unwrap_err();
+            assert!(
+                matches!(error, ObjectStoreError::Unavailable(_)),
+                "{error:?}"
+            );
+            assert_eq!(error.class(), ErrorClass::Transient);
+            assert!(error.put_may_have_stored());
+        }
+    }
+
+    #[test]
+    fn given_an_upload_when_aborting_should_delete_it_and_take_one_that_is_gone() {
+        let fake = Recorder::start(|_| (204, Vec::new(), Vec::new()));
+        let store = static_store(&fake.endpoint);
+
+        run(store.abort_parts(&upload("a/b"), 3)).unwrap();
+
+        let [request] = fake.requests().try_into().unwrap();
+        assert_eq!(request.method, "DELETE");
+        assert_eq!(request.target, format!("/segments/a/b?uploadId={UPLOAD}"));
+        let gone = Recorder::start(|_| error_answer(404, "NoSuchUpload"));
+        assert!(run(static_store(&gone.endpoint).abort_parts(&upload("a/b"), 3)).is_ok());
+    }
+
+    /// Answers a listing of uploads with an old and a young upload of the
+    /// root, and an old one of a longer root, and every abort with 204.
+    fn uploads_listing(request: &Recorded) -> Answer {
+        if request.method == "DELETE" {
+            return (204, Vec::new(), Vec::new());
+        }
+        let at = |age: TimeDelta| {
+            (Utc::now() - age).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        };
+        let ours = "iggy/1/2/3/4/00000000000000000000-00000000000000000099.log";
+        let longer = "iggy/b/1/2/3/4/00000000000000000000-00000000000000000099.log";
+        let body = format!(
+            "<ListMultipartUploadsResult><IsTruncated>false</IsTruncated>\
+             <Upload><Key>{ours}</Key><UploadId>old</UploadId><Initiated>{}</Initiated></Upload>\
+             <Upload><Key>{ours}</Key><UploadId>young</UploadId><Initiated>{}</Initiated></Upload>\
+             <Upload><Key>{longer}</Key><UploadId>other-root</UploadId><Initiated>{}</Initiated></Upload>\
+             </ListMultipartUploadsResult>",
+            at(TimeDelta::hours(2)),
+            at(TimeDelta::minutes(5)),
+            at(TimeDelta::hours(2)),
+        );
+        (200, Vec::new(), body.into_bytes())
+    }
+
+    #[test]
+    fn given_uploads_under_the_root_when_sweeping_should_abort_only_the_old_ones_of_this_root() {
+        let fake = Recorder::start(uploads_listing);
+        let store = static_store(&fake.endpoint);
+        let layout = KeyLayout::new("iggy").unwrap();
+
+        let swept = run(store.sweep_uploads(
+            &layout,
+            Duration::from_secs(3600),
+            None,
+            Duration::from_secs(30),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            swept,
+            SweptUploads {
+                removed: 1,
+                kept: 1,
+                failed: 0,
+                next: None,
+            }
+        );
+        let requests = fake.requests();
+        assert!(
+            requests[0].target.starts_with("/segments?")
+                && requests[0].target.contains("uploads=")
+                && requests[0].target.contains("prefix=iggy%2F"),
+            "{}",
+            requests[0].target
+        );
+        let aborted: Vec<&str> = requests
+            .iter()
+            .filter(|request| request.method == "DELETE")
+            .map(|request| request.target.as_str())
+            .collect();
+        assert_eq!(
+            aborted,
+            ["/segments/iggy/1/2/3/4/00000000000000000000-00000000000000000099.log?uploadId=old"]
+        );
+    }
+
+    /// Lists two old uploads, and answers the abort of the first only after
+    /// 1.5 s. The endpoint takes one connection at a time, so the abort of
+    /// the second waits for it and is answered about 0.5 s after it left.
+    fn uploads_with_a_stalled_abort(request: &Recorded) -> Answer {
+        if request.method == "DELETE" {
+            if request.target.ends_with("uploadId=stalled") {
+                std::thread::sleep(Duration::from_millis(1500));
+            }
+            return (204, Vec::new(), Vec::new());
+        }
+        let old =
+            (Utc::now() - TimeDelta::hours(2)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let key = "iggy/1/2/3/4/00000000000000000000-00000000000000000099.log";
+        let body = format!(
+            "<ListMultipartUploadsResult><IsTruncated>false</IsTruncated>\
+             <Upload><Key>{key}</Key><UploadId>stalled</UploadId><Initiated>{old}</Initiated></Upload>\
+             <Upload><Key>{key}</Key><UploadId>old</UploadId><Initiated>{old}</Initiated></Upload>\
+             </ListMultipartUploadsResult>"
+        );
+        (200, Vec::new(), body.into_bytes())
+    }
+
+    #[test]
+    fn given_an_abort_that_stalls_when_sweeping_should_count_it_failed_and_abort_the_rest() {
+        let fake = Recorder::start(uploads_with_a_stalled_abort);
+        let store = static_store(&fake.endpoint);
+        let layout = KeyLayout::new("iggy").unwrap();
+
+        let swept = run(store.sweep_uploads(
+            &layout,
+            Duration::from_secs(3600),
+            None,
+            Duration::from_secs(1),
+        ))
+        .unwrap();
+
+        assert_eq!((swept.removed, swept.kept, swept.failed), (1, 0, 1));
+        let aborted: Vec<String> = fake
+            .requests()
+            .iter()
+            .filter(|request| request.method == "DELETE")
+            .map(|request| request.target.clone())
+            .collect();
+        assert!(
+            aborted
+                .last()
+                .is_some_and(|target| target.ends_with("uploadId=old")),
+            "{aborted:?}"
+        );
+    }
+
+    #[test]
+    fn given_checksums_of_multipart_objects_when_reading_a_head_should_take_only_a_full_object_one()
+    {
+        let headers = |pairs: &[(&'static str, &str)]| {
+            let mut headers = HeaderMap::new();
+            for (name, value) in pairs {
+                headers.insert(*name, HeaderValue::from_str(value).unwrap());
+            }
+            headers
+        };
+        let full = encode_crc32c(0xdead_beef);
+
+        assert_eq!(
+            header_crc32c(&headers(&[
+                (CHECKSUM_HEADER, &full),
+                (CHECKSUM_TYPE_HEADER, "FULL_OBJECT")
+            ]))
+            .unwrap(),
+            Some(0xdead_beef)
+        );
+        assert_eq!(
+            header_crc32c(&headers(&[(CHECKSUM_HEADER, &full)])).unwrap(),
+            Some(0xdead_beef)
+        );
+        assert_eq!(
+            header_crc32c(&headers(&[
+                (CHECKSUM_HEADER, "3q2+7w==-3"),
+                (CHECKSUM_TYPE_HEADER, "COMPOSITE")
+            ]))
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            header_crc32c(&headers(&[(CHECKSUM_HEADER, "3q2+7w==-3")])).unwrap(),
+            None
+        );
     }
 
     #[test]

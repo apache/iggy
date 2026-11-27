@@ -33,15 +33,16 @@ import org.apache.iggy.stream.StreamDetails;
 import org.apache.iggy.stream.StreamOptionKey;
 import org.apache.iggy.stream.StreamOptions;
 import org.apache.iggy.stream.StreamUpdate;
+import org.apache.iggy.system.MetadataChangeBody;
 import org.apache.iggy.system.OptionKey;
 import org.apache.iggy.system.OptionSpec;
 import org.apache.iggy.system.OptionsScope;
-import org.apache.iggy.topic.CompressionAlgorithm;
-import org.apache.iggy.topic.Durability;
+import org.apache.iggy.topic.GeoMode;
 import org.apache.iggy.topic.Topic;
 import org.apache.iggy.topic.TopicDetails;
 import org.apache.iggy.topic.TopicOptionKey;
 import org.apache.iggy.topic.TopicOptions;
+import org.apache.iggy.topic.TopicType;
 import org.apache.iggy.topic.TopicUpdate;
 import org.apache.iggy.user.UserInfo;
 import org.apache.iggy.user.UserInfoDetails;
@@ -57,6 +58,7 @@ import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HexFormat;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -72,6 +74,7 @@ import static org.apache.iggy.ResourceOptionsFixture.section;
 import static org.apache.iggy.ResourceOptionsFixture.streamId;
 import static org.apache.iggy.ResourceOptionsFixture.streamUpdate;
 import static org.apache.iggy.ResourceOptionsFixture.topicId;
+import static org.apache.iggy.ResourceOptionsFixture.topicOptions;
 import static org.apache.iggy.ResourceOptionsFixture.topicUpdate;
 import static org.apache.iggy.ResourceOptionsFixture.userId;
 import static org.apache.iggy.ResourceOptionsFixture.userUpdate;
@@ -86,6 +89,17 @@ import static org.assertj.core.api.SoftAssertions.assertSoftly;
  * and every response must decode to the projection the Rust reader returns.
  */
 class ResourceOptionsTest {
+
+    private static final List<TopicOptionKey> GEO_DURATIONS = List.of(
+            TopicOptionKey.FRESH_UPLOAD_INTERVAL,
+            TopicOptionKey.CONSUMER_OFFSET_UPLOAD_INTERVAL,
+            TopicOptionKey.POSITIONS_PUBLISH_INTERVAL,
+            TopicOptionKey.TOMBSTONE_GRACE,
+            TopicOptionKey.POSITIONS_RESUME_TIMEOUT,
+            TopicOptionKey.LONG_TERM_REWRITE_MAX_INTERVAL);
+
+    private static final List<TopicOptionKey> READ_CACHE_SIZES =
+            List.of(TopicOptionKey.READ_CACHE_SIZE, TopicOptionKey.READ_AHEAD);
 
     @Test
     void givenSharedVectorsWhenEncodingShouldMatchServerContract() {
@@ -114,23 +128,15 @@ class ResourceOptionsTest {
         }
         for (JsonNode vector : section("create_topic")) {
             JsonNode input = vector.get("input");
-            var options = TopicOptions.builder()
-                    .compressionAlgorithm(CompressionAlgorithm.Gzip)
-                    .messageExpiry(new BigInteger(input.get("message_expiry").asString()))
-                    .maxTopicSize(new BigInteger(input.get("max_topic_size").asString()))
-                    .segmentSize(new BigInteger(input.get("segment_size").asString()))
-                    .durability(Durability.PERSISTED)
-                    .consumerOffsetDurability(Durability.REPLICATED)
-                    .build();
-            assertThat(input.get("compression_algorithm").asString()).isEqualTo("gzip");
+            String name = vector.get("case").asString();
+            TopicOptions options = topicOptions(input);
+            assertThat(options.entries()).as(name).isEqualTo(optionMap(vector.get("wire_options"), true));
             ByteBuf body = BytesSerializer.toCreateTopic(
                     StreamId.of(input.get("stream_id").asLong()),
                     input.get("name").asString(),
                     input.get("partitions_count").asLong(),
                     options.entries());
-            assertThat(hex(body))
-                    .as(vector.get("case").asString())
-                    .isEqualTo(vector.get("body_hex").asString());
+            assertThat(hex(body)).as(name).isEqualTo(vector.get("body_hex").asString());
         }
         for (JsonNode vector : section("create_user")) {
             JsonNode input = vector.get("input");
@@ -208,6 +214,11 @@ class ResourceOptionsTest {
         assertRefusal(
                 () -> TopicUpdate.builder().reset(TopicOptionKey.TIERED_STORAGE).build(),
                 IggyErrorCode.OPTION_NOT_UPDATABLE);
+        assertRefusal(
+                () -> TopicUpdate.builder().reset(TopicOptionKey.TOPIC_TYPE).build(),
+                IggyErrorCode.OPTION_NOT_UPDATABLE);
+        assertRefusal(
+                () -> TopicUpdate.builder().reset(TopicOptionKey.GEO_MODE).build(), IggyErrorCode.OPTION_NOT_UPDATABLE);
         assertRefusal(() -> StreamOptions.builder().encryptionKey(new byte[31]), IggyErrorCode.INVALID_ENCRYPTION_KEY);
         assertRefusal(() -> StreamOptions.builder().encryptionKeyBase64("AAAA"), IggyErrorCode.INVALID_ENCRYPTION_KEY);
         assertThat(StreamUpdate.builder().name(" ").build().entries().get(StreamOptionKey.NAME.value()))
@@ -236,6 +247,58 @@ class ResourceOptionsTest {
                         .entries()
                         .get("tiered_storage"))
                 .isEqualTo(HeaderValue.fromBool(false));
+    }
+
+    @Test
+    void givenGeoDurationsWhenBuildingUpdateShouldSendZeroAndRefuseAReset() {
+        TopicUpdate update = TopicUpdate.builder()
+                .consumerOffsetUploadInterval(BigInteger.ZERO)
+                .positionsResumeTimeout(BigInteger.valueOf(30_000_000L))
+                .messageExpiry(BigInteger.ZERO)
+                .build();
+
+        // A zero expiry is the sentinel for no change, while a zero duration of a geo topic is a value.
+        assertThat(update.entries())
+                .isEqualTo(Map.of(
+                        "consumer_offset_upload_interval",
+                        HeaderValue.fromUint64(BigInteger.ZERO),
+                        "positions_resume_timeout",
+                        HeaderValue.fromUint64(BigInteger.valueOf(30_000_000L))));
+        assertThat(TopicUpdate.builder()
+                        .freshUploadInterval(BigInteger.ZERO)
+                        .build()
+                        .entries())
+                .containsOnlyKeys("fresh_upload_interval");
+        assertRefusal(
+                () -> TopicUpdate.builder().messageExpiry(BigInteger.ZERO).build(), IggyErrorCode.INVALID_COMMAND);
+        for (TopicOptionKey key : GEO_DURATIONS) {
+            assertRefusal(() -> TopicUpdate.builder().reset(key).build(), IggyErrorCode.OPTION_NOT_RESETTABLE);
+        }
+        // A reset by name travels raw, and the server refuses it for a key without a default.
+        assertThat(TopicUpdate.builder().rawReset("tombstone_grace").build().resetKeys())
+                .containsExactly("tombstone_grace");
+    }
+
+    @Test
+    void givenReadCacheSizesWhenBuildingUpdateShouldSendZeroAndRefuseAReset() {
+        TopicUpdate update = TopicUpdate.builder()
+                .readCacheSize(BigInteger.ZERO)
+                .readAhead(BigInteger.valueOf(1_048_576L))
+                .maxTopicSize(BigInteger.ZERO)
+                .build();
+
+        // A zero size cap is the sentinel for no change, while a zero read cache size is a value.
+        assertThat(update.entries())
+                .isEqualTo(Map.of(
+                        "read_cache_size",
+                        HeaderValue.fromUint64(BigInteger.ZERO),
+                        "read_ahead",
+                        HeaderValue.fromUint64(BigInteger.valueOf(1_048_576L))));
+        assertThat(TopicUpdate.builder().readAhead(BigInteger.ZERO).build().entries())
+                .containsOnlyKeys("read_ahead");
+        for (TopicOptionKey key : READ_CACHE_SIZES) {
+            assertRefusal(() -> TopicUpdate.builder().reset(key).build(), IggyErrorCode.OPTION_NOT_RESETTABLE);
+        }
     }
 
     @Test
@@ -371,6 +434,20 @@ class ResourceOptionsTest {
             List<String> keks = new ArrayList<>();
             expected.get("encryption_kek_fingerprints").forEach(kek -> keks.add(kek.asString()));
             assertThat(stream.encryptionKekFingerprints()).as(name).isEqualTo(keks);
+            Optional<String> origin = textOrEmpty(expected.get("shadow_origin"));
+            assertThat(stream.shadowOrigin()).as(name).isEqualTo(origin);
+            assertThat(BytesDeserializer.readStreamBase(responseOf(vector)).shadowOrigin())
+                    .as(name)
+                    .isEqualTo(origin);
+            var change = new MetadataChangeBody.StreamChange(
+                    stream.id(),
+                    BigInteger.ONE,
+                    stream.createdAt(),
+                    stream.name(),
+                    stream.options(),
+                    stream.derivedOptions(),
+                    false);
+            assertThat(change.shadowOrigin()).as(name).isEqualTo(origin);
             assertNoSecretKeys(
                     name, stream.options().keySet(), stream.derivedOptions().keySet());
         }
@@ -388,8 +465,10 @@ class ResourceOptionsTest {
                     .isEqualTo(expected.get("size_bytes").asString());
             assertThat(topic.options()).as(name).isEqualTo(optionMap(expected.get("options"), true));
             assertThat(topic.derivedOptions()).as(name).isEqualTo(optionMap(expected.get("options"), false));
-            assertThat(topic.compressionAlgorithm()).as(name).contains(CompressionAlgorithm.Gzip);
-            assertThat(expected.get("compression_algorithm").asString()).isEqualTo("gzip");
+            assertThat(topic.compressionAlgorithm()
+                            .map(algorithm -> algorithm.name().toLowerCase(Locale.ROOT)))
+                    .as(name)
+                    .contains(expected.get("compression_algorithm").asString());
             assertThat(topic.messageExpiry())
                     .as(name)
                     .contains(new BigInteger(expected.get("message_expiry").asString()));
@@ -421,6 +500,22 @@ class ResourceOptionsTest {
                             .get("local_retention_size")
                             .get("value")
                             .asString()));
+            assertThat(topic.topicType().map(TopicType::value)).as(name).isEqualTo(optionText(expected, "topic_type"));
+            assertThat(topic.geoMode().map(GeoMode::value)).as(name).isEqualTo(optionText(expected, "geo_mode"));
+            Map<String, Optional<BigInteger>> durations = new LinkedHashMap<>();
+            GEO_DURATIONS.forEach(key -> durations.put(
+                    key.value(), textOrEmpty(expected.get(key.value())).map(BigInteger::new)));
+            assertThat(geoDurations(topic)).as(name).isEqualTo(durations);
+            assertThat(geoDurations(BytesDeserializer.readTopicDetails(responseOf(vector))))
+                    .as(name)
+                    .isEqualTo(durations);
+            Map<String, Optional<BigInteger>> sizes = new LinkedHashMap<>();
+            READ_CACHE_SIZES.forEach(key -> sizes.put(
+                    key.value(), textOrEmpty(expected.get(key.value())).map(BigInteger::new)));
+            assertThat(readCacheSizes(topic)).as(name).isEqualTo(sizes);
+            assertThat(readCacheSizes(BytesDeserializer.readTopicDetails(responseOf(vector))))
+                    .as(name)
+                    .isEqualTo(sizes);
         }
         for (JsonNode vector : section("user_responses")) {
             JsonNode expected = vector.get("expected");
@@ -620,6 +715,51 @@ class ResourceOptionsTest {
                 .hasValue(key);
         assertThat(options.entries().get(StreamOptionKey.ENCRYPTION_KEY.value()))
                 .isEqualTo(new HeaderValue(HeaderKind.Raw, key));
+    }
+
+    private static Map<String, Optional<BigInteger>> geoDurations(Topic topic) {
+        Map<String, Optional<BigInteger>> durations = new LinkedHashMap<>();
+        durations.put("fresh_upload_interval", topic.freshUploadInterval());
+        durations.put("consumer_offset_upload_interval", topic.consumerOffsetUploadInterval());
+        durations.put("positions_publish_interval", topic.positionsPublishInterval());
+        durations.put("tombstone_grace", topic.tombstoneGrace());
+        durations.put("positions_resume_timeout", topic.positionsResumeTimeout());
+        durations.put("long_term_rewrite_max_interval", topic.longTermRewriteMaxInterval());
+        return durations;
+    }
+
+    private static Map<String, Optional<BigInteger>> geoDurations(TopicDetails topic) {
+        Map<String, Optional<BigInteger>> durations = new LinkedHashMap<>();
+        durations.put("fresh_upload_interval", topic.freshUploadInterval());
+        durations.put("consumer_offset_upload_interval", topic.consumerOffsetUploadInterval());
+        durations.put("positions_publish_interval", topic.positionsPublishInterval());
+        durations.put("tombstone_grace", topic.tombstoneGrace());
+        durations.put("positions_resume_timeout", topic.positionsResumeTimeout());
+        durations.put("long_term_rewrite_max_interval", topic.longTermRewriteMaxInterval());
+        return durations;
+    }
+
+    private static Map<String, Optional<BigInteger>> readCacheSizes(Topic topic) {
+        Map<String, Optional<BigInteger>> sizes = new LinkedHashMap<>();
+        sizes.put("read_cache_size", topic.readCacheSize());
+        sizes.put("read_ahead", topic.readAhead());
+        return sizes;
+    }
+
+    private static Map<String, Optional<BigInteger>> readCacheSizes(TopicDetails topic) {
+        Map<String, Optional<BigInteger>> sizes = new LinkedHashMap<>();
+        sizes.put("read_cache_size", topic.readCacheSize());
+        sizes.put("read_ahead", topic.readAhead());
+        return sizes;
+    }
+
+    private static Optional<String> optionText(JsonNode expected, String key) {
+        JsonNode option = expected.get("options").get(key);
+        return option == null ? Optional.empty() : textOrEmpty(option.get("value"));
+    }
+
+    private static Optional<String> textOrEmpty(JsonNode node) {
+        return node == null || node.isNull() ? Optional.empty() : Optional.of(node.asString());
     }
 
     private static void assertInvalidKey(IggyValidationException refusal) {

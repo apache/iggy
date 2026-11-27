@@ -102,6 +102,20 @@ impl Validatable<ConfigurationError> for ServerConfig {
             .error(|e: &ConfigurationError| {
                 format!("{COMPONENT} (error: {e}) - failed to validate tiered storage config")
             })?;
+        self.geo.validate().error(|e: &ConfigurationError| {
+            format!("{COMPONENT} (error: {e}) - failed to validate geo config")
+        })?;
+        // The tier services of the peers run on the tiered storage tuning.
+        if !self.geo.peers.is_empty() {
+            self.tiered_storage
+                .validate_tuning()
+                .error(|e: &ConfigurationError| {
+                    format!(
+                        "{COMPONENT} (error: {e}) - failed to validate the tiered storage tuning \
+                         that geo peers use"
+                    )
+                })?;
+        }
 
         if self.http.enabled
             && let IggyExpiry::ServerDefault = self.http.jwt.access_token_expiry

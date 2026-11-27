@@ -76,6 +76,11 @@ pub enum Operation {
     /// key-encryption key rotation. Proposed by the metadata primary, no
     /// client wire code.
     RewrapStreamKeys = 75,
+    /// Server-originated: adopt, detach or remove the shadow of a peer
+    /// cluster's geo topic, or rename or remove a shadow stream. Proposed by
+    /// the metadata primary from what the peer's store holds, no client wire
+    /// code.
+    ShadowTopic = 76,
 
     // Metadata operations (shard 0)
     CreateStream = 128,
@@ -107,6 +112,9 @@ pub enum Operation {
     /// Generic option patch for a stream, topic or user. Prepare rewrites it to
     /// the resolved operation of the target's scope.
     UpdateResource = 150,
+    /// A geo peer that never returns: this cluster stops following it, and
+    /// its shadow topics expire by their own retention.
+    RetireGeoOrigin = 151,
 
     // Partition operations (routed by namespace)
     SendMessages = 160,
@@ -212,6 +220,7 @@ impl Operation {
                 | Self::JoinConsumerGroup
                 | Self::LeaveConsumerGroup
                 | Self::UpdateResource
+                | Self::RetireGeoOrigin
         )
     }
 
@@ -295,6 +304,7 @@ impl Operation {
             | Self::UpdateTopicResolved
             | Self::UpdateUserResolved
             | Self::RewrapStreamKeys
+            | Self::ShadowTopic
             | Self::RemoveConsumerGroupMember
             | Self::CompleteConsumerGroupRevocation
             | Self::TruncatePartition
@@ -323,6 +333,7 @@ impl Operation {
             | Self::JoinConsumerGroup
             | Self::LeaveConsumerGroup
             | Self::UpdateResource
+            | Self::RetireGeoOrigin
             | Self::SendMessages
             | Self::StoreConsumerOffset
             | Self::DeleteConsumerOffset => match crate::dispatch::lookup_by_operation(*self) {
@@ -369,6 +380,7 @@ mod tests {
             Operation::JoinConsumerGroup,
             Operation::LeaveConsumerGroup,
             Operation::UpdateResource,
+            Operation::RetireGeoOrigin,
             Operation::SendMessages,
             Operation::StoreConsumerOffset,
             Operation::DeleteConsumerOffset,
@@ -497,6 +509,19 @@ mod tests {
         assert_eq!(rewrap.to_command_code(), None);
         assert_eq!(rewrap.request_operation(), rewrap);
         assert!(!Operation::is_known_code(69));
+    }
+
+    #[test]
+    fn given_shadow_topic_operation_when_classifying_should_be_internal_metadata_and_not_client_allowed()
+     {
+        let shadow = Operation::ShadowTopic;
+        assert_eq!(shadow as u8, 76);
+        assert!(shadow.is_internal());
+        assert!(shadow.is_metadata());
+        assert!(shadow.is_result_framed());
+        assert!(!shadow.is_client_allowed());
+        assert_eq!(shadow.to_command_code(), None);
+        assert_eq!(shadow.request_operation(), shadow);
     }
 
     #[test]

@@ -36,5 +36,8 @@ public enum StreamOptionKey
     EncryptionKeyFingerprint,
 
     /// <summary><c>encryption_kek_fingerprint</c>, read-only.</summary>
-    EncryptionKekFingerprint
+    EncryptionKekFingerprint,
+
+    /// <summary><c>shadow_origin</c>, read-only and present only on a shadow stream.</summary>
+    ShadowOrigin
 }

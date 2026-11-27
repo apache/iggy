@@ -17,12 +17,14 @@
  * under the License.
  */
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <map>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -137,6 +139,16 @@ TEST(TopicCreateOptionsTest, DefaultHasNoValues) {
     EXPECT_FALSE(options.TieredStorage().has_value());
     EXPECT_FALSE(options.LocalRetentionAge().has_value());
     EXPECT_FALSE(options.LocalRetentionSize().has_value());
+    EXPECT_FALSE(options.TopicType().has_value());
+    EXPECT_FALSE(options.GeoMode().has_value());
+    EXPECT_FALSE(options.FreshUploadInterval().has_value());
+    EXPECT_FALSE(options.ConsumerOffsetUploadInterval().has_value());
+    EXPECT_FALSE(options.PositionsPublishInterval().has_value());
+    EXPECT_FALSE(options.TombstoneGrace().has_value());
+    EXPECT_FALSE(options.PositionsResumeTimeout().has_value());
+    EXPECT_FALSE(options.LongTermRewriteMaxInterval().has_value());
+    EXPECT_FALSE(options.ReadCacheSize().has_value());
+    EXPECT_FALSE(options.ReadAhead().has_value());
     EXPECT_TRUE(options.RawEntries().empty());
 }
 
@@ -275,6 +287,36 @@ TEST(TopicCreateOptionsTest, ServerDefaultSentinelsClearValues) {
     EXPECT_FALSE(options.LocalRetentionSize().has_value());
 }
 
+TEST(TopicCreateOptionsTest, GeoDurationsKeepZeroAndRefuseNegative) {
+    iggy::TopicCreateOptions options;
+    options.SetFreshUploadInterval(std::chrono::milliseconds(50))
+        .SetConsumerOffsetUploadInterval(std::chrono::microseconds::zero())
+        .SetPositionsPublishInterval(std::chrono::seconds(2))
+        .SetTombstoneGrace(std::chrono::hours(1))
+        .SetPositionsResumeTimeout(std::chrono::microseconds::zero())
+        .SetLongTermRewriteMaxInterval(std::chrono::seconds(20));
+    EXPECT_EQ(options.FreshUploadInterval(), std::chrono::microseconds(50000));
+    EXPECT_EQ(options.ConsumerOffsetUploadInterval(), std::chrono::microseconds::zero());
+    EXPECT_EQ(options.PositionsPublishInterval(), std::chrono::microseconds(2000000));
+    EXPECT_EQ(options.TombstoneGrace(), std::chrono::microseconds(3600000000));
+    EXPECT_EQ(options.PositionsResumeTimeout(), std::chrono::microseconds::zero());
+    EXPECT_EQ(options.LongTermRewriteMaxInterval(), std::chrono::microseconds(20000000));
+
+    EXPECT_THROW(options.SetTombstoneGrace(std::chrono::microseconds(-1)), std::invalid_argument);
+    EXPECT_EQ(options.TombstoneGrace(), std::chrono::microseconds(3600000000));
+}
+
+TEST(TopicCreateOptionsTest, ReadCacheKeepsZero) {
+    iggy::TopicCreateOptions options;
+    options.SetReadCacheSize(16777216).SetReadAhead(0);
+    EXPECT_EQ(options.ReadCacheSize(), std::optional<std::uint64_t>(16777216));
+    EXPECT_EQ(options.ReadAhead(), std::optional<std::uint64_t>(0));
+
+    options.SetReadCacheSize(0).SetReadAhead(1048576);
+    EXPECT_EQ(options.ReadCacheSize(), std::optional<std::uint64_t>(0));
+    EXPECT_EQ(options.ReadAhead(), std::optional<std::uint64_t>(1048576));
+}
+
 TEST(TopicCreateOptionsTest, TieredStorageKeepsAnExplicitFalse) {
     iggy::TopicCreateOptions options;
     options.SetTieredStorage(false);
@@ -321,7 +363,43 @@ TEST(TopicUpdateOptionsTest, DefaultHasNoValues) {
     EXPECT_FALSE(options.TieredStorage().has_value());
     EXPECT_FALSE(options.LocalRetentionAge().has_value());
     EXPECT_FALSE(options.LocalRetentionSize().has_value());
+    EXPECT_FALSE(options.FreshUploadInterval().has_value());
+    EXPECT_FALSE(options.ConsumerOffsetUploadInterval().has_value());
+    EXPECT_FALSE(options.PositionsPublishInterval().has_value());
+    EXPECT_FALSE(options.TombstoneGrace().has_value());
+    EXPECT_FALSE(options.PositionsResumeTimeout().has_value());
+    EXPECT_FALSE(options.LongTermRewriteMaxInterval().has_value());
+    EXPECT_FALSE(options.ReadCacheSize().has_value());
+    EXPECT_FALSE(options.ReadAhead().has_value());
     EXPECT_TRUE(options.RawEntries().empty());
+    EXPECT_TRUE(options.ResetKeys().empty());
+}
+
+TEST(TopicUpdateOptionsTest, GeoDurationsAreSetOnlyAndKeepZero) {
+    iggy::TopicUpdateOptions options;
+    options.SetFreshUploadInterval(std::chrono::microseconds::zero())
+        .SetConsumerOffsetUploadInterval(std::chrono::milliseconds(20))
+        .SetPositionsPublishInterval(std::chrono::seconds(2))
+        .SetTombstoneGrace(std::chrono::hours(1))
+        .SetPositionsResumeTimeout(std::chrono::seconds(30))
+        .SetLongTermRewriteMaxInterval(std::chrono::seconds(20));
+    EXPECT_EQ(options.FreshUploadInterval(), std::chrono::microseconds::zero());
+    EXPECT_EQ(options.ConsumerOffsetUploadInterval(), std::chrono::microseconds(20000));
+    EXPECT_EQ(options.PositionsPublishInterval(), std::chrono::microseconds(2000000));
+    EXPECT_EQ(options.TombstoneGrace(), std::chrono::microseconds(3600000000));
+    EXPECT_EQ(options.PositionsResumeTimeout(), std::chrono::microseconds(30000000));
+    EXPECT_EQ(options.LongTermRewriteMaxInterval(), std::chrono::microseconds(20000000));
+    EXPECT_TRUE(options.ResetKeys().empty());
+
+    EXPECT_THROW(options.SetPositionsResumeTimeout(std::chrono::seconds(-1)), std::invalid_argument);
+    EXPECT_EQ(options.PositionsResumeTimeout(), std::chrono::microseconds(30000000));
+}
+
+TEST(TopicUpdateOptionsTest, ReadCacheIsSetOnlyAndKeepsZero) {
+    iggy::TopicUpdateOptions options;
+    options.SetReadCacheSize(0).SetReadAhead(1048576);
+    EXPECT_EQ(options.ReadCacheSize(), std::optional<std::uint64_t>(0));
+    EXPECT_EQ(options.ReadAhead(), std::optional<std::uint64_t>(1048576));
     EXPECT_TRUE(options.ResetKeys().empty());
 }
 
@@ -402,11 +480,26 @@ TEST(OptionKeyTest, ReturnsCatalogNames) {
     EXPECT_EQ(iggy::to_string(iggy::StreamOptionKey::Name), "name");
     EXPECT_EQ(iggy::to_string(iggy::StreamOptionKey::EncryptionKey), "encryption_key");
     EXPECT_EQ(iggy::to_string(iggy::StreamOptionKey::EncryptionKekFingerprint), "encryption_kek_fingerprint");
+    EXPECT_EQ(iggy::to_string(iggy::StreamOptionKey::ShadowOrigin), "shadow_origin");
     EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::SizeOfMessagesRequiredToSave), "size_of_messages_required_to_save");
     EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::SegmentMaxAge), "segment_max_age");
     EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::TieredStorage), "tiered_storage");
     EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::LocalRetentionAge), "local_retention_age");
     EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::LocalRetentionSize), "local_retention_size");
+    EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::TopicType), "topic_type");
+    EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::GeoMode), "geo_mode");
+    EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::FreshUploadInterval), "fresh_upload_interval");
+    EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::ConsumerOffsetUploadInterval), "consumer_offset_upload_interval");
+    EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::PositionsPublishInterval), "positions_publish_interval");
+    EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::TombstoneGrace), "tombstone_grace");
+    EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::PositionsResumeTimeout), "positions_resume_timeout");
+    EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::LongTermRewriteMaxInterval), "long_term_rewrite_max_interval");
+    EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::ReadCacheSize), "read_cache_size");
+    EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::ReadAhead), "read_ahead");
+    EXPECT_EQ(iggy::to_string(iggy::TopicType::Normal), "normal");
+    EXPECT_EQ(iggy::to_string(iggy::TopicType::Geo), "geo");
+    EXPECT_EQ(iggy::to_string(iggy::GeoMode::Geo), "geo");
+    EXPECT_EQ(iggy::to_string(iggy::GeoMode::GeoTiered), "geo_tiered");
     EXPECT_EQ(iggy::to_string(iggy::UserOptionKey::Status), "status");
     EXPECT_EQ(iggy::to_string(iggy::OptionsScope::User), "user");
     EXPECT_EQ(iggy::to_string(iggy::StreamEncryptionSource::Server), "server");

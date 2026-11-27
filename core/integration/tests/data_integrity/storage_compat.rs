@@ -47,8 +47,9 @@
 //!
 //! Three failure modes reach exit code 0 with a server that boots and serves:
 //!
-//! - A partition whose durable state cannot be read is TOMBSTONED and boot
-//!   continues. Only the log says so.
+//! - A partition whose durable state cannot be read is REFUSED and boot
+//!   continues. Only the log says so, in a line that starts with
+//!   [`PARTITION_REFUSED_MARKER`].
 //! - A topic loses a single storage option, per key, with no log line at
 //!   all: `TopicCreateOptions::parse_committed` deliberately discards
 //!   per-entry parse errors so one unreadable key cannot drop the rest.
@@ -56,7 +57,7 @@
 //!   happens to poll still read back fine, because segment batch headers
 //!   carry no magic and no version.
 //!
-//! So the test asserts the tombstone marker is absent, re-reads every seeded
+//! So the test asserts that marker is absent, re-reads every seeded
 //! option value AND its provenance flag, compares every stored message field
 //! against a read taken from the baseline, and byte-compares the segment
 //! files across the swap. It stops producing MID-segment on purpose: boot
@@ -78,10 +79,14 @@
 //! their independent replicated defaults. Production SDKs gain no fallback.
 //!
 //! `IGGY_TEST_VERBOSE` makes the harness inherit the server's stdout instead
-//! of capturing it, which would make the tombstone check vacuous. The
+//! of capturing it, which would make the marker check vacuous. The
 //! graceful-shutdown assertion below is taken on the same log and fails
 //! loudly in that case rather than passing on an empty file.
 
+use crate::server::tiered_storage_fs::{
+    STREAM as TIERED_STREAM, TOPIC as TIERED_TOPIC, create_tiered_topic, fs_store_envs,
+    send_every_message, wait_for_eviction,
+};
 use bytes::Bytes;
 use iggy::prelude::*;
 use iggy_binary_protocol::codec::WireEncode;
@@ -97,10 +102,12 @@ use integration::harness::{
 };
 use serde::{Deserialize, Serialize};
 use serial_test::parallel;
+use server_common::diagnostics::PARTITION_REFUSED_MARKER;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -126,19 +133,33 @@ const BASELINE_DATA_ENV: &str = "COMPAT_BASELINE_DATA";
 /// module documentation warns about.
 const CONFIG_PATH_ENV: &str = "IGGY_CONFIG_PATH";
 
+/// The file under the data directory that names the storage format of the
+/// build that created it.
+const STORAGE_FORMAT_FILE: &str = "storage-format";
+
+/// What every build since the storage format gate says when it refuses a data
+/// directory.
+const UNSUPPORTED_STORAGE: &str = "startup refused without modifying data";
+
+/// How long the baseline may take to refuse a data directory. It refuses
+/// before it binds a port or opens a partition.
+const REFUSAL_DEADLINE: Duration = Duration::from_secs(60);
+
 const JOURNAL_SLOTS_KEY: &str = "metadata.journal_slots";
 
 /// `metadata.journal_slots` floor for `prepare_queue_depth = 32`
-/// (`4 * max(64, 32)`). With the 64-op checkpoint margin a checkpoint fires
-/// once the journal holds 192 committed ops.
+/// (`4 * max(64, 32)`). A checkpoint starts once half of it, 128 ops,
+/// committed past the last one.
 const JOURNAL_SLOTS: &str = "256";
 
-/// Committed metadata ops between forced checkpoints at [`JOURNAL_SLOTS`].
-const CHECKPOINT_EVERY: u32 = 192;
+/// Committed metadata ops between checkpoints at [`JOURNAL_SLOTS`].
+const CHECKPOINT_EVERY: u32 = 128;
 
 /// Stream creates that drive the metadata plane past its first checkpoint.
-/// Everything seeded before them lands in the snapshot.
-const SEED_STREAMS: u32 = 250;
+/// Everything seeded before them lands in the snapshot. The seed and the WAL
+/// tail end far from the second checkpoint, so no tail record lands in a
+/// snapshot.
+const SEED_STREAMS: u32 = 180;
 
 /// Stream creates issued after the checkpoint, so recovery must fold a
 /// snapshot AND replay a WAL suffix on top of it.
@@ -245,33 +266,6 @@ const READBACK_COUNT: u32 = 16;
 /// [`POLL_INTERVAL`] this is still ~50 probes per wait.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
-
-/// Substring shared by all three tombstone log lines in
-/// `core/server/src/bootstrap.rs`. Matching the full sentence of any one of
-/// them would miss the others, and a segment layout change lands on the
-/// first arm, not the consensus-state one.
-///
-/// Being shorter than a whole word is what makes it match every arm, and also
-/// what makes it collide with [`TOMBSTONE_FIELD`]. Strip that before matching
-/// rather than lengthening this.
-const TOMBSTONE_MARKER: &str = "tombston";
-
-/// The one tracing FIELD in the server named for the tombstone state
-/// (`partition_reconciler.rs`, the parked-frame discard). Fields render as
-/// `key=value`, so a shard that is merely not the namespace's owner logs
-/// `tombstoned=false`, which contains [`TOMBSTONE_MARKER`] on a HEALTHY run.
-///
-/// Removed from the log before the absence check. Only this exact field form
-/// goes: every real arm reads `tombstoning it`, `tombstoned rather than` or
-/// `tombstoning the`, and none of them emits a `tombstoned` field, so their
-/// detection is untouched.
-///
-/// The collision is dormant at the default `info` level, but the line is
-/// `debug!`, and two independent variables reach the child: the harness
-/// forwards every `IGGY_*` name, and `RUST_LOG` is inherited by any process
-/// and OUTRANKS the configured level. Filtering the text keeps the check
-/// working under both instead of refusing to run.
-const TOMBSTONE_FIELD: &str = "tombstoned=";
 
 /// Logged by `iggy-server`'s `main` once shutdown ran to completion. A stop
 /// that escalated to `SIGKILL` leaves crash-recovery state behind, which
@@ -988,14 +982,10 @@ async fn given_baseline_data_directory_when_booted_by_build_under_test_should_re
     // whole run to drain, and after a positive marker so an uncaptured log
     // fails loudly instead of passing the absence check vacuously.
     assert_graceful_shutdown(&harness, "the server under test");
-    // `stdout_plain` returns the same ANSI-stripped text `stdout_contains`
-    // matches against, so filtering it costs no matching power.
     let stdout = harness.server().stdout_plain();
     assert!(
-        !stdout
-            .replace(TOMBSTONE_FIELD, "")
-            .contains(TOMBSTONE_MARKER),
-        "the server under test tombstoned a partition rather than reading the baseline's \
+        !stdout.contains(PARTITION_REFUSED_MARKER),
+        "the server under test refused a partition rather than reading the baseline's \
          durable state; boot still exits 0, so only the log says so. Server stdout:\n{stdout}"
     );
 
@@ -1003,6 +993,148 @@ async fn given_baseline_data_directory_when_booted_by_build_under_test_should_re
         &baseline_files,
         &disk::collect_comparable_files(&data_path, false),
     );
+}
+
+/// A partition of a tiered topic keeps a chain file, and its older segments
+/// live only in the object store. A build from before tiered storage would
+/// read it as a partition that lost data, so a baseline with another storage
+/// format must refuse the whole directory and leave it as it was.
+///
+/// Run it with a baseline from before the storage format of the build under
+/// test: `COMPAT_BASELINE_SERVER` and `COMPAT_BASELINE_CONFIG` as for the
+/// seed half. A baseline with the same format fails it.
+#[tokio::test]
+#[parallel]
+#[ignore = "needs a baseline iggy-server and its config, see the test's documentation"]
+async fn given_a_tiered_data_directory_when_a_baseline_with_another_storage_format_boots_on_it_should_refuse_it_unchanged()
+ {
+    let baseline = baseline_server_binary();
+    let baseline_config = baseline_server_config();
+    let fixture = tempfile::tempdir().unwrap();
+    let baseline_document: toml::Value =
+        toml::from_str(&fs::read_to_string(&baseline_config).unwrap()).unwrap();
+    let launcher = baseline_launcher(fixture.path(), &baseline, &baseline_document);
+
+    let baseline_format = {
+        let envs = HashMap::from([(CONFIG_PATH_ENV.to_string(), baseline_config.clone())]);
+        let mut harness = TestHarness::builder()
+            .cluster_nodes(1)
+            .server(
+                TestServerConfig::builder()
+                    .executable_path(launcher.to_string_lossy().into_owned())
+                    .extra_envs(envs)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        harness
+            .start()
+            .await
+            .expect("the baseline boots on an empty data directory");
+        let format = fs::read(harness.server().data_path().join(STORAGE_FORMAT_FILE)).unwrap();
+        harness.stop().await.unwrap();
+        format
+    };
+
+    let store = tempfile::tempdir().unwrap();
+    let mut harness = TestHarness::builder()
+        .cluster_nodes(1)
+        .server(
+            TestServerConfig::builder()
+                .extra_envs(fs_store_envs(store.path()))
+                .build(),
+        )
+        .build()
+        .unwrap();
+    harness.start().await.unwrap();
+    let data_path = harness.server().data_path();
+    let client = harness.tcp_root_client().await.unwrap();
+    let stream = Identifier::named(TIERED_STREAM).unwrap();
+    let topic = Identifier::named(TIERED_TOPIC).unwrap();
+    client
+        .create_stream(TIERED_STREAM, &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    create_tiered_topic(&client, &stream).await;
+    send_every_message(&client, &stream, &topic).await;
+    wait_for_eviction(store.path(), &data_path).await;
+    drop(client);
+    harness.stop().await.unwrap();
+
+    let format = fs::read(data_path.join(STORAGE_FORMAT_FILE)).unwrap();
+    assert_ne!(
+        String::from_utf8_lossy(&format),
+        String::from_utf8_lossy(&baseline_format),
+        "the baseline writes the storage format of the build under test, so it would read the \
+         tiered partitions as its own. Either the build under test kept a format it changed, or \
+         the baseline is not from before it"
+    );
+    let directory = fixture.path().join("data");
+    copy_directory(&data_path, &directory);
+    let before = every_file(&directory);
+    assert!(
+        before.keys().any(|path| path.ends_with("remote.chain")),
+        "the data directory holds no chain file: {:?}",
+        before.keys().collect::<Vec<_>>()
+    );
+
+    let mut baseline = Command::new(&launcher)
+        .env("IGGY_PATH", &directory)
+        .env(CONFIG_PATH_ENV, &baseline_config)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + REFUSAL_DEADLINE;
+    let status = loop {
+        if let Some(status) = baseline.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = baseline.kill();
+            let _ = baseline.wait();
+            panic!(
+                "the baseline still runs {REFUSAL_DEADLINE:?} after it booted on a directory of \
+                 storage format {:?}",
+                String::from_utf8_lossy(&format)
+            );
+        }
+        sleep(Duration::from_millis(100)).await;
+    };
+    let output = baseline.wait_with_output().unwrap();
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(!status.success(), "the baseline exited with {status}");
+    assert!(
+        said.contains(UNSUPPORTED_STORAGE),
+        "the baseline exited with {status} for another reason than the storage format: {said}"
+    );
+    assert!(
+        every_file(&directory) == before,
+        "the baseline changed the data directory it refused"
+    );
+}
+
+/// Every file under `root`, by its path below `root`, with its bytes.
+fn every_file(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    let mut pending = vec![root.to_owned()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                let relative = path.strip_prefix(root).unwrap().display().to_string();
+                files.insert(relative, fs::read(&path).unwrap());
+            }
+        }
+    }
+    files
 }
 
 /// Resolve one of the baseline artefacts to an absolute, existing path.
@@ -1547,6 +1679,11 @@ async fn assert_topic_recovered(
         local_retention_size: seed
             .local_retention_size
             .and(recovered.local_retention_size),
+        topic_type: seed.topic_type.and(recovered.topic_type),
+        geo_mode: seed.geo_mode.and(recovered.geo_mode),
+        // No default is derived for them, so they read back as sent.
+        geo_durations: recovered.geo_durations,
+        read_cache: recovered.read_cache,
         raw: BTreeMap::new(),
     };
     assert_eq!(
@@ -1699,7 +1836,7 @@ fn assert_graceful_shutdown(harness: &TestHarness, who: &str) {
         "{who} did not log {GRACEFUL_SHUTDOWN_MARKER:?}. Either the stop escalated to SIGKILL, \
          leaving crash-recovery state that confounds the compatibility verdict, or stdout was \
          not captured at all (IGGY_TEST_VERBOSE makes the harness inherit it, which would also \
-         make the tombstone check vacuous). Server stdout:\n{}",
+         make the marker check vacuous). Server stdout:\n{}",
         harness.server().stdout_plain()
     );
 }

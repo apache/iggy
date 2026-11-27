@@ -21,4 +21,7 @@ export * from './get-topic.command.js';
 export * from './get-topics.command.js';
 export * from './update-topic.command.js';
 export * from './ensure-topic.virtual.command.js';
-export { CompressionAlgorithm, Durability, PartitionResizePolicy } from './topic.utils.js';
+export {
+  CompressionAlgorithm, Durability, PartitionResizePolicy, TopicType, GeoMode, type GeoTopicDurations,
+  type TopicReadCache
+} from './topic.utils.js';

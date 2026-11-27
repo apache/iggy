@@ -623,6 +623,7 @@ where
                 tracing::error!(namespace_raw = token.identity.namespace.inner(), %error, "partition I/O acceptance failed");
             }
             self.stage_wanted_upload(token.identity.namespace, partition);
+            self.stage_long_term_change(token.identity.namespace, partition);
             if matches!(
                 token.identity.continuation,
                 partitions::PartitionIoContinuation::Retention
@@ -667,6 +668,7 @@ where
         };
         let step = partition.resume_io(partitions.config()).await;
         self.stage_wanted_upload(namespace, partition);
+        self.stage_long_term_change(namespace, partition);
         if let Some(token) = self.partition_io.retained(namespace, incarnation)
             && !partition.retains_io_reservation(token.identity)
         {
@@ -804,18 +806,23 @@ mod tests {
     use std::time::Duration;
 
     use consensus::{
-        ArtifactProgress, Consensus, DvcSuffix, HeartbeatSchedule, LocalPipeline, PartitionsHandle,
-        Pipeline, Plane, PlaneKind, REPLICATION_BATCH_BYTES_MAX, ReplicationSend, Sequencer,
-        StateArtifact, StateTransferStage, TimeoutManager, VsrAction, VsrConsensus, artifact_kind,
+        ArtifactProgress, Consensus, DvcSuffix, HeartbeatSchedule, LocalPipeline, MetadataHandle,
+        PartitionsHandle, Pipeline, Plane, PlaneKind, REPLICATION_BATCH_BYTES_MAX, ReplicationSend,
+        Sequencer, StateArtifact, StateTransferStage, TimeoutManager, VsrAction, VsrConsensus,
+        artifact_kind,
     };
     use futures::FutureExt;
     use futures::channel::oneshot;
     use iggy_binary_protocol::namespace::METADATA_GROUP;
     use iggy_binary_protocol::primitives::consumer::WireConsumer;
+    use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
+    use iggy_binary_protocol::requests::topics::{
+        CreateTopicRequest, CreateTopicWithAssignmentsRequest,
+    };
     use iggy_binary_protocol::requests::users::CreateUserRequest;
-    use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
+    use iggy_binary_protocol::requests::users::login_register::{CredentialProof, RegisterRequest};
     use iggy_binary_protocol::{
         AckLevel, Command, CommitEntry, CommitHeader, CommitReplyEntry, CommitReplyHeader,
         ConsensusHeader, DoViewChangeHeader, GenericHeader, HEADER_SIZE, HeartbeatState, Operation,
@@ -832,6 +839,10 @@ mod tests {
     use journal::prepare_journal::PrepareJournal;
     use journal::superblock::{SuperblockContents, SuperblockStore};
     use message_bus::{IggyMessageBus, MessageBus, SendError};
+    use metadata::stm::StateMachine;
+    use metadata::stm::shadow::{
+        ShadowReadCache, ShadowRetention, ShadowStream, ShadowTopicRequest, ShadowTopicTarget,
+    };
     use metadata::stm::stream::{Partition, Stream, Streams, StreamsInner, Topic};
     use metadata::stm::user::{Users, UsersInner};
     use metadata::{IggyMetadata, MuxStateMachine};
@@ -4767,6 +4778,115 @@ mod tests {
         );
     }
 
+    /// A lagging replica of a tiered topic, its node's store state set as
+    /// given, armed for a transfer against the primary.
+    #[allow(clippy::future_not_send)]
+    async fn arm_transfer_with_store(
+        tiered: bool,
+        store_usable: bool,
+    ) -> (IoTestShard, TaggedSender, IggyNamespace) {
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, sender) = test_owner(&bus, None);
+        owner.set_repair_retry_ticks(1);
+        let frontier = owner.plane.metadata().applied_frontier();
+        frontier.set_tiered_storage_ready(true);
+        frontier.set_store_identity_verified(store_usable);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let mut partition = repairing_replica(
+            &bus,
+            namespace,
+            (PAIR_BACKUP, 2),
+            REPAIR_PRIMARY,
+            LAGGING_COMMIT_MIN,
+            LAGGING_COMMIT_MAX,
+        );
+        partition.set_runtime_options(TopicRuntimeOptions {
+            tiered_storage: tiered,
+            ..Default::default()
+        });
+        let partitions = owner.plane.partitions();
+        partitions.insert(namespace, partition);
+        let partition = partitions.get_mut_by_ns(&namespace).unwrap();
+        partition.consensus().begin_state_transfer_await();
+        owner
+            .arm_partition_transfer(partition, REPAIR_PRIMARY)
+            .await;
+        (owner, sender, namespace)
+    }
+
+    /// (transfer peer, re-arm pending, stage) of the partition at `namespace`.
+    fn transfer_arm_state(
+        owner: &IoTestShard,
+        namespace: IggyNamespace,
+    ) -> (Option<u8>, bool, StateTransferStage) {
+        let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
+        (
+            partition.transfer().map(|session| session.peer),
+            partition.transfer_rearm.is_some(),
+            partition.consensus().state_transfer_stage(),
+        )
+    }
+
+    #[compio::test]
+    async fn given_tiered_partition_when_store_is_not_usable_should_not_request_transfer() {
+        let (owner, _sender, namespace) = Box::pin(arm_transfer_with_store(true, false)).await;
+
+        assert_eq!(
+            transfer_arm_state(&owner, namespace),
+            (None, true, StateTransferStage::Idle)
+        );
+        assert_eq!(owner.plane.partitions().transfers_inflight(), 0);
+    }
+
+    #[compio::test]
+    async fn given_tiered_partition_waiting_for_store_when_store_becomes_usable_should_request_transfer()
+     {
+        let (owner, _sender, namespace) = Box::pin(arm_transfer_with_store(true, false)).await;
+        for _ in 0..4 {
+            assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
+        }
+        assert_eq!(
+            transfer_arm_state(&owner, namespace),
+            (None, true, StateTransferStage::Idle),
+            "the partition must keep waiting while the store is not usable"
+        );
+
+        owner
+            .plane
+            .metadata()
+            .applied_frontier()
+            .set_store_identity_verified(true);
+        for _ in 0..4 {
+            assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
+            if transfer_arm_state(&owner, namespace).0.is_some() {
+                break;
+            }
+        }
+
+        assert_eq!(
+            transfer_arm_state(&owner, namespace),
+            (
+                Some(REPAIR_PRIMARY),
+                false,
+                StateTransferStage::AwaitingTarget
+            )
+        );
+    }
+
+    #[compio::test]
+    async fn given_partition_not_tiered_when_store_is_not_usable_should_request_transfer() {
+        let (owner, _sender, namespace) = Box::pin(arm_transfer_with_store(false, false)).await;
+
+        assert_eq!(
+            transfer_arm_state(&owner, namespace),
+            (
+                Some(REPAIR_PRIMARY),
+                false,
+                StateTransferStage::AwaitingTarget
+            )
+        );
+    }
+
     /// Every path that ends a session frees its transfer slot, a partition
     /// removed during its transfer included. So the count matches a scan of
     /// the table, and a group deferred at the cap arms once a slot frees.
@@ -6268,8 +6388,9 @@ mod tests {
         for pending in &frames {
             pending.borrow_mut().clear();
         }
+        let root_header = *journal(OLD_PRIMARY).header(root_slot).unwrap();
         let registration = RegisterRequest {
-            user_created_at: journal(OLD_PRIMARY).header(root_slot).unwrap().timestamp,
+            credential: CredentialProof::account(root_header.timestamp, root_header.op),
             bind_verifier: [0x5a; 32],
         };
         let mut abandoned =
@@ -6526,6 +6647,344 @@ mod tests {
             metadata(BACKUP).client_table.borrow().get_epoch(OLD_CLIENT),
             None
         );
+    }
+
+    /// A backup of a three-replica metadata group and the repair stream of the
+    /// root user that its primary served. The backup did not take the stream.
+    struct ServedMetadataRepair {
+        backup: IoTestShard,
+        /// The `RepairPrepare` of the root user, then the `RepairDone` that
+        /// ends the stream.
+        stream: [Message<GenericHeader>; 2],
+        root_header: PrepareHeader,
+        _peers: Vec<IoTestShard>,
+        _inboxes: Vec<TaggedSender>,
+        _directory: tempfile::TempDir,
+    }
+
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
+    async fn served_metadata_repair() -> ServedMetadataRepair {
+        const REPLICAS: u8 = 3;
+        const PRIMARY: usize = 0;
+        const BACKUP: usize = 2;
+        const ROOT_OP: u64 = 1;
+        const STEP_LIMIT: usize = 10_000;
+        let root_slot = usize::try_from(ROOT_OP).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let frames: Vec<MetadataFrames> = (0..REPLICAS)
+            .map(|_| Rc::new(RefCell::new(Vec::new())))
+            .collect();
+        let mut owners = Vec::new();
+        for replica in 0..REPLICAS {
+            let bus = Rc::new(IggyMessageBus::new(0));
+            let captured = Rc::clone(&frames[usize::from(replica)]);
+            bus.set_replica_forward_fn(Box::new(move |target, _, frame| {
+                let message =
+                    Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                        .unwrap();
+                captured.borrow_mut().push((target, message));
+                Ok(())
+            }));
+            for peer in (0..REPLICAS).filter(|peer| *peer != replica) {
+                crate::test_support::connect_replica_on(&bus, peer, 1);
+            }
+            let (mut owner, inbox_owner) = test_owner(&bus, None);
+            let consensus = VsrConsensus::new(
+                1,
+                replica,
+                REPLICAS,
+                METADATA_GROUP,
+                Rc::clone(&bus),
+                LocalPipeline::new(),
+            );
+            consensus.set_incarnation(u128::from(replica) + 1);
+            consensus.init();
+            consensus.mark_superblock_durable(0, 0);
+            let journal =
+                PrepareJournal::open(&directory.path().join(format!("metadata-{replica}.wal")), 0)
+                    .await
+                    .unwrap();
+            owner.plane.inner_mut().0 = IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                None,
+                IoTestMetadata::new((
+                    UsersInner::new().into(),
+                    (StreamsInner::default().into(), ()),
+                )),
+                None,
+            );
+            owners.push((owner, inbox_owner));
+        }
+        let (mut owners, inboxes): (Vec<_>, Vec<_>) = owners.into_iter().unzip();
+        let metadata = |replica: usize| &owners[replica].plane.inner().0;
+        let consensus = |replica| metadata(replica).consensus.as_ref().unwrap();
+        let journal = |replica| metadata(replica).journal.as_ref().unwrap();
+        let take = |source: usize, target: usize, command: Command| {
+            let mut pending = frames[source].borrow_mut();
+            let index = pending
+                .iter()
+                .position(|(replica, message)| {
+                    usize::from(*replica) == target && message.header().command == command
+                })
+                .unwrap_or_else(|| panic!("missing {command:?} from {source} to {target}"));
+            pending.remove(index).1
+        };
+
+        // The primary journals the root user, and no backup hears the prepare.
+        let root_request = CreateUserRequest {
+            username: WireName::new("root").unwrap(),
+            password: "hash".to_owned(),
+            status: iggy_common::UserStatus::Active.as_code(),
+            permissions: None,
+            options: WireOptions::empty(),
+        };
+        let mut root = Box::pin(metadata(PRIMARY).submit_root_user_in_process(&root_request));
+        for _ in 0..STEP_LIMIT {
+            assert!(futures::poll!(&mut root).is_pending());
+            if journal(PRIMARY).header(root_slot).is_some() {
+                break;
+            }
+            compio::runtime::time::sleep(Duration::from_millis(1)).await;
+        }
+        let root_header = *journal(PRIMARY).header(root_slot).unwrap();
+        frames[PRIMARY].borrow_mut().clear();
+
+        // The backup probes, adopts the primary's view and fetches the op.
+        consensus(BACKUP).init_as_backup();
+        consensus(BACKUP).begin_view_probe();
+        for _ in 0..STEP_LIMIT {
+            owners[BACKUP].tick_metadata().await;
+            if frames[BACKUP]
+                .borrow()
+                .iter()
+                .any(|(_, frame)| frame.header().command == Command::RequestStartView)
+            {
+                break;
+            }
+        }
+        let probe = take(BACKUP, PRIMARY, Command::RequestStartView);
+        owners[PRIMARY]
+            .on_message(MessageBag::try_from(probe).unwrap())
+            .await;
+        let announced = take(PRIMARY, BACKUP, Command::StartView);
+        owners[BACKUP]
+            .on_message(MessageBag::try_from(announced).unwrap())
+            .await;
+        let request = take(BACKUP, PRIMARY, Command::RequestPrepares);
+        owners[PRIMARY]
+            .on_message(MessageBag::try_from(request).unwrap())
+            .await;
+        let stream = [
+            take(PRIMARY, BACKUP, Command::RepairPrepare),
+            take(PRIMARY, BACKUP, Command::RepairDone),
+        ];
+        drop(root);
+        let backup = owners.swap_remove(BACKUP);
+        ServedMetadataRepair {
+            backup,
+            stream,
+            root_header,
+            _peers: owners,
+            _inboxes: inboxes,
+            _directory: directory,
+        }
+    }
+
+    /// A repaired metadata prepare appends only under `journal_gate`, so a WAL
+    /// rewrite that holds the gate, as a view reconcile does, cannot lose it
+    /// from the rewritten file.
+    #[compio::test]
+    async fn given_held_journal_writes_when_a_metadata_repair_arrives_should_append_after_release()
+    {
+        /// Runtime turns the held repair gets, each long enough for a WAL append.
+        const HELD_TURNS: usize = 20;
+        let ServedMetadataRepair {
+            backup,
+            stream: [repaired, _],
+            root_header,
+            ..
+        } = served_metadata_repair().await;
+        let metadata = &backup.plane.inner().0;
+        let journal = metadata.journal.as_ref().unwrap();
+        let root_slot = usize::try_from(root_header.op).unwrap();
+
+        let writes = metadata
+            .hold_journal_writes()
+            .now_or_never()
+            .expect("nothing else holds the backup's journal gate");
+        let mut ingest = Box::pin(backup.on_message(MessageBag::try_from(repaired).unwrap()));
+        for _ in 0..HELD_TURNS {
+            assert!(
+                futures::poll!(&mut ingest).is_pending(),
+                "the repair ended while journal writes were held"
+            );
+            compio::runtime::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            journal.header(root_slot).is_none(),
+            "the repaired prepare landed while journal writes were held"
+        );
+
+        drop(writes);
+        ingest.await;
+        assert_eq!(
+            journal.header(root_slot).map(|header| header.checksum),
+            Some(root_header.checksum),
+            "the repaired prepare must land once journal writes are released"
+        );
+    }
+
+    /// A WAL trim keeps the answer of the peer off the plane, also after its
+    /// end while kept frames remain. The tick counted the session as idle
+    /// meanwhile, asked for the range again and spent its attempts.
+    #[compio::test]
+    async fn given_repair_frames_kept_for_a_wal_trim_when_the_plane_ticks_should_not_count_the_session_as_stalled()
+     {
+        let ServedMetadataRepair { backup, stream, .. } = served_metadata_repair().await;
+        let idle_ticks = || {
+            backup
+                .metadata_repair
+                .borrow()
+                .as_ref()
+                .map(|session| session.idle_ticks)
+        };
+        backup.tick_metadata().await;
+        let counted = idle_ticks().expect("the backup waits for the repair stream");
+        assert!(counted > 0, "a tick without an answer counts as idle");
+
+        let trim = backup.plane.inner().0.announce_checkpoint_trim();
+        for frame in stream {
+            backup
+                .on_message(MessageBag::try_from(frame).unwrap())
+                .now_or_never()
+                .expect("a repair frame must not wait for the WAL trim on the pump");
+        }
+        backup.tick_metadata().await;
+        assert_eq!(idle_ticks(), Some(counted), "the trim is pending");
+
+        drop(trim);
+        backup.tick_metadata().await;
+        assert_eq!(
+            idle_ticks(),
+            Some(counted),
+            "the kept frames have not reached the plane yet"
+        );
+    }
+
+    /// The WAL trim of a checkpoint job holds `journal_gate` for a whole
+    /// rewrite. A repaired prepare that waited for it on the pump stopped the
+    /// ticks of every partition group of shard 0.
+    #[compio::test]
+    async fn given_a_pending_wal_trim_when_a_metadata_repair_arrives_should_keep_its_frames_in_order_until_the_trim_ends()
+     {
+        let ServedMetadataRepair {
+            backup,
+            stream,
+            root_header,
+            ..
+        } = served_metadata_repair().await;
+        let metadata = &backup.plane.inner().0;
+        let journal = metadata.journal.as_ref().unwrap();
+        let root_slot = usize::try_from(root_header.op).unwrap();
+
+        // As a checkpoint job: it announces its trim, then takes the gate.
+        let trim = metadata.announce_checkpoint_trim();
+        let rewrite = metadata
+            .hold_journal_writes()
+            .now_or_never()
+            .expect("nothing else holds the backup's journal gate");
+        for frame in stream {
+            backup
+                .on_message(MessageBag::try_from(frame).unwrap())
+                .now_or_never()
+                .expect("a repair frame must not wait for the WAL trim on the pump");
+        }
+        assert!(
+            backup.pop_gated_metadata_frame().is_none(),
+            "no repair frame reaches the plane while the trim is pending"
+        );
+        assert!(journal.header(root_slot).is_none());
+
+        drop(rewrite);
+        drop(trim);
+        let mut replayed = Vec::new();
+        while let Some(frame) = backup.pop_gated_metadata_frame() {
+            replayed.push(frame.command());
+            backup.deliver_message(frame, None).await;
+        }
+        assert_eq!(
+            replayed,
+            [Command::RepairPrepare, Command::RepairDone],
+            "the end of the stream stays behind the prepare that it walks"
+        );
+        assert_eq!(
+            journal.header(root_slot).map(|header| header.checksum),
+            Some(root_header.checksum),
+            "the repaired prepare lands once the trim ended"
+        );
+    }
+
+    /// A repaired prepare can pass the pump's test and then write the
+    /// superblock. A WAL trim that starts during that write would hold the
+    /// append on the pump for the whole rewrite.
+    #[compio::test]
+    async fn given_a_wal_trim_that_starts_under_a_repaired_prepare_when_it_reaches_the_append_should_drop_it()
+     {
+        let ServedMetadataRepair {
+            backup,
+            stream: [repaired, _],
+            root_header,
+            ..
+        } = served_metadata_repair().await;
+        let metadata = &backup.plane.inner().0;
+        let _trim = metadata.announce_checkpoint_trim();
+        let _rewrite = metadata
+            .hold_journal_writes()
+            .now_or_never()
+            .expect("nothing else holds the backup's journal gate");
+
+        // Past the pump's test, as a frame that was in flight when the trim started.
+        backup
+            .deliver_message(MessageBag::try_from(repaired).unwrap(), None)
+            .now_or_never()
+            .expect("a repaired prepare must not wait for the WAL trim on the pump");
+
+        assert!(
+            metadata
+                .journal
+                .as_ref()
+                .unwrap()
+                .header(usize::try_from(root_header.op).unwrap())
+                .is_none(),
+            "the repair fetches a dropped prepare again"
+        );
+    }
+
+    /// Each repaired prepare asks for a reconcile of the view log. With a
+    /// proven log it changes nothing, and its wait for `journal_gate` held
+    /// the pump for the WAL rewrite of a checkpoint job that took the gate
+    /// during the append.
+    #[compio::test]
+    async fn given_a_proven_view_log_when_reconciling_under_held_journal_writes_should_not_wait() {
+        let ServedMetadataRepair { backup, stream, .. } = served_metadata_repair().await;
+        for frame in stream {
+            backup
+                .on_message(MessageBag::try_from(frame).unwrap())
+                .await;
+        }
+        let metadata = &backup.plane.inner().0;
+        assert!(!metadata.consensus.as_ref().unwrap().view_log_unproven());
+
+        let _rewrite = metadata
+            .hold_journal_writes()
+            .now_or_never()
+            .expect("nothing else holds the backup's journal gate");
+        backup
+            .reconcile_metadata_view_divergence()
+            .now_or_never()
+            .expect("a reconcile with nothing to do must not wait for the journal gate");
     }
 
     type MetadataFrames = Rc<RefCell<Vec<(u8, Message<GenericHeader>)>>>;
@@ -11027,6 +11486,52 @@ mod tests {
         repair_memory: Option<Arc<partitions::RepairMemoryBudget>>,
         repair_rings: Option<Rc<partitions::RepairRingBudget>>,
     ) -> (IoTestShard<B>, TaggedSender) {
+        test_owner_of_topic(
+            bus,
+            store,
+            repair_memory,
+            repair_rings,
+            TopicRuntimeOptions::default(),
+        )
+    }
+
+    /// [`test_owner_with_repair_budgets`] whose committed topic resolves to
+    /// the options `runtime`.
+    fn test_owner_of_topic<B: MessageBus + Clone + 'static>(
+        bus: &B,
+        store: Option<&Rc<HeldSuperblock>>,
+        repair_memory: Option<Arc<partitions::RepairMemoryBudget>>,
+        repair_rings: Option<Rc<partitions::RepairRingBudget>>,
+        runtime: TopicRuntimeOptions,
+    ) -> (IoTestShard<B>, TaggedSender) {
+        test_owner_shaped(bus, store, (repair_memory, repair_rings), |topic| {
+            topic.resolved.runtime = runtime;
+        })
+    }
+
+    /// [`test_owner`] whose committed topic is a geo topic that sets
+    /// `durations` for itself.
+    fn test_owner_of_geo_topic<B: MessageBus + Clone + 'static>(
+        bus: &B,
+        durations: iggy_common::GeoTopicDurations,
+    ) -> (IoTestShard<B>, TaggedSender) {
+        test_owner_shaped(bus, None, (None, None), |topic| {
+            topic.resolved.topic_type = iggy_common::TopicType::Geo;
+            topic.resolved.geo_mode = Some(iggy_common::GeoMode::Geo);
+            topic.resolved.geo_durations = durations;
+        })
+    }
+
+    /// The test owner, its committed topic shaped by `shape`.
+    fn test_owner_shaped<B: MessageBus + Clone + 'static>(
+        bus: &B,
+        store: Option<&Rc<HeldSuperblock>>,
+        (repair_memory, repair_rings): (
+            Option<Arc<partitions::RepairMemoryBudget>>,
+            Option<Rc<partitions::RepairRingBudget>>,
+        ),
+        shape: impl FnOnce(&mut Topic),
+    ) -> (IoTestShard<B>, TaggedSender) {
         let shard_id = ShardId::new(0);
         let config = PartitionsConfig {
             messages_required_to_save: 100,
@@ -11048,6 +11553,7 @@ mod tests {
         let mut inner = StreamsInner::default();
         let mut stream = Stream::default();
         let mut topic = Topic::default();
+        shape(&mut topic);
         for partition_id in 0..TEST_PARTITIONS {
             let namespace = IggyNamespace::new(0, 0, partition_id);
             let consensus = VsrConsensus::new(
@@ -11080,7 +11586,7 @@ mod tests {
             ));
         }
         stream.topics.insert(topic);
-        inner.items.insert(stream);
+        inner.items.insert(Arc::new(stream));
         let metadata = IoTestMetadata::new((Users::default(), (inner.into(), ())));
         let metadata = IggyMetadata::new(None, None, None, None, metadata, None);
         let (sender, inbox, replies) = shard_channel(0, 2, 1);
@@ -11098,6 +11604,7 @@ mod tests {
             routes,
             PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus.clone()),
             None,
+            false,
             ShardMetrics::for_shard(),
         )
         .expect("valid shard wiring");
@@ -12377,7 +12884,194 @@ mod tests {
         assert_eq!(sent_groups, groups);
     }
 
+    /// The read cache that a topic sets reaches each of its partitions: its
+    /// size shared between them, its readahead as it is, and zero as a value
+    /// that keeps nothing. What the topic leaves unset is the shard's.
+    #[test]
+    fn given_a_topic_that_sets_its_read_cache_when_its_partitions_read_should_share_the_size_between_them()
+     {
+        const MIB: u64 = 1 << 20;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let settings_of = |read_cache: iggy_common::TopicReadCache| {
+            let (owner, _) = test_owner_shaped(&bus, None, (None, None), |topic| {
+                topic.resolved.read_cache = read_cache;
+            });
+            let settings: Vec<_> = (0..TEST_PARTITIONS)
+                .map(|partition_id| {
+                    owner.partition_read_settings(IggyNamespace::new(0, 0, partition_id))
+                })
+                .collect();
+            assert!(
+                settings.windows(2).all(|pair| pair[0] == pair[1]),
+                "every partition of the topic reads alike"
+            );
+            assert_eq!(
+                owner.partition_read_settings(IggyNamespace::new(0, 1, 0)),
+                partitions::PartitionReadSettings::SHARD,
+                "a topic that is gone leaves it to the shard"
+            );
+            settings[0].clone()
+        };
+        let bytes = |value: u64| Some(IggyByteSize::from(value));
+
+        assert_eq!(
+            settings_of(iggy_common::TopicReadCache::default()),
+            partitions::PartitionReadSettings::SHARD
+        );
+        assert_eq!(
+            settings_of(iggy_common::TopicReadCache {
+                size: bytes(3 * 4 * MIB),
+                read_ahead: bytes(MIB),
+            }),
+            partitions::PartitionReadSettings::new(
+                Some(usize::try_from(4 * MIB).unwrap()),
+                Some(MIB)
+            )
+        );
+        assert_eq!(
+            settings_of(iggy_common::TopicReadCache {
+                size: bytes(0),
+                read_ahead: bytes(0),
+            }),
+            partitions::PartitionReadSettings::new(Some(0), Some(0))
+        );
+        assert_eq!(
+            settings_of(iggy_common::TopicReadCache {
+                size: None,
+                read_ahead: bytes(MIB),
+            }),
+            partitions::PartitionReadSettings::new(None, Some(MIB)),
+            "an unset size sets no limit, whatever the shard's cache is"
+        );
+    }
+
+    /// Commit the shadow topic operation `request` at `op` on `owner`.
+    fn apply_shadow_topic<B: MessageBus + Clone + 'static>(
+        owner: &IoTestShard<B>,
+        op: u64,
+        request: &ShadowTopicRequest,
+    ) {
+        let body = request.to_bytes();
+        let size = size_of::<PrepareHeader>() + body.len();
+        let mut prepare = Message::<PrepareHeader>::new(size);
+        prepare.as_mut_slice()[size_of::<PrepareHeader>()..].copy_from_slice(&body);
+        let prepare = prepare.transmute_header(|_, header: &mut PrepareHeader| {
+            header.command = Command::Prepare;
+            header.operation = Operation::ShadowTopic;
+            header.op = op;
+            header.size = u32::try_from(size).unwrap();
+        });
+        let reply = owner.plane.metadata().mux_stm.update(prepare).unwrap();
+        assert_eq!(reply.code, 0, "{request:?}");
+    }
+
+    /// A shadow topic reads with the read cache that its peer's topic sets:
+    /// what its adoption carries, and then what each change carries, from
+    /// the next poll on. A value that this node's cache cannot keep is
+    /// passed on as the peer set it, for the cache to bound.
+    #[test]
+    fn given_a_shadow_topic_when_its_peer_changes_the_read_cache_should_read_with_it_from_the_next_poll()
+     {
+        const MIB: u64 = 1 << 20;
+        const PARTITIONS: u32 = 2;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _) = test_owner_shaped(&bus, None, (None, None), |_| {});
+        let target = ShadowTopicTarget {
+            stream_id: 1,
+            source: ShadowStream {
+                origin: "dc-b".to_owned(),
+                cluster_uid: 0x0b0b,
+                stream_id: 7,
+            },
+            topic_id: 3,
+            created_revision: 41,
+        };
+        apply_shadow_topic(
+            &owner,
+            1,
+            &ShadowTopicRequest::CreateStream {
+                source: target.source.clone(),
+                name: WireName::new("__shadow_dc-b_orders").unwrap(),
+            },
+        );
+        let options = iggy_common::TopicCreateOptions {
+            read_cache: iggy_common::TopicReadCache {
+                size: Some(IggyByteSize::from(16 * MIB)),
+                read_ahead: Some(IggyByteSize::from(MIB)),
+            },
+            ..iggy_common::TopicCreateOptions::default()
+        };
+        let create = CreateTopicWithAssignmentsRequest {
+            request: CreateTopicRequest {
+                stream_id: WireIdentifier::numeric(target.stream_id),
+                partitions_count: PARTITIONS,
+                name: WireName::new("payments").unwrap(),
+                options: options.to_wire().unwrap(),
+            },
+            derived_options: WireOptions::empty(),
+            partitions: (0..PARTITIONS)
+                .map(|partition_id| CreatedPartitionAssignment {
+                    partition_id,
+                    consensus_group_id: 100 + u64::from(partition_id),
+                    initial_view: 0,
+                    members: Vec::new(),
+                })
+                .collect(),
+        };
+        apply_shadow_topic(
+            &owner,
+            2,
+            &ShadowTopicRequest::AdoptTopic {
+                target: target.clone(),
+                create: Box::new(create),
+                retention: ShadowRetention::default(),
+                geo_mode: iggy_common::GeoMode::Geo,
+            },
+        );
+        let namespace = IggyNamespace::new(1, 3, 1);
+        let mib = |count: u64| usize::try_from(count * MIB).unwrap();
+
+        assert_eq!(
+            owner.partition_read_settings(namespace),
+            partitions::PartitionReadSettings::new(Some(mib(8)), Some(MIB)),
+            "what the adoption carried"
+        );
+
+        let changes = [
+            (Some(0), None, Some(0), None),
+            (
+                Some(512 * 1024),
+                Some(4 * MIB),
+                Some(256 * 1024),
+                Some(4 * MIB),
+            ),
+            (None, None, None, None),
+        ];
+        for (op, (size, read_ahead, limit, partition_read_ahead)) in (3..).zip(changes) {
+            apply_shadow_topic(
+                &owner,
+                op,
+                &ShadowTopicRequest::SetReadCache {
+                    target: target.clone(),
+                    read_cache: ShadowReadCache { size, read_ahead },
+                },
+            );
+            assert_eq!(
+                owner.partition_read_settings(namespace),
+                partitions::PartitionReadSettings::new(limit, partition_read_ahead),
+                "{size:?}, {read_ahead:?}"
+            );
+        }
+    }
+
+    mod fresh_proofs;
+    mod fresh_writes;
+    mod geo_commits;
+    mod geo_positions_resume;
+    mod manifest_publishes;
     mod object_deletes;
+    mod peer_manifest_follows;
     mod segment_uploads;
     mod tier_service_uploads;
+    mod topic_object_checks;
 }

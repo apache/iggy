@@ -17,9 +17,9 @@
 
 //! Partition reconciliation loop.
 //!
-//! One task per shard. On wake (commit tick or periodic safety tick), it
-//! checks each namespace of its work set against committed `Streams` STM and
-//! local `IggyPartitions`:
+//! One task per shard. On wake (commit tick, periodic safety tick or due
+//! repair step), it checks each namespace of its work set against committed
+//! `Streams` STM and local `IggyPartitions`:
 //! - non-owned namespaces: seed `shards_table` row pointing at owner.
 //! - owned namespaces: `build_partition_fresh` then enqueue
 //!   `ReconcileOp::InsertOwned` for pump-side apply.
@@ -28,7 +28,7 @@
 //! # Work set
 //!
 //! A commit costs work for its own partitions, not for every partition on the
-//! node. Three sources fill [`ReconcilerCtx::pending`]:
+//! node. Four sources fill [`ReconcilerCtx::pending`]:
 //!
 //! - the partition changes each commit records
 //!   (`StreamsInner::partition_changes_since`), except consumer group
@@ -38,11 +38,18 @@
 //!   announces: every applied `ReconcileOp`, and every finished partition
 //!   install (`IggyShard::take_reconcile_needed`);
 //! - a full fill from committed metadata and every local structure: at boot,
-//!   when the change feed lost entries the last pass did not read (overflow
-//!   or a snapshot restore), and every `FULL_RECONCILE_INTERVAL` as a repair.
-//!   A repair that acts on a namespace that no change announced logs a
-//!   warning and counts `partitions_reconcile_repairs`, because one of the
-//!   sources above missed it.
+//!   and when the change feed lost entries the last pass did not read
+//!   (overflow or a snapshot restore);
+//! - the repair, which walks every committed partition this node stores,
+//!   then every mounted partition, then every routing row, one slice per
+//!   `REPAIR_SLICE_INTERVAL`, and starts again `REPAIR_INTERVAL` after the
+//!   walks ended. A slice of the committed tree goes into the work set
+//!   whole. Of a slice of mounted partitions or of routing rows, only those
+//!   that name no committed partition do. The work set holds one slice at a
+//!   time, so the repair costs a shard the same at any number of
+//!   partitions. A repair that acts on a namespace that no change announced
+//!   logs a warning and counts `partitions_reconcile_repairs`, because one
+//!   of the sources above missed it.
 //!
 //! A namespace leaves the work set only when its check finds it converged.
 //! Work the check cannot finish now (a staged build, a deferred rebuild, a
@@ -56,20 +63,23 @@
 //! so without that bound a create burst would hold a round open and leave
 //! the namespaces behind the cursor unchecked.
 //!
-//! # Materialisation race: the reply ships before the partition exists
+//! # Materialisation race: the commit lands before the partition exists
 //!
 //! `metadata::on_ack` fires the commit notifier and emits the wire reply
 //! immediately after STM apply, but the owning shard's reconciler wakes
 //! asynchronously and only enqueues `ReconcileOp::InsertOwned` once
 //! `build_partition_fresh` finishes (mkdir + segment open + fallocate,
-//! multi-millisecond). A client that produces the instant `create_topic`
-//! returns therefore races the partition into existence, on every shard at
-//! once.
+//! multi-millisecond). The metadata primary that serves the create holds the
+//! reply until its own shards have built the partitions it stores, for a
+//! bounded time (`dispatch::submit::await_created_partitions`). No other
+//! node waits, so a client that produces the instant `create_topic` returns
+//! can still race the partition into existence there, and on that primary
+//! once the bound has passed.
 //!
 //! The race is closed at the **owning shard**, not by the routing table:
 //!
 //! - `router::route_typed` treats a missing row as "not seeded yet", not
-//!   "unroutable", and falls back to `calculate_shard_assignment`. The frame
+//!   "unroutable", and falls back to `PartitionShards::shard_for`. The frame
 //!   always reaches the shard that will own the partition.
 //! - `IggyShard::park_if_unmaterialised` holds it there until the matching
 //!   `InsertOwned` lands, then hands it back to the pump -- but not to a
@@ -100,13 +110,13 @@
 //! readiness proof: every shard derives the same rows from the same committed
 //! metadata, and a row may exist before its partition does. Nothing may treat
 //! presence as "the owner is ready" - `dispatch::partition::wait_for_partition_routable`
-//! documents why the owner-readiness probe that used to live there was both
-//! unnecessary and ineffective.
+//! takes a row only as a reason not to wait, asks the owner itself when the row
+//! is missing, and documents why neither makes it a readiness gate.
 //!
 //! Keeping the table a hint is what makes it repairable: a check re-derives
 //! the namespace's row from committed metadata, so a lost row is rewritten
 //! once something puts the namespace in the work set, at the latest by the
-//! periodic full reconcile. An earlier design made the owner the sole writer and pushed
+//! repair. An earlier design made the owner the sole writer and pushed
 //! rows to peers to promote presence into a materialisation proof; it bought
 //! nothing the owner-side fences above do not already guarantee, and it traded
 //! that level-triggered repair for cross-core delta propagation that has to be
@@ -169,10 +179,10 @@
 //!
 //! TODO(krishna): `serves_committed_incarnation` and the park stamp both call
 //! `Streams::created_revision_for_namespace`, now on the per-request fence path.
-//! It indexes directly and falls back to a scan only if partition ids are not
-//! dense, so the common case is O(1) -- but nothing in the type enforces that
-//! density, and a future sparse layout silently reverts every fenced request to a
-//! full scan. It wants a partition-id-keyed map in the STM.
+//! It indexes directly and falls back to a binary search only if partition ids
+//! are not dense, so the common case is O(1) -- but nothing in the type enforces
+//! that density, and a future sparse layout silently reverts every fenced request
+//! to that search. It wants a partition-id-keyed map in the STM.
 //!
 //! TODO(krishna): the transient deny answers with `IggyError::TransientNotAccepted`,
 //! which makes the SDK refresh its route and replay within the operation deadline.
@@ -181,11 +191,19 @@
 //! helping; consider a distinct "retry here shortly" code that keeps the route.
 //!
 
+use crate::geo_topics::GeoTopics;
 use crate::incarnation_deletes::IncarnationDeletes;
+use crate::orphan_sweep::OrphanSweep;
 use crate::partition_helpers::{
-    build_partition_fresh, load_partition_or_fence, record_partition_retirement_fence,
+    ChainRecovery, LoadedPartition, build_partition_fresh, load_partition_or_fence,
+    record_partition_retirement_fence,
 };
+use crate::peer_manifests::{NodePlace, PeerManifestLister};
+use crate::peer_positions::PeerPositionLister;
+use crate::server_error::ServerError;
+use crate::shadow_topics::{ShadowTopics, peer_log_of};
 use crate::shell::{ServerShard, ShellBus, ShellShard};
+use crate::upload_sweep::UploadSweep;
 use ahash::{AHashMap, AHashSet};
 use configs::server::ServerConfig;
 use consensus::Consensus;
@@ -198,11 +216,15 @@ use iggy_binary_protocol::{
     WireIdentifier,
 };
 use iggy_common::{
-    ConsumerKind, IggyError, IggyTimestamp, StreamEncryption, check_critical_options,
+    ConsumerKind, IggyError, IggyTimestamp, PartitionStats, StreamEncryption, TopicRuntimeOptions,
+    check_critical_options,
 };
+use iggy_object_store::{TierJobCancelled, TierScope};
+use journal::superblock::PingPongSuperblock;
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::AUTO_COMMIT_CLIENT_ID;
+use message_bus::IggyMessageBus;
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::lifecycle::{
@@ -211,29 +233,34 @@ use metadata::stm::lifecycle::{
 };
 use metadata::stm::stream::{Partition, PartitionChangeKind, StatsRegistry};
 use partitions::{
-    IggyPartition, Segment, StreamKeyIdentity, delete_partitions_from_disk, read_created_revision,
+    IggyPartition, IggyPartitions, RecoveryPlan, Segment, StoreView, StoreViewOutcome,
+    StoreViewRequest, StreamKeyIdentity, TOPIC_OBJECT_RETRY, delete_partitions_from_disk,
+    object_prefix, read_created_revision,
 };
 use server_common::Message;
 use server_common::sharding::{IggyNamespace, ShardId};
 use shard::MetadataSubmit;
 use shard::ReconcileOp;
-use shard::shards_table::{ShardsTable, calculate_shard_assignment};
+use shard::shards_table::{PartitionShards, ShardsTable};
 use shard::{Receiver, Sender};
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::future::poll_fn;
 use std::ops::Bound::{Excluded, Unbounded};
+use std::ops::RangeInclusive;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::{Duration, Instant};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_mins(1);
 const GROUP_OFFSET_DELETES_PER_PASS: usize = 32;
 
-/// Checks between two yields to the shard's other tasks.
+/// Checks between two yields to the shard's other tasks. Also the size of a
+/// repair slice: the tree visits, the slots or the routing rows that one
+/// repair step reads.
 const VISITS_PER_YIELD: usize = 1_024;
 
 /// Checks with disk work (a build or a teardown) in one pass. The task runs
@@ -241,8 +268,14 @@ const VISITS_PER_YIELD: usize = 1_024;
 /// most this many builds.
 const DISK_VISITS_PER_PASS: usize = 64;
 
-/// Time from the end of one full reconcile to the start of the next repair.
-const FULL_RECONCILE_INTERVAL: Duration = Duration::from_mins(10);
+/// Time from the end of a full round or of a repair cycle to the start of
+/// the next repair cycle.
+const REPAIR_INTERVAL: Duration = Duration::from_mins(10);
+
+/// Time from the end of the round over one repair slice to the next slice.
+/// The task wakes for a due slice, so the periodic tick does not set the
+/// pace of a cycle.
+const REPAIR_SLICE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Consecutive same-cause failures before [`ReconcilerCtx::record_failure`]
 /// escalates to an operator-visible error (the backoff is capped, so
@@ -253,6 +286,11 @@ const ESCALATE_AFTER_ATTEMPTS: u32 = 10;
 /// this long, and goes out on the next reconciler wake. An admitted fence
 /// commits on its own, so an earlier resend only meets a refusal.
 const LIFECYCLE_FENCE_RETRY_MICROS: u64 = 100_000;
+
+/// Reads of the object store for lost segment chains that one shard runs at
+/// once. Each holds a slot of the demand fetch class while it runs, so this
+/// bounds the share of that class that rebuilds take from polls.
+const CHAIN_STORE_READS: usize = 2;
 
 /// Doubles per attempt, clamped at `BACKOFF_MAX`.
 fn next_backoff(attempts: u32) -> Duration {
@@ -307,9 +345,80 @@ enum Convergence {
     Pending,
 }
 
+/// What put a full fill in the work set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FullRoundTrigger {
+    /// The first pass of the task.
+    Boot,
+    /// The change feed lost changes that the last pass did not read.
+    LostChangeFeed,
+}
+
+/// The round over a full fill, kept for its log line. A fill during the round
+/// starts the round again from the first namespace, and this record with it.
+#[derive(Clone, Copy)]
+struct FullRound {
+    trigger: FullRoundTrigger,
+    /// The start of the fill.
+    started_at: Instant,
+    fill_time: Duration,
+    /// The size of the work set after the fill.
+    work_set: usize,
+    visits: usize,
+}
+
+/// Where a read of the committed tree starts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TreePosition {
+    stream: usize,
+    topic: usize,
+    /// The partition of that topic after which the read starts, `None` for
+    /// its first partition.
+    after_partition: Option<usize>,
+}
+
+/// What the next slice of a repair cycle reads. A walk goes on where its
+/// last slice stopped, and holds no place in what it reads between two
+/// slices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepairWalk {
+    /// The committed partitions this node stores. The check of one brings
+    /// its routing row and its mount in line.
+    Committed(TreePosition),
+    /// The mounted partitions, from a slot on. One that names no committed
+    /// partition is a mount to remove, and no count of the mounts can tell:
+    /// a committed partition that is not mounted makes up for it.
+    Mounted(usize),
+    /// The routing rows after a namespace, from the first row for `None`.
+    /// One that names no committed partition is a row to remove.
+    Routed(Option<IggyNamespace>),
+}
+
+/// One repair cycle: a walk over every committed partition this node stores,
+/// then over every mounted partition, then over every routing row. The
+/// counts are for its log line.
+#[derive(Clone, Copy)]
+struct RepairCycle {
+    started_at: Instant,
+    /// What the next slice reads, `None` after the last slice.
+    next: Option<RepairWalk>,
+    slices: usize,
+    /// The committed partitions the slices put in the work set.
+    stored: usize,
+    /// The mounted partitions the slices compared with committed metadata.
+    mounted: usize,
+    /// The routing rows the slices compared with committed metadata.
+    rows: usize,
+    /// Those of `mounted` and `rows` that named no committed partition this
+    /// node stores, and went into the work set. A removal under way counts.
+    unmatched: usize,
+}
+
 pub struct ReconcilerCtx {
     pub shard: Rc<ServerShard>,
-    pub total_shards: u16,
+    /// The placement of `shard`. The shard holds a read of a partition that
+    /// this value places on it until the reconciler builds the partition.
+    pub partition_shards: PartitionShards,
     pub config: Rc<ServerConfig>,
     pub cluster_id: u128,
     pub self_replica_id: u8,
@@ -336,24 +445,82 @@ pub struct ReconcilerCtx {
     /// `Streams::revision` through which committed partition changes are in
     /// `pending`. `None` makes the next pass fill it from the whole tree.
     synced_revision: Cell<Option<u64>>,
-    /// When the next repair round starts. `None` while a full fill is in
-    /// `pending` and its round has not ended.
-    next_full_reconcile_at: Cell<Option<Instant>>,
-    /// While a repair round runs: the namespaces that something other than
-    /// the repair put in `pending`.
-    repair_scrub: RefCell<Option<BTreeSet<IggyNamespace>>>,
+    /// When the next step of the repair is due. `None` while a full fill or
+    /// a repair slice is in `pending` and its round has not ended.
+    next_repair_at: Cell<Option<Instant>>,
+    /// While the round over a repair slice runs: the namespaces that only
+    /// the slice put in `pending`. A change that names one takes it out.
+    repair_only: RefCell<AHashSet<IggyNamespace>>,
+    /// The repair cycle under way, `None` between two cycles.
+    repair_cycle: Cell<Option<RepairCycle>>,
+    /// The full round under way, `None` between two full rounds.
+    full_round: Cell<Option<FullRound>>,
     group_offset_cleanup: GroupOffsetCleanup,
     lifecycle_reports: LifecycleReports,
     /// The incarnations whose delete this node saw commit as the metadata
     /// primary, and whose objects wait for their delete.
     incarnation_deletes: IncarnationDeletes,
+    /// The sweep of the store root for the objects of incarnations that
+    /// committed metadata no longer holds. Shard 0 of the metadata primary
+    /// only.
+    orphan_sweep: OrphanSweep,
+    /// The sweep of the uploads in parts that never completed. Shard 0 of the
+    /// metadata primary only.
+    upload_sweep: UploadSweep,
+    /// The objects of this cluster's geo topics in its store, which the
+    /// metadata primary keeps in step with committed metadata.
+    geo_topics: GeoTopics,
+    /// The shadow streams of the geo peers' topics, which the metadata
+    /// primary keeps in step with the peers' stores.
+    shadow_topics: ShadowTopics,
+    /// The listings of the geo peers' manifests, which keep the shadow
+    /// partitions whose primary this node is up to date. Shard 0 only.
+    peer_manifests: PeerManifestLister,
+    /// The listings of the geo peers' consumer group positions, which the
+    /// primaries here adopt when they win. Shard 0 only.
+    peer_positions: PeerPositionLister,
+    /// When the next pass over the partitions of geo topics may be staged,
+    /// in microseconds since the Unix epoch.
+    next_topic_object_check_at: Cell<u64>,
+    /// The tiered partitions whose segment chain is gone and that wait for
+    /// what the store holds of them, with where each wait stands.
+    chain_rebuilds: Rc<RefCell<AHashMap<IggyNamespace, ChainWait>>>,
+    /// The number the next read of the store for a lost chain takes.
+    next_chain_read: Cell<u64>,
+}
+
+/// Where the wait of a partition whose segment chain is gone stands.
+enum ChainWait {
+    /// A read of what `request` asks of the store has to start: the first
+    /// one, or another after a failure.
+    Queued(StoreViewRequest),
+    /// The read numbered `read` runs. Dropping `_scope` cancels it.
+    Reading {
+        request: StoreViewRequest,
+        read: u64,
+        _scope: TierScope,
+    },
+    /// The read finished, and the next check loads the partition with it.
+    Read {
+        request: StoreViewRequest,
+        outcome: Box<StoreViewOutcome>,
+    },
+}
+
+impl ChainWait {
+    const fn request(&self) -> &StoreViewRequest {
+        match self {
+            Self::Queued(request) | Self::Reading { request, .. } | Self::Read { request, .. } => {
+                request
+            }
+        }
+    }
 }
 
 impl ReconcilerCtx {
     #[must_use]
     pub fn new(
         shard: Rc<ServerShard>,
-        total_shards: u16,
         config: Rc<ServerConfig>,
         cluster_id: u128,
         self_replica_id: u8,
@@ -365,9 +532,16 @@ impl ReconcilerCtx {
             .mux_stm
             .streams()
             .read(|inner| Arc::clone(&inner.stats_registry));
+        let geo_topics = GeoTopics::new(&config.geo);
+        let orphan_sweep = OrphanSweep::new(&config.tiered_storage);
+        let upload_sweep = UploadSweep::new(&config.tiered_storage);
+        let shadow_topics = ShadowTopics::new(&config.geo);
+        let peer_manifests = PeerManifestLister::new(&config.geo);
+        let peer_positions = PeerPositionLister::new(&config.geo);
+        let partition_shards = shard.partition_shards();
         Self {
             shard,
-            total_shards,
+            partition_shards,
             config,
             cluster_id,
             self_replica_id,
@@ -379,11 +553,22 @@ impl ReconcilerCtx {
             resume_after: Cell::new(None),
             round_last: Cell::new(None),
             synced_revision: Cell::new(None),
-            next_full_reconcile_at: Cell::new(Some(Instant::now() + FULL_RECONCILE_INTERVAL)),
-            repair_scrub: RefCell::new(None),
+            next_repair_at: Cell::new(Some(Instant::now() + REPAIR_INTERVAL)),
+            repair_only: RefCell::new(AHashSet::new()),
+            repair_cycle: Cell::new(None),
+            full_round: Cell::new(None),
             group_offset_cleanup: GroupOffsetCleanup::default(),
             lifecycle_reports: LifecycleReports::default(),
             incarnation_deletes: IncarnationDeletes::default(),
+            orphan_sweep,
+            upload_sweep,
+            geo_topics,
+            shadow_topics,
+            peer_manifests,
+            peer_positions,
+            next_topic_object_check_at: Cell::new(0),
+            chain_rebuilds: Rc::new(RefCell::new(AHashMap::new())),
+            next_chain_read: Cell::new(0),
         }
     }
 
@@ -392,37 +577,92 @@ impl ReconcilerCtx {
         self.unbuilt_owned.borrow_mut().extend(namespaces);
     }
 
+    /// Record the partitions boot left unbuilt because their segment chain is
+    /// gone, with what each asks of the store, so that their first check
+    /// reads the store and does not open the partition to learn it again.
+    pub fn await_chain_rebuilds(
+        &self,
+        waits: impl IntoIterator<Item = (IggyNamespace, StoreViewRequest)>,
+    ) {
+        for (ns, request) in waits {
+            self.wait_for_chain(ns, request);
+        }
+    }
+
     /// Adds namespaces that a change announced to the work set.
     fn add_announced(&self, namespaces: impl IntoIterator<Item = IggyNamespace>) {
         let mut pending = self.pending.borrow_mut();
-        let mut scrub = self.repair_scrub.borrow_mut();
+        let mut repair_only = self.repair_only.borrow_mut();
         for ns in namespaces {
             pending.insert(ns);
-            if let Some(announced) = scrub.as_mut() {
-                announced.insert(ns);
+            repair_only.remove(&ns);
+        }
+    }
+
+    /// Adds namespaces of a repair slice to the work set. Only those that
+    /// nothing else put there can count as a repair, so the record of a
+    /// slice never outgrows the slice, whatever the work set holds.
+    fn add_repair(&self, namespaces: impl IntoIterator<Item = IggyNamespace>) {
+        let mut pending = self.pending.borrow_mut();
+        let mut repair_only = self.repair_only.borrow_mut();
+        for ns in namespaces {
+            if pending.insert(ns) {
+                repair_only.insert(ns);
             }
         }
     }
 
-    /// Ends a round over the work set. The end of a full round restarts the
-    /// repair clock and ends the repair scrub.
+    /// Ends a round over the work set. The end of the round over a full fill
+    /// or a repair slice sets the time of the next repair step. The end of a
+    /// full round also logs the round.
     fn finish_round(&self) {
-        if self.next_full_reconcile_at.get().is_none() {
-            self.next_full_reconcile_at
-                .set(Some(Instant::now() + FULL_RECONCILE_INTERVAL));
-            self.repair_scrub.take();
+        if self.next_repair_at.get().is_some() {
+            return;
         }
+        self.repair_only.borrow_mut().clear();
+        let wait = if self.repair_cycle.get().is_some() {
+            REPAIR_SLICE_INTERVAL
+        } else {
+            self.first_cycle_delay()
+        };
+        self.next_repair_at.set(Some(Instant::now() + wait));
+        if let Some(round) = self.full_round.take() {
+            info!(
+                shard = self.shard.id,
+                trigger = ?round.trigger,
+                fill_ms = round.fill_time.as_millis(),
+                round_ms = round.started_at.elapsed().as_millis(),
+                visits = round.visits,
+                work_set = round.work_set,
+                "full reconcile round complete"
+            );
+        }
+    }
+
+    /// The wait from the end of a full round to the first repair cycle after
+    /// it. The full rounds of a node's shards end together at boot, so each
+    /// shard waits a different share of the interval longer. That separates
+    /// only the starts: a cycle that lasts longer than the offset overlaps
+    /// the cycle of the next shard.
+    fn first_cycle_delay(&self) -> Duration {
+        let offset = REPAIR_INTERVAL * u32::from(self.shard.id)
+            / u32::from(self.partition_shards.shard_count());
+        REPAIR_INTERVAL + offset
+    }
+
+    /// The wait from the end of a pass to the next one when nothing wakes
+    /// the task: the periodic tick, or the time to the next repair step when
+    /// that step is due sooner.
+    fn pass_delay(&self, periodic: Duration) -> Duration {
+        self.next_repair_at.get().map_or(periodic, |at| {
+            periodic.min(at.saturating_duration_since(Instant::now()))
+        })
     }
 
     /// Warns when the repair acted on `ns` although no change announced it,
     /// which means a source of the work set missed it.
     fn report_unannounced_repair(&self, ns: IggyNamespace) {
-        let announced = self
-            .repair_scrub
-            .borrow()
-            .as_ref()
-            .is_none_or(|announced| announced.contains(&ns));
-        if announced || self.shard.reconcile_needed_contains(ns) {
+        if !self.repair_only.borrow().contains(&ns) || self.shard.reconcile_needed_contains(ns) {
             return;
         }
         // A commit that lands during this pass is folded by the next one.
@@ -441,7 +681,7 @@ impl ReconcilerCtx {
         warn!(
             shard = self.shard.id,
             ns_raw = ns.inner(),
-            "full reconcile repaired a partition that no change announced"
+            "the repair acted on a partition that no change announced"
         );
         self.shard.metrics().record_partition_reconcile_repair();
     }
@@ -512,7 +752,82 @@ impl ReconcilerCtx {
     fn forget_failures(&self, ns: IggyNamespace) {
         self.record_success(ns, FailureCause::Add);
         self.record_success(ns, FailureCause::Delete);
+        self.stop_waiting_for_chain(ns);
     }
+
+    /// Note that the partition `ns` waits for the store to rebuild its chain
+    /// with what `request` asks of it, and say so the first time.
+    fn wait_for_chain(&self, ns: IggyNamespace, request: StoreViewRequest) {
+        let (from, front) = (request.from, request.front);
+        if self.put_chain_wait(ns, ChainWait::Queued(request)) {
+            warn!(
+                shard = self.shard.id,
+                stream_id = ns.stream_id(),
+                topic_id = ns.topic_id(),
+                partition_id = ns.partition_id(),
+                from,
+                front,
+                "the segment chain of a tiered partition is gone; the partition waits for the \
+                 object store to account for the offsets below its local log"
+            );
+        }
+    }
+
+    fn stop_waiting_for_chain(&self, ns: IggyNamespace) {
+        drop(self.take_chain_wait(ns));
+    }
+
+    /// Store where the wait of `ns` stands. Returns whether it did not wait.
+    fn put_chain_wait(&self, ns: IggyNamespace, wait: ChainWait) -> bool {
+        let mut waits = self.chain_rebuilds.borrow_mut();
+        let first = waits.insert(ns, wait).is_none();
+        self.shard
+            .metrics()
+            .set_partitions_awaiting_chain_rebuild(waits.len());
+        first
+    }
+
+    /// Take the wait of `ns` out. Dropping a read under way cancels it.
+    fn take_chain_wait(&self, ns: IggyNamespace) -> Option<ChainWait> {
+        let mut waits = self.chain_rebuilds.borrow_mut();
+        let wait = waits.remove(&ns);
+        if wait.is_some() {
+            self.shard
+                .metrics()
+                .set_partitions_awaiting_chain_rebuild(waits.len());
+        }
+        wait
+    }
+
+    /// Whether the partition `ns` of incarnation `incarnation` waits for the
+    /// store to rebuild its chain, which no replica serves meanwhile.
+    fn waits_for_chain(&self, ns: IggyNamespace, incarnation: u64) -> bool {
+        self.chain_rebuilds
+            .borrow()
+            .get(&ns)
+            .is_some_and(|wait| wait.request().prefix.created_revision == incarnation)
+    }
+
+    /// Whether the next step of the wait of `ns` comes without a retry: a
+    /// read runs or finished, or one waits for another to end.
+    fn chain_read_due(&self, ns: IggyNamespace) -> bool {
+        let waits = self.chain_rebuilds.borrow();
+        match waits.get(&ns) {
+            Some(ChainWait::Reading { .. } | ChainWait::Read { .. }) => true,
+            Some(ChainWait::Queued(_)) => {
+                self.shard.store_view_reader().is_some() && chain_reads(&waits) >= CHAIN_STORE_READS
+            }
+            None => false,
+        }
+    }
+}
+
+/// The reads of the store for lost chains under way.
+fn chain_reads(waits: &AHashMap<IggyNamespace, ChainWait>) -> usize {
+    waits
+        .values()
+        .filter(|wait| matches!(wait, ChainWait::Reading { .. }))
+        .count()
 }
 
 pub type WakeTx = Sender<()>;
@@ -521,6 +836,8 @@ pub type WakeRx = Receiver<()>;
 /// One initial reconcile before the wait loop so a shard that comes up
 /// before shard 0's first `MetadataCommitTick` still converges. A pass that
 /// stopped at `DISK_VISITS_PER_PASS` is followed by the next one at once.
+/// The task also wakes for a due repair step, so a repair cycle does not
+/// wait for the periodic tick.
 pub async fn run_reconciler(
     ctx: Rc<ReconcilerCtx>,
     wake_rx: WakeRx,
@@ -529,7 +846,7 @@ pub async fn run_reconciler(
 ) {
     debug!(
         shard = ctx.shard.id,
-        total_shards = ctx.total_shards,
+        total_shards = ctx.partition_shards.shard_count(),
         periodic_ms = periodic.as_millis(),
         "partition reconciler starting"
     );
@@ -543,7 +860,7 @@ pub async fn run_reconciler(
             capped = reconcile_once(&ctx).await;
             continue;
         }
-        let sleep = ctx.shard.bus.sleep(periodic);
+        let sleep = ctx.shard.bus.sleep(ctx.pass_delay(periodic));
         // Biased for the same reason as the shard pump: unbiased `select!`
         // polls arms in process-random order, which a deterministic
         // simulator cannot seed. Listed order is the intended priority.
@@ -563,6 +880,13 @@ pub async fn run_reconciler(
     }
 
     ctx.incarnation_deletes.stop();
+    ctx.orphan_sweep.stop();
+    ctx.upload_sweep.stop();
+    ctx.geo_topics.stop();
+    ctx.shadow_topics.stop(&ctx.shard);
+    ctx.peer_manifests.stop();
+    ctx.peer_positions.stop();
+    ctx.shard.stop_geo_positions();
     debug!(shard = ctx.shard.id, "partition reconciler exited");
 }
 
@@ -646,11 +970,26 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     reconcile_parked_frames(ctx, !capped, &mut counters);
     reconcile_group_offsets(&ctx.shard, &ctx.group_offset_cleanup, &mut counters);
     if partition_may_be_gone {
-        reconcile_stream_keys(ctx);
+        reconcile_stream_keys(ctx, 0..=usize::MAX);
     }
     report_lifecycles(ctx).await;
-    ctx.incarnation_deletes
-        .pass(&ctx.shard, IggyTimestamp::now());
+    let now = IggyTimestamp::now();
+    // Before the delete pass, so it starts the orphans the last sweep found
+    // due.
+    ctx.orphan_sweep
+        .pass(&ctx.shard, &ctx.incarnation_deletes, now, Instant::now());
+    ctx.incarnation_deletes.pass(&ctx.shard, now);
+    ctx.upload_sweep.pass(&ctx.shard, now);
+    ctx.geo_topics.pass(&ctx.shard, now);
+    ctx.shadow_topics.pass(&ctx.shard, now);
+    let place = NodePlace {
+        self_replica_id: ctx.self_replica_id,
+        replica_count: ctx.replica_count,
+        partition_shards: ctx.partition_shards,
+    };
+    ctx.peer_manifests.pass(&ctx.shard, now, place);
+    ctx.peer_positions.pass(&ctx.shard, now, place);
+    stage_topic_object_checks(ctx, now);
 
     if counters.total() > 0 {
         debug!(
@@ -678,6 +1017,20 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
         );
     }
     capped
+}
+
+/// Stage a pass over the partitions of geo topics on this shard's pump, at
+/// most once per [`TOPIC_OBJECT_RETRY`]. The pump starts the read of the
+/// topic's object for each partition whose primary does not take messages
+/// yet, so a new primary reads without waiting for a produce.
+fn stage_topic_object_checks(ctx: &ReconcilerCtx, now: IggyTimestamp) {
+    if now.as_micros() < ctx.next_topic_object_check_at.get() {
+        return;
+    }
+    let wait = u64::try_from(TOPIC_OBJECT_RETRY.as_micros()).unwrap_or(u64::MAX);
+    ctx.next_topic_object_check_at
+        .set(now.as_micros().saturating_add(wait));
+    ctx.shard.request_check_topic_objects(now);
 }
 
 /// Folds into the work set what changed since the last pass. Returns whether
@@ -711,22 +1064,146 @@ async fn fold_changes(ctx: &ReconcilerCtx) -> bool {
     } else {
         // The lost changes can name any namespace, so a repair round under way
         // can no longer tell what they announced.
-        ctx.repair_scrub.take();
-        fill_pending(ctx).await;
+        ctx.repair_only.borrow_mut().clear();
+        let trigger = if ctx.synced_revision.get().is_some() {
+            FullRoundTrigger::LostChangeFeed
+        } else {
+            FullRoundTrigger::Boot
+        };
+        fill_pending(ctx, trigger).await;
     }
     ctx.synced_revision.set(Some(revision));
-    if ctx
-        .next_full_reconcile_at
-        .get()
-        .is_some_and(|at| Instant::now() >= at)
+    // A repair step starts a round, so it waits for the end of a round that
+    // a capped pass left open.
+    if ctx.resume_after.get().is_none()
+        && ctx
+            .next_repair_at
+            .get()
+            .is_some_and(|at| Instant::now() >= at)
     {
-        let announced = ctx.pending.borrow().clone();
-        *ctx.repair_scrub.borrow_mut() = Some(announced);
-        ctx.group_offset_cleanup.synced_revision.set(None);
-        fill_pending(ctx).await;
-        partition_may_be_gone = true;
+        repair_step(ctx);
     }
     partition_may_be_gone
+}
+
+/// Runs the repair step that is due: the next slice of the cycle, or the end
+/// of the cycle once the round over its last slice ended. A slice goes into
+/// the work set for the round that the pass starts next. The first slice of
+/// a cycle also holds the few local traces that no walk reads.
+fn repair_step(ctx: &ReconcilerCtx) {
+    let mut cycle = ctx.repair_cycle.get().unwrap_or_else(|| RepairCycle {
+        started_at: Instant::now(),
+        next: Some(RepairWalk::Committed(TreePosition::default())),
+        slices: 0,
+        stored: 0,
+        mounted: 0,
+        rows: 0,
+        unmatched: 0,
+    });
+    let Some(walk) = cycle.next else {
+        end_repair_cycle(ctx, cycle);
+        return;
+    };
+    if cycle.slices == 0 {
+        ctx.add_repair(rare_traces(ctx));
+    }
+    cycle.slices += 1;
+    cycle.next = match walk {
+        RepairWalk::Committed(position) => Some(committed_slice(ctx, &mut cycle, position)),
+        RepairWalk::Mounted(first_slot) => Some(mounted_slice(ctx, &mut cycle, first_slot)),
+        RepairWalk::Routed(after) => routed_slice(ctx, &mut cycle, after),
+    };
+    ctx.repair_cycle.set(Some(cycle));
+    ctx.next_repair_at.set(None);
+}
+
+/// Puts the next slice of the committed tree in the work set. A mounted
+/// partition of the slice also gets its group offset sweep, which otherwise
+/// only a group delete or the partition itself asks for. The stream keys of
+/// the streams that the slice read get their sweep too, and with the last
+/// slice those of every stream above them.
+fn committed_slice(
+    ctx: &ReconcilerCtx,
+    cycle: &mut RepairCycle,
+    position: TreePosition,
+) -> RepairWalk {
+    let mut slice = Vec::with_capacity(VISITS_PER_YIELD);
+    let next = read_committed_targets(ctx, position, &mut slice);
+    let partitions = ctx.shard.plane.partitions();
+    for ns in &slice {
+        if partitions.contains(ns) {
+            partitions.mark_consumer_group_offsets_dirty(*ns);
+        }
+    }
+    cycle.stored += slice.len();
+    ctx.add_repair(slice);
+    let last_stream = next.map_or(usize::MAX, |next| next.stream);
+    reconcile_stream_keys(ctx, position.stream..=last_stream);
+    next.map_or(RepairWalk::Mounted(0), RepairWalk::Committed)
+}
+
+/// Compares the mounted partitions of the next `VISITS_PER_YIELD` slots with
+/// committed metadata.
+fn mounted_slice(ctx: &ReconcilerCtx, cycle: &mut RepairCycle, first_slot: usize) -> RepairWalk {
+    let slots = ctx
+        .shard
+        .plane
+        .partitions()
+        .slot_namespaces(first_slot, VISITS_PER_YIELD);
+    cycle.mounted += slots.iter().flatten().count();
+    cycle.unmatched += add_unmatched(ctx, slots.iter().flatten().copied());
+    if slots.len() < VISITS_PER_YIELD {
+        RepairWalk::Routed(None)
+    } else {
+        RepairWalk::Mounted(first_slot + slots.len())
+    }
+}
+
+/// Compares the next `VISITS_PER_YIELD` routing rows with committed
+/// metadata. Returns `None` after the last row.
+fn routed_slice(
+    ctx: &ReconcilerCtx,
+    cycle: &mut RepairCycle,
+    after: Option<IggyNamespace>,
+) -> Option<RepairWalk> {
+    let rows = ctx
+        .shard
+        .shards_table()
+        .namespaces_after(after, VISITS_PER_YIELD);
+    let next = (rows.len() == VISITS_PER_YIELD).then(|| RepairWalk::Routed(rows.last().copied()));
+    cycle.rows += rows.len();
+    cycle.unmatched += add_unmatched(ctx, rows);
+    next
+}
+
+/// Puts in the work set those of `local` that name no committed partition
+/// this node stores, and returns how many. Their check removes what is left
+/// of them here. One whose removal is under way is in the work set already.
+fn add_unmatched(ctx: &ReconcilerCtx, local: impl IntoIterator<Item = IggyNamespace>) -> usize {
+    let unmatched: Vec<IggyNamespace> = local
+        .into_iter()
+        .filter(|ns| committed_target(ctx, *ns).is_none())
+        .collect();
+    let count = unmatched.len();
+    ctx.add_repair(unmatched);
+    count
+}
+
+/// Ends a repair cycle and sets the time of the next one.
+fn end_repair_cycle(ctx: &ReconcilerCtx, cycle: RepairCycle) {
+    ctx.repair_cycle.set(None);
+    ctx.next_repair_at
+        .set(Some(Instant::now() + REPAIR_INTERVAL));
+    info!(
+        shard = ctx.shard.id,
+        cycle_ms = cycle.started_at.elapsed().as_millis(),
+        slices = cycle.slices,
+        stored = cycle.stored,
+        mounted = cycle.mounted,
+        rows = cycle.rows,
+        unmatched = cycle.unmatched,
+        "partition repair cycle complete"
+    );
 }
 
 /// Whether a change can leave a partition's local state behind committed
@@ -740,73 +1217,122 @@ fn needs_partition_check(kind: PartitionChangeKind) -> bool {
 /// into the work set, and starts a round over it from the first namespace.
 /// Inserts in chunks with a yield between them, because at a million
 /// partitions the work set takes a million namespaces.
-async fn fill_pending(ctx: &ReconcilerCtx) {
+async fn fill_pending(ctx: &ReconcilerCtx, trigger: FullRoundTrigger) {
+    let started_at = Instant::now();
     add_committed_targets(ctx).await;
-    let partitions = ctx.shard.plane.partitions();
-    let local: Vec<IggyNamespace> = partitions
+    let local: Vec<IggyNamespace> = ctx
+        .shard
+        .plane
+        .partitions()
         .namespaces()
         .copied()
-        .chain(partitions.tombstoned_namespaces())
         .chain(ctx.shard.shards_table().namespaces())
-        .chain(ctx.unbuilt_owned.borrow().iter().copied())
-        .chain(ctx.failure_state.borrow().keys().map(|(ns, _)| *ns))
+        .chain(rare_traces(ctx))
         .collect();
     for chunk in local.chunks(VISITS_PER_YIELD) {
         ctx.pending.borrow_mut().extend(chunk);
         yield_now().await;
     }
     ctx.resume_after.set(None);
-    ctx.next_full_reconcile_at.set(None);
+    ctx.next_repair_at.set(None);
+    ctx.repair_cycle.set(None);
+    ctx.full_round.set(Some(FullRound {
+        trigger,
+        started_at,
+        fill_time: started_at.elapsed(),
+        work_set: ctx.pending.borrow().len(),
+        visits: 0,
+    }));
 }
 
-/// Puts every committed partition this node stores into the work set. Reads
-/// the tree in chunks with a yield between them, so no read holds the
-/// metadata writer back for a whole walk. A change between two chunks is in
+/// The namespaces of the local traces that a healthy shard holds few of:
+/// the tombstones, the namespaces boot left unbuilt and the failed checks.
+fn rare_traces(ctx: &ReconcilerCtx) -> Vec<IggyNamespace> {
+    let mut traces = ctx.shard.plane.partitions().tombstoned_namespaces();
+    traces.extend(ctx.unbuilt_owned.borrow().iter().copied());
+    traces.extend(ctx.failure_state.borrow().keys().map(|(ns, _)| *ns));
+    traces
+}
+
+/// Puts every committed partition this node stores into the work set, with
+/// a yield between two reads of the tree. A change between two reads is in
 /// the feed after the revision the caller read first.
 async fn add_committed_targets(ctx: &ReconcilerCtx) {
-    let streams = ctx.shard.plane.metadata().mux_stm.streams();
-    let mut chunk = Vec::new();
-    let mut next = Some((0, 0));
-    while let Some((first_stream, first_topic)) = next {
-        next = streams.read(|inner| {
-            let mut visited = 0;
-            for (stream_key, stream) in inner.items.iter_from(first_stream) {
-                if visited >= VISITS_PER_YIELD {
-                    return Some((stream_key, 0));
-                }
-                let topic_from = if stream_key == first_stream {
-                    first_topic
-                } else {
-                    0
-                };
-                for (topic_id, topic) in stream.topics.iter_from(topic_from) {
-                    if visited >= VISITS_PER_YIELD {
-                        return Some((stream_key, topic_id));
-                    }
-                    visited += topic.partitions.len().max(1);
-                    chunk.extend(
-                        topic
-                            .partitions
-                            .iter()
-                            .filter(|partition| {
-                                partition
-                                    .replica_set(ctx.replica_count)
-                                    .member(ctx.self_replica_id)
-                                    .is_some()
-                            })
-                            .map(|partition| IggyNamespace::new(stream.id, topic_id, partition.id)),
-                    );
-                }
-                visited += 1;
-            }
-            None
-        });
-        ctx.pending.borrow_mut().extend(&chunk);
-        chunk.clear();
+    let mut targets = Vec::new();
+    let mut next = Some(TreePosition::default());
+    while let Some(position) = next {
+        next = read_committed_targets(ctx, position, &mut targets);
+        ctx.pending.borrow_mut().extend(&targets);
+        targets.clear();
         if next.is_some() {
             yield_now().await;
         }
     }
+}
+
+/// Adds to `targets` the committed partitions this node stores, from `from`
+/// on, and stops after `VISITS_PER_YIELD` stream slots, topic slots and
+/// partitions, so the read does not hold the metadata writer back for a
+/// whole walk. A slot counts whether it is occupied or not, and a read can
+/// stop inside a topic, so neither a run of deleted streams or topics nor
+/// one large topic makes a read longer. Returns where the next read starts,
+/// `None` at the end of the tree.
+fn read_committed_targets(
+    ctx: &ReconcilerCtx,
+    from: TreePosition,
+    targets: &mut Vec<IggyNamespace>,
+) -> Option<TreePosition> {
+    let streams = ctx.shard.plane.metadata().mux_stm.streams();
+    streams.read(|inner| {
+        let mut budget = VISITS_PER_YIELD;
+        let mut position = from;
+        for (stream_key, stream) in inner.items.slots_from(from.stream) {
+            if stream_key != position.stream {
+                position = TreePosition {
+                    stream: stream_key,
+                    ..TreePosition::default()
+                };
+            }
+            if budget == 0 {
+                return Some(position);
+            }
+            budget -= 1;
+            let Some(stream) = stream else {
+                continue;
+            };
+            for (topic_id, topic) in stream.topics.slots_from(position.topic) {
+                if topic_id != position.topic {
+                    position = TreePosition {
+                        stream: stream_key,
+                        topic: topic_id,
+                        after_partition: None,
+                    };
+                }
+                if budget == 0 {
+                    return Some(position);
+                }
+                budget -= 1;
+                let Some(topic) = topic else {
+                    continue;
+                };
+                for partition in topic.partitions_after(position.after_partition, false) {
+                    if budget == 0 {
+                        return Some(position);
+                    }
+                    budget -= 1;
+                    position.after_partition = Some(partition.id);
+                    if partition
+                        .replica_set(ctx.replica_count)
+                        .member(ctx.self_replica_id)
+                        .is_some()
+                    {
+                        targets.push(IggyNamespace::new(stream.id, topic_id, partition.id));
+                    }
+                }
+            }
+        }
+        None
+    })
 }
 
 /// Checks the work set in key order, from the namespace after the last one
@@ -834,6 +1360,12 @@ async fn visit_pending(ctx: &ReconcilerCtx, counters: &mut PassCounters) -> bool
             return false;
         };
         last = Some(ns);
+        ctx.full_round.update(|round| {
+            round.map(|round| FullRound {
+                visits: round.visits + 1,
+                ..round
+            })
+        });
         let actions = counters.actions();
         if reconcile_namespace(ctx, ns, counters).await == Convergence::Converged {
             ctx.pending.borrow_mut().remove(&ns);
@@ -884,20 +1416,22 @@ async fn yield_now() {
     .await;
 }
 
-/// Forget the key of a stream incarnation that is deleted or holds no
-/// partition, so a reused stream id can never meet a previous stream's key.
-/// Only a partition build opens a key, and every commit that removes a
-/// partition records it, so this runs only after a pass that saw a partition
-/// removed or filled the work set. A stream deleted after its last topic lost
-/// its key when that topic went. A key lookup includes `created_op`, so a key
-/// the sweep has not reached yet is kept but never served.
-fn reconcile_stream_keys(ctx: &ReconcilerCtx) {
+/// Forget the key of a stream incarnation with an id in `streams` that is
+/// deleted or holds no partition, so a reused stream id can never meet a
+/// previous stream's key. Only a partition build opens a key, and every
+/// commit that removes a partition records it, so the sweep of every stream
+/// runs only after a pass that saw a partition removed or filled the work
+/// set. A repair slice sweeps the streams it read, for a removal that no
+/// change announced. A stream deleted after its last topic lost its key when
+/// that topic went. A key lookup includes `created_op`, so a key the sweep
+/// has not reached yet is kept but never served.
+fn reconcile_stream_keys(ctx: &ReconcilerCtx, streams: RangeInclusive<usize>) {
     let partitions = ctx.shard.plane.partitions();
     if !partitions.has_stream_keys() {
         return;
     }
     let () = ctx.shard.plane.metadata().mux_stm.streams().read(|inner| {
-        partitions.retain_stream_keys(|identity| {
+        partitions.retain_stream_keys(streams, |identity| {
             inner.items.get(identity.stream_id).is_some_and(|stream| {
                 stream.created_op == identity.created_op
                     && stream
@@ -1048,7 +1582,7 @@ async fn reconcile_target(
         return Convergence::Converged;
     }
 
-    let owning_shard = calculate_shard_assignment(&ns, u32::from(ctx.total_shards));
+    let owning_shard = ctx.partition_shards.shard_for(&ns);
     if owning_shard != shard_id {
         // Compare the epoch, not just presence: a delete + recreate
         // recycles the slab keys, so the row survives with the DEAD
@@ -1096,6 +1630,8 @@ async fn reconcile_target(
         metadata: partition_metadata,
         stream_key,
         encryption,
+        peer_log,
+        recovered_from,
     }) = fetch_partition_build_inputs(ctx, ns)
     else {
         return Convergence::Pending;
@@ -1182,21 +1718,47 @@ async fn reconcile_target(
         return Convergence::Pending;
     }
 
-    let built = if prior_life_on_disk {
-        load_partition_or_fence(
-            ctx.config.as_ref(),
+    // A partition of a geo topic that a recovery restored starts from what
+    // the recovery took of it, which every replica installs before it serves
+    // a frame, so the group starts from one state. Committed metadata says
+    // which partitions those are, so no replica depends on its own config.
+    let plan = match recovered_from.filter(|_| !prior_life_on_disk) {
+        None => None,
+        Some(retired_cluster_uid) => match Box::pin(recovery_plan_of(
+            ctx,
             ns,
-            partition_stats,
+            created_revision,
+            retired_cluster_uid,
+        ))
+        .await
+        {
+            Ok(plan) => plan,
+            Err(reason) => {
+                ctx.record_failure(ns, FailureCause::Add, now);
+                debug!(
+                    shard = shard_id,
+                    ns_raw = ns.inner(),
+                    reason,
+                    "the recovery plan of a partition is not read yet; building it later"
+                );
+                return Convergence::Pending;
+            }
+        },
+    };
+
+    let built = if prior_life_on_disk {
+        Box::pin(load_prior_life(
+            ctx,
+            ns,
+            &partition_stats,
             &partition_metadata,
             topic_runtime,
-            ctx.cluster_id,
-            ctx.self_replica_id,
-            partition_metadata.replica_set(ctx.replica_count),
-            Rc::clone(&ctx.shard.bus),
             partitions,
-        )
+        ))
         .await
+        .map(|partition| partition.map(Box::new))
     } else {
+        ctx.stop_waiting_for_chain(ns);
         build_partition_fresh(
             ctx.config.as_ref(),
             partitions.config(),
@@ -1212,15 +1774,49 @@ async fn reconcile_target(
             Rc::clone(&ctx.shard.bus),
         )
         .await
-        .map(Some)
+        .map(|partition| Some(Box::new(partition)))
     };
+    // Boxed, so that the install's await below holds no whole partition in
+    // this future.
     match built {
         Ok(Some(mut partition)) => {
             partition.set_encryptor(encryptor);
             partition.start_at_create_op(partition_metadata.created_op);
+            if let Some(plan) = &plan
+                && let Err(error) =
+                    Box::pin(partition.install_recovery_plan(partitions.config(), plan)).await
+            {
+                error!(
+                    shard = shard_id,
+                    stream_id = ns.stream_id(),
+                    topic_id = ns.topic_id(),
+                    partition_id = ns.partition_id(),
+                    %error,
+                    "a partition of a restored geo topic could not install what the recovery \
+                     took of it, so this node does not serve it; remove its directory and \
+                     restart the node to build it again"
+                );
+                partitions.refuse(ns, created_revision);
+                return Convergence::Converged;
+            }
+            if let Some((origin, prefix)) = peer_log
+                && let Err(error) = partition.follow_peer_log(origin, prefix)
+            {
+                ctx.record_failure(ns, FailureCause::Add, now);
+                ctx.shard.metrics().record_partition_reconcile_failure();
+                error!(
+                    shard = shard_id,
+                    stream_id = ns.stream_id(),
+                    topic_id = ns.topic_id(),
+                    partition_id = ns.partition_id(),
+                    %error,
+                    "a partition of a shadow topic cannot follow its peer's log"
+                );
+                return Convergence::Pending;
+            }
             ctx.shard.enqueue_reconcile_op(ReconcileOp::InsertOwned {
                 namespace: ns,
-                partition: Box::new(partition),
+                partition,
                 epoch: created_revision,
             });
             ctx.record_success(ns, FailureCause::Add);
@@ -1233,16 +1829,24 @@ async fn reconcile_target(
         // knows, and the commit that moves metadata on brings the namespace
         // back.
         Ok(None) => Convergence::Converged,
+        // `load_prior_life` said why already. A read under way wakes the
+        // reconciler when it ends, and one waiting for a slot gets it then.
+        Err(ServerError::PartitionChainMissing { .. }) => {
+            if !ctx.chain_read_due(ns) {
+                ctx.record_failure(ns, FailureCause::Add, now);
+            }
+            Convergence::Pending
+        }
         // Retrying cannot bring the history back; the tombstone keeps every
         // later check from rebuilding it empty.
-        Err(err @ crate::server_error::ServerError::PartitionLostWithStorage { .. }) => {
+        Err(err @ ServerError::PartitionLostWithStorage { .. }) => {
             error!(
                 shard = shard_id,
                 ns_raw = ns.inner(),
                 error = %err,
                 "refusing to rebuild a partition lost with this node's storage"
             );
-            partitions.fence(ns, created_revision);
+            partitions.refuse(ns, created_revision);
             Convergence::Converged
         }
         Err(err) => {
@@ -1258,6 +1862,221 @@ async fn reconcile_target(
             );
             Convergence::Pending
         }
+    }
+}
+
+/// Load the partition `ns` from the directory a prior life left on disk.
+///
+/// A tiered partition whose segment chain is gone fails the load while
+/// something below its local log may have left the disk. It then waits for
+/// what the store holds of it, read in a task of its own once this node
+/// passes its store identity check, and loads again with it. The wait ends
+/// with the load that rebuilt the chain or refused the partition, and is
+/// dropped when committed metadata names another incarnation or trim than
+/// the one it reads for, which the next load reconsiders from local state.
+///
+/// # Errors
+/// [`ServerError::PartitionChainMissing`] while the partition waits for the
+/// store, and any error of the load.
+async fn load_prior_life(
+    ctx: &ReconcilerCtx,
+    ns: IggyNamespace,
+    partition_stats: &Arc<PartitionStats>,
+    partition_metadata: &Partition,
+    topic_runtime: TopicRuntimeOptions,
+    partitions: &IggyPartitions<Rc<IggyMessageBus>, PingPongSuperblock>,
+) -> Result<Option<IggyPartition<Rc<IggyMessageBus>>>, ServerError> {
+    let load = PriorLife {
+        ctx,
+        ns,
+        partition_stats,
+        partition_metadata,
+        topic_runtime,
+        partitions,
+    };
+    let missing = |request: StoreViewRequest| ServerError::PartitionChainMissing {
+        stream_id: ns.stream_id(),
+        topic_id: ns.topic_id(),
+        partition_id: ns.partition_id(),
+        request: Box::new(request),
+    };
+    let wait = ctx.take_chain_wait(ns).filter(|wait| {
+        wait.request().is_for(
+            partition_metadata.created_revision,
+            partition_metadata.deleted_up_to_offset,
+        )
+    });
+    let request = match wait {
+        None => match load.load(None).await {
+            Err(ServerError::PartitionChainMissing { request, .. }) => {
+                ctx.wait_for_chain(ns, (*request).clone());
+                *request
+            }
+            loaded => return count_chain_recovery(ctx, loaded),
+        },
+        Some(ChainWait::Queued(request)) => request,
+        Some(reading @ ChainWait::Reading { .. }) => {
+            let request = reading.request().clone();
+            ctx.put_chain_wait(ns, reading);
+            return Err(missing(request));
+        }
+        Some(ChainWait::Read { request, outcome }) => {
+            let view = match *outcome {
+                Ok(Ok(view)) => view,
+                Ok(Err(error)) => {
+                    warn!(
+                        shard = ctx.shard.id,
+                        ns_raw = ns.inner(),
+                        %error,
+                        "the object store did not answer the read that rebuilds a lost segment \
+                         chain; it is read again"
+                    );
+                    ctx.put_chain_wait(ns, ChainWait::Queued(request.clone()));
+                    return Err(missing(request));
+                }
+                Err(TierJobCancelled) => {
+                    ctx.put_chain_wait(ns, ChainWait::Queued(request.clone()));
+                    return Err(missing(request));
+                }
+            };
+            let loaded = load.load(Some(&view)).await;
+            if let Err(ServerError::PartitionChainMissing { request, .. }) = &loaded {
+                ctx.put_chain_wait(ns, ChainWait::Queued((**request).clone()));
+                return loaded.map(|(partition, _)| partition);
+            }
+            return count_chain_recovery(ctx, loaded);
+        }
+    };
+    start_chain_read(ctx, ns, request.clone());
+    Err(missing(request))
+}
+
+/// Start the read of what `request` asks of the store for the partition
+/// `ns`, in a task that wakes the reconciler when it ends. The read waits
+/// queued while the node does not pass its store identity check yet, or
+/// while [`CHAIN_STORE_READS`] others run.
+fn start_chain_read(ctx: &ReconcilerCtx, ns: IggyNamespace, request: StoreViewRequest) {
+    let Some(reader) = ctx.shard.store_view_reader() else {
+        debug!(
+            shard = ctx.shard.id,
+            ns_raw = ns.inner(),
+            "the node does not pass its store identity check yet; the rebuild of the segment \
+             chain waits"
+        );
+        ctx.put_chain_wait(ns, ChainWait::Queued(request));
+        return;
+    };
+    if chain_reads(&ctx.chain_rebuilds.borrow()) >= CHAIN_STORE_READS {
+        ctx.put_chain_wait(ns, ChainWait::Queued(request));
+        return;
+    }
+    let read = ctx.next_chain_read.get();
+    ctx.next_chain_read.set(read.wrapping_add(1));
+    let scope = TierScope::new();
+    let outcome = reader.read(request.clone(), scope.token());
+    ctx.put_chain_wait(
+        ns,
+        ChainWait::Reading {
+            request,
+            read,
+            _scope: scope,
+        },
+    );
+    let waits = Rc::clone(&ctx.chain_rebuilds);
+    let shard = Rc::clone(&ctx.shard);
+    ctx.shard.bus.clone().spawn(async move {
+        let outcome = outcome.await;
+        let finished = {
+            let mut waits = waits.borrow_mut();
+            let running = waits.get_mut(&ns).filter(
+                |wait| matches!(wait, ChainWait::Reading { read: running, .. } if *running == read),
+            );
+            // `None` when the wait was dropped or replaced, and its scope with it.
+            running
+                .map(|wait| {
+                    let request = wait.request().clone();
+                    *wait = ChainWait::Read {
+                        request,
+                        outcome: Box::new(outcome),
+                    };
+                })
+                .is_some()
+        };
+        if finished {
+            shard.dispatch_metadata_commit_tick();
+        }
+    });
+}
+
+/// What [`load_prior_life`] loads a partition with.
+struct PriorLife<'a> {
+    ctx: &'a ReconcilerCtx,
+    ns: IggyNamespace,
+    partition_stats: &'a Arc<PartitionStats>,
+    partition_metadata: &'a Partition,
+    topic_runtime: TopicRuntimeOptions,
+    partitions: &'a IggyPartitions<Rc<IggyMessageBus>, PingPongSuperblock>,
+}
+
+impl PriorLife<'_> {
+    async fn load(&self, store_view: Option<&StoreView>) -> Result<LoadedPartition, ServerError> {
+        let ctx = self.ctx;
+        Box::pin(load_partition_or_fence(
+            ctx.config.as_ref(),
+            self.ns,
+            Arc::clone(self.partition_stats),
+            self.partition_metadata,
+            self.topic_runtime,
+            ctx.cluster_id,
+            ctx.self_replica_id,
+            self.partition_metadata.replica_set(ctx.replica_count),
+            Rc::clone(&ctx.shard.bus),
+            self.partitions,
+            store_view,
+        ))
+        .await
+    }
+}
+
+/// Count what a load did about a lost segment chain.
+fn count_chain_recovery(
+    ctx: &ReconcilerCtx,
+    loaded: Result<LoadedPartition, ServerError>,
+) -> Result<Option<IggyPartition<Rc<IggyMessageBus>>>, ServerError> {
+    let (partition, chain) = loaded?;
+    match chain {
+        ChainRecovery::Kept => {}
+        ChainRecovery::Rebuilt => ctx.shard.metrics().record_chain_rebuild(),
+        ChainRecovery::Refused => ctx.shard.metrics().record_chain_rebuild_refusal(),
+    }
+    Ok(partition)
+}
+
+/// What the recovery of `retired_cluster_uid` took of the partition `ns` of
+/// revision `created_revision`, `None` when it took nothing of the
+/// partition. `Err` with the reason while the plan cannot be read, as before
+/// the node passes its store identity check.
+async fn recovery_plan_of(
+    ctx: &ReconcilerCtx,
+    ns: IggyNamespace,
+    created_revision: u64,
+    retired_cluster_uid: u128,
+) -> Result<Option<RecoveryPlan>, String> {
+    let Some(objects) = ctx.shard.topic_objects() else {
+        return Err("the node does not pass its store identity check yet".to_owned());
+    };
+    let scope = TierScope::new();
+    match objects
+        .read_recovery_plan(
+            retired_cluster_uid,
+            object_prefix(ns, created_revision),
+            scope.token(),
+        )
+        .await
+    {
+        Ok(Ok(plan)) => Ok(plan),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(TierJobCancelled) => Err("the read of the plan was cancelled".to_owned()),
     }
 }
 
@@ -1314,14 +2133,13 @@ fn reconcile_parked_frames(ctx: &ReconcilerCtx, round_ended: bool, counters: &mu
         return;
     }
     let partitions = ctx.shard.plane.partitions();
-    let total_shards = u32::from(ctx.total_shards);
     for ns in parked {
         if ctx.shard.has_staged_insert_owned(ns) {
             continue;
         }
         // Tombstoned namespaces are still in the map, so `contains` below reads
         // them as materialised.
-        let not_ours = calculate_shard_assignment(&ns, total_shards) != ctx.shard.id;
+        let not_ours = ctx.partition_shards.shard_for(&ns) != ctx.shard.id;
         let tombstoned = partitions.is_tombstoned(&ns);
         if tombstoned || not_ours {
             debug!(
@@ -1420,7 +2238,7 @@ async fn tear_down_owned_partition(
     // upgrade), refuse the delete and surface the inconsistency instead of
     // panicking the pump; the partition stays addressable via its existing
     // local entry until an operator resolves the conflict.
-    let hash_owner = calculate_shard_assignment(&ns, u32::from(ctx.total_shards));
+    let hash_owner = ctx.partition_shards.shard_for(&ns);
     if hash_owner != shard_id {
         ctx.shard.metrics().record_partition_reconcile_failure();
         error!(
@@ -1956,6 +2774,11 @@ struct PartitionBuildInputs {
     metadata: Partition,
     stream_key: StreamKeyIdentity,
     encryption: StreamEncryption,
+    /// The peer's log that a partition of a shadow topic follows.
+    peer_log: Option<(String, iggy_object_store::ObjectPrefix)>,
+    /// The cluster that lost every disk, for a partition of a geo topic that
+    /// a recovery restored from its store.
+    recovered_from: Option<u128>,
 }
 
 /// Everything one namespace's build needs out of committed metadata: the shared
@@ -2002,6 +2825,8 @@ fn fetch_partition_build_inputs(
                 created_op: stream.created_op,
             },
             encryption: StreamEncryption::from(&stream.options),
+            peer_log: peer_log_of(stream, topic, ns),
+            recovered_from: topic.recovered_from,
         })
     })
 }
@@ -2247,6 +3072,12 @@ async fn reconcile_retired_lifecycles(ctx: &ReconcilerCtx) {
                             "lifecycle waits for a durable partition fence");
                         continue;
                     }
+                    // What a load would do under the fence just written: the
+                    // partition no longer waits for the store.
+                    if ctx.waits_for_chain(target.namespace, target.incarnation) {
+                        partitions.fence(target.namespace, target.incarnation);
+                        ctx.stop_waiting_for_chain(target.namespace);
+                    }
                     if members.len() == 1 {
                         RETIRED_PARTITION_OP
                     } else {
@@ -2330,10 +3161,13 @@ const fn retired_bit(node: u8) -> Option<u32> {
 }
 
 /// Whether this node's copy of the target incarnation is gone: recovery
-/// fenced it, or it waits for a state transfer that would rebuild it.
+/// fenced it, or it waits for a state transfer that would rebuild it. A copy
+/// that waits for the store to rebuild its lost segment chain serves nothing
+/// either, and a delete loses nothing by retiring it.
 fn copy_lost_here(ctx: &ReconcilerCtx, target: &RetirementTarget) -> bool {
     let partitions = ctx.shard.plane.partitions();
     partitions.failed_revision(&target.namespace) == Some(target.incarnation)
+        || (target.deletes && ctx.waits_for_chain(target.namespace, target.incarnation))
         || partitions
             .get_by_ns(&target.namespace)
             .is_some_and(|partition| {
@@ -2460,16 +3294,23 @@ pub fn install_tick_handler(shard: &Rc<ServerShard>, wake_tx: WakeTx) {
 
 #[cfg(test)]
 mod tests {
+    mod chain_waits;
+    mod geo_topics;
+    mod orphan_sweep;
+
     use super::{
         CommittedTarget, Convergence, DISK_VISITS_PER_PASS, FailureCause, FailureRecord,
-        GROUP_OFFSET_DELETES_PER_PASS, LIFECYCLE_FENCE_RETRY_MICROS, PassCounters, ReconcilerCtx,
-        build_partition_fresh, delete_partitions_from_disk, fetch_partition_build_inputs,
-        fill_pending, fold_changes, group_offset_delete_request, reconcile_group_offsets,
+        FullRoundTrigger, GROUP_OFFSET_DELETES_PER_PASS, LIFECYCLE_FENCE_RETRY_MICROS,
+        PassCounters, REPAIR_INTERVAL, REPAIR_SLICE_INTERVAL, ReconcilerCtx, RepairCycle,
+        RepairWalk, TreePosition, VISITS_PER_YIELD, build_partition_fresh,
+        delete_partitions_from_disk, fetch_partition_build_inputs, fill_pending, fold_changes,
+        group_offset_delete_request, read_committed_targets, reconcile_group_offsets,
         reconcile_once, reconcile_partition_lifecycles, reconcile_pending_revocations,
-        reconcile_retired_lifecycles, reconcile_target, visit_pending,
+        reconcile_retired_lifecycles, reconcile_target, repair_step, run_reconciler, visit_pending,
     };
     use bytes::Bytes;
     use configs::server::ServerConfig;
+    use configs::sharding::RECONCILE_PERIODIC_INTERVAL_MAX;
     use consensus::{
         MetadataHandle, PartitionsHandle, PlaneKind, Sequencer, StateTransferStage, Status,
     };
@@ -2524,9 +3365,9 @@ mod tests {
         PartitionsConfig, RETIRED_OBJECT_GRACE, RepairSession, Segment, object_prefix,
     };
     use rand::prelude::{RngExt, SeedableRng, StdRng};
-    use server_common::sharding::{IggyNamespace, ShardId};
+    use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
     use server_common::{Message, MessageBag, SegmentStorage};
-    use shard::shards_table::{PapayaShardsTable, ShardsTable, calculate_shard_assignment};
+    use shard::shards_table::{PapayaShardsTable, PartitionShards, ShardsTable};
     use shard::{IggyShard, PartitionConsensusConfig, ReconcileOp, Sender, ShardIdentity};
     use std::cell::Cell;
     use std::collections::{BTreeSet, HashSet};
@@ -3153,6 +3994,24 @@ mod tests {
         )
     }
 
+    /// [`build_test_shard`] on a node of `total_shards` shards, so the shard
+    /// places partitions over all of them. No test reads these lanes: the
+    /// receivers are dropped, and a send to them fails as `Disconnected`.
+    fn build_test_shard_in_mesh(
+        shard_id: u16,
+        config: &ServerConfig,
+        mux: TestMux,
+        total_shards: u16,
+    ) -> Rc<TestShard> {
+        const UNREAD_LANE_CAPACITY: usize = 1;
+        let (senders, ..) =
+            shard::shard_mesh_channels(total_shards, UNREAD_LANE_CAPACITY, UNREAD_LANE_CAPACITY);
+        let mut shard = Rc::into_inner(build_test_shard(shard_id, config, mux))
+            .expect("freshly built shard is uniquely owned");
+        shard.attach_senders(senders);
+        Rc::new(shard)
+    }
+
     /// Drain a test shard's lanes into `(consensus frames, staged client
     /// sends)`: work headed for the pump vs answers headed for a client.
     fn drain_inbox(lanes: &TestLanes) -> (usize, usize) {
@@ -3236,19 +4095,8 @@ mod tests {
         (fences, batches)
     }
 
-    fn make_ctx(
-        shard: Rc<TestShard>,
-        total_shards: u16,
-        config: Rc<ServerConfig>,
-    ) -> Rc<ReconcilerCtx> {
-        Rc::new(ReconcilerCtx::new(
-            shard,
-            total_shards,
-            config,
-            CLUSTER_ID,
-            0,
-            1,
-        ))
+    fn make_ctx(shard: Rc<TestShard>, config: Rc<ServerConfig>) -> Rc<ReconcilerCtx> {
+        Rc::new(ReconcilerCtx::new(shard, config, CLUSTER_ID, 0, 1))
     }
 
     /// The committed `created_view` of `ns`, what a reconcile pass would seed
@@ -3267,6 +4115,86 @@ mod tests {
     async fn reconcile_pass(ctx: &ReconcilerCtx) {
         reconcile_once(ctx).await;
         ctx.shard.apply_reconcile_ops();
+    }
+
+    /// Makes the next repair step due and runs the pass that takes it.
+    async fn repair_pass(ctx: &ReconcilerCtx) {
+        ctx.next_repair_at.set(Some(Instant::now()));
+        reconcile_pass(ctx).await;
+    }
+
+    /// More repair passes than a cycle of any test here takes. A walk that
+    /// does not get where a test waits for it then fails the test, and does
+    /// not hang it.
+    const REPAIR_PASSES_MAX: usize = 64;
+
+    /// Runs repair passes until `is_reached` holds for the walk that the
+    /// cycle goes on with, and returns the cycle.
+    async fn repair_passes_until(
+        ctx: &ReconcilerCtx,
+        is_reached: impl Fn(Option<RepairWalk>) -> bool,
+    ) -> RepairCycle {
+        for _ in 0..REPAIR_PASSES_MAX {
+            repair_pass(ctx).await;
+            let cycle = ctx
+                .repair_cycle
+                .get()
+                .expect("a repair pass must start a cycle or go on with it");
+            if is_reached(cycle.next) {
+                return cycle;
+            }
+        }
+        panic!("the repair cycle must get there within {REPAIR_PASSES_MAX} passes");
+    }
+
+    /// Runs the slices of one repair cycle and returns the cycle as its last
+    /// slice left it. The next repair pass ends the cycle.
+    async fn repair_slices(ctx: &ReconcilerCtx) -> RepairCycle {
+        repair_passes_until(ctx, |next| next.is_none()).await
+    }
+
+    /// A stream with one topic of one partition costs the walk over the tree
+    /// three visits: its slot, the slot of its topic and its partition.
+    const STREAMS_PER_SLICE: usize = VISITS_PER_YIELD / 3;
+
+    /// Shard 0 of a node that stores `streams` streams of one partition each
+    /// and owns none of them. Its boot round is over. The seed takes ops
+    /// `1..=2 * streams` and consensus groups `1..=streams`.
+    fn build_routing_only_shard(
+        tmp: &TempDir,
+        streams: usize,
+    ) -> impl Future<Output = (Rc<TestShard>, ReconcilerCtx)> {
+        let mux = TestMux::default();
+        for stream in 0..u32::try_from(streams).unwrap() {
+            let op = u64::from(stream) * 2 + 1;
+            seed_stream(&mux, op, &format!("stream-{stream}"));
+            seed_topic(
+                &mux,
+                op + 1,
+                stream,
+                "topic",
+                vec![assignment(0, u64::from(stream) + 1)],
+            );
+        }
+        routing_only_shard(tmp, mux)
+    }
+
+    /// Shard 0 of a node that owns none of the partitions `mux` holds, so a
+    /// check writes a routing row and builds nothing. Its boot round is over.
+    async fn routing_only_shard(tmp: &TempDir, mux: TestMux) -> (Rc<TestShard>, ReconcilerCtx) {
+        const TOTAL_SHARDS: u16 = 2;
+        let config = test_config(tmp);
+        let shard = build_test_shard_in_mesh(0, &config, mux, TOTAL_SHARDS);
+        let mut ctx = ReconcilerCtx::new(Rc::clone(&shard), Rc::new(config), CLUSTER_ID, 0, 1);
+        // With shard 0 skipped, shard 1 owns every partition.
+        ctx.partition_shards = PartitionShards::new(TOTAL_SHARDS, true);
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        assert!(
+            ctx.pending.borrow().is_empty(),
+            "the boot round must converge"
+        );
+        (shard, ctx)
     }
 
     /// Single-shard scenario: every committed partition is owned locally.
@@ -3289,7 +4217,7 @@ mod tests {
         );
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         reconcile_pass(&ctx).await;
 
@@ -3331,7 +4259,7 @@ mod tests {
         seed_stream(&mux, 1, "stream-a");
         seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
         reconcile_pass(&ctx).await;
         reconcile_pass(&ctx).await;
@@ -3402,7 +4330,7 @@ mod tests {
         ))
         .expect("CreateTopicWithAssignments apply succeeds");
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
 
         reconcile_pass(&ctx).await;
@@ -3452,7 +4380,7 @@ mod tests {
         ))
         .expect("CreateTopicWithAssignments apply succeeds");
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         reconcile_pass(&ctx).await;
 
@@ -3480,7 +4408,7 @@ mod tests {
             seed_encrypted_stream(&mux, 1, "stream-a", &wrap_stream_key(&stream_context, 1));
             seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
             let shard = build_test_shard_with_keys(0, &config, mux, node_context);
-            let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+            let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
             reconcile_pass(&ctx).await;
 
@@ -3509,7 +4437,7 @@ mod tests {
         seed_encrypted_stream(&mux, 1, "stream-a", &wrap_stream_key(&stream_context, 1));
         seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
         let shard = build_test_shard_with_keys(0, &config, mux, node_context);
-        let ctx = make_ctx(shard, 1, Rc::new(config));
+        let ctx = make_ctx(shard, Rc::new(config));
         let attempts = || {
             ctx.failure_state
                 .borrow()
@@ -3542,7 +4470,7 @@ mod tests {
             seed_encrypted_stream(&mux, 1, "stream-a", &wrap_stream_key(&stream_context, 1));
             seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
             let shard = build_test_shard_with_keys(0, &config, mux, key_context(OTHER_CONFIG_KEY));
-            let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+            let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
             let ns = IggyNamespace::new(0, 0, 0);
             std::fs::create_dir_all(&partition_dir).expect("prior partition files");
             if boot_deferred {
@@ -3579,7 +4507,7 @@ mod tests {
         seed_encrypted_stream(&mux, 1, "stream-a", &stored);
         seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
         let shard = build_test_shard_with_keys(0, &config, mux, Arc::clone(&new_context));
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
 
         reconcile_pass(&ctx).await;
@@ -3620,7 +4548,7 @@ mod tests {
         seed_encrypted_stream(&mux, 1, "stream-a", &wrap_stream_key(&context, 1));
         seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
         let shard = build_test_shard_with_keys(0, &config, mux, context);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         reconcile_pass(&ctx).await;
         assert!(shard.plane.partitions().has_stream_keys());
@@ -3642,7 +4570,7 @@ mod tests {
         seed_encrypted_stream(&mux, 1, "stream-a", &wrap_stream_key(&context, 1));
         seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
         let shard = build_test_shard_with_keys(0, &config, mux, context);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         assert!(shard.plane.partitions().has_stream_keys());
 
@@ -3669,7 +4597,7 @@ mod tests {
             seed_stream(&mux, 1, "stream-a");
             seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
             let shard = build_test_shard(0, &config, mux);
-            let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+            let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
             let ns = IggyNamespace::new(0, 0, 0);
             let partition = fetch_partition_build_inputs(&ctx, ns)
                 .expect("committed namespace resolves")
@@ -3723,7 +4651,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         let listed = IggyNamespace::new(0, 0, 0);
         assert!(
@@ -3762,7 +4690,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
 
         reconcile_once(&ctx).await;
@@ -3804,7 +4732,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
 
         reconcile_once(&ctx).await;
@@ -3874,7 +4802,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
 
         reconcile_once(&ctx).await;
@@ -3935,7 +4863,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config.clone()));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config.clone()));
         let ns = IggyNamespace::new(0, 0, 0);
 
         let stats = fetch_partition_build_inputs(&ctx, ns)
@@ -4023,6 +4951,7 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir for system path");
         let config = test_config(&tmp);
         let total_shards: u16 = 4;
+        let placement = PartitionShards::new(total_shards, false);
 
         // Pick a partition count where the murmur3 distribution lands
         // entries on at least two distinct shards out of four, then
@@ -4034,9 +4963,7 @@ mod tests {
         let mut counts: std::collections::HashMap<u16, usize> = std::collections::HashMap::new();
         for partition_id in 0..partition_count {
             let ns = IggyNamespace::new(0, 0, partition_id as usize);
-            *counts
-                .entry(calculate_shard_assignment(&ns, u32::from(total_shards)))
-                .or_insert(0) += 1;
+            *counts.entry(placement.shard_for(&ns)).or_insert(0) += 1;
         }
         let (shard_id, _) = counts
             .iter()
@@ -4055,8 +4982,8 @@ mod tests {
             .collect();
         seed_topic(&mux, 2, 0, "topic-shard-aware", assignments);
 
-        let shard = build_test_shard(shard_id, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), total_shards, Rc::new(config));
+        let shard = build_test_shard_in_mesh(shard_id, &config, mux, total_shards);
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         reconcile_pass(&ctx).await;
 
@@ -4066,7 +4993,7 @@ mod tests {
         let mut routed_only = 0usize;
         for partition_id in 0..partition_count {
             let ns = IggyNamespace::new(0, 0, partition_id as usize);
-            let expected_owner = calculate_shard_assignment(&ns, u32::from(total_shards));
+            let expected_owner = placement.shard_for(&ns);
             if expected_owner == shard_id {
                 assert!(
                     partitions.contains(&ns),
@@ -4120,7 +5047,7 @@ mod tests {
         );
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         reconcile_pass(&ctx).await;
         assert_eq!(shard.plane.partitions().len(), 2);
@@ -4181,7 +5108,7 @@ mod tests {
         );
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         reconcile_pass(&ctx).await;
         // Verify disk hierarchy exists before the delete commits.
@@ -4238,7 +5165,7 @@ mod tests {
         seed_topic(&mux, 3, 0, "topic-d2", vec![assignment(0, 3)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         reconcile_pass(&ctx).await;
         assert_eq!(
@@ -4294,6 +5221,12 @@ mod tests {
     /// Store both objects of one segment and the manifest of `prefix`, and
     /// return their keys.
     async fn store_incarnation(deleter: &MemoryDeleter, prefix: ObjectPrefix) -> Vec<String> {
+        store_objects(deleter.executor().store(), prefix).await
+    }
+
+    /// Store both objects of one segment and the manifest of `prefix` in
+    /// `store`, and return their keys.
+    async fn store_objects(store: &MemoryStore, prefix: ObjectPrefix) -> Vec<String> {
         let layout = object_layout();
         let mut keys: Vec<String> = SegmentObject::ALL
             .into_iter()
@@ -4307,9 +5240,7 @@ mod tests {
             .collect();
         keys.push(layout.manifest_key(&prefix));
         for key in &keys {
-            deleter
-                .executor()
-                .store()
+            store
                 .put(key, PutBody::from_bytes(vec![1]), &PutOptions::default())
                 .await
                 .unwrap();
@@ -4356,7 +5287,7 @@ mod tests {
         seed_topic(&mux, 3, 0, "kept", vec![assignment(0, 3)]);
         let shard = build_metadata_primary_shard(&config, mux);
         let deleter = install_memory_deleter(&shard);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         let deleted = [IggyNamespace::new(0, 0, 0), IggyNamespace::new(0, 0, 1)]
             .map(|ns| committed_prefix(&shard, ns));
@@ -4408,7 +5339,7 @@ mod tests {
         seed_topic(&mux, 5, 1, "third", vec![assignment(0, 4)]);
         let shard = build_metadata_primary_shard(&config, mux);
         let deleter = install_memory_deleter(&shard);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         let deleted = [
             IggyNamespace::new(0, 0, 0),
@@ -4449,7 +5380,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-reuse", vec![assignment(0, 1)]);
         let shard = build_metadata_primary_shard(&config, mux);
         let deleter = install_memory_deleter(&shard);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         let ns = IggyNamespace::new(0, 0, 0);
         let old = committed_prefix(&shard, ns);
@@ -4484,7 +5415,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-live", vec![assignment(0, 1)]);
         let shard = build_metadata_primary_shard(&config, mux);
         let deleter = install_memory_deleter(&shard);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         let ns = IggyNamespace::new(0, 0, 0);
         let live = committed_prefix(&shard, ns);
@@ -4498,6 +5429,7 @@ mod tests {
                 namespace: ns,
                 created_revision: live.created_revision,
                 kind: PartitionChangeKind::Removed,
+                skips_object_deletes: false,
             }],
             IggyTimestamp::now(),
         );
@@ -4526,7 +5458,7 @@ mod tests {
                 metadata_replica,
             );
             let deleter = install_memory_deleter(&shard);
-            let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+            let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
             reconcile_pass(&ctx).await;
             let ns = IggyNamespace::new(0, 0, 0);
             let stored = store_incarnation(&deleter, committed_prefix(&shard, ns)).await;
@@ -4543,6 +5475,7 @@ mod tests {
                     namespace: ns,
                     created_revision: 1,
                     kind: PartitionChangeKind::Removed,
+                    skips_object_deletes: false,
                 }],
                 IggyTimestamp::now(),
             );
@@ -4562,7 +5495,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-unannounced", vec![assignment(0, 1)]);
         let shard = build_metadata_primary_shard(&config, mux);
         let deleter = install_memory_deleter(&shard);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         let ns = IggyNamespace::new(0, 0, 0);
         let stored = store_incarnation(&deleter, committed_prefix(&shard, ns)).await;
@@ -4588,7 +5521,7 @@ mod tests {
         seed_stream(&mux, 1, "stream-no-deleter");
         seed_topic(&mux, 2, 0, "topic-no-deleter", vec![assignment(0, 1)]);
         let shard = build_metadata_primary_shard(&config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
 
         seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
@@ -4607,7 +5540,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-demoted", vec![assignment(0, 1)]);
         let shard = build_metadata_primary_shard(&config, mux);
         let deleter = install_memory_deleter(&shard);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         let ns = IggyNamespace::new(0, 0, 0);
         let stored = store_incarnation(&deleter, committed_prefix(&shard, ns)).await;
@@ -4644,7 +5577,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-reuse", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         reconcile_pass(&ctx).await;
         let ns = IggyNamespace::new(0, 0, 0);
@@ -4706,7 +5639,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-fence", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
 
         reconcile_pass(&ctx).await;
@@ -4761,7 +5694,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-unverifiable", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
 
         // Committed, but no reconcile pass has run: no row to prove against.
@@ -4803,7 +5736,7 @@ mod tests {
         seed_stream(&mux, 1, "stream-delta");
         seed_topic(&mux, 2, 0, "topic-delta", vec![assignment(0, 1)]);
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         reconcile_pass(&ctx).await;
         reconcile_pass(&ctx).await;
@@ -4825,6 +5758,10 @@ mod tests {
             *ctx.pending.borrow(),
             BTreeSet::from([created]),
             "only the new partition needs a check"
+        );
+        assert!(
+            ctx.full_round.get().is_none(),
+            "a commit must start no full round"
         );
 
         reconcile_pass(&ctx).await;
@@ -4850,7 +5787,7 @@ mod tests {
         );
         seed_create_consumer_group(&mux, 3, 0, 0, "group");
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         reconcile_pass(&ctx).await;
         assert!(ctx.pending.borrow().is_empty());
@@ -4898,16 +5835,29 @@ mod tests {
                 .collect(),
         );
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let partitions = shard.plane.partitions();
 
         assert!(reconcile_once(&ctx).await, "the pass must stop at the cap");
+        let round = ctx
+            .full_round
+            .get()
+            .expect("a capped pass must leave the boot round open");
+        assert_eq!(round.trigger, FullRoundTrigger::Boot);
+        assert_eq!(
+            (round.work_set, round.visits),
+            (partitions_count, DISK_VISITS_PER_PASS)
+        );
         shard.apply_reconcile_ops();
         assert_eq!(partitions.namespaces().count(), DISK_VISITS_PER_PASS);
 
         assert!(
             !reconcile_once(&ctx).await,
             "the next pass must build the rest"
+        );
+        assert!(
+            ctx.full_round.get().is_none(),
+            "the end of the round must log it and drop its record"
         );
         shard.apply_reconcile_ops();
         assert_eq!(partitions.namespaces().count(), partitions_count);
@@ -4935,7 +5885,7 @@ mod tests {
                 .collect(),
         );
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let partitions = shard.plane.partitions();
         while reconcile_once(&ctx).await {
             shard.apply_reconcile_ops();
@@ -4970,7 +5920,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-early", vec![assignment(0, 1)]);
         seed_stream(&mux, 3, "stream-burst");
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let partitions = shard.plane.partitions();
         let mux = &shard.plane.metadata().mux_stm;
         let early = IggyNamespace::new(0, 0, 0);
@@ -5011,8 +5961,9 @@ mod tests {
 
     /// The change feed and the pump's records must leave nothing for a full
     /// reconcile. Random creates, deletes and recreates on two shards, with
-    /// passes and pump applies at random points, drain the work set, and a
-    /// full fill then finds no action.
+    /// passes and pump applies at random points, drain the work set. A repair
+    /// cycle then meets each routing row and each mounted partition, so it
+    /// starts no full round, and a full fill finds no action.
     #[compio::test]
     async fn given_random_partition_changes_when_the_work_set_drains_should_leave_a_full_reconcile_nothing()
      {
@@ -5027,8 +5978,8 @@ mod tests {
             let config = test_config(&tmp);
             let mux = TestMux::default();
             seed_stream(&mux, 1, "oracle-stream");
-            let shard = build_test_shard(0, &config, mux);
-            let ctx = make_ctx(Rc::clone(&shard), TOTAL_SHARDS, Rc::new(config));
+            let shard = build_test_shard_in_mesh(0, &config, mux, TOTAL_SHARDS);
+            let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
             let stm = &shard.plane.metadata().mux_stm;
             let topic_ids = || {
                 stm.streams().read(|inner| {
@@ -5075,7 +6026,30 @@ mod tests {
                 ctx.pending.borrow()
             );
 
-            fill_pending(&ctx).await;
+            let cycle = repair_slices(&ctx).await;
+            assert_eq!(
+                (cycle.unmatched, ctx.pending.borrow().len()),
+                (0, 0),
+                "seed {seed}: a cycle on a converged shard must find nothing to remove"
+            );
+            assert_eq!(
+                (cycle.rows, cycle.mounted),
+                (
+                    shard.shards_table().namespaces().len(),
+                    shard.plane.partitions().len()
+                ),
+                "seed {seed}: the cycle must compare each routing row and each mounted partition"
+            );
+            assert_eq!(
+                (
+                    cycle.stored,
+                    shard.metrics().partitions_reconcile_repairs_value()
+                ),
+                (cycle.rows, 0),
+                "seed {seed}: each committed partition must have its row, with nothing to repair"
+            );
+
+            fill_pending(&ctx, FullRoundTrigger::LostChangeFeed).await;
             let mut counters = PassCounters::default();
             assert!(!visit_pending(&ctx, &mut counters).await);
             assert_eq!(
@@ -5108,14 +6082,14 @@ mod tests {
                 .map(|partition_id| assignment(partition_id, u64::from(partition_id) + 1))
                 .collect(),
         );
-        let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), TOTAL_SHARDS, Rc::new(config));
+        let shard = build_test_shard_in_mesh(0, &config, mux, TOTAL_SHARDS);
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let namespaces: Vec<_> = (0..PARTITIONS as usize)
             .map(|partition_id| IggyNamespace::new(0, 0, partition_id))
             .collect();
         let owners: BTreeSet<_> = namespaces
             .iter()
-            .map(|ns| calculate_shard_assignment(ns, u32::from(TOTAL_SHARDS)))
+            .map(|ns| ctx.partition_shards.shard_for(ns))
             .collect();
         assert_eq!(owners.len(), 2, "the topic must straddle both shards");
 
@@ -5160,7 +6134,6 @@ mod tests {
         let shard = build_test_shard(0, &config, mux);
         let ctx = Rc::new(ReconcilerCtx::new(
             Rc::clone(&shard),
-            1,
             Rc::new(config),
             CLUSTER_ID,
             0,
@@ -5191,8 +6164,8 @@ mod tests {
         assert_eq!(shard.plane.partitions().len(), 1);
     }
 
-    /// The periodic full reconcile repairs what no change announced and counts
-    /// it. A change announced in the same round is not counted.
+    /// The repair fixes what no change announced and counts it. A change
+    /// announced in the same round is not counted.
     #[compio::test]
     async fn given_unannounced_damage_when_the_repair_runs_should_fix_it_and_count_only_it() {
         let tmp = TempDir::new().unwrap();
@@ -5201,7 +6174,7 @@ mod tests {
         seed_stream(&mux, 1, "repair-stream");
         seed_topic(&mux, 2, 0, "repair-topic", vec![assignment(0, 1)]);
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         reconcile_pass(&ctx).await;
         let damaged = IggyNamespace::new(0, 0, 0);
@@ -5214,7 +6187,7 @@ mod tests {
             "announced-topic",
             vec![assignment(0, 2)],
         );
-        ctx.next_full_reconcile_at.set(Some(Instant::now()));
+        ctx.next_repair_at.set(Some(Instant::now()));
 
         reconcile_pass(&ctx).await;
         reconcile_pass(&ctx).await;
@@ -5234,9 +6207,11 @@ mod tests {
     }
 
     /// Changes an overflow pushed out of the feed can name any namespace, so
-    /// acting on them in a repair round under way is no repair.
+    /// what the round over a repair slice does after the overflow is no
+    /// repair, also for a namespace that only the slice named. The full fill
+    /// that the overflow starts also ends the repair cycle.
     #[compio::test]
-    async fn given_repair_round_when_the_feed_overflows_should_count_no_repair() {
+    async fn given_repair_slice_when_the_feed_overflows_should_count_no_repair() {
         const NODES: u8 = 3;
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
@@ -5245,7 +6220,6 @@ mod tests {
         let shard = build_test_shard(0, &config, mux);
         let ctx = Rc::new(ReconcilerCtx::new(
             Rc::clone(&shard),
-            1,
             Rc::new(config),
             CLUSTER_ID,
             0,
@@ -5260,10 +6234,26 @@ mod tests {
             Durability::Persisted,
             &[0],
         );
-        ctx.next_full_reconcile_at.set(Some(Instant::now()));
+        // Creates that the feed does not hand to the reconciler, so only the
+        // slice names their partitions.
+        let (revision, _) = streams.revision_and_partition_changes(None);
+        ctx.synced_revision.set(Some(revision));
+        ctx.next_repair_at.set(Some(Instant::now()));
         assert!(
             reconcile_once(&ctx).await,
-            "the builds must hold the repair round open"
+            "the builds must hold the round over the slice open"
+        );
+        let cycle = ctx.repair_cycle.get().expect("the cycle is under way");
+        assert_eq!((cycle.slices, cycle.stored), (1, DISK_VISITS_PER_PASS + 1));
+        assert!(
+            ctx.next_repair_at.get().is_none(),
+            "no repair step is due before the round over the slice ends"
+        );
+        let repairs_before_the_overflow = shard.metrics().partitions_reconcile_repairs_value();
+        assert_eq!(
+            repairs_before_the_overflow,
+            u64::try_from(DISK_VISITS_PER_PASS).unwrap(),
+            "each build of the first pass is a repair, and one partition of the slice is left"
         );
 
         let lost = IggyNamespace::new(0, 1, 0);
@@ -5281,14 +6271,895 @@ mod tests {
             "the overflow must push the create of `lost` out of the feed"
         );
 
+        fold_changes(&ctx).await;
+        let round = ctx
+            .full_round
+            .get()
+            .expect("the fill must start a full round");
+        assert_eq!(
+            (round.trigger, round.visits),
+            (FullRoundTrigger::LostChangeFeed, 0)
+        );
+        assert!(
+            ctx.repair_cycle.get().is_none(),
+            "a full fill must end the repair cycle"
+        );
         reconcile_pass(&ctx).await;
         reconcile_pass(&ctx).await;
 
-        assert!(shard.plane.partitions().contains(&lost));
+        assert!(ctx.full_round.get().is_none());
+        let partitions = shard.plane.partitions();
+        assert!(partitions.contains(&lost));
+        assert_eq!(partitions.len(), DISK_VISITS_PER_PASS + 2);
         assert_eq!(
             shard.metrics().partitions_reconcile_repairs_value(),
-            0,
+            repairs_before_the_overflow,
             "a change the feed lost is not one that no source announced"
+        );
+    }
+
+    /// The repair checks the committed tree a slice at a time. The work set
+    /// holds one slice, and a lost routing row comes back with the slice that
+    /// holds its partition.
+    #[compio::test]
+    async fn given_more_partitions_than_one_slice_when_the_repair_runs_should_check_them_slice_by_slice()
+     {
+        const SLICES: usize = 3;
+        let tmp = TempDir::new().unwrap();
+        let (shard, ctx) = build_routing_only_shard(&tmp, SLICES * STREAMS_PER_SLICE).await;
+        let rows = shard.shards_table();
+        let first = IggyNamespace::new(0, 0, 0);
+        let last = IggyNamespace::new(SLICES * STREAMS_PER_SLICE - 1, 0, 0);
+        rows.remove(&first);
+        rows.remove(&last);
+
+        ctx.next_repair_at.set(Some(Instant::now()));
+        fold_changes(&ctx).await;
+        assert_eq!(
+            ctx.pending.borrow().len(),
+            STREAMS_PER_SLICE,
+            "the work set must hold one slice"
+        );
+        reconcile_pass(&ctx).await;
+        assert_eq!(
+            (rows.shard_for(first), rows.shard_for(last)),
+            (Some(1), None),
+            "the first slice must rewrite only the row of its own partition"
+        );
+        assert!(
+            ctx.repair_only.borrow().is_empty(),
+            "the record of a slice must end with the round over it"
+        );
+
+        let cycle = repair_slices(&ctx).await;
+        assert_eq!(
+            (cycle.stored, cycle.rows, cycle.mounted, cycle.unmatched),
+            (SLICES * STREAMS_PER_SLICE, SLICES * STREAMS_PER_SLICE, 0, 0)
+        );
+        assert_eq!(
+            cycle.slices,
+            SLICES + 2,
+            "the slices of the tree, then one of the mounts and one of the rows"
+        );
+        assert_eq!(rows.shard_for(last), Some(1));
+        assert!(ctx.pending.borrow().is_empty());
+
+        let before = Instant::now();
+        repair_pass(&ctx).await;
+        assert!(
+            ctx.repair_cycle.get().is_none(),
+            "the step after the last slice must end the cycle"
+        );
+        assert!(
+            ctx.next_repair_at
+                .get()
+                .is_some_and(|at| at >= before + REPAIR_INTERVAL),
+            "the next cycle must wait for the repair interval"
+        );
+        assert!(ctx.full_round.get().is_none());
+        assert_eq!(shard.metrics().partitions_reconcile_repairs_value(), 2);
+    }
+
+    /// A repair slice starts a round. While a capped pass holds a round open,
+    /// a due slice waits, so the round resumes where it stopped.
+    #[compio::test]
+    async fn given_a_round_that_a_capped_pass_left_open_when_a_slice_is_due_should_wait_for_its_end()
+     {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        let partitions_count = DISK_VISITS_PER_PASS + 1;
+        seed_stream(&mux, 1, "stream-capped");
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
+        reconcile_pass(&ctx).await;
+        seed_topic(
+            &shard.plane.metadata().mux_stm,
+            2,
+            0,
+            "topic-capped",
+            (0..u32::try_from(partitions_count).unwrap())
+                .map(|partition_id| assignment(partition_id, u64::from(partition_id) + 1))
+                .collect(),
+        );
+        assert!(reconcile_once(&ctx).await, "the builds must cap the pass");
+        shard.apply_reconcile_ops();
+
+        ctx.next_repair_at.set(Some(Instant::now()));
+        assert!(
+            !reconcile_once(&ctx).await,
+            "the next pass must end the round"
+        );
+        assert!(
+            ctx.repair_cycle.get().is_none(),
+            "no slice may start while a round is open"
+        );
+        assert_eq!(shard.plane.partitions().len(), DISK_VISITS_PER_PASS);
+        shard.apply_reconcile_ops();
+
+        reconcile_pass(&ctx).await;
+        let cycle = ctx
+            .repair_cycle
+            .get()
+            .expect("the pass after the round must start the slice");
+        assert_eq!(cycle.stored, partitions_count);
+    }
+
+    /// A partition created behind the cursor of the walk over the tree
+    /// reaches its check through the feed. The walk over the rows then meets
+    /// its row, finds its committed partition, and counts no repair.
+    #[compio::test]
+    async fn given_a_partition_created_behind_the_cursor_when_the_cycle_goes_on_should_count_no_repair()
+     {
+        const STREAMS: usize = 2 * STREAMS_PER_SLICE;
+        let tmp = TempDir::new().unwrap();
+        let (shard, ctx) = build_routing_only_shard(&tmp, STREAMS).await;
+        repair_pass(&ctx).await;
+        let streams = u64::try_from(STREAMS).unwrap();
+        seed_topic(
+            &shard.plane.metadata().mux_stm,
+            2 * streams + 1,
+            0,
+            "late-topic",
+            vec![assignment(0, streams + 1)],
+        );
+
+        let cycle = repair_slices(&ctx).await;
+
+        assert_eq!(
+            (cycle.stored, cycle.rows, cycle.unmatched),
+            (STREAMS, STREAMS + 1, 0),
+            "only the walk over the rows meets the late partition"
+        );
+        assert_eq!(shard.metrics().partitions_reconcile_repairs_value(), 0);
+    }
+
+    /// A deleted partition keeps its routing row until the pump applies the
+    /// removal, and the work set holds its namespace until then. The walk
+    /// over the rows meets that row, and must not take the removal for a
+    /// repair.
+    #[compio::test]
+    async fn given_a_removal_that_the_pump_has_not_applied_when_the_repair_meets_its_row_should_count_no_repair()
+     {
+        let tmp = TempDir::new().unwrap();
+        let (shard, ctx) = build_routing_only_shard(&tmp, 2).await;
+        let deleted = IggyNamespace::new(0, 0, 0);
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 5, 0, 0);
+
+        // No pass applies an op, so the row stays through the whole cycle.
+        let mut cycle = None;
+        for _ in 0..REPAIR_PASSES_MAX {
+            ctx.next_repair_at.set(Some(Instant::now()));
+            reconcile_once(&ctx).await;
+            cycle = ctx.repair_cycle.get();
+            if cycle.is_none_or(|cycle| cycle.next.is_none()) {
+                break;
+            }
+        }
+        let cycle = cycle.expect("the cycle must be at its end, and not over");
+        assert_eq!(cycle.next, None);
+
+        assert_eq!((cycle.stored, cycle.rows, cycle.unmatched), (1, 2, 1));
+        assert_eq!(shard.shards_table().shard_for(deleted), Some(1));
+        assert_eq!(shard.metrics().partitions_reconcile_repairs_value(), 0);
+    }
+
+    /// A delete can commit after a pass read the feed and before its repair
+    /// slice reads the rows. The slice then meets a row that no change
+    /// announced yet. The feed holds the delete, so the removal is no repair.
+    #[compio::test]
+    async fn given_a_removal_that_no_pass_folded_when_the_repair_meets_its_row_should_count_no_repair()
+     {
+        let tmp = TempDir::new().unwrap();
+        let (shard, ctx) = build_routing_only_shard(&tmp, 2).await;
+        repair_passes_until(&ctx, |next| next == Some(RepairWalk::Routed(None))).await;
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 5, 1, 0);
+
+        repair_step(&ctx);
+        let mut counters = PassCounters::default();
+        assert!(!visit_pending(&ctx, &mut counters).await);
+
+        assert_eq!(counters.removed_routed, 1, "the round must remove the row");
+        assert_eq!(shard.metrics().partitions_reconcile_repairs_value(), 0);
+    }
+
+    /// A routing row of a committed partition that this node does not store
+    /// has nothing to route to here. The walk over the rows removes it, and
+    /// leaves the row of a partition that this node stores.
+    #[compio::test]
+    async fn given_a_routing_row_of_a_partition_this_node_does_not_store_when_the_repair_runs_should_remove_it()
+     {
+        const NODES: u8 = 3;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "placed-stream");
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = Rc::new(ReconcilerCtx::new(
+            Rc::clone(&shard),
+            Rc::new(config),
+            CLUSTER_ID,
+            0,
+            NODES,
+        ));
+        let streams = shard.plane.metadata().mux_stm.streams();
+        let stored_here = IggyNamespace::new(0, 0, 0);
+        let stored_elsewhere = IggyNamespace::new(0, 1, 0);
+        streams.seed_namespace_on(stored_here, 1, 0, Durability::Persisted, &[0]);
+        streams.seed_namespace_on(stored_elsewhere, 2, 0, Durability::Persisted, &[1, 2]);
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        let rows = shard.shards_table();
+        assert_eq!(
+            (
+                rows.shard_for(stored_here),
+                rows.shard_for(stored_elsewhere)
+            ),
+            (Some(0), None)
+        );
+        rows.insert(stored_elsewhere, PartitionLocation::new(ShardId::new(0), 2));
+
+        let cycle = repair_slices(&ctx).await;
+        reconcile_pass(&ctx).await;
+
+        assert_eq!((cycle.stored, cycle.rows, cycle.unmatched), (1, 2, 1));
+        assert_eq!(
+            (
+                rows.shard_for(stored_here),
+                rows.shard_for(stored_elsewhere)
+            ),
+            (Some(0), None)
+        );
+        assert_eq!(shard.metrics().partitions_reconcile_repairs_value(), 1);
+        assert!(ctx.pending.borrow().is_empty());
+    }
+
+    /// A mounted partition that committed metadata no longer holds, with no
+    /// routing row and no announced delete, is in no slice of the tree and
+    /// in no slice of the rows. The walk over the mounted partitions removes
+    /// it.
+    #[compio::test]
+    async fn given_a_mounted_partition_that_no_row_and_no_change_names_when_the_repair_runs_should_remove_it()
+     {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "ghost-stream");
+        seed_topic(&mux, 2, 0, "ghost-topic", vec![assignment(0, 1)]);
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
+        let partitions = shard.plane.partitions();
+        let ns = IggyNamespace::new(0, 0, 0);
+        let partition_dir = ctx.config.get_partition_path(0, 0, 0);
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        assert!(partitions.contains(&ns));
+
+        // A delete that the feed does not hand to the reconciler.
+        let mux = &shard.plane.metadata().mux_stm;
+        seed_delete_topic(mux, 3, 0, 0);
+        let (revision, _) = mux.streams().revision_and_partition_changes(None);
+        ctx.synced_revision.set(Some(revision));
+        shard.shards_table().remove(&ns);
+
+        let cycle = repair_slices(&ctx).await;
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+
+        assert_eq!(
+            (cycle.stored, cycle.mounted, cycle.rows, cycle.unmatched),
+            (0, 1, 0, 1)
+        );
+        assert!(!partitions.contains(&ns));
+        assert!(!Path::new(&partition_dir).exists());
+        assert!(ctx.full_round.get().is_none());
+        assert_eq!(shard.metrics().partitions_reconcile_repairs_value(), 1);
+    }
+
+    /// A partition that boot fenced stays committed and is never mounted, so
+    /// a shard can hold as many mounts as committed partitions and still hold
+    /// a stale one. The repair compares each mount by its namespace, and so
+    /// removes the mounted partition that committed metadata no longer holds.
+    #[compio::test]
+    async fn given_a_fenced_partition_that_is_not_mounted_when_the_repair_runs_should_remove_a_stale_mount()
+     {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "fenced-stream");
+        seed_topic(&mux, 2, 0, "stale-topic", vec![assignment(0, 1)]);
+        seed_topic(&mux, 3, 0, "fenced-topic", vec![assignment(0, 2)]);
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
+        let partitions = shard.plane.partitions();
+        let stale = IggyNamespace::new(0, 0, 0);
+        let fenced = IggyNamespace::new(0, 1, 0);
+        let stale_dir = ctx.config.get_partition_path(0, 0, 0);
+        // A boot-time damage verdict.
+        partitions.tombstone(fenced);
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        assert!(partitions.contains(&stale) && !partitions.contains(&fenced));
+
+        // A delete that the feed does not hand to the reconciler.
+        let mux = &shard.plane.metadata().mux_stm;
+        seed_delete_topic(mux, 4, 0, 0);
+        let (revision, _) = mux.streams().revision_and_partition_changes(None);
+        ctx.synced_revision.set(Some(revision));
+
+        let cycle = repair_slices(&ctx).await;
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+
+        assert_eq!(
+            (cycle.stored, cycle.mounted, cycle.unmatched),
+            (1, 1, 1),
+            "one committed partition and one mount, and the mount is not that partition"
+        );
+        assert!(!partitions.contains(&stale));
+        assert!(!Path::new(&stale_dir).exists());
+        assert_eq!(shard.shards_table().shard_for(stale), None);
+        assert!(
+            partitions.is_tombstoned(&fenced) && !partitions.contains(&fenced),
+            "the repair must leave the fenced partition as it is"
+        );
+        assert_eq!(shard.metrics().partitions_reconcile_repairs_value(), 1);
+    }
+
+    /// A change of another partition during a cycle must not hide a routing
+    /// row that no committed partition accounts for. The repair compares
+    /// each row by its namespace, so the row goes and only it is a repair.
+    #[compio::test]
+    async fn given_a_truncate_of_another_partition_when_the_repair_runs_should_remove_a_stale_routing_row()
+     {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "truncate-stream");
+        seed_topic(&mux, 2, 0, "truncate-topic", vec![assignment(0, 1)]);
+        let (shard, _lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        let rows = shard.shards_table();
+        let stale = IggyNamespace::new(7, 0, 0);
+        rows.insert(stale, PartitionLocation::new(ShardId::new(0), 1));
+
+        repair_pass(&ctx).await;
+        let truncated = IggyNamespace::new(0, 0, 0);
+        let stm = &shard.plane.metadata().mux_stm;
+        let created_revision = stm
+            .streams()
+            .created_revision_for_namespace(truncated)
+            .unwrap();
+        stm.update(build_prepare(
+            3,
+            Operation::TruncatePartition,
+            &TruncatePartitionRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partition_id: 0,
+                up_to_offset: 10,
+                expected_history: Some(created_revision),
+            },
+        ))
+        .expect("TruncatePartition apply succeeds");
+        let cycle = repair_slices(&ctx).await;
+        reconcile_pass(&ctx).await;
+
+        assert_eq!((cycle.stored, cycle.rows, cycle.unmatched), (1, 2, 1));
+        assert_eq!(
+            (rows.shard_for(stale), rows.shard_for(truncated)),
+            (None, Some(0))
+        );
+        assert!(ctx.full_round.get().is_none());
+        assert_eq!(
+            shard.metrics().partitions_reconcile_repairs_value(),
+            1,
+            "the announced truncate is no repair"
+        );
+    }
+
+    /// One topic can hold more partitions than a slice. The walk over the
+    /// tree then stops inside the topic and goes on after the last partition
+    /// it read, so the work set never takes the whole topic.
+    #[compio::test]
+    async fn given_a_topic_with_more_partitions_than_one_slice_when_the_repair_runs_should_go_on_inside_the_topic()
+     {
+        const PARTITIONS: usize = VISITS_PER_YIELD + VISITS_PER_YIELD / 2;
+        // The slot of the stream and the slot of the topic take two visits.
+        const FIRST_SLICE: usize = VISITS_PER_YIELD - 2;
+        let tmp = TempDir::new().unwrap();
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "wide-stream");
+        seed_topic(
+            &mux,
+            2,
+            0,
+            "wide-topic",
+            (0..u32::try_from(PARTITIONS).unwrap())
+                .map(|partition_id| assignment(partition_id, u64::from(partition_id) + 1))
+                .collect(),
+        );
+        let (shard, ctx) = routing_only_shard(&tmp, mux).await;
+        let rows = shard.shards_table();
+        let last = IggyNamespace::new(0, 0, PARTITIONS - 1);
+        rows.remove(&last);
+
+        ctx.next_repair_at.set(Some(Instant::now()));
+        fold_changes(&ctx).await;
+        assert_eq!(
+            ctx.pending.borrow().len(),
+            FIRST_SLICE,
+            "the work set must hold one slice, not the topic"
+        );
+        let cycle = ctx.repair_cycle.get().expect("the cycle is under way");
+        assert_eq!(
+            cycle.next,
+            Some(RepairWalk::Committed(TreePosition {
+                stream: 0,
+                topic: 0,
+                after_partition: Some(FIRST_SLICE - 1),
+            }))
+        );
+        reconcile_pass(&ctx).await;
+        assert_eq!(
+            rows.shard_for(last),
+            None,
+            "the first slice must not reach the last partition"
+        );
+
+        let cycle = repair_slices(&ctx).await;
+        assert_eq!((cycle.stored, cycle.rows), (PARTITIONS, PARTITIONS));
+        assert_eq!(rows.shard_for(last), Some(1));
+        assert_eq!(shard.metrics().partitions_reconcile_repairs_value(), 1);
+    }
+
+    /// The walk over the tree starts each stream at its first topic and each
+    /// topic at its first partition, whatever it read before, and passes the
+    /// slots of deleted streams and topics.
+    #[compio::test]
+    async fn given_deleted_streams_and_topics_when_the_repair_reads_the_tree_should_name_each_partition_once()
+     {
+        let tmp = TempDir::new().unwrap();
+        let mux = TestMux::default();
+        let partitions = |count: u32, first_group: u64| {
+            (0..count)
+                .map(|partition_id| assignment(partition_id, first_group + u64::from(partition_id)))
+                .collect::<Vec<_>>()
+        };
+        seed_stream(&mux, 1, "stream-0");
+        seed_topic(&mux, 2, 0, "topic-0", partitions(3, 1));
+        seed_topic(&mux, 3, 0, "topic-1", partitions(1, 4));
+        seed_topic(&mux, 4, 0, "topic-2", partitions(2, 5));
+        seed_stream(&mux, 5, "stream-1");
+        seed_topic(&mux, 6, 1, "topic-0", partitions(1, 7));
+        seed_stream(&mux, 7, "stream-2");
+        seed_topic(&mux, 8, 2, "topic-0", partitions(1, 8));
+        seed_topic(&mux, 9, 2, "topic-1", partitions(4, 9));
+        seed_delete_topic(&mux, 10, 0, 1);
+        seed_delete_stream(&mux, 11, 1);
+        let (_shard, ctx) = routing_only_shard(&tmp, mux).await;
+
+        let mut targets = Vec::new();
+        let next = read_committed_targets(&ctx, TreePosition::default(), &mut targets);
+
+        let expected: Vec<IggyNamespace> = [(0, 0, 3), (0, 2, 2), (2, 0, 1), (2, 1, 4)]
+            .into_iter()
+            .flat_map(|(stream, topic, count)| {
+                (0..count).map(move |partition| IggyNamespace::new(stream, topic, partition))
+            })
+            .collect();
+        assert_eq!((next, targets), (None, expected));
+    }
+
+    /// A deleted stream leaves its slot behind. The walk over the tree counts
+    /// each slot it reads, so a run of deleted streams ends a slice as a run
+    /// of partitions does.
+    #[compio::test]
+    async fn given_a_run_of_deleted_streams_when_the_repair_reads_the_tree_should_end_the_slice_inside_the_run()
+     {
+        const STREAMS: usize = VISITS_PER_YIELD + 2;
+        let tmp = TempDir::new().unwrap();
+        let (shard, ctx) = build_routing_only_shard(&tmp, STREAMS).await;
+        let mux = &shard.plane.metadata().mux_stm;
+        let streams = u32::try_from(STREAMS).unwrap();
+        for stream in 0..streams - 1 {
+            seed_delete_stream(mux, u64::from(2 * streams + 1 + stream), stream);
+        }
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        assert!(ctx.pending.borrow().is_empty());
+
+        repair_pass(&ctx).await;
+        let cycle = ctx.repair_cycle.get().expect("the cycle is under way");
+        assert_eq!(
+            (cycle.stored, cycle.next),
+            (
+                0,
+                Some(RepairWalk::Committed(TreePosition {
+                    stream: VISITS_PER_YIELD,
+                    ..TreePosition::default()
+                }))
+            ),
+            "the first slice must end after its budget of empty slots"
+        );
+
+        let cycle = repair_slices(&ctx).await;
+        assert_eq!((cycle.stored, cycle.rows, cycle.unmatched), (1, 1, 0));
+    }
+
+    /// A shard can mount more partitions than a slice holds. The walk over
+    /// the mounted partitions then goes on at the next slot, and reaches a
+    /// stale mount in the last one.
+    #[compio::test]
+    async fn given_more_mounted_partitions_than_one_slice_when_the_repair_runs_should_reach_a_stale_mount_in_the_last_slot()
+     {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        let first_slice = u32::try_from(VISITS_PER_YIELD).unwrap();
+        seed_stream(&mux, 1, "full-stream");
+        seed_topic(
+            &mux,
+            2,
+            0,
+            "full-topic",
+            (0..first_slice)
+                .map(|partition_id| assignment(partition_id, u64::from(partition_id) + 1))
+                .collect(),
+        );
+        seed_topic(
+            &mux,
+            3,
+            0,
+            "stale-topic",
+            vec![assignment(0, u64::from(first_slice) + 1)],
+        );
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
+        let partitions = shard.plane.partitions();
+        // A pass builds at most `DISK_VISITS_PER_PASS` partitions.
+        for _ in 0..=VISITS_PER_YIELD / DISK_VISITS_PER_PASS + 1 {
+            reconcile_pass(&ctx).await;
+        }
+        assert!(ctx.pending.borrow().is_empty());
+        let stale = IggyNamespace::new(0, 1, 0);
+        assert_eq!(
+            partitions.local_idx(&stale).map(|slot| *slot),
+            Some(VISITS_PER_YIELD),
+            "the stale partition must sit in the slot after the first slice"
+        );
+
+        // A delete that the feed does not hand to the reconciler.
+        let mux = &shard.plane.metadata().mux_stm;
+        seed_delete_topic(mux, 4, 0, 1);
+        let (revision, _) = mux.streams().revision_and_partition_changes(None);
+        ctx.synced_revision.set(Some(revision));
+
+        repair_passes_until(&ctx, |next| {
+            next == Some(RepairWalk::Mounted(VISITS_PER_YIELD))
+        })
+        .await;
+        assert!(
+            partitions.contains(&stale),
+            "the first slice of slots must end before the stale mount"
+        );
+        let cycle = repair_slices(&ctx).await;
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+
+        assert_eq!((cycle.mounted, cycle.unmatched), (VISITS_PER_YIELD + 1, 1));
+        assert!(!partitions.contains(&stale));
+        assert_eq!(partitions.len(), VISITS_PER_YIELD);
+    }
+
+    /// A shard can hold more routing rows than a slice. The walk over the
+    /// rows then goes on after the last row it read, and reaches a stale row
+    /// past the first slice.
+    #[compio::test]
+    async fn given_more_routing_rows_than_one_slice_when_the_repair_runs_should_reach_a_stale_row_past_the_first_slice()
+     {
+        const STREAMS: usize = VISITS_PER_YIELD + 2;
+        let tmp = TempDir::new().unwrap();
+        let (shard, ctx) = build_routing_only_shard(&tmp, STREAMS).await;
+        let rows = shard.shards_table();
+        let stale = IggyNamespace::new(STREAMS, 0, 0);
+        rows.insert(stale, PartitionLocation::new(ShardId::new(1), 1));
+
+        let cycle = repair_passes_until(&ctx, |next| {
+            matches!(next, Some(RepairWalk::Routed(Some(_))))
+        })
+        .await;
+        assert_eq!(
+            cycle.next,
+            Some(RepairWalk::Routed(Some(IggyNamespace::new(
+                VISITS_PER_YIELD - 1,
+                0,
+                0
+            )))),
+            "the rows are read in key order"
+        );
+        assert_eq!(
+            rows.shard_for(stale),
+            Some(1),
+            "the first slice of rows must end before the stale row"
+        );
+        let cycle = repair_slices(&ctx).await;
+        reconcile_pass(&ctx).await;
+
+        assert_eq!((cycle.rows, cycle.unmatched), (STREAMS + 1, 1));
+        assert_eq!(rows.shard_for(stale), None);
+        assert_eq!(shard.metrics().partitions_reconcile_repairs_value(), 1);
+    }
+
+    /// The work set can hold a backlog when a slice starts. The slice records
+    /// only the namespaces it added itself, so the record does not grow with
+    /// the backlog. A namespace that a change announced is not in it.
+    #[compio::test]
+    async fn given_a_backlog_in_the_work_set_when_a_slice_starts_should_record_only_what_the_slice_added()
+     {
+        const STREAMS: usize = 4;
+        let tmp = TempDir::new().unwrap();
+        let (_shard, ctx) = build_routing_only_shard(&tmp, STREAMS).await;
+        let stream = |stream| IggyNamespace::new(stream, 0, 0);
+        ctx.add_announced([stream(0), stream(8), stream(9)]);
+
+        repair_step(&ctx);
+
+        let recorded = || {
+            ctx.repair_only
+                .borrow()
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(recorded(), (1..STREAMS).map(stream).collect());
+        assert_eq!(ctx.pending.borrow().len(), STREAMS + 2);
+
+        ctx.add_announced([stream(1)]);
+        assert_eq!(
+            recorded(),
+            (2..STREAMS).map(stream).collect(),
+            "a change that names a namespace of the slice takes it out of the record"
+        );
+    }
+
+    /// A slice of the tree sweeps the keys of the streams it read. The key of
+    /// a stream whose delete no change announced goes with the slice that
+    /// reads the slot of that stream, and not with a slice before it.
+    #[compio::test]
+    async fn given_a_stream_key_that_no_change_removed_when_the_repair_reads_the_slot_of_its_stream_should_forget_it()
+     {
+        // Streams with no topic, one more than the slots the first slice reads.
+        let empty_streams = u32::try_from(VISITS_PER_YIELD).unwrap() + 1;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let context = key_context(CONFIG_KEY);
+        let mux = TestMux::default();
+        for stream in 0..empty_streams {
+            seed_stream(&mux, u64::from(stream) + 1, &format!("empty-{stream}"));
+        }
+        let op = u64::from(empty_streams) + 1;
+        seed_encrypted_stream(&mux, op, "encrypted", &wrap_stream_key(&context, 1));
+        seed_topic(&mux, op + 1, empty_streams, "topic", vec![assignment(0, 1)]);
+        let shard = build_test_shard_with_keys(0, &config, mux, context);
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
+        let partitions = shard.plane.partitions();
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        assert!(partitions.has_stream_keys());
+
+        // A delete that the feed does not hand to the reconciler.
+        let mux = &shard.plane.metadata().mux_stm;
+        seed_delete_stream(mux, op + 2, empty_streams);
+        let (revision, _) = mux.streams().revision_and_partition_changes(None);
+        ctx.synced_revision.set(Some(revision));
+
+        repair_pass(&ctx).await;
+        assert!(
+            partitions.has_stream_keys(),
+            "the first slice ends before the slot of the stream"
+        );
+        repair_pass(&ctx).await;
+        assert!(!partitions.has_stream_keys());
+    }
+
+    /// The first slice of a cycle also checks the few traces that no walk
+    /// reads: here the files of a namespace boot left unbuilt, whose delete
+    /// no change announced.
+    #[compio::test]
+    async fn given_an_unbuilt_namespace_that_no_change_names_when_a_cycle_starts_should_remove_its_files()
+     {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let partition_dir = config.get_partition_path(3, 0, 0);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "unbuilt-stream");
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
+        reconcile_pass(&ctx).await;
+        let ns = IggyNamespace::new(3, 0, 0);
+        std::fs::create_dir_all(&partition_dir).expect("files of a prior life");
+        ctx.mark_unbuilt([ns]);
+
+        repair_pass(&ctx).await;
+
+        assert!(!Path::new(&partition_dir).exists());
+        assert!(!shard.plane.partitions().is_tombstoned(&ns));
+        assert_eq!(shard.metrics().partitions_reconcile_repairs_value(), 1);
+    }
+
+    /// A repair slice asks for the group offset sweep of the partitions it
+    /// holds that are mounted here, and of no other.
+    #[compio::test]
+    async fn given_a_repair_slice_when_it_holds_mounted_partitions_should_mark_their_group_offsets()
+    {
+        const TOTAL_SHARDS: u16 = 2;
+        const PARTITIONS: u32 = 8;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "sweep-stream");
+        seed_topic(
+            &mux,
+            2,
+            0,
+            "sweep-topic",
+            (0..PARTITIONS)
+                .map(|partition_id| assignment(partition_id, u64::from(partition_id) + 1))
+                .collect(),
+        );
+        let shard = build_test_shard_in_mesh(0, &config, mux, TOTAL_SHARDS);
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        let partitions = shard.plane.partitions();
+        let mounted: BTreeSet<IggyNamespace> = partitions.namespaces().copied().collect();
+        assert!(
+            !mounted.is_empty() && mounted.len() < PARTITIONS as usize,
+            "the topic must straddle both shards"
+        );
+        assert!(partitions.take_consumer_group_offsets_dirty().is_empty());
+
+        ctx.next_repair_at.set(Some(Instant::now()));
+        fold_changes(&ctx).await;
+
+        assert_eq!(partitions.take_consumer_group_offsets_dirty(), mounted);
+    }
+
+    /// The shards of a node end their boot rounds together. Each then waits a
+    /// different share of the repair interval longer, so their cycles do not
+    /// end in the same second.
+    #[compio::test]
+    async fn given_the_shards_of_a_node_when_their_boot_rounds_end_should_start_their_repairs_apart()
+     {
+        const TOTAL_SHARDS: u16 = 4;
+        for shard_id in 0..TOTAL_SHARDS {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(&tmp);
+            let mux = TestMux::default();
+            seed_stream(&mux, 1, "offset-stream");
+            let shard = build_test_shard_in_mesh(shard_id, &config, mux, TOTAL_SHARDS);
+            let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
+
+            let before = Instant::now();
+            reconcile_pass(&ctx).await;
+            let after = Instant::now();
+
+            let wait =
+                REPAIR_INTERVAL + REPAIR_INTERVAL * u32::from(shard_id) / u32::from(TOTAL_SHARDS);
+            let first_cycle = ctx
+                .next_repair_at
+                .get()
+                .expect("the end of the boot round must set the first cycle");
+            assert!(
+                before + wait <= first_cycle && first_cycle <= after + wait,
+                "shard {shard_id}"
+            );
+        }
+    }
+
+    /// The task sleeps to the next repair step when that step is due before
+    /// the periodic tick, so the tick does not set the pace of a cycle. The
+    /// pass after the sleep takes the due step and moves the next one
+    /// forward, so a wait of zero cannot repeat.
+    #[compio::test]
+    async fn given_a_repair_cycle_when_the_task_sleeps_should_wake_for_the_next_slice() {
+        const PERIODIC: Duration = RECONCILE_PERIODIC_INTERVAL_MAX;
+        let tmp = TempDir::new().unwrap();
+        let (_shard, ctx) = build_routing_only_shard(&tmp, 1).await;
+        assert_eq!(
+            ctx.pass_delay(PERIODIC),
+            PERIODIC,
+            "the first cycle is further away than a tick"
+        );
+
+        repair_pass(&ctx).await;
+        let slices = ctx.repair_cycle.get().expect("the cycle started").slices;
+        assert!(
+            ctx.pass_delay(PERIODIC) <= REPAIR_SLICE_INTERVAL,
+            "the next slice is due before the tick"
+        );
+
+        let due = Instant::now();
+        ctx.next_repair_at.set(Some(due));
+        assert_eq!(ctx.pass_delay(PERIODIC), Duration::ZERO);
+        reconcile_pass(&ctx).await;
+        assert_eq!(
+            ctx.repair_cycle.get().expect("the cycle goes on").slices,
+            slices + 1,
+            "the pass after the sleep must take the due slice"
+        );
+        assert!(
+            ctx.next_repair_at.get().is_some_and(|next| next > due),
+            "the pass must move the next step forward"
+        );
+
+        repair_slices(&ctx).await;
+        repair_pass(&ctx).await;
+        assert!(ctx.repair_cycle.get().is_none(), "the cycle ended");
+        assert_eq!(
+            ctx.pass_delay(PERIODIC),
+            PERIODIC,
+            "the next cycle is further away than a tick"
+        );
+    }
+
+    /// A cycle of three slices that waits one tick per slice takes more than
+    /// a minute at the longest tick. The loop must run it without the tick.
+    #[compio::test]
+    async fn given_the_longest_tick_when_a_repair_cycle_is_due_should_run_every_slice_before_the_tick()
+     {
+        const CYCLE_TIME_MAX: Duration = Duration::from_secs(10);
+        let tmp = TempDir::new().unwrap();
+        let (_shard, ctx) = build_routing_only_shard(&tmp, 1).await;
+        let ctx = Rc::new(ctx);
+        ctx.next_repair_at.set(Some(Instant::now()));
+        let (_wake_tx, wake_rx) = shard::channel::<()>(1);
+        let (stop_tx, stop_rx) = shard::channel::<()>(1);
+        let task = compio::runtime::spawn(run_reconciler(
+            Rc::clone(&ctx),
+            wake_rx,
+            stop_rx,
+            RECONCILE_PERIODIC_INTERVAL_MAX,
+        ));
+
+        let cycle = compio::time::timeout(CYCLE_TIME_MAX, async {
+            let mut started = false;
+            while !started || ctx.repair_cycle.get().is_some() {
+                started |= ctx.repair_cycle.get().is_some();
+                compio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        stop_tx.try_send(()).expect("the stop channel has room");
+        task.await.expect("the reconciler task must not panic");
+
+        assert!(
+            cycle.is_ok(),
+            "the cycle must end within {CYCLE_TIME_MAX:?} at a tick of \
+             {RECONCILE_PERIODIC_INTERVAL_MAX:?}"
         );
     }
 
@@ -5305,7 +7176,7 @@ mod tests {
         seed_stream(&mux, 1, "trim-stream");
         seed_topic(&mux, 2, 0, "trim-topic", vec![assignment(0, 1)]);
         let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let trims = || {
             let mut trims = Vec::new();
             while let Ok(frame) = lanes.main.try_recv() {
@@ -5361,7 +7232,7 @@ mod tests {
         seed_stream(&mux, 1, "trim-stream");
         seed_topic(&mux, 2, 0, "trim-topic", vec![assignment(0, 1)]);
         let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let trims = || {
             let mut trims = Vec::new();
             while let Ok(frame) = lanes.main.try_recv() {
@@ -5449,7 +7320,7 @@ mod tests {
         seed_stream(&mux, 1, "retained-stream");
         seed_topic(&mux, 2, 0, "retained-topic", vec![assignment(0, 1)]);
         let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         reconcile_pass(&ctx).await;
         let namespace = IggyNamespace::new(0, 0, 0);
@@ -5601,6 +7472,157 @@ mod tests {
         ));
     }
 
+    /// Nothing else asks a partition that places its batches to delete the
+    /// objects its long-term log stopped listing. The pass carries no
+    /// truncation watermark, which does not bound those deletes.
+    #[compio::test]
+    async fn given_a_topic_that_places_its_batches_when_the_cleaner_passes_should_stage_a_delete_pass()
+     {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "placing-stream");
+        seed_topic(&mux, 2, 0, "placing-topic", vec![assignment(0, 1)]);
+        let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let deletes = || {
+            crate::segment_cleaner::stage_owned_partitions(&shard, &mut HashSet::new());
+            let mut deletes = Vec::new();
+            while let Ok(frame) = lanes.main.try_recv() {
+                if let shard::ShardFrame::Lifecycle(shard::LifecycleFrame::DeleteObjects {
+                    namespace,
+                    created_revision,
+                    committed_up_to,
+                    ..
+                }) = frame
+                {
+                    deletes.push((namespace, created_revision, committed_up_to));
+                }
+            }
+            deletes
+        };
+        assert_eq!(deletes(), []);
+        let partition = shard
+            .plane
+            .partitions()
+            .get_mut_by_ns(&namespace)
+            .expect("the reconciler materialized the partition");
+        let created_revision = partition.created_revision();
+        partition.set_runtime_options(iggy_common::TopicRuntimeOptions {
+            places_batches: true,
+            ..Default::default()
+        });
+
+        assert_eq!(deletes(), [(namespace, created_revision, 0)]);
+    }
+
+    /// The segments of a partition that places its batches hold where the
+    /// messages are, so the per-replica expiry of those is not its retention:
+    /// the cleaner stages the pass over its long-term segments in its place,
+    /// with a byte budget of at least one such segment. Any other partition
+    /// keeps the per-replica pass and the budget of its own segments.
+    #[compio::test]
+    async fn given_a_retention_policy_when_the_cleaner_passes_should_stage_long_term_retention_only_for_a_topic_that_places_its_batches()
+     {
+        const EXPIRY_MICROS: u64 = 60_000_000;
+        // The smallest cap a topic takes is one of its segments. Shared
+        // between this many partitions it is below a long-term segment.
+        const TOPIC_BYTES: u64 = iggy_common::DEFAULT_SEGMENT_SIZE;
+        const PARTITIONS: u32 = 32;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "placing-stream");
+        let assignments = (0..PARTITIONS)
+            .map(|partition| assignment(partition, u64::from(partition) + 1))
+            .collect();
+        seed_topic(&mux, 2, 0, "placing-topic", assignments);
+        let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 1024);
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let explicit: ResourceOptions = [
+            (OptionKey::MessageExpiry, HeaderValue::from(EXPIRY_MICROS)),
+            (OptionKey::MaxTopicSize, HeaderValue::from(TOPIC_BYTES)),
+        ]
+        .into_iter()
+        .map(|(key, value)| (HeaderKey::from(key), OptionValue::explicit(value)))
+        .collect();
+        let update = UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            name: None,
+            explicit_options: resource_options_to_wire(&explicit, OptionsProvenance::All)
+                .expect("options fit the wire"),
+            derived_options: WireOptions::empty(),
+        };
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .update(build_prepare(3, Operation::UpdateTopicResolved, &update))
+            .expect("UpdateTopic apply succeeds");
+        // The long-term retention passes the cleaner staged, and the byte
+        // budgets of the per-replica expiry passes that went with them.
+        let staged = || {
+            crate::segment_cleaner::stage_owned_partitions(&shard, &mut HashSet::new());
+            let mut long_term = Vec::new();
+            let mut expiry_budgets = Vec::new();
+            while let Ok(frame) = lanes.main.try_recv() {
+                match frame {
+                    shard::ShardFrame::Lifecycle(shard::LifecycleFrame::RetainLongTerm {
+                        namespace,
+                        created_revision,
+                        message_expiry,
+                        max_bytes,
+                        ..
+                    }) => long_term.push((namespace, created_revision, message_expiry, max_bytes)),
+                    shard::ShardFrame::Lifecycle(shard::LifecycleFrame::CleanPartition {
+                        max_bytes,
+                        ..
+                    }) => expiry_budgets.push(max_bytes),
+                    _ => {}
+                }
+            }
+            (long_term, expiry_budgets)
+        };
+        let expiry = IggyExpiry::ExpireDuration(IggyDuration::from(EXPIRY_MICROS));
+        let long_term_segment = partitions::LONG_TERM_SEGMENT_BYTES as u64;
+
+        let (long_term, expiry_budgets) = staged();
+        assert_eq!(long_term, []);
+        assert_eq!(expiry_budgets.len(), PARTITIONS as usize);
+        assert!(
+            expiry_budgets
+                .iter()
+                .all(|budget| budget.is_some_and(|budget| budget >= TOPIC_BYTES)),
+            "a partition of whole batches keeps at least one of its own segments: \
+             {expiry_budgets:?}"
+        );
+
+        let partition = shard
+            .plane
+            .partitions()
+            .get_mut_by_ns(&namespace)
+            .expect("the reconciler materialized the partition");
+        let created_revision = partition.created_revision();
+        partition.set_runtime_options(iggy_common::TopicRuntimeOptions {
+            places_batches: true,
+            ..Default::default()
+        });
+
+        let (long_term, expiry_budgets) = staged();
+        assert_eq!(
+            long_term,
+            [(namespace, created_revision, expiry, Some(long_term_segment))]
+        );
+        assert_eq!(expiry_budgets.len(), PARTITIONS as usize - 1);
+    }
+
     /// An evicted segment is read back from the store, so the cleaner stages
     /// an eviction only while the node reads remote segments and passes the
     /// store identity check.
@@ -5612,7 +7634,7 @@ mod tests {
         seed_stream(&mux, 1, "evicted-stream");
         seed_topic(&mux, 2, 0, "evicted-topic", vec![assignment(0, 1)]);
         let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         reconcile_pass(&ctx).await;
         let namespace = IggyNamespace::new(0, 0, 0);
@@ -5659,6 +7681,96 @@ mod tests {
         assert_eq!(evictions(), [namespace]);
         frontier.set_store_identity_verified(false);
         assert_eq!(evictions(), Vec::<IggyNamespace>::new());
+    }
+
+    /// The delete pass of a tiered partition waits for a manifest that no
+    /// longer lists what it removes, so the cleaner stages the manifest pass
+    /// first. A shard without a publisher drops the pass, so it is staged
+    /// whether or not the node can tier topics.
+    #[compio::test]
+    async fn given_a_tiered_topic_when_the_cleaner_stages_its_passes_should_stage_the_manifest_ahead_of_the_object_deletes()
+     {
+        #[derive(Debug, PartialEq, Eq)]
+        enum Pass {
+            Manifest(IggyNamespace, u64),
+            Deletes(IggyNamespace, u64),
+        }
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "manifest-stream");
+        seed_topic(&mux, 2, 0, "manifest-topic", vec![assignment(0, 1)]);
+        let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        let namespace = IggyNamespace::new(0, 0, 0);
+        assert!(shard.plane.partitions().contains(&namespace));
+        let passes = || {
+            crate::segment_cleaner::stage_owned_partitions(&shard, &mut HashSet::new());
+            let mut passes = Vec::new();
+            while let Ok(frame) = lanes.main.try_recv() {
+                match frame {
+                    shard::ShardFrame::Lifecycle(shard::LifecycleFrame::PublishManifest {
+                        namespace,
+                        created_revision,
+                        ..
+                    }) => passes.push(Pass::Manifest(namespace, created_revision)),
+                    shard::ShardFrame::Lifecycle(shard::LifecycleFrame::DeleteObjects {
+                        namespace,
+                        created_revision,
+                        ..
+                    }) => passes.push(Pass::Deletes(namespace, created_revision)),
+                    _ => {}
+                }
+            }
+            passes
+        };
+        assert_eq!(passes(), [], "a topic that is not tiered has no manifest");
+
+        let explicit: ResourceOptions = std::iter::once((
+            HeaderKey::from(OptionKey::TieredStorage),
+            OptionValue::explicit(HeaderValue::from(true)),
+        ))
+        .collect();
+        let enable = UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            name: None,
+            explicit_options: resource_options_to_wire(&explicit, OptionsProvenance::All)
+                .expect("options fit the wire"),
+            derived_options: WireOptions::empty(),
+        };
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .update(build_prepare(3, Operation::UpdateTopicResolved, &enable))
+            .expect("UpdateTopic apply succeeds");
+        let created_revision = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(namespace)
+            .expect("the partition has an incarnation");
+
+        let expected = [
+            Pass::Manifest(namespace, created_revision),
+            Pass::Deletes(namespace, created_revision),
+        ];
+        assert!(
+            !shard
+                .plane
+                .metadata()
+                .applied_frontier()
+                .tiered_storage_ready()
+        );
+        assert_eq!(passes(), expected);
+        let frontier = shard.plane.metadata().applied_frontier();
+        frontier.set_store_identity_verified(true);
+        frontier.set_tiered_storage_ready(true);
+        assert_eq!(passes(), expected);
     }
 
     /// The mixed-version upgrade hole from IGGY-250, at the router seam this
@@ -5803,7 +7915,6 @@ mod tests {
         // The repair peer must be a member of the group it repairs from.
         let ctx = Rc::new(ReconcilerCtx::new(
             Rc::clone(&shard),
-            1,
             Rc::new(config),
             CLUSTER_ID,
             0,
@@ -5945,7 +8056,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-wedge", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         reconcile_pass(&ctx).await;
         let ns = IggyNamespace::new(0, 0, 0);
@@ -6033,7 +8144,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-defer", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         reconcile_pass(&ctx).await;
         let ns = IggyNamespace::new(0, 0, 0);
@@ -6081,7 +8192,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-fence", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
         let partitions = shard.plane.partitions();
         // Boot-fence shape: the verdict lands during partition load, before
@@ -6126,7 +8237,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-fence-exit", vec![assignment(0, 1)]);
 
         let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
         let partitions = shard.plane.partitions();
         let mux = &shard.plane.metadata().mux_stm;
@@ -6227,7 +8338,6 @@ mod tests {
         let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
         let ctx = Rc::new(ReconcilerCtx::new(
             Rc::clone(&shard),
-            1,
             Rc::new(config),
             CLUSTER_ID,
             0,
@@ -6293,7 +8403,6 @@ mod tests {
         let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
         let ctx = Rc::new(ReconcilerCtx::new(
             Rc::clone(&shard),
-            1,
             Rc::new(config),
             CLUSTER_ID,
             0,
@@ -6403,7 +8512,6 @@ mod tests {
         let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
         let ctx = Rc::new(ReconcilerCtx::new(
             Rc::clone(&shard),
-            1,
             Rc::new(config),
             CLUSTER_ID,
             0,
@@ -6455,7 +8563,7 @@ mod tests {
         seed_stream(&mux, 1, "stream");
         seed_topic(&mux, TOPIC_OP, 0, "topic", vec![assignment(0, 1)]);
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         reconcile_pass(&ctx).await;
 
@@ -6490,7 +8598,7 @@ mod tests {
         seed_stream(&mux, 1, "stream");
         seed_topic(&mux, 2, 0, "old", vec![assignment(0, 1)]);
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let namespace = IggyNamespace::new(0, 0, 0);
         let old_revision = shard
             .plane
@@ -6551,7 +8659,7 @@ mod tests {
             );
         }
         let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let stm = &shard.plane.metadata().mux_stm;
         let namespaces: Vec<_> = (0..TOPICS)
             .flat_map(|topic_id| {
@@ -6625,7 +8733,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-fence-hold", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
         let partitions = shard.plane.partitions();
         partitions.tombstone(ns);
@@ -6660,7 +8768,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-race", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
         let partitions = shard.plane.partitions();
 
@@ -6710,7 +8818,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-defer-skip", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         reconcile_pass(&ctx).await;
         let ns = IggyNamespace::new(0, 0, 0);
@@ -6781,7 +8889,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-quarantine", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
         let partitions = shard.plane.partitions();
 
@@ -6821,7 +8929,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-lost-row", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
         let partitions = shard.plane.partitions();
         let partition_dir = ctx.config.get_partition_path(0, 0, 0);
@@ -6864,7 +8972,7 @@ mod tests {
         seed_create_consumer_group(&mux, 3, 0, 0, "deleted");
         seed_delete_consumer_group(&mux, 4, 0, 0, 0);
         let (shard, _inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         let namespace = IggyNamespace::new(0, 0, 0);
         install_deleted_group_owner(&shard, namespace, 0, 4).await;
@@ -6944,7 +9052,7 @@ mod tests {
         .expect("JoinConsumerGroup apply succeeds");
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
         let rebalancing_timeout = config.consumer_group.rebalancing_timeout.as_micros();
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         drain_partition_submits(&inbox);
         let now = iggy_common::IggyTimestamp::now().as_micros();
@@ -6978,7 +9086,7 @@ mod tests {
         seed_pending_join(&mux, 4, 0, 0, 0, 100);
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
         let rebalancing_timeout = config.consumer_group.rebalancing_timeout.as_micros();
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         drain_partition_submits(&inbox);
         let now = iggy_common::IggyTimestamp::now().as_micros();
@@ -7019,7 +9127,7 @@ mod tests {
         seed_join_consumer_group(&mux, 4, 0, 0, 0, CLIENT_ID);
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
         let rebalancing_timeout = config.consumer_group.rebalancing_timeout.as_micros();
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         drain_partition_submits(&inbox);
         let stm = &shard.plane.metadata().mux_stm;
@@ -7073,7 +9181,7 @@ mod tests {
         seed_join_consumer_group(&mux, 4, 0, 0, GROUP_ID, FIRST_CLIENT);
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
         let timeout = config.consumer_group.rebalancing_timeout.as_micros();
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         drain_partition_submits(&inbox);
         let stm = &shard.plane.metadata().mux_stm;
@@ -7127,7 +9235,7 @@ mod tests {
         seed_stream(&mux, 1, "stream");
         seed_topic(&mux, 2, 0, "topic", vec![assignment(0, 1)]);
         let (shard, _inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         let namespace = IggyNamespace::new(0, 0, 0);
         install_deleted_group_owner(&shard, namespace, 0, 4).await;
@@ -7178,7 +9286,7 @@ mod tests {
             .collect();
         seed_topic(&mux, 2, 0, "batch-topic", assignments);
         let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 64);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         let wakes = Rc::new(Cell::new(0));
         let counter = Rc::clone(&wakes);
@@ -7266,7 +9374,7 @@ mod tests {
         seed_delete_consumer_group(&mux, DELETED_REMOVAL_OP, 0, 0, DELETED_GROUP);
         seed_consumer_group_deletion_intent(&mux, DELETING_INTENT_OP, 0, 0, DELETING_GROUP);
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         let namespace = IggyNamespace::new(0, 0, 0);
         install_deleted_group_owner(&shard, namespace, DELETED_GROUP, DELETED_REMOVAL_OP).await;
@@ -7352,7 +9460,7 @@ mod tests {
         seed_delete_consumer_group(&mux, FIRST_REMOVAL_OP, 0, 0, GROUP_WITH_OFFSET);
         seed_delete_consumer_group(&mux, SECOND_REMOVAL_OP, 0, 0, GROUP_WITHOUT_OFFSET);
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         let namespace = IggyNamespace::new(0, 0, 0);
         install_deleted_group_owner(&shard, namespace, GROUP_WITH_OFFSET, FIRST_REMOVAL_OP).await;
@@ -7412,7 +9520,6 @@ mod tests {
         let shard = build_test_shard(0, &config, mux);
         let ctx = Rc::new(ReconcilerCtx::new(
             Rc::clone(&shard),
-            1,
             Rc::new(config),
             CLUSTER_ID,
             0,
@@ -7487,7 +9594,7 @@ mod tests {
         seed_delete_consumer_group(&mux, STRANDED_REMOVAL_OP, 0, 0, STRANDED_GROUP);
         seed_delete_consumer_group(&mux, FREE_REMOVAL_OP, 0, 0, FREE_GROUP);
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         let namespace = IggyNamespace::new(0, 0, 0);
         install_deleted_group_owner(&shard, namespace, STRANDED_GROUP, STRANDED_REMOVAL_OP).await;
@@ -7535,7 +9642,7 @@ mod tests {
         seed_create_consumer_group(&mux, 3, 0, 0, "retired");
         seed_delete_consumer_group(&mux, REMOVAL_OP, 0, 0, RETIRED_GROUP);
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         let namespace = IggyNamespace::new(0, 0, 0);
         install_deleted_group_owner(&shard, namespace, RETIRED_GROUP, REMOVAL_OP).await;
@@ -7590,7 +9697,7 @@ mod tests {
         }
         let (shard, inbox) =
             build_test_shard_with_inbox(0, &config, mux, GROUP_OFFSET_DELETES_PER_PASS + 8);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         let namespace = IggyNamespace::new(0, 0, 0);
         for group in 0..groups {
@@ -7670,7 +9777,7 @@ mod tests {
         }
         seed_delete_consumer_group(&mux, delete_op, 0, 0, DELETED_GROUP);
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         let namespaces = [IggyNamespace::new(0, 0, 0), IggyNamespace::new(0, 0, 1)];
         for namespace in namespaces {
@@ -7716,7 +9823,7 @@ mod tests {
         seed_create_consumer_group(&mux, 3, 0, 0, "deleted");
         seed_delete_consumer_group(&mux, REMOVAL_OP, 0, 0, DELETED_GROUP);
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, INBOX_CAPACITY);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         drain_partition_submits(&inbox);
         let namespace = IggyNamespace::new(0, 0, 0);
@@ -7761,7 +9868,7 @@ mod tests {
         seed_stream(&mux, 1, "stream");
         seed_topic(&mux, 2, 0, "topic", vec![assignment(0, 1)]);
         let (shard, _inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         shard
             .plane
@@ -7795,7 +9902,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-cg", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
 
         let ns = IggyNamespace::new(0, 0, 0);
@@ -8010,7 +10117,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-reclaim", vec![assignment(0, 1)]);
 
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 8);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
 
         // No pass yet, so the namespace is committed but unmaterialised.
@@ -8063,7 +10170,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-known", vec![assignment(0, 1)]);
 
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 8);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         // Topic slab 1 does not exist yet, so there is no committed
         // `created_revision` to stamp: the frame parks with `epoch: None`.
@@ -8127,7 +10234,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-bytes", vec![assignment(0, 1)]);
 
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 16);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         // Drain path 1: materialisation re-dispatches.
         let late = IggyNamespace::new(0, 1, 0);
@@ -8188,7 +10295,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-known", vec![assignment(0, 1)]);
 
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 8);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         // The primary replicates ahead of this node's metadata: topic slab 1 is
         // not committed here yet, so the prepare parks with `epoch: None`.
@@ -8241,7 +10348,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-first", vec![assignment(0, 1)]);
 
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 8);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
 
         // Parked against the FIRST incarnation, so it carries that revision.
@@ -8294,7 +10401,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-restamp-first", vec![assignment(0, 1)]);
 
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 8);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
 
         // Parked against the FIRST incarnation, so it carries that revision.
@@ -8382,7 +10489,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-order", vec![assignment(0, 1)]);
 
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 8);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
 
         park_one_prepare(&shard, ns, 5).await;
@@ -8436,7 +10543,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-park", vec![assignment(0, 1)]);
 
         let (shard, _inbox) = build_test_shard_with_inbox(0, &config, mux, 8);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         reconcile_pass(&ctx).await;
         assert!(
@@ -8480,7 +10587,7 @@ mod tests {
                 .collect(),
         );
         let (shard, _inbox) = build_test_shard_with_inbox(0, &config, mux, 8);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let parked = IggyNamespace::new(0, 0, last_partition);
         park_one_request(&shard, parked).await;
         assert_eq!(shard.parked_frame_count(parked), 1);
@@ -8522,7 +10629,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-backoff", vec![assignment(0, 1)]);
 
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 16);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
 
         park_one_request(&shard, ns).await;
@@ -8590,7 +10697,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-epoch", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
 
         // Parked against the first incarnation, before any pass builds it.
@@ -9082,7 +11189,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-tombstone-park", vec![assignment(0, 1)]);
 
         let (shard, _inbox) = build_test_shard_with_inbox(0, &config, mux, 8);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
 
         park_one_request(&shard, ns).await;
@@ -9139,20 +11246,30 @@ mod tests {
     /// cross-core path, which only happens for namespaces the connection's shard
     /// does not own. That property is a murmur3 outcome, invisible from the
     /// integration test itself: it would stay green while silently degrading to
-    /// single-shard if the hash or the shard count changed. Pin it here, where
-    /// the assignment is a pure function, over the namespaces that test creates
-    /// (stream 0, topics 0..8, partition 0 - the slab keys the STM hands out).
+    /// single-shard if the hash, the shard count or the partition placement
+    /// changed. Pin it here, where the assignment is a pure function, over the
+    /// namespaces that test creates on its three shards (stream 0, topics 0..8,
+    /// partition 0 - the slab keys the STM hands out), for each placement it
+    /// runs: with shard 0 as a partition owner, and with partitions kept off it.
     #[test]
-    fn integration_topic_set_straddles_both_shards() {
-        let owners: Vec<u16> = (0..8)
-            .map(|topic_id| calculate_shard_assignment(&IggyNamespace::new(0, topic_id, 0), 2))
-            .collect();
-        let on_shard_one = owners.iter().filter(|owner| **owner == 1).count();
-        assert!(
-            on_shard_one > 0 && on_shard_one < owners.len(),
-            "the integration test's topics must land on both shards, else it \
-             silently stops covering the cross-core path; got {owners:?}"
-        );
+    fn given_the_integration_topics_when_placed_on_three_shards_should_straddle_shards() {
+        const SHARDS: u16 = 3;
+        const TOPICS: usize = 8;
+        for (skip_shard_zero, expected_owners) in [
+            (false, BTreeSet::from([0, 1, 2])),
+            (true, BTreeSet::from([1, 2])),
+        ] {
+            let placement = PartitionShards::new(SHARDS, skip_shard_zero);
+            let owners: BTreeSet<u16> = (0..TOPICS)
+                .map(|topic_id| placement.shard_for(&IggyNamespace::new(0, topic_id, 0)))
+                .collect();
+            assert_eq!(
+                owners, expected_owners,
+                "skip_shard_zero = {skip_shard_zero}: the integration test's topics must land \
+                 on more than one partition shard, else it silently stops covering the \
+                 cross-core path"
+            );
+        }
     }
 
     fn park_overflow_count(shard: &TestShard) -> u64 {

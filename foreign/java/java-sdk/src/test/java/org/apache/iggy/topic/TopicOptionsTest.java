@@ -59,6 +59,16 @@ class TopicOptionsTest {
                 .tieredStorage(false)
                 .localRetentionAge(BigInteger.valueOf(21_600_000_000L))
                 .localRetentionSize(BigInteger.valueOf(10_737_418_240L))
+                .topicType(TopicType.GEO)
+                .geoMode(GeoMode.GEO_TIERED)
+                .freshUploadInterval(BigInteger.valueOf(50_000))
+                .consumerOffsetUploadInterval(BigInteger.valueOf(20_000))
+                .positionsPublishInterval(BigInteger.valueOf(2_000_000))
+                .tombstoneGrace(BigInteger.valueOf(3_600_000_000L))
+                .positionsResumeTimeout(BigInteger.valueOf(30_000_000))
+                .longTermRewriteMaxInterval(BigInteger.valueOf(20_000_000))
+                .readCacheSize(BigInteger.valueOf(16_777_216))
+                .readAhead(BigInteger.valueOf(1_048_576))
                 .build()
                 .entries();
 
@@ -74,7 +84,30 @@ class TopicOptionsTest {
                         "segment_max_age",
                         "tiered_storage",
                         "local_retention_age",
-                        "local_retention_size");
+                        "local_retention_size",
+                        "topic_type",
+                        "geo_mode",
+                        "fresh_upload_interval",
+                        "consumer_offset_upload_interval",
+                        "positions_publish_interval",
+                        "tombstone_grace",
+                        "positions_resume_timeout",
+                        "long_term_rewrite_max_interval",
+                        "read_cache_size",
+                        "read_ahead");
+        assertThat(options.get("fresh_upload_interval")).isEqualTo(HeaderValue.fromUint64(BigInteger.valueOf(50_000)));
+        assertThat(options.get("consumer_offset_upload_interval"))
+                .isEqualTo(HeaderValue.fromUint64(BigInteger.valueOf(20_000)));
+        assertThat(options.get("positions_publish_interval"))
+                .isEqualTo(HeaderValue.fromUint64(BigInteger.valueOf(2_000_000)));
+        assertThat(options.get("tombstone_grace"))
+                .isEqualTo(HeaderValue.fromUint64(BigInteger.valueOf(3_600_000_000L)));
+        assertThat(options.get("positions_resume_timeout"))
+                .isEqualTo(HeaderValue.fromUint64(BigInteger.valueOf(30_000_000)));
+        assertThat(options.get("long_term_rewrite_max_interval"))
+                .isEqualTo(HeaderValue.fromUint64(BigInteger.valueOf(20_000_000)));
+        assertThat(options.get("read_cache_size")).isEqualTo(HeaderValue.fromUint64(BigInteger.valueOf(16_777_216)));
+        assertThat(options.get("read_ahead")).isEqualTo(HeaderValue.fromUint64(BigInteger.valueOf(1_048_576)));
         assertThat(options.get("segment_size").kind()).isEqualTo(HeaderKind.Uint64);
         assertThat(options.get("messages_required_to_save").kind()).isEqualTo(HeaderKind.Uint32);
         assertThat(options.get("size_of_messages_required_to_save").kind()).isEqualTo(HeaderKind.Uint64);
@@ -89,8 +122,47 @@ class TopicOptionsTest {
         assertThat(options.get("local_retention_age").asUint64()).isEqualTo(BigInteger.valueOf(21_600_000_000L));
         assertThat(options.get("local_retention_size").kind()).isEqualTo(HeaderKind.Uint64);
         assertThat(options.get("local_retention_size").asUint64()).isEqualTo(BigInteger.valueOf(10_737_418_240L));
+        assertThat(options.get("topic_type").kind()).isEqualTo(HeaderKind.String);
+        assertThat(options.get("topic_type").toStringValue()).isEqualTo("geo");
+        assertThat(options.get("geo_mode").kind()).isEqualTo(HeaderKind.String);
+        assertThat(options.get("geo_mode").toStringValue()).isEqualTo("geo_tiered");
         // Little-endian, so the low byte of 128 MiB leads and the high bytes are zero.
         assertThat(options.get("segment_size").value()).containsExactly(0, 0, 0, 8, 0, 0, 0, 0);
+    }
+
+    @Test
+    void shouldSendAZeroDurationOfAGeoTopicAndLeaveAnUnsetOneOut() {
+        var options = TopicOptions.builder()
+                .topicType(TopicType.GEO)
+                .freshUploadInterval(BigInteger.ZERO)
+                .positionsResumeTimeout(BigInteger.ZERO)
+                .messageExpiry(BigInteger.ZERO)
+                .build()
+                .entries();
+
+        // A zero expiry leaves the key to the server default, while a zero duration of a geo topic is a value.
+        assertThat(options)
+                .containsOnlyKeys(
+                        "durability",
+                        "consumer_offset_durability",
+                        "topic_type",
+                        "fresh_upload_interval",
+                        "positions_resume_timeout");
+        assertThat(options.get("fresh_upload_interval")).isEqualTo(HeaderValue.fromUint64(BigInteger.ZERO));
+        assertThat(options.get("positions_resume_timeout")).isEqualTo(HeaderValue.fromUint64(BigInteger.ZERO));
+    }
+
+    @Test
+    void shouldSendAZeroReadCacheSizeAndLeaveAnUnsetOneOut() {
+        var options = TopicOptions.builder()
+                .readAhead(BigInteger.ZERO)
+                .maxTopicSize(BigInteger.ZERO)
+                .build()
+                .entries();
+
+        // A zero size cap leaves the key to the server default, while a zero read cache size is a value.
+        assertThat(options).containsOnlyKeys("durability", "consumer_offset_durability", "read_ahead");
+        assertThat(options.get("read_ahead")).isEqualTo(HeaderValue.fromUint64(BigInteger.ZERO));
     }
 
     @Test

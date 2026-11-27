@@ -28,7 +28,11 @@ import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.stream.StreamOptionKey;
 import org.apache.iggy.stream.StreamUpdate;
 import org.apache.iggy.system.OptionKey;
+import org.apache.iggy.topic.CompressionAlgorithm;
+import org.apache.iggy.topic.Durability;
 import org.apache.iggy.topic.TopicOptionKey;
+import org.apache.iggy.topic.TopicOptions;
+import org.apache.iggy.topic.TopicType;
 import org.apache.iggy.topic.TopicUpdate;
 import org.apache.iggy.user.UserOptionKey;
 import org.apache.iggy.user.UserStatus;
@@ -46,6 +50,7 @@ import java.util.Base64;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.function.Consumer;
@@ -146,7 +151,53 @@ public final class ResourceOptionsFixture {
         text(input, "name").ifPresent(builder::name);
         text(input, "message_expiry").map(BigInteger::new).ifPresent(builder::messageExpiry);
         text(input, "max_topic_size").map(BigInteger::new).ifPresent(builder::maxTopicSize);
+        text(input, "fresh_upload_interval").map(BigInteger::new).ifPresent(builder::freshUploadInterval);
+        text(input, "consumer_offset_upload_interval")
+                .map(BigInteger::new)
+                .ifPresent(builder::consumerOffsetUploadInterval);
+        text(input, "positions_publish_interval").map(BigInteger::new).ifPresent(builder::positionsPublishInterval);
+        text(input, "tombstone_grace").map(BigInteger::new).ifPresent(builder::tombstoneGrace);
+        text(input, "positions_resume_timeout").map(BigInteger::new).ifPresent(builder::positionsResumeTimeout);
+        text(input, "long_term_rewrite_max_interval")
+                .map(BigInteger::new)
+                .ifPresent(builder::longTermRewriteMaxInterval);
+        text(input, "read_cache_size").map(BigInteger::new).ifPresent(builder::readCacheSize);
+        text(input, "read_ahead").map(BigInteger::new).ifPresent(builder::readAhead);
         resetKeys(input, TopicOptionKey.class, builder::rawReset).forEach(builder::reset);
+        return builder.build();
+    }
+
+    /**
+     * The typed create options a {@code create_topic} vector's {@code input} describes. An input field this
+     * runner does not know fails the vector, so a new fixture field cannot be skipped unnoticed.
+     */
+    @SuppressWarnings("checkstyle:CyclomaticComplexity")
+    public static TopicOptions topicOptions(JsonNode input) {
+        var builder = TopicOptions.builder();
+        for (Map.Entry<String, JsonNode> field : input.properties()) {
+            String text = field.getValue().asString();
+            switch (field.getKey()) {
+                case "stream_id", "name", "partitions_count" -> {
+                    // Request fields of the create command, not options.
+                }
+                case "compression_algorithm" -> builder.compressionAlgorithm(named(CompressionAlgorithm.class, text));
+                case "message_expiry" -> builder.messageExpiry(new BigInteger(text));
+                case "max_topic_size" -> builder.maxTopicSize(new BigInteger(text));
+                case "segment_size" -> builder.segmentSize(new BigInteger(text));
+                case "durability" -> builder.durability(named(Durability.class, text));
+                case "consumer_offset_durability" -> builder.consumerOffsetDurability(named(Durability.class, text));
+                case "topic_type" -> builder.topicType(named(TopicType.class, text));
+                case "fresh_upload_interval" -> builder.freshUploadInterval(new BigInteger(text));
+                case "consumer_offset_upload_interval" -> builder.consumerOffsetUploadInterval(new BigInteger(text));
+                case "positions_publish_interval" -> builder.positionsPublishInterval(new BigInteger(text));
+                case "tombstone_grace" -> builder.tombstoneGrace(new BigInteger(text));
+                case "positions_resume_timeout" -> builder.positionsResumeTimeout(new BigInteger(text));
+                case "long_term_rewrite_max_interval" -> builder.longTermRewriteMaxInterval(new BigInteger(text));
+                case "read_cache_size" -> builder.readCacheSize(new BigInteger(text));
+                case "read_ahead" -> builder.readAhead(new BigInteger(text));
+                default -> throw new IllegalArgumentException("create_topic input field " + field.getKey());
+            }
+        }
         return builder.build();
     }
 
@@ -172,6 +223,16 @@ public final class ResourceOptionsFixture {
 
     private static Optional<String> text(JsonNode input, String field) {
         return Optional.ofNullable(input.get(field)).map(JsonNode::asString);
+    }
+
+    /** The constant of {@code type} the fixture spells {@code value}, its lowercase name. */
+    private static <E extends Enum<E>> E named(Class<E> type, String value) {
+        for (E constant : type.getEnumConstants()) {
+            if (constant.name().toLowerCase(Locale.ROOT).equals(value)) {
+                return constant;
+            }
+        }
+        throw new IllegalArgumentException("no " + type.getSimpleName() + " named " + value);
     }
 
     /** The typed reset keys of {@code input}, handing every name without a key constant to {@code raw}. */

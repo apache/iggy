@@ -94,4 +94,61 @@ public record TopicDetails(
     public Optional<BigInteger> localRetentionSize() {
         return TopicSettings.uint64(options, derivedOptions, TopicOptionKey.LOCAL_RETENTION_SIZE);
     }
+
+    /** Whether the topic is normal or geo. */
+    public Optional<TopicType> topicType() {
+        return TopicSettings.topicType(options, derivedOptions);
+    }
+
+    /** How a geo topic writes its messages, empty on a normal topic. */
+    public Optional<GeoMode> geoMode() {
+        return TopicSettings.geoMode(options, derivedOptions);
+    }
+
+    /**
+     * The longest time a send waits for its upload to start, in microseconds. This and the five durations below
+     * are empty unless a geo topic sets them, and each node then applies its server setting of the same name.
+     */
+    public Optional<BigInteger> freshUploadInterval() {
+        return TopicSettings.uint64(options, derivedOptions, TopicOptionKey.FRESH_UPLOAD_INTERVAL);
+    }
+
+    /** The shortest time between two uploads of the positions that stored offsets wait for, in microseconds. */
+    public Optional<BigInteger> consumerOffsetUploadInterval() {
+        return TopicSettings.uint64(options, derivedOptions, TopicOptionKey.CONSUMER_OFFSET_UPLOAD_INTERVAL);
+    }
+
+    /** How often a node uploads the changed positions of the topic's consumer groups, in microseconds. */
+    public Optional<BigInteger> positionsPublishInterval() {
+        return TopicSettings.uint64(options, derivedOptions, TopicOptionKey.POSITIONS_PUBLISH_INTERVAL);
+    }
+
+    /** How long the deleted topic's tombstone and objects stay in the object store, in microseconds. */
+    public Optional<BigInteger> tombstoneGrace() {
+        return TopicSettings.uint64(options, derivedOptions, TopicOptionKey.TOMBSTONE_GRACE);
+    }
+
+    /** How long the group polls wait for the positions of the geo peers after a node starts, in microseconds. */
+    public Optional<BigInteger> positionsResumeTimeout() {
+        return TopicSettings.uint64(options, derivedOptions, TopicOptionKey.POSITIONS_RESUME_TIMEOUT);
+    }
+
+    /** The longest wait between two long-term rewrites of a partition, in microseconds. */
+    public Optional<BigInteger> longTermRewriteMaxInterval() {
+        return TopicSettings.uint64(options, derivedOptions, TopicOptionKey.LONG_TERM_REWRITE_MAX_INTERVAL);
+    }
+
+    /**
+     * The memory in bytes that each node keeps for what the topic's reads fetch from the object store, zero
+     * keeping nothing. This and {@link #readAhead} are empty unless the topic sets them, and each node then
+     * applies its {@code [tiered_storage]} setting of the same name.
+     */
+    public Optional<BigInteger> readCacheSize() {
+        return TopicSettings.uint64(options, derivedOptions, TopicOptionKey.READ_CACHE_SIZE);
+    }
+
+    /** The most bytes that readahead fetches in front of a sequential reader, zero meaning readahead is off. */
+    public Optional<BigInteger> readAhead() {
+        return TopicSettings.uint64(options, derivedOptions, TopicOptionKey.READ_AHEAD);
+    }
 }

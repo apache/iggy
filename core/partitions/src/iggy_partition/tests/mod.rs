@@ -461,6 +461,8 @@ fn poll_read_result<B: MessageBus>(
                 PollingConsumer::Consumer(..) => None,
             },
             _group_poll: None,
+            peer_first_segment: None,
+            peer_segments: None,
         },
         fragments,
         commit_offset: partition.offsets().commit_offset,
@@ -676,11 +678,15 @@ fn primary_transfer_grant<B: MessageBus, SB: SuperblockStore>(
 const COMMAND_KIND: u16 = 10;
 
 fn command_prepare(op: u64, parent: u128, kind: u16, value: u64) -> Message<PrepareHeader> {
+    command_prepare_of(op, parent, kind, &value.to_le_bytes())
+}
+
+/// A prepare of the command of `kind` with `payload`.
+fn command_prepare_of(op: u64, parent: u128, kind: u16, payload: &[u8]) -> Message<PrepareHeader> {
     let namespace = IggyNamespace::new(1, 1, 0);
-    let payload = value.to_le_bytes();
     let body = crate::state_machine::MachineCommand {
         kind: crate::state_machine::CommandKind(kind),
-        payload: &payload,
+        payload,
     }
     .encode()
     .unwrap();
@@ -1216,17 +1222,37 @@ pub(super) fn recording_partition_at(
     recording_partition_with_pipeline(replica, replica_count, LocalPipeline::new())
 }
 
-/// The offer `partition` serves once the I/O turn pinned its plan.
+/// The offer `partition` serves once the store answered its check and the I/O
+/// turn pinned its plan.
 async fn serve_offer(
     partition: &mut IggyPartition<IggyMessageBus>,
 ) -> Rc<crate::state_transfer::PartitionStateTransferOffer> {
     let config = repair_config();
-    assert!(matches!(
-        partition.state_transfer_offer(&config).await,
-        Err(PartitionTransferUnavailable::FlushPending)
-    ));
+    let first = after_store_check(partition, &config).await;
+    assert!(
+        matches!(first, Err(PartitionTransferUnavailable::FlushPending)),
+        "{first:?}"
+    );
     settle_partition_io(partition, &config).await;
     partition.state_transfer_offer(&config).await.unwrap()
+}
+
+/// The first offer round of `partition` that does not wait for the store.
+async fn after_store_check(
+    partition: &mut IggyPartition<IggyMessageBus>,
+    config: &PartitionsConfig,
+) -> Result<Rc<crate::state_transfer::PartitionStateTransferOffer>, PartitionTransferUnavailable> {
+    const ROUNDS_MAX: usize = 100;
+    for _ in 0..ROUNDS_MAX {
+        match partition.state_transfer_offer(config).await {
+            // The check runs in a detached task.
+            Err(PartitionTransferUnavailable::StoreCheckPending) => {
+                compio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            round => return round,
+        }
+    }
+    panic!("the store check did not answer in {ROUNDS_MAX} rounds");
 }
 
 /// `count` one-message records. Each call gives its messages new random
@@ -2000,16 +2026,35 @@ async fn backup_with_counter(
     directory: &std::path::Path,
     durability: iggy_common::Durability,
 ) -> Box<IggyPartition<RecordingBus>> {
+    Box::pin(backup_with_machines(
+        config,
+        directory,
+        durability,
+        |backup| {
+            backup
+                .register_state_machine(Box::new(
+                    crate::state_machine::registry::tests::CounterMachine::new(1, &[COMMAND_KIND]),
+                ))
+                .unwrap();
+        },
+    ))
+    .await
+}
+
+/// A backup on disk at `directory` with the machines `register` gives it,
+/// its sends and offsets under `durability`.
+async fn backup_with_machines(
+    config: &PartitionsConfig,
+    directory: &std::path::Path,
+    durability: iggy_common::Durability,
+    register: impl FnOnce(&mut IggyPartition<RecordingBus>),
+) -> Box<IggyPartition<RecordingBus>> {
     const BACKUP: u8 = 2;
     let (backup, _) = recording_partition_at(BACKUP, 3);
     let mut backup = Box::new(backup);
     backup.runtime_options.durability = durability;
     backup.runtime_options.consumer_offset_durability = durability;
-    backup
-        .register_state_machine(Box::new(
-            crate::state_machine::registry::tests::CounterMachine::new(1, &[COMMAND_KIND]),
-        ))
-        .unwrap();
+    register(&mut backup);
     backup.set_partition_dir(directory.to_string_lossy().into_owned());
     set_offset_dirs_under(&mut backup, directory);
     Box::pin(backup.open_persistence()).await.unwrap();
@@ -2025,6 +2070,7 @@ async fn backup_with_counter(
 }
 
 mod age_roll;
+mod auto_commit_merge;
 mod chain_transfer;
 mod checkpoint_policy;
 mod consensus_tests;
@@ -2034,8 +2080,15 @@ mod empty_offsets;
 mod eviction;
 mod floor_eviction;
 mod free_space;
+mod fresh_proofs;
+mod geo_positions;
 mod history;
 mod journal_budget;
+mod long_term_delete;
+mod long_term_merge;
+mod long_term_retention;
+mod manifest_history;
+mod manifest_publish;
 mod materialization;
 mod materialization_io;
 mod materialization_tail;
@@ -2047,7 +2100,13 @@ mod offset_replication;
 mod offset_reservations;
 mod offset_storage;
 mod offsets;
+mod origin_recovery;
+mod peer_log;
+mod peer_log_merges;
+mod peer_log_skips;
+mod peer_manifests;
 mod persistence_checkpoint;
+mod placed_batches;
 mod quiet;
 mod reload_budget;
 mod remote_poll;
@@ -2057,12 +2116,14 @@ mod repair_protocol;
 mod retention;
 mod segment_chain;
 mod segment_upload;
+mod segment_verify;
 mod session_retirement;
 mod state_machines;
 mod state_transfer_offer;
 mod state_transfer_segments;
 mod superblock;
 mod tiering;
+mod topic_object;
 mod total_retention;
 mod transfer_ownership;
 mod wal;

@@ -18,6 +18,7 @@
 use super::COMPONENT;
 use super::cluster::ClusterConfig;
 use super::external_auth::ExternalAuthConfig;
+use super::geo::GeoConfig;
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
 use super::node::NodeConfig;
@@ -200,6 +201,8 @@ pub struct ServerConfig {
     pub external_auth: ExternalAuthConfig,
     #[serde(default)]
     pub tiered_storage: TieredStorageConfig,
+    #[serde(default)]
+    pub geo: GeoConfig,
 }
 
 /// One client-facing listener, as the client-facing address derivation and
@@ -424,9 +427,13 @@ impl SystemPaths for ServerConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tiered_storage::TieredStorageBackend;
+    use super::super::geo::GeoPeerConfig;
+    use super::super::tiered_storage::{GcsAuth, S3UrlStyle, TieredStorageBackend};
     use super::*;
     use figment::Figment;
+    use figment::providers::Serialized;
+    use iggy_common::IggyByteSize;
+    use std::time::Duration;
 
     /// The embedded default TOML deserializes into a fully populated
     /// [`ServerConfig`] and passes validation. Exercises the
@@ -486,6 +493,115 @@ mod tests {
         assert_eq!(cfg.metadata.change_log_activity_capacity, 4096);
     }
 
+    /// The config file documents `retention = "0"` as turning deletion by age
+    /// off, so the same digits from the environment have to load the same way.
+    #[test]
+    #[serial_test::serial]
+    fn given_a_bare_zero_for_a_duration_env_var_when_loading_should_read_zero() {
+        let cfg = load_with_env_vars(&[("IGGY_LOGGING_RETENTION", "0")])
+            .expect("config with a bare 0 duration from the environment deserializes");
+
+        assert!(cfg.logging.retention.is_zero());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn given_a_bare_byte_count_for_a_size_env_var_when_loading_should_read_bytes() {
+        let cfg = load_with_env_vars(&[("IGGY_WEBSOCKET_READ_BUFFER_SIZE", "131072")])
+            .expect("config with a bare byte count from the environment deserializes");
+
+        assert_eq!(
+            cfg.websocket.read_buffer_size,
+            Some(IggyByteSize::from(131_072_u64))
+        );
+    }
+
+    /// The environment provider hands every all-digit value over as a number,
+    /// so a setting that parses the same digits from text has to take the
+    /// number too. Settings that take any text are plain strings and exempt.
+    #[test]
+    #[serial_test::serial]
+    fn given_digits_from_env_for_a_setting_parsing_them_as_text_when_loading_should_accept_them() {
+        const ANY_TEXT: &str = "any text";
+        let file = Figment::new().merge(Toml::string(include_str!("../../../server/config.toml")));
+        let leaves = ServerConfig::env_templates()
+            .iter()
+            .filter(|template| template.max_elements.is_empty());
+
+        let mut refused = Vec::new();
+        for template in leaves {
+            for digits in ["0", "1"] {
+                if load_with_env_vars(&[(template.env_name, digits)]).is_err()
+                    && loads_as_text(&file, template.config_path, digits)
+                    && !loads_as_text(&file, template.config_path, ANY_TEXT)
+                {
+                    refused.push(format!("{}={digits}", template.env_name));
+                }
+            }
+        }
+
+        assert!(
+            refused.is_empty(),
+            "these settings parse the digits as text but refuse them from the environment: {refused:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn given_bare_byte_counts_for_the_read_cache_env_vars_when_loading_should_read_bytes() {
+        let cfg = load_with_env_vars(&[
+            ("IGGY_TIERED_STORAGE_READ_CACHE_SIZE", "33554432"),
+            ("IGGY_TIERED_STORAGE_READ_CACHE_BLOCK_SIZE", "65536"),
+            ("IGGY_TIERED_STORAGE_READ_AHEAD", "0"),
+        ])
+        .expect("config with bare byte counts for the read cache deserializes");
+
+        assert_eq!(cfg.tiered_storage.read_cache_size.as_bytes_u64(), 32 << 20);
+        assert_eq!(
+            cfg.tiered_storage.read_cache_block_size.as_bytes_u64(),
+            64 << 10
+        );
+        assert_eq!(cfg.tiered_storage.read_ahead.as_bytes_u64(), 0);
+        TieredStorageConfig {
+            backend: TieredStorageBackend::Fs,
+            path: "/var/lib/iggy-tiered".to_owned(),
+            ..cfg.tiered_storage
+        }
+        .validate()
+        .expect("a read cache without readahead validates");
+    }
+
+    #[test]
+    fn given_a_config_file_without_the_partition_skip_key_when_loading_should_place_partitions_on_every_shard()
+     {
+        const KEY_LINE: &str = "skip_shard_zero_for_partitions = false\n";
+        let shipped = include_str!("../../../server/config.toml");
+        assert!(shipped.contains(KEY_LINE), "the shipped file sets the key");
+
+        let cfg: ServerConfig = Figment::new()
+            .merge(Toml::string(&shipped.replace(KEY_LINE, "")))
+            .extract()
+            .expect("TOML without the key deserializes");
+
+        assert!(!cfg.cluster.coordinator.skip_shard_zero_for_partitions);
+        assert!(
+            !ServerConfig::default()
+                .cluster
+                .coordinator
+                .skip_shard_zero_for_partitions
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn given_partition_skip_env_var_when_loading_should_override_the_file() {
+        const NAME: &str = "IGGY_CLUSTER_COORDINATOR_SKIP_SHARD_ZERO_FOR_PARTITIONS";
+        let cfg = load_with_env_vars(&[(NAME, "true")])
+            .expect("config with the env override deserializes");
+
+        assert!(cfg.cluster.coordinator.skip_shard_zero_for_partitions);
+    }
+
     /// The shipped file, like every file written before tiered storage, has
     /// no `[tiered_storage]` table.
     #[test]
@@ -512,6 +628,15 @@ mod tests {
             ("IGGY_TIERED_STORAGE_PROGRESS_TIMEOUT", "1 m"),
             ("IGGY_TIERED_STORAGE_JOBS_UPLOADS", "5"),
             ("IGGY_TIERED_STORAGE_JOBS_UPLOAD_BYTES", "4 GiB"),
+            ("IGGY_TIERED_STORAGE_JOBS_FRESH_UPLOADS", "8"),
+            ("IGGY_TIERED_STORAGE_FRESH_UPLOAD_INTERVAL", "25 ms"),
+            ("IGGY_TIERED_STORAGE_LONG_TERM_BACKLOG_LIMIT", "512 MiB"),
+            ("IGGY_TIERED_STORAGE_FRESH_PENDING_BYTES", "96 MiB"),
+            (
+                "IGGY_TIERED_STORAGE_FRESH_PARTITION_PENDING_BYTES",
+                "24 MiB",
+            ),
+            ("IGGY_TIERED_STORAGE_ORPHAN_GRACE", "disabled"),
         ];
         let known = ServerConfig::all_env_var_names();
         for (name, value) in vars {
@@ -538,6 +663,18 @@ mod tests {
         assert_eq!(tiered.secret_access_key, "wJalrXUtnFEMI");
         assert_eq!(tiered.progress_timeout.get_duration().as_secs(), 60);
         assert_eq!(tiered.jobs.uploads, 5);
+        assert_eq!(tiered.jobs.fresh_uploads, 8);
+        assert_eq!(tiered.fresh_upload_interval.get_duration().as_millis(), 25);
+        assert_eq!(
+            tiered.long_term_backlog_limit.as_bytes_u64(),
+            512 * 1024 * 1024
+        );
+        assert_eq!(tiered.fresh_pending_bytes.as_bytes_u64(), 96 * 1024 * 1024);
+        assert_eq!(
+            tiered.fresh_partition_pending_bytes.as_bytes_u64(),
+            24 * 1024 * 1024
+        );
+        assert!(tiered.orphan_grace.is_zero());
         assert_eq!(
             tiered.jobs.upload_bytes.as_bytes_u64(),
             4 * 1024 * 1024 * 1024
@@ -545,6 +682,241 @@ mod tests {
         cfg.validate()
             .expect("an s3 section from the environment validates");
         assert!(!cfg.to_string().contains("wJalrXUtnFEMI"));
+    }
+
+    #[test]
+    fn given_fresh_pending_bytes_in_the_file_when_loading_should_take_them() {
+        let load = |shard: &str, partition: &str| -> ServerConfig {
+            Figment::new()
+                .merge(Toml::string(include_str!("../../../server/config.toml")))
+                .merge(Toml::string(&format!(
+                    "[tiered_storage]\nbackend = \"fs\"\npath = \"/var/lib/iggy-tiered\"\n\
+                     fresh_pending_bytes = \"{shard}\"\n\
+                     fresh_partition_pending_bytes = \"{partition}\"\n"
+                )))
+                .extract()
+                .expect("TOML with fresh pending bytes deserializes")
+        };
+
+        let tuned = load("64 MiB", "32 MiB");
+        let share_above_cap = load("16 MiB", "32 MiB");
+
+        let tiered = &tuned.tiered_storage;
+        assert_eq!(tiered.fresh_pending_bytes.as_bytes_u64(), 64 * 1024 * 1024);
+        assert_eq!(
+            tiered.fresh_partition_pending_bytes.as_bytes_u64(),
+            32 * 1024 * 1024
+        );
+        tuned
+            .validate()
+            .expect("a share of 32 MiB under a cap of 64 MiB validates");
+        assert!(share_above_cap.validate().is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn given_mock_s3_env_vars_when_loading_should_set_the_backend_and_its_latency() {
+        let vars = [
+            ("IGGY_TIERED_STORAGE_BACKEND", "mock_s3"),
+            ("IGGY_TIERED_STORAGE_MOCK_S3_PUT_LATENCY", "30 ms"),
+            ("IGGY_TIERED_STORAGE_MOCK_S3_GET_LATENCY", "15 ms"),
+            ("IGGY_TIERED_STORAGE_MOCK_S3_OTHER_LATENCY", "5 ms"),
+            ("IGGY_TIERED_STORAGE_MOCK_S3_BYTES_PER_SECOND", "100 MiB"),
+        ];
+        let known = ServerConfig::all_env_var_names();
+        for (name, value) in vars {
+            assert!(known.contains(&name), "{name}");
+            // SAFETY: `serial_test::serial` keeps other tests off the environment.
+            unsafe { env::set_var(name, value) };
+        }
+
+        let cfg: Result<ServerConfig, _> = Figment::new()
+            .merge(Toml::string(include_str!("../../../server/config.toml")))
+            .merge(ServerConfigEnvProvider::default())
+            .extract();
+
+        for (name, _) in vars {
+            // SAFETY: paired with the set above.
+            unsafe { env::remove_var(name) };
+        }
+        let cfg = cfg.expect("config with the env overrides deserializes");
+        let tiered = &cfg.tiered_storage;
+        assert_eq!(tiered.backend, TieredStorageBackend::MockS3);
+        assert_eq!(tiered.mock_s3.put_latency.get_duration().as_millis(), 30);
+        assert_eq!(tiered.mock_s3.get_latency.get_duration().as_millis(), 15);
+        assert_eq!(tiered.mock_s3.other_latency.get_duration().as_millis(), 5);
+        assert_eq!(
+            tiered.mock_s3.bytes_per_second.as_bytes_u64(),
+            100 * 1024 * 1024
+        );
+        cfg.validate()
+            .expect("a mock_s3 section from the environment validates");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn given_gcs_env_vars_when_loading_should_set_the_section_and_a_peer() {
+        let vars = [
+            ("IGGY_TIERED_STORAGE_BACKEND", "gcs"),
+            ("IGGY_TIERED_STORAGE_GCS_BUCKET", "segments"),
+            ("IGGY_TIERED_STORAGE_GCS_ENDPOINT", "http://localhost:4443"),
+            ("IGGY_TIERED_STORAGE_GCS_AUTH", "none"),
+            (
+                "IGGY_TIERED_STORAGE_GCS_SERVICE_ACCOUNT_KEY",
+                "/etc/iggy/key.json",
+            ),
+            ("IGGY_GEO_ORIGIN", "dc-a"),
+            ("IGGY_GEO_PEERS_0_ORIGIN", "dc-b"),
+            ("IGGY_GEO_PEERS_0_BACKEND", "gcs"),
+            ("IGGY_GEO_PEERS_0_GCS_BUCKET", "iggy-dc-b"),
+        ];
+        let known = ServerConfig::all_env_var_names();
+        for (name, value) in vars {
+            assert!(known.contains(&name), "{name}");
+            // SAFETY: `serial_test::serial` keeps other tests off the environment.
+            unsafe { env::set_var(name, value) };
+        }
+
+        let cfg: Result<ServerConfig, _> = Figment::new()
+            .merge(Toml::string(include_str!("../../../server/config.toml")))
+            .merge(ServerConfigEnvProvider::default())
+            .extract();
+
+        for (name, _) in vars {
+            // SAFETY: paired with the set above.
+            unsafe { env::remove_var(name) };
+        }
+        let cfg = cfg.expect("config with the env overrides deserializes");
+        let gcs = &cfg.tiered_storage.gcs;
+        assert_eq!(cfg.tiered_storage.backend, TieredStorageBackend::Gcs);
+        assert_eq!(gcs.bucket, "segments");
+        assert_eq!(gcs.endpoint, "http://localhost:4443");
+        assert_eq!(gcs.auth, GcsAuth::None);
+        assert_eq!(gcs.service_account_key, "/etc/iggy/key.json");
+        let [peer] = cfg.geo.peers.as_slice() else {
+            panic!("one peer: {}", cfg.geo);
+        };
+        assert_eq!(peer.backend, TieredStorageBackend::Gcs);
+        assert_eq!(peer.gcs.bucket, "iggy-dc-b");
+        assert_eq!(peer.gcs.auth, GcsAuth::Auto);
+        cfg.validate()
+            .expect("a gcs section from the environment validates");
+    }
+
+    /// Every file written before geo topics has no `[geo]` table.
+    #[test]
+    fn given_a_config_file_without_geo_when_loading_should_have_no_origin_or_peers() {
+        let cfg: ServerConfig = Figment::new()
+            .merge(Toml::string(include_str!("../../../server/config.toml")))
+            .extract()
+            .expect("embedded TOML deserializes");
+
+        assert!(cfg.geo.origin.is_empty());
+        assert!(cfg.geo.peers.is_empty());
+        assert_eq!(cfg.geo.tombstone_grace.get_duration().as_secs(), 24 * 3600);
+        assert_eq!(
+            cfg.geo.long_term_rewrite_max_interval.get_duration(),
+            Duration::from_secs(10)
+        );
+        cfg.validate().expect("a config without geo validates");
+    }
+
+    #[test]
+    fn given_a_long_term_rewrite_max_interval_in_the_file_when_loading_should_take_it() {
+        let load = |value: &str| -> ServerConfig {
+            Figment::new()
+                .merge(Toml::string(include_str!("../../../server/config.toml")))
+                .merge(Toml::string(&format!(
+                    "[geo]\nlong_term_rewrite_max_interval = \"{value}\"\n"
+                )))
+                .extract()
+                .expect("TOML with a rewrite ceiling deserializes")
+        };
+
+        let tuned = load("2 s");
+        let too_short = load("500 ms");
+
+        assert_eq!(
+            tuned.geo.long_term_rewrite_max_interval.get_duration(),
+            Duration::from_secs(2)
+        );
+        tuned.validate().expect("a ceiling of 2 s validates");
+        assert!(too_short.validate().is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn given_geo_env_vars_when_loading_should_set_the_origin_and_a_peer() {
+        let vars = [
+            ("IGGY_GEO_ORIGIN", "dc-a"),
+            ("IGGY_GEO_TOMBSTONE_GRACE", "2 h"),
+            ("IGGY_GEO_LONG_TERM_REWRITE_MAX_INTERVAL", "3 s"),
+            ("IGGY_GEO_PEERS_0_ORIGIN", "dc-b"),
+            ("IGGY_GEO_PEERS_0_BACKEND", "s3"),
+            ("IGGY_GEO_PEERS_0_BUCKET", "iggy-dc-b"),
+            ("IGGY_GEO_PEERS_0_REGION", "us-east-1"),
+            ("IGGY_GEO_PEERS_0_URL_STYLE", "path"),
+            ("IGGY_GEO_PEERS_0_ACCESS_KEY_ID", "AKIDPEEREXAMPLE"),
+            ("IGGY_GEO_PEERS_0_SECRET_ACCESS_KEY", "peerSecretKeyExample"),
+        ];
+        let known = ServerConfig::all_env_var_names();
+        for (name, value) in vars {
+            assert!(known.contains(&name), "{name}");
+            // SAFETY: `serial_test::serial` keeps other tests off the environment.
+            unsafe { env::set_var(name, value) };
+        }
+
+        let cfg: Result<ServerConfig, _> = Figment::new()
+            .merge(Toml::string(include_str!("../../../server/config.toml")))
+            .merge(ServerConfigEnvProvider::default())
+            .extract();
+
+        for (name, _) in vars {
+            // SAFETY: paired with the set above.
+            unsafe { env::remove_var(name) };
+        }
+        let cfg = cfg.expect("config with the env overrides deserializes");
+        assert_eq!(cfg.geo.origin, "dc-a");
+        assert_eq!(cfg.geo.tombstone_grace.get_duration().as_secs(), 2 * 3600);
+        assert_eq!(
+            cfg.geo.long_term_rewrite_max_interval.get_duration(),
+            Duration::from_secs(3)
+        );
+        let [peer] = cfg.geo.peers.as_slice() else {
+            panic!("one peer: {}", cfg.geo);
+        };
+        assert_eq!(peer.origin, "dc-b");
+        assert_eq!(peer.backend, TieredStorageBackend::S3);
+        assert_eq!(peer.bucket, "iggy-dc-b");
+        assert_eq!(peer.region, "us-east-1");
+        assert_eq!(peer.prefix, "iggy", "the default prefix");
+        assert_eq!(peer.url_style, S3UrlStyle::Path);
+        assert_eq!(peer.access_key_id, "AKIDPEEREXAMPLE");
+        assert_eq!(peer.secret_access_key, "peerSecretKeyExample");
+        cfg.validate()
+            .expect("a geo section from the environment validates");
+        assert!(!cfg.to_string().contains("peerSecretKeyExample"));
+        assert!(
+            !known.contains(&"IGGY_GEO_PEERS_16_ORIGIN"),
+            "env overrides stop at geo::MAX_PEERS"
+        );
+    }
+
+    #[test]
+    fn given_peers_and_bad_tuning_without_a_backend_when_validating_should_refuse() {
+        let mut cfg = ServerConfig::default();
+        cfg.tiered_storage.max_attempts = 0;
+        assert!(cfg.validate().is_ok(), "no peer takes the tuning");
+
+        cfg.geo.origin = "dc-a".to_owned();
+        cfg.geo.peers.push(GeoPeerConfig {
+            origin: "dc-b".to_owned(),
+            backend: TieredStorageBackend::Fs,
+            path: "/mnt/dc-b".to_owned(),
+            ..GeoPeerConfig::default()
+        });
+
+        assert!(cfg.validate().is_err());
     }
 
     #[test]
@@ -631,5 +1003,38 @@ mod tests {
                 .all(|name| !SERVER_SCAN_ONLY_ENV_VARS.contains(name)),
             "advertised and scan-only env vars must stay disjoint"
         );
+    }
+
+    /// Loads the embedded config with `vars` set. Callers must be
+    /// `serial_test::serial`.
+    fn load_with_env_vars(vars: &[(&str, &str)]) -> Result<ServerConfig, Box<figment::Error>> {
+        let known = ServerConfig::all_env_var_names();
+        for (name, value) in vars {
+            assert!(known.contains(name), "{name}");
+            // SAFETY: `serial_test::serial` on every caller keeps other tests
+            // off the environment.
+            unsafe { env::set_var(name, value) };
+        }
+
+        let cfg = Figment::new()
+            .merge(Toml::string(include_str!("../../../server/config.toml")))
+            .merge(ServerConfigEnvProvider::default())
+            .extract()
+            .map_err(Box::new);
+
+        for (name, _) in vars {
+            // SAFETY: paired with the set above.
+            unsafe { env::remove_var(name) };
+        }
+        cfg
+    }
+
+    /// Whether `file` deserializes with `text` written as a string at `path`,
+    /// the form the environment cannot produce for digits.
+    fn loads_as_text(file: &Figment, path: &str, text: &str) -> bool {
+        file.clone()
+            .merge(Serialized::default(path, text))
+            .extract::<ServerConfig>()
+            .is_ok()
     }
 }

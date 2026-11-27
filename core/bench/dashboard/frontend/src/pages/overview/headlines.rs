@@ -20,15 +20,17 @@
 //! maintainers choose the workloads in the configuration file, so the Overview never picks a run by
 //! its numbers.
 
-use bench_dashboard_shared::config::{DashboardConfig, HeadlineConfig, SuiteConfig, Thresholds};
+use bench_dashboard_shared::config::{DashboardConfig, SuiteConfig, Thresholds};
 use bench_dashboard_shared::delta::Metric;
+use bench_dashboard_shared::headline::{HeadlineLine, newest_release, official_runs};
+use bench_dashboard_shared::history::VersionStep;
 use bench_dashboard_shared::identity::VersionOrder;
+use bench_dashboard_shared::labels::conditions;
 use bench_dashboard_shared::summary::BenchmarkSummary;
 use uuid::Uuid;
 
 use crate::pages::compare::releases::ReleasesQuery;
-use crate::pages::run::change::{Change, Headline, HistoryLine, LineVersion, VersionStep, change};
-use crate::pages::run::facts::conditions;
+use crate::pages::run::change::{Change, Headline, change};
 use crate::pages::run::history::HistoryChart;
 
 /// One release isn't a trend.
@@ -111,37 +113,21 @@ pub struct ReleaseLink {
     pub query: ReleasesQuery,
 }
 
-/// The official runs of one headline workload, on the history line of its newest release run. Runs
-/// with the same labels on another line ran a different workload, so they're never compared.
-struct HeadlineLine<'a> {
-    config: &'a HeadlineConfig,
-    /// Releases and builds.
-    all: HistoryLine<'a>,
-    releases: HistoryLine<'a>,
-}
-
 impl Headlines {
     pub fn new(summaries: &[BenchmarkSummary], config: &DashboardConfig) -> Self {
-        let official: Vec<_> = summaries
-            .iter()
-            .filter(|summary| config.is_official(summary.suite.as_deref()))
-            .collect();
-        let lines: Vec<_> = config
-            .headlines
-            .iter()
-            .map(|headline| HeadlineLine::new(headline, &official))
-            .collect();
+        let official = official_runs(summaries, config);
+        let lines = HeadlineLine::all_of(summaries, config);
         let thresholds = &config.thresholds;
         let latest_release =
             newest_release(official.iter().copied()).map(|summary| summary.version.as_str());
-        let cards: Vec<_> = lines.iter().map(|line| line.card(thresholds)).collect();
+        let cards: Vec<_> = lines.iter().map(|line| card(line, thresholds)).collect();
         let since_release: Vec<_> = lines
             .iter()
-            .filter_map(|line| line.since_release(latest_release, thresholds))
+            .filter_map(|line| since_release(line, latest_release, thresholds))
             .collect();
         Self {
             machine: shared_machine(&cards),
-            trends: lines.iter().filter_map(HeadlineLine::trend).collect(),
+            trends: lines.iter().filter_map(trend).collect(),
             release_links: release_links(&since_release, &config.suites),
             since_release,
             latest_release: latest_release.map(str::to_owned),
@@ -150,118 +136,79 @@ impl Headlines {
     }
 }
 
-impl<'a> HeadlineLine<'a> {
-    fn new(config: &'a HeadlineConfig, official: &[&'a BenchmarkSummary]) -> Self {
-        let runs: Vec<_> = official
-            .iter()
-            .copied()
-            .filter(|summary| {
-                summary.suite.as_deref() == Some(config.suite.as_str())
-                    && summary.workload_key.workload.as_deref() == Some(config.workload.as_str())
-            })
-            .collect();
-        let key = newest_release(runs.iter().copied()).map(BenchmarkSummary::history_key);
-        let on_line: Vec<_> = runs
-            .into_iter()
-            .filter(|summary| key.as_ref() == Some(&summary.history_key()))
-            .collect();
-        Self {
-            config,
-            releases: HistoryLine::from_runs(on_line.iter().copied().filter(|run| run.release)),
-            all: HistoryLine::from_runs(on_line),
-        }
-    }
-
-    fn card(&self, thresholds: &Thresholds) -> HeadlineCard {
-        let metric = self.config.metric;
-        let newest = self.newest_release();
-        HeadlineCard {
-            title: self.config.title.clone(),
-            headline: Headline {
-                metric,
-                value: newest.and_then(|(version, _)| version.median(metric)),
-                change: newest.and_then(|(_, run)| {
-                    let step = self.releases.step(run)?;
-                    change(metric, run, &step, thresholds)
-                }),
-            },
-            release: newest.map(|(version, run)| CardRelease {
-                version: version.version.to_owned(),
-                runs: version.runs.len(),
-                newest: run.uuid,
-                run_title: run.title.clone(),
-                conditions: conditions(run),
-                machine: run.machine.clone(),
-            }),
-        }
-    }
-
-    fn trend(&self) -> Option<ReleaseTrend> {
-        if self.releases.versions.len() < MIN_TREND_RELEASES {
-            return None;
-        }
-        let (_, newest) = self.newest_release()?;
-        Some(ReleaseTrend {
-            title: self.config.title.clone(),
-            uuid: newest.uuid,
-            chart: HistoryChart::new(
-                self.config.metric,
-                newest.kind_family.primary_group(),
-                &self.releases,
-                None,
-            ),
-        })
-    }
-
-    /// `None` when the line didn't run the latest release, because a row from an older release
-    /// could show a build from before the latest release.
-    fn since_release(
-        &self,
-        latest_release: Option<&str>,
-        thresholds: &Thresholds,
-    ) -> Option<SinceRelease> {
-        let (release, _) = self.newest_release()?;
-        if latest_release != Some(release.version) {
-            return None;
-        }
-        // Every version after the line's newest release is a build, so the line's last version is
-        // the newest build, unless it's the release itself.
-        let build = self
-            .all
-            .versions
-            .last()
-            .filter(|build| build.version != release.version)?;
-        let newest_build = *build.runs.last()?;
-        let metric = self.config.metric;
-        let step = VersionStep::between(release, build);
-        Some(SinceRelease {
-            title: self.config.title.clone(),
-            suite: self.config.suite.clone(),
+fn card(line: &HeadlineLine<'_>, thresholds: &Thresholds) -> HeadlineCard {
+    let metric = line.config.metric;
+    let newest = line.newest_release();
+    HeadlineCard {
+        title: line.config.title.clone(),
+        headline: Headline {
             metric,
-            release: release.version.to_owned(),
-            build: build.version.to_owned(),
-            build_order: build.runs.first()?.version_order.clone(),
-            release_value: release.median(metric)?,
-            build_value: build.median(metric)?,
-            change: change(metric, newest_build, &step, thresholds)?,
-        })
-    }
-
-    /// The line's newest release version and that version's newest run.
-    fn newest_release(&self) -> Option<(&LineVersion<'a>, &'a BenchmarkSummary)> {
-        let version = self.releases.versions.last()?;
-        Some((version, *version.runs.last()?))
+            value: newest.and_then(|(version, _)| version.median(metric)),
+            change: newest.and_then(|(_, run)| {
+                let step = line.releases.step(run)?;
+                change(metric, run, &step, thresholds)
+            }),
+        },
+        release: newest.map(|(version, run)| CardRelease {
+            version: version.version.to_owned(),
+            runs: version.runs.len(),
+            newest: run.uuid,
+            run_title: run.title.clone(),
+            conditions: conditions(run),
+            machine: run.machine.clone(),
+        }),
     }
 }
 
-/// The newest release run in the shared version order. Builds never count, release candidates
-/// included.
-fn newest_release<'a>(
-    runs: impl IntoIterator<Item = &'a BenchmarkSummary>,
-) -> Option<&'a BenchmarkSummary> {
-    runs.into_iter()
-        .filter(|summary| summary.release)
-        .max_by(|left, right| left.version_order.cmp(&right.version_order))
+fn trend(line: &HeadlineLine<'_>) -> Option<ReleaseTrend> {
+    if line.releases.versions.len() < MIN_TREND_RELEASES {
+        return None;
+    }
+    let (_, newest) = line.newest_release()?;
+    Some(ReleaseTrend {
+        title: line.config.title.clone(),
+        uuid: newest.uuid,
+        chart: HistoryChart::new(
+            line.config.metric,
+            newest.kind_family.primary_group(),
+            &line.releases,
+            None,
+        ),
+    })
+}
+
+/// `None` when the line didn't run the latest release, because a row from an older release
+/// could show a build from before the latest release.
+fn since_release(
+    line: &HeadlineLine<'_>,
+    latest_release: Option<&str>,
+    thresholds: &Thresholds,
+) -> Option<SinceRelease> {
+    let (release, _) = line.newest_release()?;
+    if latest_release != Some(release.version) {
+        return None;
+    }
+    // Every version after the line's newest release is a build, so the line's last version is
+    // the newest build, unless it's the release itself.
+    let build = line
+        .all
+        .versions
+        .last()
+        .filter(|build| build.version != release.version)?;
+    let newest_build = *build.runs.last()?;
+    let metric = line.config.metric;
+    let step = VersionStep::between(release, build);
+    Some(SinceRelease {
+        title: line.config.title.clone(),
+        suite: line.config.suite.clone(),
+        metric,
+        release: release.version.to_owned(),
+        build: build.version.to_owned(),
+        build_order: build.runs.first()?.version_order.clone(),
+        release_value: release.median(metric)?,
+        build_value: build.median(metric)?,
+        change: change(metric, newest_build, &step, thresholds)?,
+    })
 }
 
 /// Every row of a suite compares against the same latest release. The link takes the newest build
@@ -309,6 +256,7 @@ mod tests {
         CANDIDATE, COMMIT, MACHINE, OLD_RELEASE, RELEASE, THRESHOLDS, producer, rate_limited, run,
         with_numbers,
     };
+    use bench_dashboard_shared::config::HeadlineConfig;
     use bench_dashboard_shared::delta::DeltaVerdict;
     use bench_report::params::BenchmarkParams;
 

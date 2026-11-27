@@ -92,6 +92,11 @@ if err := cli.UpdateTopic(ctx, streamId, topicId, iggcon.TopicUpdate{
 
 The sample is `Example_resourceOptions` in `client/example_resource_options_test.go`.
 
+A geo topic takes six durations of its own, in microseconds: `FreshUploadInterval`, `ConsumerOffsetUploadInterval`, `PositionsPublishInterval`, `TombstoneGrace`, `PositionsResumeTimeout` and `LongTermRewriteMaxInterval`. Each overrides the server setting of the same name, and nil leaves that setting. Zero is a value and is sent. `TopicUpdate` can set them, but not reset them. A normal topic refuses them.
+
+Any topic takes two byte sizes for its reads from the object store. `ReadCacheSize` is the memory each node keeps for what the topic's reads fetch, divided between its partitions, and zero keeps nothing. `ReadAhead` is the most bytes that readahead fetches in front of a sequential reader, and zero turns readahead off.
+Nil leaves each node's `[tiered_storage]` setting of the same name, and `Topic` reports nil there too. `TopicUpdate` can change them on any topic, geo included, but not reset them. They and the six durations are the only keys an update may change on a geo topic.
+
 A stream encryption key is exactly 32 random bytes. Never derive it from a password: the fingerprint reads would then be an offline guessing oracle. The key travels inside the create request over the client's transport, so use TLS when the network between client and server is not trusted.
 
 The server stores the key wrapped under its own key and never returns it. Reads report only its source and fingerprints. Without a key, a server with encryption enabled generates one for the stream, and a server without it keeps the stream plaintext and refuses a client key.
@@ -320,9 +325,7 @@ roster discovery failure after Register succeeds, discards its tentative session
 and requires another explicit sign-in. The sign-in does not wait for a pending
 automatic registration, and late completion cannot replace a newer session.
 
-An established session has its own lifetime. Password or PAT changes and PAT
-expiry do not end it. Logout, session lease expiry, or user deactivation end the
-session and prevent its bind proof from restoring it.
+With server 0.10.1-edge.2, a password change keeps the binary session that submitted it and ends the account's other sessions. Deleting or expiring a personal access token ends access for the sessions opened with it. A valid personal access token can open a new session after a password change. Logout, lease expiry and account deactivation also end session access.
 
 Crash durability follows the topic's `durability` policy: `replicated`
 confirms replication, while `persisted` also waits for the required replicas

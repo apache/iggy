@@ -51,7 +51,8 @@ public sealed class TopicUpdate
     ///     unless the update carries a raw key. Null changes nothing.
     /// </summary>
     /// <remarks>
-    ///     Not available yet: the server refuses <c>true</c> with <c>feature_unavailable</c>.
+    ///     Needs an object store on every node of the cluster: while one is not ready, the server refuses
+    ///     <c>true</c> with <c>feature_unavailable</c>.
     /// </remarks>
     public bool? TieredStorage { get; init; }
 
@@ -68,6 +69,56 @@ public sealed class TopicUpdate
     ///     <see cref="TopicOptionKey.LocalRetentionSize" /> to return to the default.
     /// </summary>
     public ulong? LocalRetentionSize { get; init; }
+
+    /// <summary>
+    ///     The longest time a send waits for the upload of its fresh object to start, at most ten seconds. Null
+    ///     changes nothing.
+    /// </summary>
+    /// <remarks>
+    ///     This and the five durations below are the only settings an update changes on a geo topic, besides
+    ///     <see cref="ReadCacheSize" /> and <see cref="ReadAhead" />, and the server refuses them on a normal topic.
+    ///     Zero is a value for them and is sent, and a negative span is refused before anything is sent. They have no
+    ///     default, so the server refuses a reset of them.
+    /// </remarks>
+    public TimeSpan? FreshUploadInterval { get; init; }
+
+    /// <summary>
+    ///     The shortest time between two uploads of the positions that the offsets its consumer groups store
+    ///     themselves wait for, at most one second. Zero answers such a store at its local commit.
+    /// </summary>
+    public TimeSpan? ConsumerOffsetUploadInterval { get; init; }
+
+    /// <summary>How often a node uploads the changed positions of the topic's consumer groups, more than zero.</summary>
+    public TimeSpan? PositionsPublishInterval { get; init; }
+
+    /// <summary>How long the tombstone and the objects of the deleted topic stay in the object store, more than zero.</summary>
+    public TimeSpan? TombstoneGrace { get; init; }
+
+    /// <summary>
+    ///     How long, after a node starts, the group polls of the topic's partitions wait for the positions of the geo
+    ///     peers. Zero does not wait.
+    /// </summary>
+    public TimeSpan? PositionsResumeTimeout { get; init; }
+
+    /// <summary>The longest wait between two long-term rewrites of a partition, at least one second.</summary>
+    public TimeSpan? LongTermRewriteMaxInterval { get; init; }
+
+    /// <summary>
+    ///     The new memory in bytes that each node keeps for what the topic's reads fetch from the object store. Zero
+    ///     keeps nothing that they fetch, otherwise at least 512 KiB. Null changes nothing.
+    /// </summary>
+    /// <remarks>
+    ///     This and <see cref="ReadAhead" /> change on a normal or a geo topic. Zero is a value for them and is sent,
+    ///     unlike a zero <see cref="MaxTopicSize" />. They have no default, so the server refuses a reset of them.
+    /// </remarks>
+    public ulong? ReadCacheSize { get; init; }
+
+    /// <summary>
+    ///     The new most bytes that readahead fetches in front of a sequential reader of the topic. Zero turns
+    ///     readahead off, otherwise at least 128 KiB, and at most an eighth of a nonzero read cache size that the
+    ///     topic sets. Null changes nothing.
+    /// </summary>
+    public ulong? ReadAhead { get; init; }
 
     /// <summary>
     ///     Keys to reset to their defaults: <see cref="TopicOptionKey.MessageExpiry" />,
@@ -123,7 +174,37 @@ public sealed class TopicUpdate
                 HeaderValue.FromUInt64(localRetentionSize);
         }
 
+        SetGeoDuration(set, TopicOptionKey.FreshUploadInterval, FreshUploadInterval, nameof(FreshUploadInterval));
+        SetGeoDuration(set, TopicOptionKey.ConsumerOffsetUploadInterval, ConsumerOffsetUploadInterval,
+            nameof(ConsumerOffsetUploadInterval));
+        SetGeoDuration(set, TopicOptionKey.PositionsPublishInterval, PositionsPublishInterval,
+            nameof(PositionsPublishInterval));
+        SetGeoDuration(set, TopicOptionKey.TombstoneGrace, TombstoneGrace, nameof(TombstoneGrace));
+        SetGeoDuration(set, TopicOptionKey.PositionsResumeTimeout, PositionsResumeTimeout,
+            nameof(PositionsResumeTimeout));
+        SetGeoDuration(set, TopicOptionKey.LongTermRewriteMaxInterval, LongTermRewriteMaxInterval,
+            nameof(LongTermRewriteMaxInterval));
+
+        if (ReadCacheSize is { } readCacheSize)
+        {
+            set[OptionKeys.Describe(TopicOptionKey.ReadCacheSize).Name] = HeaderValue.FromUInt64(readCacheSize);
+        }
+
+        if (ReadAhead is { } readAhead)
+        {
+            set[OptionKeys.Describe(TopicOptionKey.ReadAhead).Name] = HeaderValue.FromUInt64(readAhead);
+        }
+
         return OptionKeys.Patch(OptionsScope.Topic, set, (Reset ?? NoReset).Select(OptionKeys.Describe),
             RawReset, hasRawSet);
+    }
+
+    private static void SetGeoDuration(Dictionary<string, HeaderValue> set, TopicOptionKey key, TimeSpan? duration,
+        string property)
+    {
+        if (duration is { } value)
+        {
+            set[OptionKeys.Describe(key).Name] = OptionKeys.GeoDuration(value, property);
+        }
     }
 }

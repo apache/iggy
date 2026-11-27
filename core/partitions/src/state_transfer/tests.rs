@@ -16,7 +16,28 @@
 // under the License.
 
 use super::*;
+use crate::geo_positions::GeoPositions;
+use crate::state_machine::PartitionStateMachine;
 use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
+
+#[test]
+fn partition_transfer_formats_match_replica_wire_revision() {
+    let mut snapshot = Vec::new();
+    StateMachineSnapshot::default().encode_into(&mut snapshot);
+    let mut geo_positions = Vec::new();
+    GeoPositions::default().snapshot_into(&mut geo_positions);
+    assert_eq!(
+        (
+            iggy_binary_protocol::REPLICA_WIRE_REVISION,
+            CONSUMER_OFFSETS_MAGIC,
+            CONSUMER_OFFSETS_VERSION_MIN,
+            CONSUMER_OFFSETS_VERSION,
+            &snapshot[..8],
+            geo_positions[0],
+        ),
+        (6, *b"ICO1", 8, 9, b"IGGYSMS1".as_slice(), 2)
+    );
+}
 
 /// A producer entry with `(first_sequence, last_sequence, base_offset)`
 /// batches, oldest first.

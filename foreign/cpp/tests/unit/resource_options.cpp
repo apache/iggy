@@ -18,11 +18,14 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -125,6 +128,198 @@ SurfaceCheck ResetMember(Key key) {
     };
 }
 
+template <typename Holder>
+using DurationGetter = std::optional<std::chrono::microseconds> (Holder::*)() const;
+
+template <typename Options>
+using DurationSetter = Options &(Options::*)(std::chrono::microseconds);
+
+// The durations of a geo topic by catalog key, on the options that set them.
+template <typename Options>
+const std::map<std::string, std::pair<DurationSetter<Options>, DurationGetter<Options>>> &GeoDurationAccessors() {
+    static const std::map<std::string, std::pair<DurationSetter<Options>, DurationGetter<Options>>> accessors = {
+        {"fresh_upload_interval", {&Options::SetFreshUploadInterval, &Options::FreshUploadInterval}},
+        {"consumer_offset_upload_interval",
+         {&Options::SetConsumerOffsetUploadInterval, &Options::ConsumerOffsetUploadInterval}},
+        {"positions_publish_interval", {&Options::SetPositionsPublishInterval, &Options::PositionsPublishInterval}},
+        {"tombstone_grace", {&Options::SetTombstoneGrace, &Options::TombstoneGrace}},
+        {"positions_resume_timeout", {&Options::SetPositionsResumeTimeout, &Options::PositionsResumeTimeout}},
+        {"long_term_rewrite_max_interval",
+         {&Options::SetLongTermRewriteMaxInterval, &Options::LongTermRewriteMaxInterval}},
+    };
+    return accessors;
+}
+
+// The durations of a geo topic by catalog key, on the topics that read them.
+template <typename Topic>
+const std::map<std::string, DurationGetter<Topic>> &GeoDurationGetters() {
+    static const std::map<std::string, DurationGetter<Topic>> getters = {
+        {"fresh_upload_interval", &Topic::FreshUploadInterval},
+        {"consumer_offset_upload_interval", &Topic::ConsumerOffsetUploadInterval},
+        {"positions_publish_interval", &Topic::PositionsPublishInterval},
+        {"tombstone_grace", &Topic::TombstoneGrace},
+        {"positions_resume_timeout", &Topic::PositionsResumeTimeout},
+        {"long_term_rewrite_max_interval", &Topic::LongTermRewriteMaxInterval},
+    };
+    return getters;
+}
+
+using FfiGeoDurationField =
+    std::pair<bool iggy::ffi::GeoTopicDurations::*, std::uint64_t iggy::ffi::GeoTopicDurations::*>;
+
+// The bridge fields of each duration, by catalog key.
+const std::map<std::string, FfiGeoDurationField> &FfiGeoDurationFields() {
+    using Durations                                                = iggy::ffi::GeoTopicDurations;
+    static const std::map<std::string, FfiGeoDurationField> fields = {
+        {"fresh_upload_interval", {&Durations::has_fresh_upload_interval, &Durations::fresh_upload_interval_micros}},
+        {"consumer_offset_upload_interval",
+         {&Durations::has_consumer_offset_upload_interval, &Durations::consumer_offset_upload_interval_micros}},
+        {"positions_publish_interval",
+         {&Durations::has_positions_publish_interval, &Durations::positions_publish_interval_micros}},
+        {"tombstone_grace", {&Durations::has_tombstone_grace, &Durations::tombstone_grace_micros}},
+        {"positions_resume_timeout",
+         {&Durations::has_positions_resume_timeout, &Durations::positions_resume_timeout_micros}},
+        {"long_term_rewrite_max_interval",
+         {&Durations::has_long_term_rewrite_max_interval, &Durations::long_term_rewrite_max_interval_micros}},
+    };
+    return fields;
+}
+
+// A zero duration is a value, so setting one must read back as set.
+template <typename Options>
+SurfaceCheck GeoDurationMember(const std::string &key) {
+    return [key] {
+        const auto &[set, get] = GeoDurationAccessors<Options>().at(key);
+        Options options;
+        (options.*set)(std::chrono::microseconds::zero());
+        return (options.*get)() == std::chrono::microseconds::zero();
+    };
+}
+
+// A projection or input lists a duration as decimal microseconds, and leaves out one that is unset.
+std::optional<std::chrono::microseconds> FixtureMicros(const nlohmann::json &object, const std::string &key) {
+    if (!object.contains(key)) {
+        return std::nullopt;
+    }
+    return std::chrono::microseconds(std::stoll(object.at(key).get<std::string>()));
+}
+
+const nlohmann::json &FixtureCase(const std::string &section, const std::string &name) {
+    for (const auto &vector : Fixture().at(section)) {
+        if (vector.at("case") == name) {
+            return vector;
+        }
+    }
+    throw std::runtime_error("No fixture case " + section + "." + name);
+}
+
+// Sets every duration the input names through the typed setters, and checks each reads back.
+template <typename Options>
+void ExpectTypedGeoDurations(const nlohmann::json &input) {
+    Options options;
+    for (const auto &[key, accessors] : GeoDurationAccessors<Options>()) {
+        ASSERT_TRUE(input.contains(key)) << key;
+        (options.*accessors.first)(*FixtureMicros(input, key));
+    }
+    for (const auto &[key, accessors] : GeoDurationAccessors<Options>()) {
+        EXPECT_EQ((options.*accessors.second)(), FixtureMicros(input, key)) << key;
+    }
+}
+
+// The bridge durations of a topic response projection.
+iggy::ffi::GeoTopicDurations FfiGeoDurations(const nlohmann::json &expected) {
+    iggy::ffi::GeoTopicDurations durations{};
+    for (const auto &[key, fields] : FfiGeoDurationFields()) {
+        if (const auto micros = FixtureMicros(expected, key)) {
+            durations.*fields.first  = true;
+            durations.*fields.second = static_cast<std::uint64_t>(micros->count());
+        }
+    }
+    return durations;
+}
+
+template <typename Holder>
+using BytesGetter = std::optional<std::uint64_t> (Holder::*)() const;
+
+template <typename Options>
+using BytesSetter = Options &(Options::*)(std::uint64_t);
+
+// The read cache settings of a topic by catalog key, on the options that set them.
+template <typename Options>
+const std::map<std::string, std::pair<BytesSetter<Options>, BytesGetter<Options>>> &ReadCacheAccessors() {
+    static const std::map<std::string, std::pair<BytesSetter<Options>, BytesGetter<Options>>> accessors = {
+        {"read_cache_size", {&Options::SetReadCacheSize, &Options::ReadCacheSize}},
+        {"read_ahead", {&Options::SetReadAhead, &Options::ReadAhead}},
+    };
+    return accessors;
+}
+
+// The read cache settings of a topic by catalog key, on the topics that read them.
+template <typename Topic>
+const std::map<std::string, BytesGetter<Topic>> &ReadCacheGetters() {
+    static const std::map<std::string, BytesGetter<Topic>> getters = {
+        {"read_cache_size", &Topic::ReadCacheSize},
+        {"read_ahead", &Topic::ReadAhead},
+    };
+    return getters;
+}
+
+using FfiReadCacheField = std::pair<bool iggy::ffi::TopicReadCache::*, std::uint64_t iggy::ffi::TopicReadCache::*>;
+
+// The bridge fields of each read cache setting, by catalog key.
+const std::map<std::string, FfiReadCacheField> &FfiReadCacheFields() {
+    using ReadCache                                              = iggy::ffi::TopicReadCache;
+    static const std::map<std::string, FfiReadCacheField> fields = {
+        {"read_cache_size", {&ReadCache::has_read_cache_size, &ReadCache::read_cache_size}},
+        {"read_ahead", {&ReadCache::has_read_ahead, &ReadCache::read_ahead}},
+    };
+    return fields;
+}
+
+// Zero turns a read cache setting off, so setting it must read back as set.
+template <typename Options>
+SurfaceCheck ReadCacheMember(const std::string &key) {
+    return [key] {
+        const auto &[set, get] = ReadCacheAccessors<Options>().at(key);
+        Options options;
+        (options.*set)(0);
+        return (options.*get)() == std::uint64_t{0};
+    };
+}
+
+// A projection or input lists a read cache setting as decimal bytes, and leaves out one that is unset.
+std::optional<std::uint64_t> FixtureBytes(const nlohmann::json &object, const std::string &key) {
+    if (!object.contains(key)) {
+        return std::nullopt;
+    }
+    return std::stoull(object.at(key).get<std::string>());
+}
+
+// Sets every read cache setting the input names through the typed setters, and checks each reads back.
+template <typename Options>
+void ExpectTypedReadCache(const nlohmann::json &input) {
+    Options options;
+    for (const auto &[key, accessors] : ReadCacheAccessors<Options>()) {
+        ASSERT_TRUE(input.contains(key)) << key;
+        (options.*accessors.first)(*FixtureBytes(input, key));
+    }
+    for (const auto &[key, accessors] : ReadCacheAccessors<Options>()) {
+        EXPECT_EQ((options.*accessors.second)(), FixtureBytes(input, key)) << key;
+    }
+}
+
+// The bridge read cache of a topic response projection.
+iggy::ffi::TopicReadCache FfiReadCache(const nlohmann::json &expected) {
+    iggy::ffi::TopicReadCache read_cache{};
+    for (const auto &[key, fields] : FfiReadCacheFields()) {
+        if (const auto bytes = FixtureBytes(expected, key)) {
+            read_cache.*fields.first  = true;
+            read_cache.*fields.second = *bytes;
+        }
+    }
+    return read_cache;
+}
+
 std::map<std::string, ScopeSurface> TypedSurface() {
     using iggy::StreamCreateOptions;
     using iggy::StreamUpdateOptions;
@@ -208,6 +403,20 @@ std::map<std::string, ScopeSurface> TypedSurface() {
                        .LocalRetentionSize()
                        .has_value();
                }},
+              {"topic_type",
+               [] { return TopicCreateOptions().SetTopicType(iggy::TopicType::Geo).TopicType().has_value(); }},
+              {"geo_mode",
+               [] { return TopicCreateOptions().SetGeoMode(iggy::GeoMode::GeoTiered).GeoMode().has_value(); }},
+              {"fresh_upload_interval", GeoDurationMember<TopicCreateOptions>("fresh_upload_interval")},
+              {"consumer_offset_upload_interval",
+               GeoDurationMember<TopicCreateOptions>("consumer_offset_upload_interval")},
+              {"positions_publish_interval", GeoDurationMember<TopicCreateOptions>("positions_publish_interval")},
+              {"tombstone_grace", GeoDurationMember<TopicCreateOptions>("tombstone_grace")},
+              {"positions_resume_timeout", GeoDurationMember<TopicCreateOptions>("positions_resume_timeout")},
+              {"long_term_rewrite_max_interval",
+               GeoDurationMember<TopicCreateOptions>("long_term_rewrite_max_interval")},
+              {"read_cache_size", ReadCacheMember<TopicCreateOptions>("read_cache_size")},
+              {"read_ahead", ReadCacheMember<TopicCreateOptions>("read_ahead")},
           },
           {
               {"name", [] { return TopicUpdateOptions().SetName("renamed").Name().has_value(); }},
@@ -241,6 +450,16 @@ std::map<std::string, ScopeSurface> TypedSurface() {
                        .LocalRetentionSize()
                        .has_value();
                }},
+              {"fresh_upload_interval", GeoDurationMember<TopicUpdateOptions>("fresh_upload_interval")},
+              {"consumer_offset_upload_interval",
+               GeoDurationMember<TopicUpdateOptions>("consumer_offset_upload_interval")},
+              {"positions_publish_interval", GeoDurationMember<TopicUpdateOptions>("positions_publish_interval")},
+              {"tombstone_grace", GeoDurationMember<TopicUpdateOptions>("tombstone_grace")},
+              {"positions_resume_timeout", GeoDurationMember<TopicUpdateOptions>("positions_resume_timeout")},
+              {"long_term_rewrite_max_interval",
+               GeoDurationMember<TopicUpdateOptions>("long_term_rewrite_max_interval")},
+              {"read_cache_size", ReadCacheMember<TopicUpdateOptions>("read_cache_size")},
+              {"read_ahead", ReadCacheMember<TopicUpdateOptions>("read_ahead")},
           },
           {
               {"message_expiry", ResetMember<TopicUpdateOptions>(iggy::TopicOptionKey::MessageExpiry)},
@@ -276,6 +495,12 @@ std::map<std::string, ScopeSurface> TypedSurface() {
                    static_cast<void>(&iggy::StreamDetails::EncryptionKekFingerprints);
                    return true;
                }},
+              {"shadow_origin",
+               [] {
+                   static_cast<void>(&iggy::StreamDetails::ShadowOrigin);
+                   static_cast<void>(&iggy::Stream::ShadowOrigin);
+                   return true;
+               }},
           }}},
         {"user",
          {{},
@@ -305,6 +530,17 @@ template <typename Operation>
 }
 
 }  // namespace
+
+namespace iggy {
+
+// Topic and TopicDetails name this class as a friend, because only a read against a server builds one.
+class TopicTestPeer {
+  public:
+    static Topic FromBridge(ffi::Topic topic) { return Topic::FromFfi(std::move(topic)); }
+    static TopicDetails FromBridge(ffi::TopicDetails topic) { return TopicDetails::FromFfi(std::move(topic)); }
+};
+
+}  // namespace iggy
 
 TEST(ResourceOptionsFixtureTest, GivenFixtureKeyWhenFingerprintingShouldMatchSharedVector) {
     const auto &stream_key = Fixture().at("stream_key");
@@ -397,4 +633,75 @@ TEST(ResourceOptionsFixtureTest, GivenReadmeSampleWhenCompilingShouldMatchThePub
         return same_key;
     };
     static_cast<void>(sample);
+}
+
+// C++ cannot encode a request without sending it, so the Rust tests of the bridge check the wire bytes and HTTP
+// bodies of these vectors, from the bridge fields that IggyBlockingClient fills from these typed options.
+TEST(ResourceOptionsFixtureTest, GivenGeoDurationVectorsWhenSettingTypedOptionsShouldKeepEachValueAndZero) {
+    ExpectTypedGeoDurations<iggy::TopicCreateOptions>(
+        FixtureCase("create_topic", "geo_topic_with_durations").at("input"));
+    ExpectTypedGeoDurations<iggy::TopicUpdateOptions>(
+        FixtureCase("update_resource", "topic_set_geo_durations").at("input"));
+}
+
+TEST(ResourceOptionsFixtureTest, GivenTopicResponseProjectionsWhenReadingShouldExposeEachGeoDuration) {
+    for (const auto &vector : Fixture().at("topic_responses")) {
+        SCOPED_TRACE(vector.at("case").get<std::string>());
+        const auto &expected = vector.at("expected");
+        iggy::ffi::Topic summary{};
+        summary.geo_durations = FfiGeoDurations(expected);
+        iggy::ffi::TopicDetails details{};
+        details.geo_durations = FfiGeoDurations(expected);
+
+        const auto topic         = iggy::TopicTestPeer::FromBridge(std::move(summary));
+        const auto topic_details = iggy::TopicTestPeer::FromBridge(std::move(details));
+
+        for (const auto &[key, getter] : GeoDurationGetters<iggy::Topic>()) {
+            EXPECT_EQ((topic.*getter)(), FixtureMicros(expected, key)) << key;
+        }
+        for (const auto &[key, getter] : GeoDurationGetters<iggy::TopicDetails>()) {
+            EXPECT_EQ((topic_details.*getter)(), FixtureMicros(expected, key)) << key;
+        }
+    }
+}
+
+TEST(ResourceOptionsFixtureTest, GivenReadCacheVectorsWhenSettingTypedOptionsShouldKeepEachValueAndZero) {
+    ExpectTypedReadCache<iggy::TopicCreateOptions>(FixtureCase("create_topic", "topic_with_read_cache").at("input"));
+    ExpectTypedReadCache<iggy::TopicUpdateOptions>(FixtureCase("update_resource", "topic_set_read_cache").at("input"));
+}
+
+TEST(ResourceOptionsFixtureTest, GivenTopicResponseProjectionsWhenReadingShouldExposeTheReadCache) {
+    for (const auto &vector : Fixture().at("topic_responses")) {
+        SCOPED_TRACE(vector.at("case").get<std::string>());
+        const auto &expected = vector.at("expected");
+        iggy::ffi::Topic summary{};
+        summary.read_cache = FfiReadCache(expected);
+        iggy::ffi::TopicDetails details{};
+        details.read_cache = FfiReadCache(expected);
+
+        const auto topic         = iggy::TopicTestPeer::FromBridge(std::move(summary));
+        const auto topic_details = iggy::TopicTestPeer::FromBridge(std::move(details));
+
+        for (const auto &[key, getter] : ReadCacheGetters<iggy::Topic>()) {
+            EXPECT_EQ((topic.*getter)(), FixtureBytes(expected, key)) << key;
+        }
+        for (const auto &[key, getter] : ReadCacheGetters<iggy::TopicDetails>()) {
+            EXPECT_EQ((topic_details.*getter)(), FixtureBytes(expected, key)) << key;
+        }
+    }
+}
+
+TEST(ResourceOptionsFixtureTest, GivenDurationPastTheMicrosecondsRangeWhenReadingShouldReadTheLongest) {
+    const auto longest = static_cast<std::uint64_t>(std::chrono::microseconds::max().count());
+    iggy::ffi::TopicDetails details{};
+    details.geo_durations.has_tombstone_grace             = true;
+    details.geo_durations.tombstone_grace_micros          = std::numeric_limits<std::uint64_t>::max();
+    details.geo_durations.has_positions_resume_timeout    = true;
+    details.geo_durations.positions_resume_timeout_micros = longest;
+
+    const auto topic = iggy::TopicTestPeer::FromBridge(std::move(details));
+
+    EXPECT_EQ(topic.TombstoneGrace(), std::chrono::microseconds::max());
+    EXPECT_EQ(topic.PositionsResumeTimeout(), std::chrono::microseconds::max());
+    EXPECT_FALSE(topic.FreshUploadInterval().has_value());
 }

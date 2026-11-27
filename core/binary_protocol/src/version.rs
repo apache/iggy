@@ -120,15 +120,29 @@ pub const IGGY_PROTOCOL_VERSION: u32 = pack_protocol_version(0, 12, 3);
 
 /// Revision of what replicas send each other, which clients never see.
 ///
-/// Peers refuse each other at the replica handshake unless it matches, so bump
-/// it whenever a build stops decoding what another build sends. Revision 1 adds
-/// partition member lists, partition status bodies on metadata probes and
+/// Bump this revision when replicas can no longer read each other's frames or state transfer artifacts, including metadata snapshots, client tables, state manifests and partition transfers. The same rule applies to incompatible changes to the HTTP relay between nodes or configuration defaults required for interoperability. If a shared setting supports both releases, pin it on every node before upgrading the first binary and switch to the new default only after the last node rejoins. For a metadata journal capacity increase, raise the backups first and the metadata primary last.
+///
+/// Revision 1 adds partition member lists, partition status bodies on metadata probes and
 /// replies, retirement debt on session finalization and the paid-through mark
 /// on session retirement. Revision 2 batches `Commit` and `CommitReply`
 /// frames, one entry per group. Revision 3 retires ended sessions in batches:
 /// retirement reports and session finalization carry a walk watermark instead
-/// of one session and a namespace revision.
-pub const REPLICA_WIRE_REVISION: u32 = 3;
+/// of one session and a namespace revision. Revision 4 binds sessions to the
+/// credential that opened them: `Register` carries an access revision and a
+/// token id, a password change carries the revision it verified, and the client
+/// table transfer carries each session's token. Revision 5 lets a `ReplicaHello`
+/// carry, as its body, the identities of the releases its sender lists as
+/// compatible. An earlier build ignores that body, so it must never match a
+/// listed identity. Revision 6 adds a `ShadowTopic` kind that sets the read
+/// cache options of a shadow topic, lets an update of a geo topic set
+/// `read_cache_size` and `read_ahead`, refuses at commit a topic update that
+/// leaves that pair invalid, stores persisted durability for the consumer
+/// offsets of geo and shadow topics, and sends in a partition state transfer
+/// every segment of the stored front as its chain record alone, even while
+/// its `.log` is still on the sender's disk. An earlier build cannot decode
+/// the new kind, and it reaches other verdicts and stores other options for
+/// the same metadata operations.
+pub const REPLICA_WIRE_REVISION: u32 = 6;
 
 /// Oldest protocol version this build accepts at login.
 ///

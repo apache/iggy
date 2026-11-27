@@ -36,6 +36,7 @@
 //! endpoint via [`ShardMetrics::register`] (one `shard`-labelled
 //! sub-registry per shard). Drop-site tracing supplements the counters.
 
+use crate::geo_commits::CommitAnswer;
 use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue, LabelValueEncoder};
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
@@ -44,7 +45,8 @@ use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use consensus::ReplicationStats;
@@ -52,6 +54,7 @@ use iggy_binary_protocol::{COMMAND_TABLE, Command, command_index};
 use iggy_common::ConsumerKind;
 use message_bus::{ReplicaLinkMetrics, ReplicaReadMetrics};
 use partitions::CheckpointTrigger;
+use server_common::sharding::IggyNamespace;
 
 /// Label for `frame_drops_total`.
 ///
@@ -78,9 +81,24 @@ pub struct ConsumerOffsetKindLabel {
     pub kind: &'static str,
 }
 
+/// Label of the geo peer gauges: the origin name of the peer, as the
+/// configuration gives it.
+#[derive(Clone, Hash, Eq, PartialEq, EncodeLabelSet, Debug)]
+pub struct GeoPeerLabel {
+    pub origin: String,
+}
+
 #[derive(Clone, Hash, Eq, PartialEq, EncodeLabelSet, Debug)]
 pub struct CheckpointTriggerLabel {
     pub trigger: &'static str,
+}
+
+/// Label of the geo peer request counters: the peer's origin and the
+/// request, `list` or `get`.
+#[derive(Clone, Hash, Eq, PartialEq, EncodeLabelSet, Debug)]
+pub struct GeoPeerRequestLabel {
+    pub origin: String,
+    pub request: &'static str,
 }
 
 /// Label for `partition_frames_incarnation_mismatch_total`: the dropped
@@ -114,6 +132,25 @@ impl From<Command> for FrameCommandLabel {
             command: CommandLabel(command),
         }
     }
+}
+
+/// What one partition that places its batches has yet to rewrite into
+/// long-term segments, as the shard that leads it found at its last tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LongTermLag {
+    pub namespace: IggyNamespace,
+    /// Messages it committed that no long-term segment holds.
+    pub messages: u64,
+    /// Bytes of those messages, `None` until its replica counted them.
+    pub bytes: Option<u64>,
+}
+
+/// The lags a shard reported last, and the list of the report before it,
+/// which the next report fills so that a tick allocates none.
+#[derive(Debug, Default)]
+struct LongTermLags {
+    reported: Vec<LongTermLag>,
+    spare: Vec<LongTermLag>,
 }
 
 /// Variant labels used in `frame_drops_total`. Exposed as constants to
@@ -250,6 +287,149 @@ fn variant_index(s: &str) -> Option<usize> {
 
 fn reason_index(s: &str) -> Option<usize> {
     REASONS.iter().position(|r| *r == s)
+}
+
+/// What the tier store of a shard did to the puts it can send again, see
+/// [`crate::tier_service::TierStore`]. Clones count into the same counters.
+#[derive(Debug, Clone, Default)]
+pub struct TierStoreCounters {
+    put_retries: Counter,
+    second_attempts: Counter,
+    second_attempt_wins: Counter,
+    own_objects_found: Counter,
+    parts_uploads: Counter,
+    parts_uploads_completed: Counter,
+    parts_uploads_aborted: Counter,
+    parts_fallbacks: Counter,
+    parts_sent: Counter,
+}
+
+impl TierStoreCounters {
+    /// A put is sent again after an attempt that failed.
+    pub(crate) fn record_put_retry(&self) {
+        self.put_retries.inc();
+    }
+
+    /// A slow create-only put got a second attempt beside its first.
+    pub(crate) fn record_second_attempt(&self) {
+        self.second_attempts.inc();
+    }
+
+    /// The second attempt of a put stored the object first.
+    pub(crate) fn record_second_attempt_win(&self) {
+        self.second_attempt_wins.inc();
+    }
+
+    /// A create-only put that the store refused found the object that an
+    /// earlier attempt of the same put stored.
+    pub(crate) fn record_own_object_found(&self) {
+        self.own_objects_found.inc();
+    }
+
+    /// An upload in parts began.
+    pub(crate) fn record_parts_upload(&self) {
+        self.parts_uploads.inc();
+    }
+
+    /// An upload in parts created its object.
+    pub(crate) fn record_parts_upload_completed(&self) {
+        self.parts_uploads_completed.inc();
+    }
+
+    /// An upload in parts ended without its object and was aborted.
+    pub(crate) fn record_parts_upload_aborted(&self) {
+        self.parts_uploads_aborted.inc();
+    }
+
+    /// A put that would go up in parts went whole, because the store does
+    /// not take uploads in parts.
+    pub(crate) fn record_parts_fallback(&self) {
+        self.parts_fallbacks.inc();
+    }
+
+    /// One attempt at a part went out.
+    pub(crate) fn record_part_sent(&self) {
+        self.parts_sent.inc();
+    }
+
+    /// Test-only read: uploads in parts begun, completed, aborted, fallen
+    /// back to a whole put, and parts sent.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn parts_values(&self) -> (u64, u64, u64, u64, u64) {
+        (
+            self.parts_uploads.get(),
+            self.parts_uploads_completed.get(),
+            self.parts_uploads_aborted.get(),
+            self.parts_fallbacks.get(),
+            self.parts_sent.get(),
+        )
+    }
+
+    /// Test-only read: put retries, second attempts, second attempt wins and
+    /// own objects found.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn values(&self) -> (u64, u64, u64, u64) {
+        (
+            self.put_retries.get(),
+            self.second_attempts.get(),
+            self.second_attempt_wins.get(),
+            self.own_objects_found.get(),
+        )
+    }
+
+    fn register(&self, registry: &mut Registry) {
+        registry.register(
+            "object_store_put_retries",
+            "attempts at a put to the object store, whose body the shard holds in memory, after an \
+             attempt that failed",
+            self.put_retries.clone(),
+        );
+        registry.register(
+            "object_store_put_second_attempts",
+            "second attempts at a create-only put to the object store that ran past \
+             tiered_storage.second_attempt_after",
+            self.second_attempts.clone(),
+        );
+        registry.register(
+            "object_store_put_second_attempt_wins",
+            "create-only puts to the object store whose second attempt stored the object first",
+            self.second_attempt_wins.clone(),
+        );
+        registry.register(
+            "object_store_put_own_objects_found",
+            "create-only puts that the object store refused because an earlier attempt of the same \
+             put had stored the object, counted as stored",
+            self.own_objects_found.clone(),
+        );
+        registry.register(
+            "object_store_parts_uploads",
+            "uploads in parts of large objects to the object store that began",
+            self.parts_uploads.clone(),
+        );
+        registry.register(
+            "object_store_parts_uploads_completed",
+            "uploads in parts that created their object",
+            self.parts_uploads_completed.clone(),
+        );
+        registry.register(
+            "object_store_parts_uploads_aborted",
+            "uploads in parts that ended without their object and were aborted",
+            self.parts_uploads_aborted.clone(),
+        );
+        registry.register(
+            "object_store_parts_fallbacks",
+            "puts that would have gone up in parts and went whole, because the object store does \
+             not take uploads in parts",
+            self.parts_fallbacks.clone(),
+        );
+        registry.register(
+            "object_store_parts_sent",
+            "attempts at the parts of uploads in parts",
+            self.parts_sent.clone(),
+        );
+    }
 }
 
 #[derive(Clone, Default)]
@@ -391,6 +571,14 @@ pub struct ShardMetrics {
     partitions_reconcile_repairs_total: Counter,
     partition_transfer_refusals_total: Counter,
     partition_applied_divergences_total: Counter,
+    partition_chain_rebuilds_total: Counter,
+    partition_chain_rebuild_refusals_total: Counter,
+    partitions_awaiting_chain_rebuild: Gauge,
+    partition_segment_verify_passes_total: Counter,
+    partition_stored_segments_verified_total: Counter,
+    partition_segment_verify_unanswered_total: Counter,
+    partition_stored_segments_missing: Gauge,
+    partition_stored_segments_diverged: Gauge,
     partitions_untrusted_log: Gauge,
     partitions_in_view_change: Gauge,
     partition_view_change_votes_held: Gauge,
@@ -398,16 +586,46 @@ pub struct ShardMetrics {
     partitions_below_write_quorum: Gauge,
     partitions_owing_retirement: Gauge,
     partition_segment_upload_lag_seconds: Gauge,
+    partition_long_term_rewrite_lag_messages: Gauge,
+    partition_long_term_unannounced_objects: Gauge,
+    partition_long_term_merges_total: Counter,
+    partition_long_term_merged_segments_total: Counter,
+    partition_long_term_segments: Gauge,
+    partition_long_term_dead_objects: Gauge,
+    partition_long_term_trims_total: Counter,
+    partition_long_term_deleted_objects_total: Counter,
+    fresh_objects: Gauge,
+    fresh_object_bytes: Gauge,
+    fresh_object_oldest_age_seconds: Gauge,
+    fresh_objects_unnamed: Gauge,
+    fresh_objects_due: Gauge,
+    fresh_objects_proving: Gauge,
+    fresh_listings_truncated: Gauge,
+    fresh_sweeps_held: Gauge,
+    fresh_objects_deleted_total: Counter,
+    orphan_sweeps_total: Counter,
+    orphan_incarnations: Gauge,
+    orphan_incarnations_deleted_total: Counter,
+    orphan_objects_before_claim: Gauge,
+    orphan_identity_skips_total: Counter,
+    partition_long_term_backlog_bytes: Gauge,
+    partition_long_term_lags: Arc<Mutex<LongTermLags>>,
+    partition_long_term_delayed_sends_total: Counter,
     retirement_debts_paid_total: Counter,
     partition_frames_rejected_stale_total: Counter,
     partition_frames_rejected_ahead_total: Counter,
     partition_frames_incarnation_mismatch_total: Family<FrameCommandLabel, Counter>,
+    partition_frames_dropped_unbuilt_total: Counter,
+    partition_held_reads_expired_total: Counter,
+    partition_held_reads_refused_total: Counter,
+    partition_held_reads: Gauge,
     partition_requests_denied_transient_total: Counter,
     partition_prepare_gap_drops_total: Counter,
     metadata_prepare_gap_drops_total: Counter,
     partition_applied_log_contradictions_total: Counter,
     metadata_applied_log_contradictions_total: Counter,
     metadata_read_frontier_refusals_total: Counter,
+    partition_request_frontier_refusals_total: Counter,
     client_requests_denied_queue_full_total: Counter,
     replica_socket_reads_total: Counter,
     replica_inbound_frames_total: Counter,
@@ -430,6 +648,69 @@ pub struct ShardMetrics {
     /// How late each consensus tick of the message pump ran after its timer
     /// was due: the time the shard's thread spent on other work first.
     pump_tick_lateness: Histogram,
+    /// Fresh objects this shard stored, the ones the store refused, and the
+    /// bytes of the stored ones.
+    fresh_uploads_total: Counter,
+    fresh_upload_failures_total: Counter,
+    fresh_upload_bytes_total: Counter,
+    /// Attempts at storing a fresh object after one that failed.
+    fresh_upload_retries_total: Counter,
+    /// Sends to partitions that place their batches that this shard answered
+    /// as not accepted, before or after it stored their messages.
+    fresh_sends_denied_total: Counter,
+    /// Of those, the sends turned away because the waiting sends of their
+    /// partition held its share of the bytes, and because the waiting sends
+    /// of the shard held all the bytes they may: the bounds
+    /// `tiered_storage.fresh_partition_pending_bytes` and
+    /// `tiered_storage.fresh_pending_bytes`.
+    fresh_sends_denied_partition_share_total: Counter,
+    fresh_sends_denied_shard_cap_total: Counter,
+    /// Fresh objects whose upload holds one of the shard's upload slots.
+    fresh_uploads_in_flight: Gauge,
+    /// Sends whose messages this shard holds or stored and whose request
+    /// has not reached its partition.
+    fresh_staged_sends: Gauge,
+    /// The three parts of a send to a partition that places its batches:
+    /// the wait of its upload window, the upload of its fresh object, and
+    /// the commit of where its messages sit.
+    fresh_window_wait: Histogram,
+    fresh_upload: Histogram,
+    fresh_commit: Histogram,
+    /// Bytes of each fresh object this shard stored. Objects far below
+    /// `FRESH_OBJECT_BYTES` under load mean that windows close with few
+    /// sends, so the store is asked for more objects than the load needs.
+    fresh_object_size: Histogram,
+    /// How long the oldest proof row of a batch that committed has waited
+    /// for a stored object to carry it. Another cluster reads a batch only
+    /// once its row is stored.
+    fresh_proof_lag_seconds: Gauge<f64, AtomicU64>,
+    /// Fresh objects this shard stored that carry proof rows and no data,
+    /// because no window closed soon enough after their batches committed.
+    fresh_confirmations_total: Counter,
+    /// Blocks of objects that polls took from the read cache of the shard,
+    /// and the blocks they fetched or waited for.
+    remote_read_block_hits_total: Counter,
+    remote_read_block_misses_total: Counter,
+    /// First reads of blocks that readahead fetched, and the blocks it
+    /// fetched.
+    remote_read_ahead_hits_total: Counter,
+    remote_read_blocks_fetched_ahead_total: Counter,
+    /// Bytes of the GETs that polls waited for, and of the GETs of readahead.
+    remote_read_demand_bytes_total: Counter,
+    remote_read_ahead_bytes_total: Counter,
+    /// Bytes that the read cache holds.
+    remote_read_cache_bytes: Gauge,
+    /// Of those, bytes of the fresh objects this shard uploaded that it
+    /// holds for the polls of their partitions.
+    remote_read_held_bytes: Gauge,
+    /// Fresh objects the shard stopped holding once the long-term floors of
+    /// their partitions passed them.
+    remote_read_fresh_releases_total: Counter,
+    /// Bytes of long-term segments that rewrites handed to the read cache.
+    remote_read_carried_bytes_total: Counter,
+    /// Blocks and objects that left the read cache because their partition
+    /// was over its limit.
+    remote_read_limit_evictions_total: Counter,
     /// 1 while this node passes the store identity check of tiered storage.
     /// Both object store gauges hold for the whole node, so every shard
     /// exports the same ones, see [`Self::share_object_store_gauges`].
@@ -437,6 +718,65 @@ pub struct ShardMetrics {
     /// 1 while the object store did not answer the last read of its identity
     /// object: the boot probe, then each identity check.
     object_store_unreachable: Gauge,
+    /// What the tier store of this shard did to its puts.
+    tier_store: TierStoreCounters,
+    /// Per geo peer, 1 while this node reads the peer: a check verified the
+    /// cluster that owns the peer's root. Node-wide like the object store
+    /// gauges.
+    geo_peer_identity_verified: Family<GeoPeerLabel, Gauge>,
+    /// Per geo peer, 1 while the peer's store did not answer the last read of
+    /// its identity object.
+    geo_peer_unreachable: Family<GeoPeerLabel, Gauge>,
+    /// Per geo peer, 1 once committed metadata retired its origin, so this
+    /// node follows nothing of it again.
+    geo_peer_retired: Family<GeoPeerLabel, Gauge>,
+    /// Per geo peer, the shadow topics that serve what they hold because the
+    /// peer's store did not answer the last listing of its topic objects. Set
+    /// by the metadata primary.
+    geo_shadow_topics_stale: Family<GeoPeerLabel, Gauge>,
+    /// Per geo peer and request, the manifest listings and reads this shard
+    /// sent to the peer's store.
+    geo_peer_manifest_requests_total: Family<GeoPeerRequestLabel, Counter>,
+    /// Per geo peer and request, the ones of those that failed.
+    geo_peer_manifest_failures_total: Family<GeoPeerRequestLabel, Counter>,
+    /// Per geo peer, the manifests that the shadow partitions here refused
+    /// to commit: the alarm of a manifest that goes back, names another
+    /// incarnation or does not check.
+    geo_peer_manifests_refused_total: Family<GeoPeerLabel, Counter>,
+    /// Per geo peer, the commands that committed its manifests, as the
+    /// primaries here proposed them.
+    geo_peer_manifest_commands_total: Family<GeoPeerLabel, Counter>,
+    /// Per geo peer, the Unix time in seconds of the last listing of its
+    /// manifests that succeeded. Set by shard 0.
+    geo_peer_manifest_listed_seconds: Family<GeoPeerLabel, Gauge>,
+    /// Per geo peer, the shadow partitions whose primary is here and whose
+    /// committed manifest is behind the one the peer lists.
+    geo_shadow_partitions_behind: Family<GeoPeerLabel, Gauge>,
+    /// Per geo peer, how long the furthest behind of those has been behind,
+    /// in seconds.
+    geo_shadow_manifest_lag_seconds: Family<GeoPeerLabel, Gauge>,
+    /// Per geo peer and request, the listings and reads of its consumer
+    /// group positions that this shard sent to its store.
+    geo_peer_position_requests_total: Family<GeoPeerRequestLabel, Counter>,
+    /// Per geo peer and request, the ones of those that failed.
+    geo_peer_position_failures_total: Family<GeoPeerRequestLabel, Counter>,
+    /// Per geo peer, the positions of its consumer groups that the
+    /// partitions here proposed to take.
+    geo_peer_positions_adopted_total: Family<GeoPeerLabel, Counter>,
+    /// Objects of consumer group positions that this shard stored in the
+    /// node's store.
+    geo_positions_stored_total: Counter,
+    /// The ones of those that the store refused.
+    geo_positions_store_failures_total: Counter,
+    /// Offset stores of consumer groups on geo and shadow partitions that
+    /// were answered once the node's store held their positions.
+    geo_positions_commits_confirmed_total: Counter,
+    /// The ones answered `TransientNotCommitted` instead, as their positions
+    /// were not stored in time or their partitions stopped being led here.
+    geo_positions_commits_uncertain_total: Counter,
+    /// 1 while the group polls of geo and shadow partitions on this shard
+    /// wait for the first positions of every geo peer since the node started.
+    geo_positions_resume_waiting: Gauge,
 }
 
 impl ShardMetrics {
@@ -444,6 +784,7 @@ impl ShardMetrics {
     /// virtue of being constructed once per shard; the shard id does not
     /// appear in the label set (see [`FrameDropLabel`] doc).
     #[must_use]
+    // One line per metric, and nothing else.
     #[allow(clippy::too_many_lines)]
     pub fn for_shard() -> Self {
         let frame_drops_total: Family<FrameDropLabel, Counter> = Family::default();
@@ -534,6 +875,14 @@ impl ShardMetrics {
             partitions_reconcile_repairs_total: Counter::default(),
             partition_transfer_refusals_total: Counter::default(),
             partition_applied_divergences_total: Counter::default(),
+            partition_chain_rebuilds_total: Counter::default(),
+            partition_chain_rebuild_refusals_total: Counter::default(),
+            partitions_awaiting_chain_rebuild: Gauge::default(),
+            partition_segment_verify_passes_total: Counter::default(),
+            partition_stored_segments_verified_total: Counter::default(),
+            partition_segment_verify_unanswered_total: Counter::default(),
+            partition_stored_segments_missing: Gauge::default(),
+            partition_stored_segments_diverged: Gauge::default(),
             partitions_untrusted_log: Gauge::default(),
             partitions_in_view_change: Gauge::default(),
             partition_view_change_votes_held: Gauge::default(),
@@ -541,16 +890,46 @@ impl ShardMetrics {
             partitions_below_write_quorum: Gauge::default(),
             partitions_owing_retirement: Gauge::default(),
             partition_segment_upload_lag_seconds: Gauge::default(),
+            partition_long_term_rewrite_lag_messages: Gauge::default(),
+            partition_long_term_unannounced_objects: Gauge::default(),
+            partition_long_term_merges_total: Counter::default(),
+            partition_long_term_merged_segments_total: Counter::default(),
+            partition_long_term_segments: Gauge::default(),
+            partition_long_term_dead_objects: Gauge::default(),
+            partition_long_term_trims_total: Counter::default(),
+            partition_long_term_deleted_objects_total: Counter::default(),
+            fresh_objects: Gauge::default(),
+            fresh_object_bytes: Gauge::default(),
+            fresh_object_oldest_age_seconds: Gauge::default(),
+            fresh_objects_unnamed: Gauge::default(),
+            fresh_objects_due: Gauge::default(),
+            fresh_objects_proving: Gauge::default(),
+            fresh_listings_truncated: Gauge::default(),
+            fresh_sweeps_held: Gauge::default(),
+            fresh_objects_deleted_total: Counter::default(),
+            orphan_sweeps_total: Counter::default(),
+            orphan_incarnations: Gauge::default(),
+            orphan_incarnations_deleted_total: Counter::default(),
+            orphan_objects_before_claim: Gauge::default(),
+            orphan_identity_skips_total: Counter::default(),
+            partition_long_term_backlog_bytes: Gauge::default(),
+            partition_long_term_lags: Arc::default(),
+            partition_long_term_delayed_sends_total: Counter::default(),
             retirement_debts_paid_total: Counter::default(),
             partition_frames_rejected_stale_total: Counter::default(),
             partition_frames_rejected_ahead_total: Counter::default(),
             partition_frames_incarnation_mismatch_total: Family::default(),
+            partition_frames_dropped_unbuilt_total: Counter::default(),
+            partition_held_reads_expired_total: Counter::default(),
+            partition_held_reads_refused_total: Counter::default(),
+            partition_held_reads: Gauge::default(),
             partition_requests_denied_transient_total: Counter::default(),
             partition_prepare_gap_drops_total: Counter::default(),
             metadata_prepare_gap_drops_total: Counter::default(),
             partition_applied_log_contradictions_total: Counter::default(),
             metadata_applied_log_contradictions_total: Counter::default(),
             metadata_read_frontier_refusals_total: Counter::default(),
+            partition_request_frontier_refusals_total: Counter::default(),
             client_requests_denied_queue_full_total: Counter::default(),
             replica_socket_reads_total: Counter::default(),
             replica_inbound_frames_total: Counter::default(),
@@ -571,8 +950,54 @@ impl ShardMetrics {
             fetches: FetchMetrics::new(),
             readiness_push_to_fire: latency_histogram(),
             pump_tick_lateness: latency_histogram(),
+            fresh_uploads_total: Counter::default(),
+            fresh_upload_failures_total: Counter::default(),
+            fresh_upload_bytes_total: Counter::default(),
+            fresh_upload_retries_total: Counter::default(),
+            fresh_sends_denied_total: Counter::default(),
+            fresh_sends_denied_partition_share_total: Counter::default(),
+            fresh_sends_denied_shard_cap_total: Counter::default(),
+            fresh_uploads_in_flight: Gauge::default(),
+            fresh_staged_sends: Gauge::default(),
+            fresh_window_wait: fresh_latency_histogram(),
+            fresh_upload: fresh_latency_histogram(),
+            fresh_commit: fresh_latency_histogram(),
+            fresh_object_size: fresh_object_size_histogram(),
+            fresh_proof_lag_seconds: Gauge::default(),
+            fresh_confirmations_total: Counter::default(),
+            remote_read_block_hits_total: Counter::default(),
+            remote_read_block_misses_total: Counter::default(),
+            remote_read_ahead_hits_total: Counter::default(),
+            remote_read_blocks_fetched_ahead_total: Counter::default(),
+            remote_read_demand_bytes_total: Counter::default(),
+            remote_read_ahead_bytes_total: Counter::default(),
+            remote_read_cache_bytes: Gauge::default(),
+            remote_read_held_bytes: Gauge::default(),
+            remote_read_fresh_releases_total: Counter::default(),
+            remote_read_carried_bytes_total: Counter::default(),
+            remote_read_limit_evictions_total: Counter::default(),
             object_store_identity_verified: Gauge::default(),
             object_store_unreachable: Gauge::default(),
+            tier_store: TierStoreCounters::default(),
+            geo_peer_identity_verified: Family::default(),
+            geo_peer_unreachable: Family::default(),
+            geo_peer_retired: Family::default(),
+            geo_shadow_topics_stale: Family::default(),
+            geo_peer_manifest_requests_total: Family::default(),
+            geo_peer_manifest_failures_total: Family::default(),
+            geo_peer_manifests_refused_total: Family::default(),
+            geo_peer_manifest_commands_total: Family::default(),
+            geo_peer_manifest_listed_seconds: Family::default(),
+            geo_shadow_partitions_behind: Family::default(),
+            geo_shadow_manifest_lag_seconds: Family::default(),
+            geo_peer_position_requests_total: Family::default(),
+            geo_peer_position_failures_total: Family::default(),
+            geo_peer_positions_adopted_total: Family::default(),
+            geo_positions_stored_total: Counter::default(),
+            geo_positions_store_failures_total: Counter::default(),
+            geo_positions_commits_confirmed_total: Counter::default(),
+            geo_positions_commits_uncertain_total: Counter::default(),
+            geo_positions_resume_waiting: Gauge::default(),
         }
     }
 
@@ -591,11 +1016,153 @@ impl ShardMetrics {
         self.readiness_push_to_fire.observe(elapsed.as_secs_f64());
     }
 
+    /// An upload window started its upload `wait` after its first send.
+    pub(crate) fn record_fresh_window_wait(&self, wait: Duration) {
+        self.fresh_window_wait.observe(wait.as_secs_f64());
+    }
+
+    /// The oldest proof row this shard has not stored yet has waited for
+    /// `lag`, zero when none waits.
+    pub(crate) fn set_fresh_proof_lag(&self, lag: Duration) {
+        self.fresh_proof_lag_seconds.set(lag.as_secs_f64());
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_proof_lag_value(&self) -> f64 {
+        self.fresh_proof_lag_seconds.get()
+    }
+
+    /// The shard stored an object of proof rows alone.
+    pub(crate) fn record_fresh_confirmation(&self) {
+        self.fresh_confirmations_total.inc();
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_confirmations_value(&self) -> u64 {
+        self.fresh_confirmations_total.get()
+    }
+
+    /// The upload of a fresh object of `bytes` ended after `elapsed`, and
+    /// the store holds the object or not.
+    pub(crate) fn record_fresh_upload(&self, bytes: u64, elapsed: Duration, stored: bool) {
+        self.fresh_upload.observe(elapsed.as_secs_f64());
+        if stored {
+            self.fresh_uploads_total.inc();
+            self.fresh_upload_bytes_total.inc_by(bytes);
+            #[allow(clippy::cast_precision_loss)]
+            self.fresh_object_size.observe(bytes as f64);
+        } else {
+            self.fresh_upload_failures_total.inc();
+        }
+    }
+
+    /// An attempt at storing a fresh object failed, and another follows.
+    pub(crate) fn record_fresh_upload_retry(&self) {
+        self.fresh_upload_retries_total.inc();
+    }
+
+    /// A send to a partition that places its batches was answered as not
+    /// accepted.
+    pub(crate) fn record_fresh_send_denied(&self) {
+        self.fresh_sends_denied_total.inc();
+    }
+
+    /// A send was turned away because the waiting sends of its partition
+    /// hold the partition's share of the bytes.
+    pub(crate) fn record_fresh_send_over_partition_share(&self) {
+        self.fresh_sends_denied_partition_share_total.inc();
+    }
+
+    /// A send was turned away because the waiting sends of the shard hold
+    /// all the bytes they may.
+    pub(crate) fn record_fresh_send_over_shard_cap(&self) {
+        self.fresh_sends_denied_shard_cap_total.inc();
+    }
+
+    /// The shard has `in_flight` uploads of fresh objects and holds `staged`
+    /// sends for them.
+    pub(crate) fn set_fresh_load(&self, in_flight: usize, staged: usize) {
+        self.fresh_uploads_in_flight
+            .set(i64::try_from(in_flight).unwrap_or(i64::MAX));
+        self.fresh_staged_sends
+            .set(i64::try_from(staged).unwrap_or(i64::MAX));
+    }
+
+    /// The histogram of the time from a stored object to the answer of each
+    /// send in it, for the task that waits for the answer.
+    pub(crate) fn fresh_commit_latency(&self) -> Histogram {
+        self.fresh_commit.clone()
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_uploads_value(&self) -> (u64, u64, u64) {
+        (
+            self.fresh_uploads_total.get(),
+            self.fresh_upload_failures_total.get(),
+            self.fresh_upload_bytes_total.get(),
+        )
+    }
+
+    /// Test-only read: upload retries, denied sends, uploads in flight and
+    /// staged sends.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_load_value(&self) -> (u64, u64, i64, i64) {
+        (
+            self.fresh_upload_retries_total.get(),
+            self.fresh_sends_denied_total.get(),
+            self.fresh_uploads_in_flight.get(),
+            self.fresh_staged_sends.get(),
+        )
+    }
+
+    /// Test-only read: sends turned away at their partition's share and at
+    /// the shard's cap.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_cap_denials_value(&self) -> (u64, u64) {
+        (
+            self.fresh_sends_denied_partition_share_total.get(),
+            self.fresh_sends_denied_shard_cap_total.get(),
+        )
+    }
+
     pub(crate) fn record_pump_tick_lateness(&self, lateness: Duration) {
         self.pump_tick_lateness.observe(lateness.as_secs_f64());
     }
 
     /// Set `object_store_identity_verified`, for every shard that shares it.
+    /// What the read cache of the shard did since the last take, see
+    /// [`partitions::ReadCache::take_metrics`].
+    pub fn record_remote_reads(&self, reads: &partitions::RemoteReadMetrics) {
+        self.remote_read_block_hits_total.inc_by(reads.block_hits);
+        self.remote_read_block_misses_total
+            .inc_by(reads.block_misses);
+        self.remote_read_ahead_hits_total
+            .inc_by(reads.read_ahead_hits);
+        self.remote_read_blocks_fetched_ahead_total
+            .inc_by(reads.blocks_fetched_ahead);
+        self.remote_read_demand_bytes_total
+            .inc_by(reads.demand_bytes);
+        self.remote_read_ahead_bytes_total.inc_by(reads.ahead_bytes);
+        self.remote_read_cache_bytes
+            .set(i64::try_from(reads.cached_bytes).unwrap_or(i64::MAX));
+        self.remote_read_held_bytes
+            .set(i64::try_from(reads.held_bytes).unwrap_or(i64::MAX));
+        self.remote_read_fresh_releases_total
+            .inc_by(reads.fresh_releases);
+        self.remote_read_carried_bytes_total
+            .inc_by(reads.carried_bytes);
+        self.remote_read_limit_evictions_total
+            .inc_by(reads.limit_evictions);
+    }
+
     pub fn set_object_store_identity_verified(&self, verified: bool) {
         self.object_store_identity_verified.set(i64::from(verified));
     }
@@ -605,11 +1172,262 @@ impl ShardMetrics {
         self.object_store_unreachable.set(i64::from(unreachable));
     }
 
-    /// Export the object store gauges of `node` from this shard as well.
-    /// Only the boot probe and the store identity check of shard 0 set them.
+    /// Set both gauges of the geo peer `origin`, for every shard that shares
+    /// them.
+    pub fn set_geo_peer_status(&self, origin: &str, verified: bool, unreachable: bool) {
+        let label = GeoPeerLabel {
+            origin: origin.to_owned(),
+        };
+        self.geo_peer_identity_verified
+            .get_or_create(&label)
+            .set(i64::from(verified));
+        self.geo_peer_unreachable
+            .get_or_create(&label)
+            .set(i64::from(unreachable));
+    }
+
+    /// Mark the geo peer `origin` retired, for every shard that shares the
+    /// gauge.
+    pub fn set_geo_peer_retired(&self, origin: &str) {
+        let label = GeoPeerLabel {
+            origin: origin.to_owned(),
+        };
+        self.geo_peer_retired.get_or_create(&label).set(1);
+    }
+
+    /// The counters that the tier store of this shard moves.
+    #[must_use]
+    pub fn tier_store_counters(&self) -> TierStoreCounters {
+        self.tier_store.clone()
+    }
+
+    /// Export the object store and geo peer gauges of `node` from this shard
+    /// as well. Only the boot probe and the identity checks of shard 0 set
+    /// them.
     pub fn share_object_store_gauges(&mut self, node: &Self) {
         self.object_store_identity_verified = node.object_store_identity_verified.clone();
         self.object_store_unreachable = node.object_store_unreachable.clone();
+        self.geo_peer_identity_verified = node.geo_peer_identity_verified.clone();
+        self.geo_peer_unreachable = node.geo_peer_unreachable.clone();
+        self.geo_peer_retired = node.geo_peer_retired.clone();
+        self.geo_shadow_topics_stale = node.geo_shadow_topics_stale.clone();
+    }
+
+    /// Set the count of stale shadow topics of the geo peer `origin`.
+    pub fn set_geo_shadow_topics_stale(&self, origin: &str, stale: usize) {
+        let label = GeoPeerLabel {
+            origin: origin.to_owned(),
+        };
+        self.geo_shadow_topics_stale
+            .get_or_create(&label)
+            .set(i64::try_from(stale).unwrap_or(i64::MAX));
+    }
+
+    /// A listing of the manifests of a stream of the geo peer `origin`, which
+    /// succeeded at the Unix time `listed_at` in seconds or failed.
+    pub fn record_peer_manifest_list(&self, origin: &str, listed_at: Option<u64>) {
+        let request = GeoPeerRequestLabel {
+            origin: origin.to_owned(),
+            request: "list",
+        };
+        self.geo_peer_manifest_requests_total
+            .get_or_create(&request)
+            .inc();
+        match listed_at {
+            Some(listed_at) => {
+                self.geo_peer_manifest_listed_seconds
+                    .get_or_create(&GeoPeerLabel {
+                        origin: origin.to_owned(),
+                    })
+                    .set(i64::try_from(listed_at).unwrap_or(i64::MAX));
+            }
+            None => {
+                self.geo_peer_manifest_failures_total
+                    .get_or_create(&request)
+                    .inc();
+            }
+        }
+    }
+
+    /// A read of a manifest of the geo peer `origin`.
+    pub fn record_peer_manifest_read(&self, origin: &str) {
+        self.geo_peer_manifest_requests_total
+            .get_or_create(&GeoPeerRequestLabel {
+                origin: origin.to_owned(),
+                request: "get",
+            })
+            .inc();
+    }
+
+    /// A read of a manifest of the geo peer `origin` that failed.
+    pub fn record_peer_manifest_read_failure(&self, origin: &str) {
+        self.geo_peer_manifest_failures_total
+            .get_or_create(&GeoPeerRequestLabel {
+                origin: origin.to_owned(),
+                request: "get",
+            })
+            .inc();
+    }
+
+    /// A manifest of the geo peer `origin` that a shadow partition refused.
+    pub fn record_peer_manifest_refused(&self, origin: &str) {
+        self.geo_peer_manifests_refused_total
+            .get_or_create(&GeoPeerLabel {
+                origin: origin.to_owned(),
+            })
+            .inc();
+    }
+
+    /// `commands` commands proposed to commit a manifest of the geo peer
+    /// `origin`.
+    pub fn record_peer_manifest_commands(&self, origin: &str, commands: usize) {
+        self.geo_peer_manifest_commands_total
+            .get_or_create(&GeoPeerLabel {
+                origin: origin.to_owned(),
+            })
+            .inc_by(u64::try_from(commands).unwrap_or(u64::MAX));
+    }
+
+    /// The shadow partitions of the geo peer `origin` whose primary is here
+    /// and that are behind its manifests, and how long the furthest behind
+    /// has been, in microseconds.
+    pub fn set_shadow_manifest_lag(&self, origin: &str, behind: usize, lag_micros: u64) {
+        let label = GeoPeerLabel {
+            origin: origin.to_owned(),
+        };
+        self.geo_shadow_partitions_behind
+            .get_or_create(&label)
+            .set(i64::try_from(behind).unwrap_or(i64::MAX));
+        self.geo_shadow_manifest_lag_seconds
+            .get_or_create(&label)
+            .set(i64::try_from(lag_micros / 1_000_000).unwrap_or(i64::MAX));
+    }
+
+    /// A listing or read, `request`, of the consumer group positions of the
+    /// geo peer `origin`, and whether it succeeded.
+    pub fn record_peer_position_request(
+        &self,
+        origin: &str,
+        request: &'static str,
+        succeeded: bool,
+    ) {
+        let label = GeoPeerRequestLabel {
+            origin: origin.to_owned(),
+            request,
+        };
+        self.geo_peer_position_requests_total
+            .get_or_create(&label)
+            .inc();
+        if !succeeded {
+            self.geo_peer_position_failures_total
+                .get_or_create(&label)
+                .inc();
+        }
+    }
+
+    /// `positions` positions of the geo peer `origin` proposed for adoption.
+    pub fn record_peer_positions_adopted(&self, origin: &str, positions: usize) {
+        self.geo_peer_positions_adopted_total
+            .get_or_create(&GeoPeerLabel {
+                origin: origin.to_owned(),
+            })
+            .inc_by(u64::try_from(positions).unwrap_or(u64::MAX));
+    }
+
+    /// An object of consumer group positions that the store took or refused.
+    pub fn record_positions_stored(&self, stored: bool) {
+        if stored {
+            self.geo_positions_stored_total.inc();
+        } else {
+            self.geo_positions_store_failures_total.inc();
+        }
+    }
+
+    /// A group offset store whose reply waited for its position, answered.
+    pub fn record_geo_commit_answered(&self, answer: CommitAnswer) {
+        match answer {
+            CommitAnswer::Committed => self.geo_positions_commits_confirmed_total.inc(),
+            CommitAnswer::Uncertain => self.geo_positions_commits_uncertain_total.inc(),
+        };
+    }
+
+    /// Whether the group polls here wait for the positions of the geo peers.
+    pub fn set_positions_resume_waiting(&self, waiting: bool) {
+        self.geo_positions_resume_waiting.set(i64::from(waiting));
+    }
+
+    /// The counts of the manifest requests to the geo peer `origin` and of
+    /// its refused manifests: lists, gets, refused.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn peer_manifest_counts(&self, origin: &str) -> (u64, u64, u64) {
+        let request = |request| GeoPeerRequestLabel {
+            origin: origin.to_owned(),
+            request,
+        };
+        // One guard at a time: a family holds its lock while a guard lives,
+        // and creating a series takes it for writing.
+        let lists = self
+            .geo_peer_manifest_requests_total
+            .get_or_create(&request("list"))
+            .get();
+        let gets = self
+            .geo_peer_manifest_requests_total
+            .get_or_create(&request("get"))
+            .get();
+        let refused = self
+            .geo_peer_manifests_refused_total
+            .get_or_create(&GeoPeerLabel {
+                origin: origin.to_owned(),
+            })
+            .get();
+        (lists, gets, refused)
+    }
+
+    /// The count of the manifest reads of the geo peer `origin` that failed
+    /// or that the pump did not take.
+    #[cfg(test)]
+    #[must_use]
+    pub fn peer_manifest_read_failures(&self, origin: &str) -> u64 {
+        self.geo_peer_manifest_failures_total
+            .get_or_create(&GeoPeerRequestLabel {
+                origin: origin.to_owned(),
+                request: "get",
+            })
+            .get()
+    }
+
+    /// The count of stale shadow topics of the geo peer `origin`.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn geo_shadow_topics_stale_value(&self, origin: &str) -> i64 {
+        let label = GeoPeerLabel {
+            origin: origin.to_owned(),
+        };
+        self.geo_shadow_topics_stale.get_or_create(&label).get()
+    }
+
+    /// Both gauges of the geo peer `origin`: verified, then unreachable.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn geo_peer_status_value(&self, origin: &str) -> (bool, bool) {
+        let label = GeoPeerLabel {
+            origin: origin.to_owned(),
+        };
+        (
+            self.geo_peer_identity_verified.get_or_create(&label).get() != 0,
+            self.geo_peer_unreachable.get_or_create(&label).get() != 0,
+        )
+    }
+
+    /// Whether the geo peer `origin` is marked retired.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn geo_peer_retired_value(&self, origin: &str) -> bool {
+        let label = GeoPeerLabel {
+            origin: origin.to_owned(),
+        };
+        self.geo_peer_retired.get_or_create(&label).get() != 0
     }
 
     #[cfg(any(test, feature = "simulator"))]
@@ -955,6 +1773,10 @@ impl ShardMetrics {
             .set(i64::try_from(levels.repair_ring_entries).unwrap_or(i64::MAX));
         self.partition_repair_ring_bytes
             .set(i64::try_from(levels.repair_ring_bytes).unwrap_or(i64::MAX));
+        self.partition_stored_segments_missing
+            .set(i64::try_from(levels.stored_segments_missing).unwrap_or(i64::MAX));
+        self.partition_stored_segments_diverged
+            .set(i64::try_from(levels.stored_segments_diverged).unwrap_or(i64::MAX));
     }
 
     pub fn set_wal_reload_budget(&self, bytes_max: u64) {
@@ -1113,6 +1935,21 @@ impl ShardMetrics {
         self.metadata_read_frontier_refusals_total.get()
     }
 
+    /// Bumped every time a partition request is refused because this node's
+    /// applied frontier did not reach what the caller was told committed: at
+    /// the end of its wait for the frontier, or without a wait after an
+    /// earlier request of its connection waited in vain at the same frontier.
+    pub fn record_partition_request_frontier_refusal(&self) {
+        self.partition_request_frontier_refusals_total.inc();
+    }
+
+    /// Current value of [`Self::record_partition_request_frontier_refusal`],
+    /// for tests that assert a refusal was counted rather than scraping it.
+    #[must_use]
+    pub fn partition_request_frontier_refusals_value(&self) -> u64 {
+        self.partition_request_frontier_refusals_total.get()
+    }
+
     /// Increment `frame_drops_total{variant, reason}` by 1.
     ///
     /// Callers should pass label constants from [`frame_drop_variant`]
@@ -1161,7 +1998,7 @@ impl ShardMetrics {
         self.partitions_reconcile_failures_total.inc();
     }
 
-    /// Bumped when the periodic full reconcile changes a partition that no
+    /// Bumped when the reconciler's repair changes a partition that no
     /// committed change and no local record announced. The reconciler's
     /// change sources should make this unreachable, so a non-zero value is a
     /// caught correctness anomaly that only the repair fixed.
@@ -1212,6 +2049,45 @@ impl ShardMetrics {
     #[must_use]
     pub fn partition_applied_divergences_value(&self) -> u64 {
         self.partition_applied_divergences_total.get()
+    }
+
+    /// Bumped when a tiered partition whose segment chain was gone gets it
+    /// back from the object store and loads over it.
+    pub fn record_chain_rebuild(&self) {
+        self.partition_chain_rebuilds_total.inc();
+    }
+
+    /// Bumped when a tiered partition whose segment chain is gone is refused,
+    /// because neither its disk nor the object store accounts for every
+    /// offset below its local log.
+    pub fn record_chain_rebuild_refusal(&self) {
+        self.partition_chain_rebuild_refusals_total.inc();
+    }
+
+    /// Republished whenever the set changes: the partitions on this shard
+    /// whose segment chain is gone and that wait for the object store.
+    pub fn set_partitions_awaiting_chain_rebuild(&self, waiting: usize) {
+        self.partitions_awaiting_chain_rebuild
+            .set(i64::try_from(waiting).unwrap_or(i64::MAX));
+    }
+
+    /// Bumped when a verify pass over the segments a partition stored has
+    /// asked for the last of them, whether or not the store answered for
+    /// each.
+    pub fn record_segment_verify_pass(&self) {
+        self.partition_segment_verify_passes_total.inc();
+    }
+
+    /// Bumped by the segments a verify job compared with the store's answers.
+    pub fn record_stored_segments_verified(&self, segments: usize) {
+        self.partition_stored_segments_verified_total
+            .inc_by(u64::try_from(segments).unwrap_or(u64::MAX));
+    }
+
+    /// Bumped by each verify job that the store left a HEAD of without an
+    /// answer.
+    pub fn record_segment_verify_unanswered(&self) {
+        self.partition_segment_verify_unanswered_total.inc();
     }
 
     /// Republished by every partition sweep: how many of this shard's
@@ -1290,6 +2166,298 @@ impl ShardMetrics {
         self.partition_segment_upload_lag_seconds.get()
     }
 
+    /// Republished by every sweep of fresh objects: how many objects of
+    /// this replica the store holds, their bytes, the age of the oldest, and
+    /// how many of them nothing names.
+    pub fn set_fresh_objects(&self, objects: usize, bytes: u64, oldest: Duration, unnamed: usize) {
+        self.fresh_objects
+            .set(i64::try_from(objects).unwrap_or(i64::MAX));
+        self.fresh_object_bytes
+            .set(i64::try_from(bytes).unwrap_or(i64::MAX));
+        self.fresh_object_oldest_age_seconds
+            .set(i64::try_from(oldest.as_secs()).unwrap_or(i64::MAX));
+        self.fresh_objects_unnamed
+            .set(i64::try_from(unnamed).unwrap_or(i64::MAX));
+    }
+
+    /// Republished at the end of every sweep of fresh objects: how many of
+    /// its listings stopped before the last key of their scope, how many
+    /// objects past their grace period it left in the store, and how many
+    /// it kept for the proof rows they hold.
+    pub fn set_fresh_sweep_backlog(&self, truncated: usize, due: usize, proving: usize) {
+        self.fresh_listings_truncated
+            .set(i64::try_from(truncated).unwrap_or(i64::MAX));
+        self.fresh_objects_due
+            .set(i64::try_from(due).unwrap_or(i64::MAX));
+        self.fresh_objects_proving
+            .set(i64::try_from(proving).unwrap_or(i64::MAX));
+    }
+
+    /// Test-only read, mirroring the siblings: the objects past their grace
+    /// that the last sweep kept for their proof rows.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_objects_proving_value(&self) -> i64 {
+        self.fresh_objects_proving.get()
+    }
+
+    /// Republished by every sweep of fresh objects that ends with the
+    /// answers of the shards: whether one could not tell which objects it
+    /// needs, so the sweep deleted nothing.
+    pub fn set_fresh_sweeps_held(&self, held: bool) {
+        self.fresh_sweeps_held.set(i64::from(held));
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_sweeps_held_value(&self) -> i64 {
+        self.fresh_sweeps_held.get()
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_objects_unnamed_value(&self) -> i64 {
+        self.fresh_objects_unnamed.get()
+    }
+
+    /// Test-only read, mirroring the siblings: the listings the last sweep
+    /// cut short, and the objects it left due.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_sweep_backlog_value(&self) -> (i64, i64) {
+        (
+            self.fresh_listings_truncated.get(),
+            self.fresh_objects_due.get(),
+        )
+    }
+
+    pub fn record_fresh_objects_deleted(&self, objects: usize) {
+        self.fresh_objects_deleted_total.inc_by(objects as u64);
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_objects_value(&self) -> i64 {
+        self.fresh_objects.get()
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_objects_deleted_value(&self) -> u64 {
+        self.fresh_objects_deleted_total.get()
+    }
+
+    /// Bumped by every sweep of the root for orphan incarnations that listed
+    /// the whole root.
+    pub fn record_orphan_sweep(&self) {
+        self.orphan_sweeps_total.inc();
+    }
+
+    /// Republished by every sweep of the root that listed all of it, and
+    /// zeroed when its findings are dropped: the orphans it found, and the
+    /// objects no newer than this cluster's claim of the root of the
+    /// incarnations it leaves for an operator.
+    pub fn set_orphan_findings(&self, orphans: usize, objects_before_claim: usize) {
+        self.orphan_incarnations
+            .set(i64::try_from(orphans).unwrap_or(i64::MAX));
+        self.orphan_objects_before_claim
+            .set(i64::try_from(objects_before_claim).unwrap_or(i64::MAX));
+    }
+
+    /// Bumped when the delete of an orphan incarnation left nothing of it.
+    pub fn record_orphan_incarnation_deleted(&self) {
+        self.orphan_incarnations_deleted_total.inc();
+    }
+
+    /// Bumped when a sweep of the root, or the delete of an orphan, found
+    /// the store identity object other than the claim it expected, and
+    /// deleted nothing.
+    pub fn record_orphan_identity_skip(&self) {
+        self.orphan_identity_skips_total.inc();
+    }
+
+    /// Test-only read, mirroring the siblings: the full sweeps, the orphans
+    /// of the last one, the orphans deleted, the objects from before the
+    /// claim, and the identity skips.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn orphan_sweep_values(&self) -> (u64, i64, u64, i64, u64) {
+        (
+            self.orphan_sweeps_total.get(),
+            self.orphan_incarnations.get(),
+            self.orphan_incarnations_deleted_total.get(),
+            self.orphan_objects_before_claim.get(),
+            self.orphan_identity_skips_total.get(),
+        )
+    }
+
+    /// Republished by the pump's tick: the most messages one partition this
+    /// shard leads committed that no long-term segment holds yet, as the
+    /// partition's last rewrite pass found. Zero when none waits.
+    pub fn set_long_term_rewrite_lag(&self, messages: u64) {
+        self.partition_long_term_rewrite_lag_messages
+            .set(i64::try_from(messages).unwrap_or(i64::MAX));
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn long_term_rewrite_lag_value(&self) -> i64 {
+        self.partition_long_term_rewrite_lag_messages.get()
+    }
+
+    /// Republished by the pump's tick: the objects in the store that no
+    /// long-term log lists and that are not dead, summed over the partitions
+    /// this shard leads, as the last listing of each found. Nothing deletes
+    /// such an object, so a count that stays above zero is storage that only
+    /// a later replace or trim over its offsets frees.
+    pub fn set_long_term_unannounced_objects(&self, objects: usize) {
+        self.partition_long_term_unannounced_objects
+            .set(i64::try_from(objects).unwrap_or(i64::MAX));
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn long_term_unannounced_objects_value(&self) -> i64 {
+        self.partition_long_term_unannounced_objects.get()
+    }
+
+    /// A merge of long-term segments committed on a partition this shard
+    /// leads, and put one segment in the place of `replaced`.
+    pub fn record_long_term_merge(&self, replaced: usize) {
+        self.partition_long_term_merges_total.inc();
+        self.partition_long_term_merged_segments_total
+            .inc_by(replaced as u64);
+    }
+
+    /// Test-only read, mirroring the siblings: the merges that committed
+    /// and the segments they replaced.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn long_term_merges_value(&self) -> (u64, u64) {
+        (
+            self.partition_long_term_merges_total.get(),
+            self.partition_long_term_merged_segments_total.get(),
+        )
+    }
+
+    /// Republished by the pump's tick: the most segments the long-term log
+    /// of one partition this shard leads holds. A log takes no segment
+    /// beyond its limit, so this is how far the fullest one is from it.
+    pub fn set_long_term_segments(&self, segments: usize) {
+        self.partition_long_term_segments
+            .set(i64::try_from(segments).unwrap_or(i64::MAX));
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn long_term_segments_value(&self) -> i64 {
+        self.partition_long_term_segments.get()
+    }
+
+    /// Republished by the pump's tick: the objects no long-term log lists
+    /// any more that wait to be deleted, summed over the partitions this
+    /// shard leads.
+    pub fn set_long_term_dead_objects(&self, objects: usize) {
+        self.partition_long_term_dead_objects
+            .set(i64::try_from(objects).unwrap_or(i64::MAX));
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn long_term_dead_objects_value(&self) -> i64 {
+        self.partition_long_term_dead_objects.get()
+    }
+
+    /// A partition this shard leads sent a trim of its long-term log.
+    pub fn record_long_term_trim(&self) {
+        self.partition_long_term_trims_total.inc();
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn long_term_trims_value(&self) -> u64 {
+        self.partition_long_term_trims_total.get()
+    }
+
+    /// A delete removed `objects` long-term objects of a partition this
+    /// shard leads from the store.
+    pub fn record_long_term_objects_deleted(&self, objects: usize) {
+        self.partition_long_term_deleted_objects_total
+            .inc_by(objects as u64);
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn long_term_deleted_objects_value(&self) -> u64 {
+        self.partition_long_term_deleted_objects_total.get()
+    }
+
+    /// Republished by the pump's tick: the most bytes of messages one
+    /// partition this shard leads committed that no long-term segment holds
+    /// yet, as far as its replica counted them.
+    pub fn set_long_term_backlog(&self, bytes: u64) {
+        self.partition_long_term_backlog_bytes
+            .set(i64::try_from(bytes).unwrap_or(i64::MAX));
+    }
+
+    /// An empty list for the pump's tick to fill and hand to
+    /// [`Self::set_long_term_lags`].
+    #[must_use]
+    pub fn long_term_lags_to_fill(&self) -> Vec<LongTermLag> {
+        let mut spare = std::mem::take(&mut self.lock_long_term_lags().spare);
+        spare.clear();
+        spare
+    }
+
+    /// Republished by the pump's tick: the lag of every partition this shard
+    /// leads that places its batches and has a rewrite wait. A scrape sees
+    /// the whole list of one tick or of the next, never a part.
+    pub fn set_long_term_lags(&self, lags: Vec<LongTermLag>) {
+        let mut held = self.lock_long_term_lags();
+        held.spare = std::mem::replace(&mut held.reported, lags);
+    }
+
+    /// What [`Self::set_long_term_lags`] took last.
+    ///
+    /// Not a registered series: a series per partition carries the names of
+    /// its stream and topic, which a shard does not hold.
+    #[must_use]
+    pub fn long_term_lags(&self) -> Vec<LongTermLag> {
+        self.lock_long_term_lags().reported.clone()
+    }
+
+    fn lock_long_term_lags(&self) -> MutexGuard<'_, LongTermLags> {
+        self.partition_long_term_lags
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A send to a partition past its long-term backlog limit waits before
+    /// the shard takes it.
+    pub(crate) fn record_long_term_delayed_send(&self) {
+        self.partition_long_term_delayed_sends_total.inc();
+    }
+
+    /// Test-only read: the largest backlog and the delayed sends.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn long_term_backlog_value(&self) -> (i64, u64) {
+        (
+            self.partition_long_term_backlog_bytes.get(),
+            self.partition_long_term_delayed_sends_total.get(),
+        )
+    }
+
     pub fn record_retirement_debt_paid(&self) {
         self.retirement_debts_paid_total.inc();
     }
@@ -1353,6 +2521,70 @@ impl ShardMetrics {
         self.partition_frames_incarnation_mismatch_total
             .get(&FrameCommandLabel::from(frame))
             .map_or(0, |counter| counter.get())
+    }
+
+    /// Bumped when a partition control frame is dropped because its partition
+    /// is not built on this shard yet: the create is committed and the
+    /// reconciler has not built it, or local metadata has not applied the
+    /// create. Ordinary after a create, where the incarnation mismatch and
+    /// the unknown namespace are not.
+    pub fn record_partition_frame_dropped_unbuilt(&self) {
+        self.partition_frames_dropped_unbuilt_total.inc();
+    }
+
+    /// Snapshot of `partition_frames_dropped_unbuilt_total`. Test/simulator
+    /// accessor.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partition_frames_dropped_unbuilt_value(&self) -> u64 {
+        self.partition_frames_dropped_unbuilt_total.get()
+    }
+
+    /// Bumped when a held partition read reaches the end of its hold before
+    /// its partition can serve: not built, a primary that still starts or,
+    /// for a lookup of the primary, an older incarnation. A lookup gets what
+    /// the partition here says, or `NotFound`. A batch of offset reads is
+    /// answered entry by entry, each as a read of its own. Every other read
+    /// is refused as `TransientNotAccepted`.
+    pub fn record_partition_held_read_expired(&self) {
+        self.partition_held_reads_expired_total.inc();
+    }
+
+    /// Snapshot of `partition_held_reads_expired_total`. Test/simulator
+    /// accessor.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partition_held_reads_expired_value(&self) -> u64 {
+        self.partition_held_reads_expired_total.get()
+    }
+
+    /// Bumped when a partition read that would be held is answered at once,
+    /// because the shard or the namespace of the read holds as many reads as
+    /// its cap allows. A lookup of a partition that is not built then gets
+    /// `NotFound`, the answer that the hold exists to avoid.
+    pub fn record_partition_held_read_refused(&self) {
+        self.partition_held_reads_refused_total.inc();
+    }
+
+    /// Snapshot of `partition_held_reads_refused_total`. Test-only accessor.
+    #[cfg(test)]
+    #[must_use]
+    pub fn partition_held_reads_refused_value(&self) -> u64 {
+        self.partition_held_reads_refused_total.get()
+    }
+
+    /// Republished by every pump tick: the reads held on this shard as the
+    /// shard cap counts them, each read of an offset batch on its own.
+    pub fn set_partition_held_reads(&self, held: usize) {
+        self.partition_held_reads
+            .set(i64::try_from(held).unwrap_or(i64::MAX));
+    }
+
+    /// Test-only read of [`Self::set_partition_held_reads`].
+    #[cfg(test)]
+    #[must_use]
+    pub fn partition_held_reads_value(&self) -> i64 {
+        self.partition_held_reads.get()
     }
 
     /// Total frame drops across every `{variant, reason}` pair.
@@ -1648,7 +2880,7 @@ impl ShardMetrics {
         );
         registry.register(
             "partitions_reconcile_repairs",
-            "partitions the periodic full reconcile changed although no change announced them; non-zero is a caught anomaly",
+            "partitions the reconciler's repair changed although no change announced them; non-zero is a caught anomaly",
             self.partitions_reconcile_repairs_total.clone(),
         );
         registry.register(
@@ -1661,6 +2893,51 @@ impl ShardMetrics {
             "adopted views that contradicted an applied partition op; non-zero means committed \
              history diverged",
             self.partition_applied_divergences_total.clone(),
+        );
+        registry.register(
+            "partition_chain_rebuilds",
+            "tiered partitions whose lost segment chain was rebuilt from the object store",
+            self.partition_chain_rebuilds_total.clone(),
+        );
+        registry.register(
+            "partition_chain_rebuild_refusals",
+            "tiered partitions refused because their segment chain is gone and offsets below              their local log are accounted for neither on disk nor in the object store",
+            self.partition_chain_rebuild_refusals_total.clone(),
+        );
+        registry.register(
+            "partitions_awaiting_chain_rebuild",
+            "tiered partitions whose segment chain is gone and that wait for the object store",
+            self.partitions_awaiting_chain_rebuild.clone(),
+        );
+        registry.register(
+            "partition_segment_verify_passes",
+            "verify passes that asked the object store for every segment a tiered partition \
+             this shard leads stored; a pass also ends when the store answered no HEAD for \
+             some of them, which partition_segment_verify_unanswered counts",
+            self.partition_segment_verify_passes_total.clone(),
+        );
+        registry.register(
+            "partition_segment_verify_unanswered",
+            "verify jobs that the object store left a HEAD of without an answer, whose segment \
+             counts as neither verified nor missing",
+            self.partition_segment_verify_unanswered_total.clone(),
+        );
+        registry.register(
+            "partition_stored_segments_verified",
+            "stored segments whose objects a verify pass compared with the partition's record",
+            self.partition_stored_segments_verified_total.clone(),
+        );
+        registry.register(
+            "partition_stored_segments_missing",
+            "stored segments of the partitions this shard leads with an object the object \
+             store no longer holds",
+            self.partition_stored_segments_missing.clone(),
+        );
+        registry.register(
+            "partition_stored_segments_diverged",
+            "stored segments of the partitions this shard leads with an object that differs \
+             from the partition's record",
+            self.partition_stored_segments_diverged.clone(),
         );
         registry.register(
             "partitions_untrusted_log",
@@ -1705,6 +2982,147 @@ impl ShardMetrics {
             self.partition_segment_upload_lag_seconds.clone(),
         );
         registry.register(
+            "fresh_objects",
+            "fresh objects of this replica that its last sweep listed; fewer than the store \
+             holds while fresh_listings_truncated is not zero",
+            self.fresh_objects.clone(),
+        );
+        registry.register(
+            "fresh_object_bytes",
+            "bytes of the fresh objects of this replica in the object store",
+            self.fresh_object_bytes.clone(),
+        );
+        registry.register(
+            "fresh_object_oldest_age_seconds",
+            "age of the oldest fresh object of this replica in the object store",
+            self.fresh_object_oldest_age_seconds.clone(),
+        );
+        registry.register(
+            "fresh_objects_unnamed",
+            "fresh objects of this replica that no placed batch names and that wait out \
+             their grace period",
+            self.fresh_objects_unnamed.clone(),
+        );
+        registry.register(
+            "fresh_objects_due",
+            "fresh objects of this replica past their grace period that its last sweep left \
+             in the object store",
+            self.fresh_objects_due.clone(),
+        );
+        registry.register(
+            "fresh_objects_proving",
+            "fresh objects of this replica past their grace period that its last sweep kept \
+             for the proof rows of batches no long-term segment holds yet",
+            self.fresh_objects_proving.clone(),
+        );
+        registry.register(
+            "fresh_listings_truncated",
+            "listings of the last sweep of fresh objects that stopped at their share of keys, \
+             of one per shard and one for the replica",
+            self.fresh_listings_truncated.clone(),
+        );
+        registry.register(
+            "fresh_sweeps_held",
+            "1 while the last sweep of fresh objects of this replica deleted nothing because \
+             a shard could not tell which objects its partitions need, else 0",
+            self.fresh_sweeps_held.clone(),
+        );
+        registry.register(
+            "fresh_objects_deleted",
+            "fresh objects this replica deleted",
+            self.fresh_objects_deleted_total.clone(),
+        );
+        registry.register(
+            "orphan_sweeps",
+            "sweeps of the object store root that listed every key of it for the objects of \
+             partition incarnations that committed metadata no longer holds",
+            self.orphan_sweeps_total.clone(),
+        );
+        registry.register(
+            "orphan_incarnations",
+            "partition incarnations the last sweep of the object store root found with objects \
+             and without a partition in committed metadata, which the sweeps delete once they \
+             found the same objects for orphan_grace",
+            self.orphan_incarnations.clone(),
+        );
+        registry.register(
+            "orphan_incarnations_deleted",
+            "orphan partition incarnations whose objects were deleted from the object store",
+            self.orphan_incarnations_deleted_total.clone(),
+        );
+        registry.register(
+            "orphan_objects_before_claim",
+            "objects of partition incarnations without a partition in committed metadata that \
+             are no newer than this cluster's claim of the object store root, which the last \
+             sweep left for an operator",
+            self.orphan_objects_before_claim.clone(),
+        );
+        registry.register(
+            "orphan_identity_skips",
+            "sweeps of the object store root and orphan deletes that deleted nothing because \
+             the store identity object was not the claim they expected",
+            self.orphan_identity_skips_total.clone(),
+        );
+        registry.register(
+            "partition_long_term_rewrite_lag_messages",
+            "most messages one partition this shard leads committed that no long-term \
+             segment holds yet, over the partitions that place their batches",
+            self.partition_long_term_rewrite_lag_messages.clone(),
+        );
+        registry.register(
+            "partition_long_term_unannounced_objects",
+            "objects of long-term segments in the store that no long-term log lists and \
+             that no later state of it rules out, over the partitions this shard leads",
+            self.partition_long_term_unannounced_objects.clone(),
+        );
+        registry.register(
+            "partition_long_term_merges",
+            "merges of small long-term segments that committed, over the partitions this \
+             shard leads",
+            self.partition_long_term_merges_total.clone(),
+        );
+        registry.register(
+            "partition_long_term_merged_segments",
+            "long-term segments that committed merges replaced, each merge by one segment",
+            self.partition_long_term_merged_segments_total.clone(),
+        );
+        registry.register(
+            "partition_long_term_segments",
+            "most segments the long-term log of one partition this shard leads holds, \
+             of the 65536 a log takes",
+            self.partition_long_term_segments.clone(),
+        );
+        registry.register(
+            "partition_long_term_dead_objects",
+            "objects of long-term segments that no long-term log lists any more and that \
+             wait to be deleted, over the partitions this shard leads",
+            self.partition_long_term_dead_objects.clone(),
+        );
+        registry.register(
+            "partition_long_term_trims",
+            "trims of a long-term log that the partitions this shard leads sent, one for \
+             every retention pass until the trim commits",
+            self.partition_long_term_trims_total.clone(),
+        );
+        registry.register(
+            "partition_long_term_deleted_objects",
+            "objects of long-term segments that the partitions this shard leads deleted \
+             from the store, the log and the index of a segment as one",
+            self.partition_long_term_deleted_objects_total.clone(),
+        );
+        registry.register(
+            "partition_long_term_backlog_bytes",
+            "most bytes of messages one partition this shard leads committed that no \
+             long-term segment holds yet, over the partitions that place their batches",
+            self.partition_long_term_backlog_bytes.clone(),
+        );
+        registry.register(
+            "partition_long_term_delayed_sends",
+            "sends this shard delayed because their partition's long-term backlog passed \
+             tiered_storage.long_term_backlog_limit",
+            self.partition_long_term_delayed_sends_total.clone(),
+        );
+        registry.register(
             "retirement_debts_paid",
             "retirement debts this node paid as a partition primary",
             self.retirement_debts_paid_total.clone(),
@@ -1724,6 +3142,27 @@ impl ShardMetrics {
             "partition control frames dropped for addressing another incarnation of their \
              namespace, by frame command",
             self.partition_frames_incarnation_mismatch_total.clone(),
+        );
+        registry.register(
+            "partition_frames_dropped_unbuilt",
+            "partition control frames dropped because their partition is not built here yet",
+            self.partition_frames_dropped_unbuilt_total.clone(),
+        );
+        registry.register(
+            "partition_held_reads_expired",
+            "held partition reads that reached the end of their hold before their partition \
+             could serve",
+            self.partition_held_reads_expired_total.clone(),
+        );
+        registry.register(
+            "partition_held_reads_refused",
+            "partition reads answered without a hold because a held-read cap was spent",
+            self.partition_held_reads_refused_total.clone(),
+        );
+        registry.register(
+            "partition_held_reads",
+            "partition reads held on this shard, each read of an offset batch counted",
+            self.partition_held_reads.clone(),
         );
         registry.register(
             "partition_requests_denied_transient",
@@ -1806,6 +3245,12 @@ impl ShardMetrics {
             self.metadata_read_frontier_refusals_total.clone(),
         );
         registry.register(
+            "partition_request_frontier_refusals",
+            "partition requests refused because this node did not apply the caller's committed \
+             metadata op in time",
+            self.partition_request_frontier_refusals_total.clone(),
+        );
+        registry.register(
             "client_requests_denied_queue_full",
             "client requests denied retryable because that client's request queue was full",
             self.client_requests_denied_queue_full_total.clone(),
@@ -1835,9 +3280,150 @@ impl ShardMetrics {
             self.readiness_push_to_fire.clone(),
         );
         registry.register(
+            "fresh_uploads",
+            "fresh objects this shard stored for the partitions that place their batches",
+            self.fresh_uploads_total.clone(),
+        );
+        registry.register(
+            "fresh_upload_failures",
+            "fresh objects the object store refused, whose sends were answered as not accepted",
+            self.fresh_upload_failures_total.clone(),
+        );
+        registry.register(
+            "fresh_upload_bytes",
+            "bytes of the fresh objects this shard stored",
+            self.fresh_upload_bytes_total.clone(),
+        );
+        registry.register(
+            "fresh_upload_retries",
+            "attempts at storing a fresh object after an attempt that failed",
+            self.fresh_upload_retries_total.clone(),
+        );
+        registry.register(
+            "fresh_sends_denied",
+            "sends to partitions that place their batches that this shard answered as not \
+             accepted",
+            self.fresh_sends_denied_total.clone(),
+        );
+        registry.register(
+            "fresh_sends_denied_partition_share",
+            "sends turned away because the waiting sends of their partition held \
+             tiered_storage.fresh_partition_pending_bytes",
+            self.fresh_sends_denied_partition_share_total.clone(),
+        );
+        registry.register(
+            "fresh_sends_denied_shard_cap",
+            "sends turned away because the waiting sends of the shard held \
+             tiered_storage.fresh_pending_bytes",
+            self.fresh_sends_denied_shard_cap_total.clone(),
+        );
+        registry.register(
+            "fresh_uploads_in_flight",
+            "fresh objects whose upload holds one of the shard's upload slots",
+            self.fresh_uploads_in_flight.clone(),
+        );
+        registry.register(
+            "fresh_staged_sends",
+            "sends whose messages this shard holds or stored and whose request has not \
+             reached its partition",
+            self.fresh_staged_sends.clone(),
+        );
+        registry.register(
+            "fresh_window_wait_seconds",
+            "how long an upload window stayed open after its first send",
+            self.fresh_window_wait.clone(),
+        );
+        registry.register(
+            "fresh_upload_seconds",
+            "how long the upload of a fresh object took",
+            self.fresh_upload.clone(),
+        );
+        registry.register(
+            "fresh_commit_seconds",
+            "how long a send waited for its answer after its fresh object was stored",
+            self.fresh_commit.clone(),
+        );
+        registry.register(
+            "fresh_object_size_bytes",
+            "bytes of each fresh object this shard stored",
+            self.fresh_object_size.clone(),
+        );
+        registry.register(
+            "fresh_confirmations",
+            "fresh objects this shard stored that carry proof rows and no data",
+            self.fresh_confirmations_total.clone(),
+        );
+        registry.register(
+            "fresh_proof_lag_seconds",
+            "how long the oldest proof row of a committed batch has waited for a stored fresh \
+             object to carry it",
+            self.fresh_proof_lag_seconds.clone(),
+        );
+        registry.register(
             "pump_tick_lateness_seconds",
             "how late each consensus tick of the message pump ran after its timer was due",
             self.pump_tick_lateness.clone(),
+        );
+        registry.register(
+            "remote_read_block_hits",
+            "blocks of objects in the object store that polls took from the read cache",
+            self.remote_read_block_hits_total.clone(),
+        );
+        registry.register(
+            "remote_read_block_misses",
+            "blocks of objects in the object store that polls fetched, or waited for while \
+             another poll fetched them",
+            self.remote_read_block_misses_total.clone(),
+        );
+        registry.register(
+            "remote_read_ahead_hits",
+            "first reads of blocks that readahead fetched",
+            self.remote_read_ahead_hits_total.clone(),
+        );
+        registry.register(
+            "remote_read_blocks_fetched_ahead",
+            "blocks that readahead fetched before any poll asked for them",
+            self.remote_read_blocks_fetched_ahead_total.clone(),
+        );
+        registry.register(
+            "remote_read_demand_bytes",
+            "bytes of the object store reads that polls waited for",
+            self.remote_read_demand_bytes_total.clone(),
+        );
+        registry.register(
+            "remote_read_ahead_bytes",
+            "bytes of the object store reads of readahead",
+            self.remote_read_ahead_bytes_total.clone(),
+        );
+        registry.register(
+            "remote_read_cache_bytes",
+            "bytes of objects in the object store that the read cache holds",
+            self.remote_read_cache_bytes.clone(),
+        );
+        registry.register(
+            "remote_read_held_bytes",
+            "bytes of the fresh objects this shard uploaded that the read cache holds for the \
+             polls of their partitions",
+            self.remote_read_held_bytes.clone(),
+        );
+        registry.register(
+            "remote_read_fresh_releases",
+            "fresh objects the read cache stopped holding: once the long-term floors of their \
+             partitions passed them, once every send in them was answered and none committed, \
+             or once their partitions left the shard",
+            self.remote_read_fresh_releases_total.clone(),
+        );
+        registry.register(
+            "remote_read_carried_bytes",
+            "bytes of long-term segments that rewrites handed to the read cache as they stored \
+             them",
+            self.remote_read_carried_bytes_total.clone(),
+        );
+        registry.register(
+            "remote_read_limit_evictions",
+            "blocks and objects that left the read cache because their partition was over its \
+             limit",
+            self.remote_read_limit_evictions_total.clone(),
         );
         registry.register(
             "object_store_identity_verified",
@@ -1848,6 +3434,102 @@ impl ShardMetrics {
             "object_store_unreachable",
             "1 while the object store did not answer the last read of its identity object, at boot or in the check every minute",
             self.object_store_unreachable.clone(),
+        );
+        self.tier_store.register(registry);
+        registry.register(
+            "geo_peer_identity_verified",
+            "1 while this node reads the geo peer: a check verified the cluster that owns its root",
+            self.geo_peer_identity_verified.clone(),
+        );
+        registry.register(
+            "geo_peer_unreachable",
+            "1 while the store of the geo peer did not answer the last read of its identity object",
+            self.geo_peer_unreachable.clone(),
+        );
+        registry.register(
+            "geo_peer_retired",
+            "1 once committed metadata retired the geo peer, so this node sends no listing and no check to its store",
+            self.geo_peer_retired.clone(),
+        );
+        registry.register(
+            "geo_shadow_topics_stale",
+            "Shadow topics of the geo peer that serve what they hold, because its store did not answer the last listing",
+            self.geo_shadow_topics_stale.clone(),
+        );
+        registry.register(
+            "geo_peer_manifest_requests",
+            "Listings and reads of the geo peer's manifests that this shard sent to its store",
+            self.geo_peer_manifest_requests_total.clone(),
+        );
+        registry.register(
+            "geo_peer_manifest_failures",
+            "Listings and reads of the geo peer's manifests that failed",
+            self.geo_peer_manifest_failures_total.clone(),
+        );
+        registry.register(
+            "geo_peer_manifests_refused",
+            "Manifests of the geo peer that a shadow partition refused: they go back, name another incarnation or do not check",
+            self.geo_peer_manifests_refused_total.clone(),
+        );
+        registry.register(
+            "geo_peer_manifest_commands",
+            "Commands that the shadow partitions here proposed to commit the geo peer's manifests",
+            self.geo_peer_manifest_commands_total.clone(),
+        );
+        registry.register(
+            "geo_peer_manifest_listed_seconds",
+            "Unix time of the last listing of the geo peer's manifests that succeeded",
+            self.geo_peer_manifest_listed_seconds.clone(),
+        );
+        registry.register(
+            "geo_shadow_partitions_behind",
+            "Shadow partitions whose primary is on this shard and whose committed manifest is behind the geo peer's",
+            self.geo_shadow_partitions_behind.clone(),
+        );
+        registry.register(
+            "geo_shadow_manifest_lag_seconds",
+            "How long the furthest behind shadow partition on this shard has been behind the geo peer's manifest",
+            self.geo_shadow_manifest_lag_seconds.clone(),
+        );
+        registry.register(
+            "geo_peer_position_requests",
+            "Listings and reads of the geo peer's consumer group positions that this shard sent to its store",
+            self.geo_peer_position_requests_total.clone(),
+        );
+        registry.register(
+            "geo_peer_position_failures",
+            "Listings and reads of the geo peer's consumer group positions that failed",
+            self.geo_peer_position_failures_total.clone(),
+        );
+        registry.register(
+            "geo_peer_positions_adopted",
+            "Consumer group positions of the geo peer that the partitions here proposed to take",
+            self.geo_peer_positions_adopted_total.clone(),
+        );
+        registry.register(
+            "geo_positions_stored",
+            "Objects of consumer group positions that this shard stored in the node's store",
+            self.geo_positions_stored_total.clone(),
+        );
+        registry.register(
+            "geo_positions_store_failures",
+            "Objects of consumer group positions that the node's store refused",
+            self.geo_positions_store_failures_total.clone(),
+        );
+        registry.register(
+            "geo_positions_commits_confirmed",
+            "Offset stores of consumer groups on geo and shadow partitions answered once the node's store held their positions",
+            self.geo_positions_commits_confirmed_total.clone(),
+        );
+        registry.register(
+            "geo_positions_commits_uncertain",
+            "Offset stores of consumer groups on geo and shadow partitions answered as uncertain, their positions not stored in time or their partitions no longer led here",
+            self.geo_positions_commits_uncertain_total.clone(),
+        );
+        registry.register(
+            "geo_positions_resume_waiting",
+            "1 while group polls of geo and shadow partitions here wait for every geo peer's positions after a start",
+            self.geo_positions_resume_waiting.clone(),
         );
     }
 
@@ -1963,6 +3645,25 @@ fn latency_histogram() -> Histogram {
         LATENCY_BUCKET_FACTOR,
         LATENCY_BUCKET_COUNT,
     ))
+}
+
+/// Buckets for the parts of a send that goes to the object store first, which
+/// take from 1 ms to a few hundred: every millisecond up to 5 ms, every 5 ms
+/// up to 100 ms, every 10 ms up to 200 ms, and from there half as much again
+/// per bucket up to about a minute.
+fn fresh_latency_histogram() -> Histogram {
+    let millis = (1..=5_u32)
+        .chain((10..=100).step_by(5))
+        .chain((110..=200).step_by(10))
+        .map(|millis| f64::from(millis) / 1_000.0);
+    Histogram::new(millis.chain(exponential_buckets(0.3, 1.5, 14)))
+}
+
+/// Buckets for the bytes of a stored fresh object: each twice the one before,
+/// from 1 KiB to 32 MiB. An object closes at 4 MiB, and is larger only when
+/// one send is.
+fn fresh_object_size_histogram() -> Histogram {
+    Histogram::new(exponential_buckets(1024.0, 2.0, 16))
 }
 
 /// The `command` of a request whose code the command table does not hold.
@@ -2356,6 +4057,72 @@ mod tests {
                 scrape.lines().any(|line| line == series),
                 "{series} is not in the scrape:\n{scrape}"
             );
+        }
+    }
+
+    #[test]
+    fn given_fresh_uploads_when_they_settle_should_record_the_size_of_each_stored_object() {
+        let metrics = ShardMetrics::for_shard();
+        metrics.record_fresh_upload(1_000, Duration::from_millis(5), true);
+        metrics.record_fresh_upload(3_000_000, Duration::from_millis(5), true);
+        metrics.record_fresh_upload(500, Duration::from_millis(5), false);
+        let scrape = metrics.scrape();
+        for series in [
+            "fresh_object_size_bytes_count 2",
+            "fresh_object_size_bytes_sum 3001000.0",
+            "fresh_object_size_bytes_bucket{le=\"1024.0\"} 1",
+            "fresh_object_size_bytes_bucket{le=\"2097152.0\"} 1",
+            "fresh_object_size_bytes_bucket{le=\"4194304.0\"} 2",
+            "fresh_object_size_bytes_bucket{le=\"33554432.0\"} 2",
+        ] {
+            assert!(
+                scrape.lines().any(|line| line == series),
+                "{series} is not in the scrape:\n{scrape}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_remote_reads_of_two_sweeps_when_scraping_should_add_the_counts_and_show_the_last_level()
+     {
+        let metrics = ShardMetrics::for_shard();
+        let reads = partitions::RemoteReadMetrics {
+            block_hits: 3,
+            block_misses: 2,
+            read_ahead_hits: 1,
+            blocks_fetched_ahead: 4,
+            demand_bytes: 512,
+            ahead_bytes: 1024,
+            cached_bytes: 2048,
+            held_bytes: 256,
+            fresh_releases: 5,
+            carried_bytes: 4096,
+            limit_evictions: 7,
+        };
+        metrics.record_remote_reads(&reads);
+        metrics.record_remote_reads(&partitions::RemoteReadMetrics {
+            cached_bytes: 1536,
+            ..reads
+        });
+
+        let mut registry = Registry::default();
+        metrics.register(&mut registry);
+        let mut buffer = String::new();
+        prometheus_client::encoding::text::encode(&mut buffer, &registry).unwrap();
+        for line in [
+            "remote_read_block_hits_total 6",
+            "remote_read_block_misses_total 4",
+            "remote_read_ahead_hits_total 2",
+            "remote_read_blocks_fetched_ahead_total 8",
+            "remote_read_demand_bytes_total 1024",
+            "remote_read_ahead_bytes_total 2048",
+            "remote_read_cache_bytes 1536",
+            "remote_read_held_bytes 256",
+            "remote_read_fresh_releases_total 10",
+            "remote_read_carried_bytes_total 8192",
+            "remote_read_limit_evictions_total 14",
+        ] {
+            assert!(buffer.lines().any(|scraped| scraped == line), "{line}");
         }
     }
 

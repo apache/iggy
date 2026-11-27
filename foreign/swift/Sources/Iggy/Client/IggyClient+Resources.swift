@@ -30,18 +30,18 @@ extension IggyClient {
         return body.isEmpty ? nil : try Responses.streamDetails(body[...])
     }
 
-    /// Every stream, read in pages of ``PageQuery/maxLimit`` in id order. The
-    /// pages are separate reads, so a stream that someone creates or deletes
-    /// during the read can appear or not appear. The read keeps the sign-in it
-    /// started with, and one request timeout covers every page. If the server
-    /// answers with the cursor it was sent, the read fails with
-    /// ``IggyErrorCode/invalidCommand``.
+    /// Every stream the caller may read, read in pages of ``PageQuery/maxLimit``
+    /// in id order. The pages are separate reads, so a stream that someone
+    /// creates or deletes during the read can appear or not appear. The read
+    /// keeps the sign-in it started with, and one request timeout covers every
+    /// page. If the server answers with the cursor it was sent, the read fails
+    /// with ``IggyErrorCode/invalidCommand``.
     public func getStreams() async throws -> [StreamInfo] {
         try await readWholeList(.getStreams, item: Responses.stream(from:)) { try Requests.listPage(query: $0) }
     }
 
-    /// One page of the streams. A query that breaks a page rule fails with
-    /// ``IggyErrorCode/invalidCommand`` before anything is sent.
+    /// One page of the streams the caller may read. A query that breaks a page
+    /// rule fails with ``IggyErrorCode/invalidCommand`` before anything is sent.
     public func getStreamsPage(_ query: NamedPageQuery = NamedPageQuery()) async throws -> Page<StreamInfo> {
         try await listPage(.getStreams, Requests.listPage(query: query), item: Responses.stream(from:))
     }
@@ -97,20 +97,28 @@ extension IggyClient {
         return details
     }
 
-    /// Every topic of a stream, read in pages of ``PageQuery/maxLimit`` in id
-    /// order. The pages are separate reads, so a topic that someone creates or
-    /// deletes during the read can appear or not appear. The read keeps the
-    /// sign-in it started with, and one request timeout covers every page. A
-    /// stream that does not exist has no topics. If someone deletes the stream
-    /// between two pages, the read fails with
-    /// ``IggyErrorCode/streamIdNotFound``. If the server answers with the
-    /// cursor it was sent, the read fails with ``IggyErrorCode/invalidCommand``.
+    /// Every topic the caller may read in a stream, read in pages of
+    /// ``PageQuery/maxLimit`` in id order. The pages are separate reads, so a
+    /// topic that someone creates or deletes during the read can appear or not
+    /// appear. The read keeps the sign-in it started with, and one request
+    /// timeout covers every page. A stream that does not exist, or one the
+    /// caller may read no topic of, gives no topics. If someone deletes the
+    /// stream between two pages, the read fails with
+    /// ``IggyErrorCode/streamIdNotFound`` for a caller with a global read
+    /// grant, and ends there for any other caller. If the server answers with
+    /// the cursor it was sent, the read fails with
+    /// ``IggyErrorCode/invalidCommand``.
     public func getTopics(streamID: Identifier) async throws -> [Topic] {
         try await readWholeList(.getTopics, item: Responses.topic(from:)) { try Requests.listPage(streamID, query: $0) }
     }
 
-    /// One page of the topics of a stream. A query that breaks a page rule
-    /// fails with ``IggyErrorCode/invalidCommand`` before anything is sent.
+    /// One page of the topics the caller may read in a stream. For a stream
+    /// that does not exist, or one the caller may read no topic of, the first
+    /// page is empty and has no ``Page/next``. For a caller with a global read
+    /// grant, a page read with a cursor fails with
+    /// ``IggyErrorCode/streamIdNotFound`` instead, because the stream was
+    /// deleted during the walk. A query that breaks a page rule fails with
+    /// ``IggyErrorCode/invalidCommand`` before anything is sent.
     public func getTopicsPage(streamID: Identifier, query: NamedPageQuery = NamedPageQuery()) async throws -> Page<Topic> {
         try await listPage(.getTopics, Requests.listPage(streamID, query: query), item: Responses.topic(from:))
     }

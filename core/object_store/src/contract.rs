@@ -76,10 +76,12 @@ use futures::future::{self, Either};
 use futures::stream::{self, StreamExt};
 
 use crate::error::ObjectStoreError;
+use crate::layout::KeyLayout;
 use crate::store::{
     DeleteFailure, DeleteOutcome, ListRequest, ListedObject, MAX_KEY_LEN, MAX_KEY_SEGMENT_LEN,
-    MAX_KEY_SEGMENTS, MAX_KEYS_PER_REQUEST, MAX_METADATA_LEN, ObjectMeta, ObjectStore, PutBody,
-    PutMode, PutOptions, UserMetadata, validate_key,
+    MAX_KEY_SEGMENTS, MAX_KEYS_PER_REQUEST, MAX_METADATA_LEN, ObjectMeta, ObjectStore,
+    PUT_ID_METADATA, PartsUpload, PutBody, PutMode, PutOptions, StoredPart, UserMetadata,
+    validate_key,
 };
 
 /// How far the clock of a store can be from the local clock. A signed S3
@@ -161,6 +163,21 @@ macro_rules! if_absent_contract_cases {
             given_racing_puts_when_putting_if_absent_should_let_one_win,
             given_failed_body_when_putting_if_absent_should_leave_key_free,
             given_put_dropped_mid_body_when_putting_if_absent_again_should_store_object,
+        }
+    };
+}
+
+/// Calls `$callback!` with the name of every case of the uploads in parts in
+/// [`crate::contract`]. A provider runs them when
+/// [`crate::ObjectStore::parts_limits`] says that it takes uploads in parts.
+#[macro_export]
+macro_rules! parts_contract_cases {
+    ($callback:ident) => {
+        $callback! {
+            given_parts_when_completing_should_create_the_whole_object_once,
+            given_an_object_under_the_key_when_completing_a_create_only_upload_should_refuse_and_keep_it,
+            given_an_aborted_upload_when_completing_should_find_it_gone,
+            given_an_abandoned_upload_when_sweeping_should_remove_it_only_past_the_grace,
         }
     };
 }
@@ -1258,6 +1275,217 @@ fn if_absent() -> PutOptions {
         mode: PutMode::IfAbsent,
         ..PutOptions::default()
     }
+}
+
+pub async fn given_parts_when_completing_should_create_the_whole_object_once(
+    store: &impl ObjectStore,
+    root: &str,
+) {
+    let layout = KeyLayout::new(root).expect("a root of the contract is a layout");
+    let key = long_term_key(root);
+    let (bytes, lens) = parts_body(store);
+    let options = parts_options(&bytes);
+
+    let upload = begin(store, &key, &options, &layout).await;
+    let parts = put_parts(store, &upload, &bytes, &lens).await;
+    store
+        .complete_parts(&upload, &parts, &options, bytes.len() as u64)
+        .await
+        .unwrap_or_else(|error| panic!("complete {key:?}: {error}"));
+    store
+        .release_parts(&upload)
+        .await
+        .unwrap_or_else(|error| panic!("release {key:?}: {error}"));
+
+    let head = store
+        .head(&key)
+        .await
+        .unwrap_or_else(|error| panic!("head {key:?}: {error}"));
+    assert_eq!(head.size, bytes.len() as u64);
+    assert_eq!(
+        head.metadata, options.metadata,
+        "the object keeps the metadata"
+    );
+    assert_eq!(
+        head.crc32c, options.crc32c,
+        "the store reports the CRC32C of the whole object"
+    );
+    assert_eq!(read_all(store, &key).await, bytes);
+    let left = list_all(store, &layout.uploads_prefix(), MAX_KEYS_PER_REQUEST).await;
+    assert!(left.is_empty(), "the upload leaves nothing: {left:?}");
+}
+
+pub async fn given_an_object_under_the_key_when_completing_a_create_only_upload_should_refuse_and_keep_it(
+    store: &impl ObjectStore,
+    root: &str,
+) {
+    let layout = KeyLayout::new(root).expect("a root of the contract is a layout");
+    let key = long_term_key(root);
+    let first = Bytes::from_static(b"the first object");
+    put(store, &key, first.clone(), &PutOptions::default()).await;
+    let before = store.head(&key).await.expect("head");
+    let (bytes, lens) = parts_body(store);
+    let options = parts_options(&bytes);
+
+    let upload = begin(store, &key, &options, &layout).await;
+    let parts = put_parts(store, &upload, &bytes, &lens).await;
+    let completed = store
+        .complete_parts(&upload, &parts, &options, bytes.len() as u64)
+        .await;
+
+    assert!(
+        matches!(completed, Err(ObjectStoreError::PreconditionFailed { .. })),
+        "{completed:?}"
+    );
+    assert_unchanged(store, &key, &before, &first).await;
+    store
+        .abort_parts(&upload, part_count(&lens))
+        .await
+        .unwrap_or_else(|error| panic!("abort {key:?}: {error}"));
+}
+
+pub async fn given_an_aborted_upload_when_completing_should_find_it_gone(
+    store: &impl ObjectStore,
+    root: &str,
+) {
+    let layout = KeyLayout::new(root).expect("a root of the contract is a layout");
+    let key = long_term_key(root);
+    let (bytes, lens) = parts_body(store);
+    let options = parts_options(&bytes);
+    let upload = begin(store, &key, &options, &layout).await;
+    let parts = put_parts(store, &upload, &bytes, &lens).await;
+
+    store
+        .abort_parts(&upload, part_count(&lens))
+        .await
+        .unwrap_or_else(|error| panic!("abort {key:?}: {error}"));
+    let completed = store
+        .complete_parts(&upload, &parts, &options, bytes.len() as u64)
+        .await;
+
+    assert!(
+        matches!(completed, Err(ObjectStoreError::NotFound { .. })),
+        "{completed:?}"
+    );
+    assert_absent(store, &key).await;
+    let left = list_all(store, &layout.uploads_prefix(), MAX_KEYS_PER_REQUEST).await;
+    assert!(left.is_empty(), "the abort leaves nothing: {left:?}");
+}
+
+pub async fn given_an_abandoned_upload_when_sweeping_should_remove_it_only_past_the_grace(
+    store: &impl ObjectStore,
+    root: &str,
+) {
+    let layout = KeyLayout::new(root).expect("a root of the contract is a layout");
+    let key = long_term_key(root);
+    let (bytes, lens) = parts_body(store);
+    let options = parts_options(&bytes);
+    let upload = begin(store, &key, &options, &layout).await;
+    put_parts(store, &upload, &bytes, &lens).await;
+
+    let young = sweep_all(store, &layout, Duration::from_hours(1)).await;
+    assert_eq!(young, 0, "a young upload stays");
+    // GCS reads the store's clock from the `Date` header, in whole seconds,
+    // so an upload of the same second would still look younger than it.
+    compio::time::sleep(Duration::from_millis(1_100)).await;
+    // Past any skew of the clocks, so every upload of this root is old.
+    let all = sweep_all(store, &layout, Duration::ZERO).await;
+    assert!(all >= 1, "the abandoned upload goes");
+
+    let again = sweep_all(store, &layout, Duration::ZERO).await;
+    assert_eq!(again, 0, "nothing of the upload is left to remove");
+    let left = list_all(store, &layout.uploads_prefix(), MAX_KEYS_PER_REQUEST).await;
+    assert!(left.is_empty(), "the sweep leaves nothing: {left:?}");
+    assert_absent(store, &key).await;
+}
+
+/// The key of a long-term segment under `root`, which an upload in parts
+/// stores.
+fn long_term_key(root: &str) -> String {
+    format!("{root}/1/2/3/4/00000000000000000000-00000000000000000099.log")
+}
+
+/// Two parts: the first as long as the provider's least part, at least
+/// 64 KiB, and a short last one.
+fn parts_body(store: &impl ObjectStore) -> (Bytes, Vec<usize>) {
+    let limits = store
+        .parts_limits()
+        .expect("a provider that runs these cases takes uploads in parts");
+    let first = usize::try_from(limits.min_part_len)
+        .unwrap_or(usize::MAX)
+        .max(64 * 1024);
+    let last = 1000;
+    (pattern(first + last, 3), vec![first, last])
+}
+
+fn parts_options(bytes: &Bytes) -> PutOptions {
+    PutOptions {
+        mode: PutMode::IfAbsent,
+        metadata: metadata(&[(PUT_ID_METADATA, "0000000000000000000000000000002a")]),
+        crc32c: Some(crc32c::crc32c(bytes)),
+        ..PutOptions::default()
+    }
+}
+
+async fn begin(
+    store: &impl ObjectStore,
+    key: &str,
+    options: &PutOptions,
+    layout: &KeyLayout,
+) -> PartsUpload {
+    store
+        .begin_parts(key, options, layout)
+        .await
+        .unwrap_or_else(|error| panic!("begin {key:?}: {error}"))
+}
+
+async fn put_parts(
+    store: &impl ObjectStore,
+    upload: &PartsUpload,
+    bytes: &Bytes,
+    lens: &[usize],
+) -> Vec<StoredPart> {
+    let mut parts = Vec::with_capacity(lens.len());
+    let mut start = 0;
+    for (number, len) in (1..).zip(lens) {
+        let part = bytes.slice(start..start + len);
+        start += len;
+        let crc32c = crc32c::crc32c(&part);
+        let stored = store
+            .put_part(upload, number, PutBody::from_bytes(part), crc32c)
+            .await
+            .unwrap_or_else(|error| panic!("part {number} of {:?}: {error}", upload.key));
+        parts.push(stored);
+    }
+    parts
+}
+
+fn part_count(lens: &[usize]) -> u32 {
+    u32::try_from(lens.len()).unwrap_or(u32::MAX)
+}
+
+/// What every page of a sweep removed.
+async fn sweep_all(store: &impl ObjectStore, layout: &KeyLayout, older_than: Duration) -> u64 {
+    let mut removed = 0;
+    let mut after: Option<String> = None;
+    for _ in 0..100 {
+        let page = store
+            .sweep_uploads(
+                layout,
+                older_than,
+                after.as_deref(),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("sweep: {error}"));
+        removed += page.removed;
+        assert_eq!(page.failed, 0, "the store removed every abandoned upload");
+        after = page.next;
+        if after.is_none() {
+            return removed;
+        }
+    }
+    panic!("the sweep did not end");
 }
 
 async fn put(store: &impl ObjectStore, key: &str, bytes: Bytes, options: &PutOptions) {

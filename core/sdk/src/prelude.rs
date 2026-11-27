@@ -34,6 +34,10 @@ pub use crate::clients::client::IggyClient;
 pub use crate::clients::client_builder::IggyClientBuilder;
 pub use crate::clients::consumer::{IggyConsumer, IggyConsumerState, ReceivedMessage};
 pub use crate::clients::consumer_builder::IggyConsumerBuilder;
+pub use crate::clients::geo_consumer::{
+    GeoOrigin, GeoReadError, GeoReceivedMessage, GeoSources, IggyGeoConsumer,
+};
+pub use crate::clients::geo_consumer_builder::IggyGeoConsumerBuilder;
 pub use crate::clients::producer::IggyProducer;
 pub use crate::clients::producer_builder::IggyProducerBuilder;
 pub use crate::clients::producer_config::{BackgroundConfig, DirectConfig};
@@ -54,24 +58,25 @@ pub use iggy_common::{
     CacheMetricsKey, Checkpoint, ClientError, ClientInfoDetails, ClusterMetadata, ClusterNode,
     ClusterNodeRole, ClusterNodeStatus, CommitAfter, CommitEvery, CommitPolicy,
     CompressionAlgorithm, Consumer, ConsumerGroup, ConsumerGroupAssignment, ConsumerGroupDetails,
-    ConsumerGroupMember, ConsumerKind, Credentials, Durability, EncryptorKind, GlobalPermissions,
-    HeaderField, HeaderFieldMarker, HeaderKey, HeaderKind, HeaderValue, HttpClientConfig,
-    HttpClientConfigBuilder, HttpMethod, IdKind, Identifier, IdentityInfo, IggyByteSize,
-    IggyDuration, IggyError, IggyExpiry, IggyIndexView, IggyMessage, IggyMessageHeader,
-    IggyMessageHeaderView, IggyMessageView, IggyMessageViewIterator, IggyTimestamp, MaxTopicSize,
-    NonZeroDurationError, NonZeroIggyDuration, OptionKey, OptionSpec, OptionValue, OptionsScope,
-    Partition, PartitionContext, PartitionResizePolicy, Partitioner, Partitioning,
-    PendingOperationsConfig, Permissions, PersonalAccessTokenExpiry, PollMessages, PollOptions,
-    PolledMessages, PollingKind, PollingStrategy, QuicClientConfig, QuicClientConfigBuilder,
-    QuicClientReconnectionConfig, ResourceOptions, SendMessages, SendMessagesConfirmationResponse,
-    SendMessagesResponse, Sizeable, SnapshotCompression, Stats, Stream, StreamCreateOptions,
-    StreamDetails, StreamEncryptionKey, StreamEncryptionSource, StreamPermissions,
-    StreamUpdateOptions, SystemSnapshotType, TcpClientConfig, TcpClientConfigBuilder,
-    TcpClientReconnectionConfig, Topic, TopicCreateOptions, TopicDetails, TopicPermissions,
-    TopicResolvedOptions, TopicUpdateOptions, TransportEndpoints, TransportProtocol,
-    UndecodedRecord, UserCreateOptions, UserId, UserInfo, UserInfoDetails, UserStatus,
-    UserUpdateOptions, Validatable, WebSocketClientConfig, WebSocketClientConfigBuilder,
-    WebSocketClientReconnectionConfig, WebSocketConfig, defaults, locking, topic_option_keys,
+    ConsumerGroupMember, ConsumerKind, Credentials, Durability, EncryptorKind, GeoMode,
+    GeoTopicDurations, GlobalPermissions, HeaderField, HeaderFieldMarker, HeaderKey, HeaderKind,
+    HeaderValue, HttpClientConfig, HttpClientConfigBuilder, HttpMethod, IdKind, Identifier,
+    IdentityInfo, IggyByteSize, IggyDuration, IggyError, IggyExpiry, IggyIndexView, IggyMessage,
+    IggyMessageHeader, IggyMessageHeaderView, IggyMessageView, IggyMessageViewIterator,
+    IggyTimestamp, MaxTopicSize, NonZeroDurationError, NonZeroIggyDuration, OptionKey, OptionSpec,
+    OptionValue, OptionsScope, Partition, PartitionContext, PartitionResizePolicy, Partitioner,
+    Partitioning, PendingOperationsConfig, Permissions, PersonalAccessTokenExpiry, PollMessages,
+    PollOptions, PolledMessages, PollingKind, PollingStrategy, QuicClientConfig,
+    QuicClientConfigBuilder, QuicClientReconnectionConfig, ResourceOptions, SendMessages,
+    SendMessagesConfirmationResponse, SendMessagesResponse, Sizeable, SnapshotCompression, Stats,
+    Stream, StreamCreateOptions, StreamDetails, StreamEncryptionKey, StreamEncryptionSource,
+    StreamPermissions, StreamUpdateOptions, SystemSnapshotType, TcpClientConfig,
+    TcpClientConfigBuilder, TcpClientReconnectionConfig, Topic, TopicCreateOptions, TopicDetails,
+    TopicPermissions, TopicReadCache, TopicResolvedOptions, TopicType, TopicUpdateOptions,
+    TransportEndpoints, TransportProtocol, UndecodedRecord, UserCreateOptions, UserId, UserInfo,
+    UserInfoDetails, UserStatus, UserUpdateOptions, Validatable, WebSocketClientConfig,
+    WebSocketClientConfigBuilder, WebSocketClientReconnectionConfig, WebSocketConfig, defaults,
+    locking, topic_option_keys,
 };
 pub use iggy_common::{
     Client, ClusterClient, ConsumerGroupClient, ConsumerOffsetClient, MessageClient,

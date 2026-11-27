@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub mod crawl;
 pub mod omb;
+pub mod pages;
 
 use crate::artifacts;
 use crate::cache::{SeriesBuilder, SeriesKey};
@@ -29,9 +31,11 @@ use actix_web::http::header::{
     DispositionType,
 };
 use actix_web::{HttpRequest, HttpResponse, get, mime, web};
+use bench_dashboard_shared::card::RunCard;
 use bench_dashboard_shared::config::DashboardConfig;
 use bench_dashboard_shared::embed::{ChartType, PngSize};
 use bench_dashboard_shared::github::GithubStars;
+use bench_dashboard_shared::html::script_safe;
 use bench_dashboard_shared::series::{SeriesMetric, SeriesScope};
 use charming::Chart;
 use serde::Deserialize;
@@ -51,6 +55,8 @@ const ECHARTS_SCRIPT_PATH: &str = "/vendor/echarts-5.5.1.min.js";
 /// How long a browser or a proxy can keep an iggy-bench PNG. A report seldom changes after upload,
 /// and the max age bounds how long a reader sees the old one.
 const IGGY_BENCH_PNG_MAX_AGE_SECS: u32 = 86_400;
+/// The hexadecimal digits of the card hash in the name of a cached card.
+const CARD_HASH_CHARS: usize = 16;
 /// Shorter than the PNG max age, because the page loads `ECHARTS_SCRIPT_PATH`, and an upgrade that
 /// changes the ECharts version removes that file. A page kept for longer shows an empty frame.
 const IGGY_BENCH_PAGE_MAX_AGE_SECS: u32 = 3600;
@@ -527,6 +533,57 @@ pub async fn embed_chart_png(
     ))
 }
 
+/// The preview card of a run, the link preview image of its page. It has one size and one look,
+/// so it takes no query.
+#[get("/embed/{uuid}/card.png")]
+pub async fn embed_card_png(
+    data: web::Data<AppState>,
+    uuid_str: web::Path<String>,
+    req: HttpRequest,
+) -> Result<HttpResponse> {
+    let uuid = Uuid::parse_str(&uuid_str).map_err(|_| {
+        IggyBenchDashboardServerError::InvalidUuid(format!("Invalid UUID format: '{uuid_str}'"))
+    })?;
+    // The log names the parsed id, because a `%0A` in the path decodes to a line break.
+    info!("{}: Embed card request for '{uuid}'", get_client_addr(&req));
+    let EmbedReport { file_prefix, .. } = embed_report(&data, &uuid, &uuid_str)?;
+    let card = data
+        .cache
+        .get_summaries()
+        .iter()
+        .find(|run| run.uuid == uuid)
+        .map(RunCard::run)
+        .ok_or_else(|| {
+            IggyBenchDashboardServerError::NotFound(format!("Benchmark '{uuid_str}' not found"))
+        })?;
+    let png = cached_card(&data, &card_file_name(file_prefix, &card), card).await?;
+    Ok(embed_response(
+        mime::IMAGE_PNG,
+        png,
+        IGGY_BENCH_PNG_MAX_AGE_SECS,
+    ))
+}
+
+/// The name of a cached card. A hash of the card text is in it, because the text can change while
+/// the result file stays, for example the environment of an OMB run.
+fn card_file_name(run: impl fmt::Display, card: &RunCard) -> String {
+    let hash = blake3::hash(format!("{card:?}").as_bytes());
+    format!("{run}_card_{}.png", &hash.to_hex()[..CARD_HASH_CHARS])
+}
+
+/// The card from the embed cache. The card thread draws it when the cache does not hold it.
+async fn cached_card(data: &AppState, name: &str, card: RunCard) -> Result<web::Bytes> {
+    let render_pool = Arc::clone(&data.render_pool);
+    let build = async move {
+        render_pool
+            .render_card(card)
+            .await
+            .map(web::Bytes::from)
+            .map_err(IggyBenchDashboardServerError::InternalError)
+    };
+    data.embed_cache.get_or_build(name, build).await
+}
+
 /// What the embeds of a run take from the loaded runs before they read the cache.
 struct EmbedReport {
     json_path: PathBuf,
@@ -914,13 +971,6 @@ impl EmbedPage<'_> {
     }
 }
 
-/// `script` with every `</` and `<!--` escaped, so no text in it can end the `<script>` element
-/// early. After `<!--<script`, the HTML parser does not take the next `</script>` as the end of
-/// the element.
-fn script_safe(script: &str) -> String {
-    script.replace("</", "<\\/").replace("<!--", "<\\!--")
-}
-
 /// `text` as a JavaScript string literal that can stand in a `<script>` element.
 fn script_string(text: &str) -> String {
     script_safe(&serde_json::Value::from(text).to_string())
@@ -956,11 +1006,14 @@ mod tests {
     use actix_web::http::StatusCode;
     use actix_web::http::header::{CACHE_CONTROL, CONTENT_TYPE};
     use actix_web::{App, test};
+    use bench_dashboard_shared::card::CARD_SIZE;
+    use bench_dashboard_shared::head::PageHead;
     use bench_dashboard_shared::metrics::GroupMetrics;
     use bench_dashboard_shared::series::BenchmarkSeries;
     use bench_dashboard_shared::summary::BenchmarkSummary;
     use bench_report::group_metrics_kind::GroupMetricsKind;
     use charming::component::Title;
+    use resvg::tiny_skia::Pixmap;
     use std::collections::HashSet;
     use std::path::Path;
     use std::sync::Mutex;
@@ -1648,6 +1701,52 @@ mod tests {
             let subtext = subtext.as_str().expect("every chart has a subtext");
             assert!(subtext.contains(&total), "{subtext}");
             assert!(!subtext.contains(CLUSTER_RUN_SUMMED_RATE), "{subtext}");
+        }
+    }
+
+    #[actix_web::test]
+    async fn given_runs_when_requesting_image_of_their_heads_should_answer_card_png() {
+        let cache_dir = tempfile::tempdir().expect("a temporary directory is created");
+        let state = app_state_with_cache_dir(app_state(), cache_dir.path());
+        let summaries = state.cache.get_summaries();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .service(embed_card_png),
+        )
+        .await;
+
+        for run in summaries.iter() {
+            let path = PageHead::run(run)
+                .image
+                .expect("a run page has an image")
+                .path;
+            let response =
+                test::call_service(&app, test::TestRequest::get().uri(&path).to_request()).await;
+
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(header(&response, "content-type"), Some(PNG_CONTENT_TYPE));
+            let body = test::read_body(response).await;
+            let card = Pixmap::decode_png(&body).expect("the card is a PNG");
+            assert_eq!(
+                (card.width(), card.height()),
+                (CARD_SIZE.width(), CARD_SIZE.height()),
+                "{path}"
+            );
+        }
+        for (uri, status) in [
+            (
+                format!("/embed/{}/card.png", Uuid::nil()),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "/embed/not-a-uuid/card.png".to_owned(),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let response =
+                test::call_service(&app, test::TestRequest::get().uri(&uri).to_request()).await;
+            assert_eq!(response.status(), status, "{uri}");
         }
     }
 

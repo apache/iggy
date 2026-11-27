@@ -565,4 +565,103 @@ struct TopicOptionsTests {
         #expect(explicit.localRetentionAge == .after(.seconds(1_800)))
         #expect(explicit.localRetentionSize == .bytes(1 << 20))
     }
+
+    /// The type and mode travel as the server's canonical names. Both are
+    /// fixed at create, so an update refuses a reset before anything is sent.
+    @Test func topicTypeAndGeoModeAreCreateOnly() throws {
+        let typeKey = TopicOptionKey.topicType.rawValue
+        let modeKey = TopicOptionKey.geoMode.rawValue
+        let defaults = try TopicCreateOptions().toResourceOptions()
+        #expect(defaults[typeKey] == nil)
+        #expect(defaults[modeKey] == nil)
+        let geo = try TopicCreateOptions(topicType: .geo, geoMode: .geoTiered).toResourceOptions()
+        #expect(geo[typeKey] == .explicit("geo"))
+        #expect(geo[modeKey] == .explicit("geo_tiered"))
+        #expect(try TopicCreateOptions(topicType: .normal).toResourceOptions()[typeKey] == .explicit("normal"))
+        #expect(try TopicCreateOptions(topicType: .geo, geoMode: .geo).toResourceOptions()[modeKey] == .explicit("geo"))
+        for key in [TopicOptionKey.topicType, .geoMode] {
+            #expect(throws: IggyError(.optionNotUpdatable)) { try TopicUpdateOptions(reset: [key]).toPatch() }
+        }
+    }
+
+    /// The durations of a geo topic travel as whole microseconds. Zero is a
+    /// value, so it is sent, and an unset duration is left out. An update
+    /// sets them, zero included, but never resets them.
+    @Test func geoDurationsSendZeroAndAreNeverReset() throws {
+        let create = try TopicCreateOptions(topicType: .geo, consumerOffsetUploadInterval: .zero, tombstoneGrace: .seconds(3_600)).toResourceOptions()
+        #expect(create[TopicOptionKey.consumerOffsetUploadInterval.rawValue] == .explicit(.uint64(0)))
+        #expect(create[TopicOptionKey.tombstoneGrace.rawValue] == .explicit(.uint64(3_600_000_000)))
+        for key in [TopicOptionKey.freshUploadInterval, .positionsPublishInterval, .positionsResumeTimeout, .longTermRewriteMaxInterval] {
+            #expect(create[key.rawValue] == nil, "\(key)")
+        }
+        #expect(throws: IggyError(.invalidOptionValue)) { try TopicCreateOptions(tombstoneGrace: .seconds(-1)).encode() }
+        #expect(throws: IggyError(.invalidOptionValue)) { try TopicUpdateOptions(positionsResumeTimeout: .milliseconds(-1)).toPatch() }
+
+        let patch = try TopicUpdateOptions(positionsResumeTimeout: .zero).toPatch()
+        #expect(patch.set == [TopicOptionKey.positionsResumeTimeout.rawValue: .explicit(.uint64(0))])
+        #expect(patch.reset.isEmpty)
+        let durations: [TopicOptionKey] = [
+            .freshUploadInterval, .consumerOffsetUploadInterval, .positionsPublishInterval, .tombstoneGrace, .positionsResumeTimeout,
+            .longTermRewriteMaxInterval,
+        ]
+        for key in durations {
+            #expect(throws: IggyError(.optionNotResettable), "\(key)") { try TopicUpdateOptions(reset: [key]).toPatch() }
+        }
+    }
+
+    /// Only a geo topic has durations. A read reports the ones it sets and
+    /// nil for the others, so each node applies its own server setting.
+    @Test func geoDurationReadsAreNilUnlessTheGeoTopicSetsThem() {
+        func topic(_ options: ResourceOptions) -> Topic {
+            Topic(
+                id: 1, createdAt: IggyTimestamp(microseconds: 0), name: "orders", sizeBytes: 0, messagesCount: 0, partitionsCount: 1,
+                options: options)
+        }
+        let geo = topic([
+            TopicOptionKey.topicType.rawValue: .explicit("geo"),
+            TopicOptionKey.freshUploadInterval.rawValue: .explicit(.uint64(50_000)),
+            TopicOptionKey.positionsResumeTimeout.rawValue: .explicit(.uint64(0)),
+        ])
+        #expect(geo.freshUploadInterval == Duration.milliseconds(50))
+        #expect(geo.positionsResumeTimeout == Duration.zero)
+        #expect(geo.tombstoneGrace == nil)
+        let normal = topic([TopicOptionKey.freshUploadInterval.rawValue: .explicit(.uint64(50_000))])
+        #expect(normal.freshUploadInterval == nil)
+    }
+
+    /// The read cache settings travel as bytes on any topic. Zero turns one
+    /// off, so it is sent, and an unset one is left out. An update sets
+    /// them, zero included, but never resets them.
+    @Test func readCacheSendsZeroOnAnyTopicAndIsNeverReset() throws {
+        let create = try TopicCreateOptions(readAheadBytes: 0).toResourceOptions()
+        #expect(create[TopicOptionKey.readAhead.rawValue] == .explicit(.uint64(0)))
+        #expect(create[TopicOptionKey.readCacheSize.rawValue] == nil)
+        #expect(create[TopicOptionKey.topicType.rawValue] == nil)
+
+        let patch = try TopicUpdateOptions(readCacheSizeBytes: 0).toPatch()
+        #expect(patch.set == [TopicOptionKey.readCacheSize.rawValue: .explicit(.uint64(0))])
+        #expect(patch.reset.isEmpty)
+        for key in [TopicOptionKey.readCacheSize, .readAhead] {
+            #expect(throws: IggyError(.optionNotResettable), "\(key)") { try TopicUpdateOptions(reset: [key]).toPatch() }
+        }
+    }
+
+    /// A read reports the read cache settings a topic of either type sets,
+    /// zero as a value, and nil for one it leaves to each node.
+    @Test func readCacheReadsKeepZeroAndAreNilWhenUnset() {
+        func topic(_ options: ResourceOptions) -> Topic {
+            Topic(
+                id: 1, createdAt: IggyTimestamp(microseconds: 0), name: "archive", sizeBytes: 0, messagesCount: 0, partitionsCount: 1,
+                options: options)
+        }
+        let normal = topic([TopicOptionKey.readCacheSize.rawValue: .explicit(.uint64(0))])
+        #expect(normal.readCacheSizeBytes == 0)
+        #expect(normal.readAheadBytes == nil)
+        let geo = topic([
+            TopicOptionKey.topicType.rawValue: .explicit("geo"),
+            TopicOptionKey.readAhead.rawValue: .explicit(.uint64(1_048_576)),
+        ])
+        #expect(geo.readCacheSizeBytes == nil)
+        #expect(geo.readAheadBytes == 1_048_576)
+    }
 }

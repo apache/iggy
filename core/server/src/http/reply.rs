@@ -242,7 +242,8 @@ pub(in crate::http) const fn login_error_to_iggy(error: &LoginRegisterError) -> 
         LoginRegisterError::InvalidToken => IggyError::InvalidPersonalAccessToken,
         LoginRegisterError::UserInactive => IggyError::UserInactive,
         LoginRegisterError::Transient(MetadataSubmitError::NotCaughtUp)
-        | LoginRegisterError::ExternalAuthUnavailable => IggyError::TransientNotAccepted,
+        | LoginRegisterError::ExternalAuthUnavailable
+        | LoginRegisterError::CredentialChanged => IggyError::TransientNotAccepted,
         _ => IggyError::Unauthenticated,
     }
 }

@@ -44,7 +44,12 @@ export type Stream = {
   /** Fingerprint of the stream's data key, `null` for a plaintext stream */
   encryptionKeyFingerprint: string | null,
   /** Fingerprints of the server keys wrapping the data key, empty for a plaintext stream */
-  encryptionKekFingerprints: string[]
+  encryptionKekFingerprints: string[],
+  /**
+   * The geo origin whose topics this shadow stream serves, such as `dc-a`,
+   * `null` for any other stream
+   */
+  shadowOrigin: string | null
 }
 
 /**
@@ -94,7 +99,8 @@ export const deserializeToStream = (r: Buffer, pos = 0): StreamDeserialized => {
       encryptionKeySource: Object.values<string>(EncryptionKeySource).includes(source ?? '')
         ? source as EncryptionKeySource : null,
       encryptionKeyFingerprint: text('encryption_key_fingerprint'),
-      encryptionKekFingerprints: keks === null ? [] : keks.split(',')
+      encryptionKekFingerprints: keks === null ? [] : keks.split(','),
+      shadowOrigin: text('shadow_origin')
     }
   };
 };

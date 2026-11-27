@@ -32,9 +32,9 @@ use futures::future::LocalBoxFuture;
 use futures::{FutureExt, Stream};
 use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BatchHeader};
 use iggy_object_store::{
-    ErrorClass, KeyLayout, ObjectPrefix, ObjectStore, ObjectStoreError, PutBody, PutMode,
-    PutOptions, SegmentKey, SegmentMetadata, SegmentObject, TierExecutor, TierJobCancelled,
-    TierJobClass, TierJobRequest, TierScopeToken, UserMetadata,
+    ErrorClass, KeyLayout, ObjectMeta, ObjectPrefix, ObjectStore, ObjectStoreError, PutBody,
+    PutMode, PutOptions, PutParts, SegmentKey, SegmentMetadata, SegmentObject, TierExecutor,
+    TierJobCancelled, TierJobClass, TierJobRequest, TierScopeToken, UserMetadata,
 };
 use server_common::send_messages::decode_batch_slice;
 
@@ -42,10 +42,19 @@ use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::remote_segments::IndexCheck;
 use crate::segment_chain::{SegmentHasher, SegmentRecord};
 use crate::segment_recovery::MAX_RECOVERABLE_BATCH_BYTES;
+use crate::segment_verify::{index_divergence, log_divergence};
 use crate::state_transfer::{ChunkHasher, hash_segment_range};
 
 /// Bytes of a file that one piece of a put body holds.
 const UPLOAD_PIECE_LEN: usize = 1 << 20;
+
+/// Bytes of a body held in memory that one piece holds.
+///
+/// The tier store gives up an attempt at a create-only put whose provider
+/// takes no piece within its stall deadline, so a small piece makes that
+/// deadline mean "less than 64 KiB in that time", and a slow link that keeps
+/// moving is not cut.
+pub const MEMORY_PIECE_LEN: usize = 64 << 10;
 
 /// A sealed segment to upload, as the partition's owner captured it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,7 +159,35 @@ impl<E: TierExecutor> SegmentUploader for ExecutorUploader<E> {
     }
 }
 
-/// Store the `.log` and then the `.index` of `upload`.
+/// Store the `.log` and then the `.index` of `upload` under the keys of a
+/// segment that starts at the record's first offset, as
+/// `upload_segment_under` does.
+///
+/// # Errors
+/// Those of `upload_segment_under`.
+pub async fn upload_segment<S: ObjectStore>(
+    store: &S,
+    layout: &KeyLayout,
+    upload: &SegmentUpload,
+) -> Result<(), UploadError> {
+    let key = |object| {
+        layout.segment_key(&SegmentKey {
+            prefix: upload.prefix,
+            start_offset: upload.record.start_offset,
+            object,
+        })
+    };
+    upload_segment_under(
+        store,
+        upload,
+        key(SegmentObject::Log),
+        &key(SegmentObject::Index),
+    )
+    .await
+}
+
+/// Store the `.log` of `upload` under `log_key` and then its `.index` under
+/// `index_key`.
 ///
 /// An object that is there already counts as stored when it is the same one:
 /// a `.log` of the recorded size and checksum, and an `.index` that holds
@@ -161,10 +198,11 @@ impl<E: TierExecutor> SegmentUploader for ExecutorUploader<E> {
 /// [`UploadError::MediaFault`] when the local files are not what the chain
 /// records, [`UploadError::Diverged`] when the store holds something else
 /// under a key, and the store's own error otherwise.
-pub async fn upload_segment<S: ObjectStore>(
+pub async fn upload_segment_under<S: ObjectStore>(
     store: &S,
-    layout: &KeyLayout,
     upload: &SegmentUpload,
+    log_key: String,
+    index_key: &str,
 ) -> Result<(), UploadError> {
     let record = &upload.record;
     let fault = |reason| UploadError::MediaFault {
@@ -184,15 +222,54 @@ pub async fn upload_segment<S: ObjectStore>(
     if index_len == 0 || !index.is_whole() {
         return Err(fault("its index does not describe it"));
     }
+    store_segment(
+        store,
+        record,
+        LogPut {
+            key: log_key,
+            body: file_body(&upload.log_path, record.size),
+            // A body streamed from a file cannot be sent again, so it never
+            // goes up in parts.
+            parts: PutParts::Whole,
+        },
+        index_key,
+        file_body(&upload.index_path, index_len),
+        index.crc32c,
+    )
+    .await
+}
 
-    let key = |object| {
-        layout.segment_key(&SegmentKey {
-            prefix: upload.prefix,
-            start_offset: record.start_offset,
-            object,
-        })
+/// The `.log` of a segment for [`store_segment`]: its key, its body, asked
+/// for when its put starts, and whether its put may go up in parts.
+pub struct LogPut<F> {
+    pub key: String,
+    pub body: F,
+    pub parts: PutParts,
+}
+
+/// Put the `.log` of the segment of `record` and then its `.index` under
+/// `index_key`, whose bytes the caller has checked. Each body is asked for
+/// when its put starts. The `.index` always goes whole.
+///
+/// An object that is there already counts as stored when it is the same
+/// one, as [`upload_segment_under`] says.
+pub async fn store_segment<S: ObjectStore>(
+    store: &S,
+    record: &SegmentRecord,
+    log: LogPut<impl Future<Output = Result<PutBody, ObjectStoreError>>>,
+    index_key: &str,
+    index: impl Future<Output = Result<PutBody, ObjectStoreError>>,
+    index_crc32c: u32,
+) -> Result<(), UploadError> {
+    let LogPut {
+        key: log_key,
+        body: log,
+        parts: log_parts,
+    } = log;
+    let fault = |reason| UploadError::MediaFault {
+        start_offset: record.start_offset,
+        reason,
     };
-    let log_key = key(SegmentObject::Log);
     let metadata = UserMetadata::from(&SegmentMetadata {
         start_offset: record.start_offset,
         end_offset: record.end_offset,
@@ -202,27 +279,18 @@ pub async fn upload_segment<S: ObjectStore>(
         size: record.size,
         hash: record.hash,
     });
-    let stored = put_file(
-        store,
-        &log_key,
-        &upload.log_path,
-        record.size,
+    let log_options = PutOptions {
+        mode: PutMode::IfAbsent,
         metadata,
-        record.crc32c,
-    )
-    .await;
+        crc32c: Some(record.crc32c),
+        parts: log_parts,
+    };
+    let stored = put_if_absent(store, &log_key, log, &log_options).await;
     match stored {
         Ok(()) => {}
         Err(ObjectStoreError::PreconditionFailed { .. }) => {
             let held = store.head(&log_key).await.map_err(UploadError::Store)?;
-            let same_bytes = held.crc32c.map_or_else(
-                || {
-                    SegmentMetadata::try_from(&held.metadata)
-                        .is_ok_and(|metadata| metadata.hash == record.hash)
-                },
-                |crc32c| crc32c == record.crc32c,
-            );
-            if held.size != record.size || !same_bytes {
+            if log_divergence(&held, record).is_some() {
                 return Err(UploadError::Diverged { key: log_key });
             }
         }
@@ -233,24 +301,22 @@ pub async fn upload_segment<S: ObjectStore>(
         Err(error) => return Err(UploadError::Store(error)),
     }
 
-    let index_key = key(SegmentObject::Index);
-    let stored = put_file(
-        store,
-        &index_key,
-        &upload.index_path,
-        index_len,
-        UserMetadata::new(),
-        index.crc32c,
-    )
-    .await;
+    let index_options = PutOptions {
+        mode: PutMode::IfAbsent,
+        crc32c: Some(index_crc32c),
+        ..PutOptions::default()
+    };
+    let stored = put_if_absent(store, index_key, index, &index_options).await;
     match stored {
         Ok(()) => Ok(()),
         // Sparse indexes differ between replicas, so an index another primary
         // stored only has to be one.
         Err(ObjectStoreError::PreconditionFailed { .. }) => {
-            let held = store.head(&index_key).await.map_err(UploadError::Store)?;
-            if held.size == 0 || held.size % IGGY_INDEX_SIZE as u64 != 0 {
-                return Err(UploadError::Diverged { key: index_key });
+            let held = store.head(index_key).await.map_err(UploadError::Store)?;
+            if index_divergence(&held).is_some() {
+                return Err(UploadError::Diverged {
+                    key: index_key.to_owned(),
+                });
             }
             Ok(())
         }
@@ -258,27 +324,51 @@ pub async fn upload_segment<S: ObjectStore>(
     }
 }
 
-/// Put the first `len` bytes of the file at `path` under `key`, unless an
-/// object is there already.
-async fn put_file<S: ObjectStore>(
+/// Whether `held`, the object under a segment's `.log` key, is the one
+/// `record` describes: of the recorded size, with the recorded CRC32C, or
+/// with the recorded hash in its metadata when the store keeps no CRC32C.
+pub fn is_recorded_log(held: &ObjectMeta, record: &SegmentRecord) -> bool {
+    let same_bytes = held.crc32c.map_or_else(
+        || {
+            SegmentMetadata::try_from(&held.metadata)
+                .is_ok_and(|metadata| metadata.hash == record.hash)
+        },
+        |crc32c| crc32c == record.crc32c,
+    );
+    held.size == record.size && same_bytes
+}
+
+/// Whether `held`, the object under a segment's `.index` key, holds whole
+/// index entries, at least one. Sparse indexes differ between replicas, so
+/// no record says more of it.
+pub const fn is_whole_index(held: &ObjectMeta) -> bool {
+    held.size != 0 && held.size.is_multiple_of(IGGY_INDEX_SIZE as u64)
+}
+
+/// Put `body` under `key` with the create-only `options`, unless an object
+/// is there already.
+async fn put_if_absent<S: ObjectStore>(
     store: &S,
     key: &str,
-    path: &str,
-    len: u64,
-    metadata: UserMetadata,
-    crc32c: u32,
+    body: impl Future<Output = Result<PutBody, ObjectStoreError>>,
+    options: &PutOptions,
 ) -> Result<(), ObjectStoreError> {
+    store.put(key, body.await?, options).await
+}
+
+/// The first `len` bytes of the file at `path` as a put body.
+async fn file_body(path: &str, len: u64) -> Result<PutBody, ObjectStoreError> {
     let file = compio::fs::File::open(path)
         .await
         .map_err(ObjectStoreError::Body)?;
-    let options = PutOptions {
-        mode: PutMode::IfAbsent,
-        metadata,
-        crc32c: Some(crc32c),
-    };
-    store
-        .put(key, PutBody::from_stream(len, pieces(file, len)), &options)
-        .await
+    Ok(PutBody::from_stream(len, pieces(file, len)))
+}
+
+/// `bytes` as a put body that hands them over a piece at a time, so a
+/// provider that sums or copies what it sends does so in steps, and that a
+/// put can send again.
+pub fn memory_body(bytes: &Bytes) -> PutBody {
+    PutBody::from_bytes_in_pieces(bytes.clone(), MEMORY_PIECE_LEN)
 }
 
 /// The first `len` bytes of `file`, a piece at a time.

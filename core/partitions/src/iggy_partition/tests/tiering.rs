@@ -279,6 +279,36 @@ async fn given_a_trim_point_above_the_floor_when_asking_what_to_commit_should_of
     assert_eq!(partition.trim_point_to_commit(trim_point + 1), None);
 }
 
+/// A chain rebuilt from the store takes its trim point from the watermark
+/// metadata committed, so the primary that loads it neither proposes a trim
+/// nor lets its deletes reach past what was already committed.
+#[compio::test]
+async fn given_a_chain_rebuilt_at_the_committed_watermark_when_asking_what_to_commit_or_delete_should_add_nothing()
+ {
+    let (_directory, mut partition) = Box::pin(untiered_partition()).await;
+    let _ = partition.register_builtin_state_machines();
+    let watermark = partition.log.segments()[0].end_offset;
+    let records = vec![ChainRecord::TrimPoint(watermark)];
+    partition
+        .adopt_segment_chain(&crate::segment_chain::Chain {
+            prefix: PREFIX,
+            valid_len: (crate::segment_chain::HEADER_SIZE
+                + records.len() * crate::segment_chain::RECORD_SIZE) as u64,
+            records,
+            torn_tail: false,
+        })
+        .unwrap();
+
+    assert_eq!(partition.chain_trim_point(), Some(watermark));
+    // A primary that would propose a trim above the watermark.
+    assert_eq!(
+        partition.trim_point_to_commit(watermark - 1),
+        Some(watermark)
+    );
+    assert_eq!(partition.trim_point_to_commit(watermark), None);
+    assert_eq!(partition.object_delete_bound(watermark), Some(watermark));
+}
+
 #[compio::test]
 async fn given_no_trim_point_when_asking_what_to_commit_should_offer_nothing() {
     let (_directory, mut partition) = Box::pin(untiered_partition()).await;

@@ -27,6 +27,7 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
     case bindSession = 15
     case updateResource = 16
     case getMetadataChanges = 17
+    case retireGeoOrigin = 18
     case getMe = 20
     case getClient = 21
     case getClients = 22
@@ -91,6 +92,7 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
         case .bindSession: "session.bind"
         case .updateResource: "resource.update"
         case .getMetadataChanges: "metadata.changes"
+        case .retireGeoOrigin: "geo.retire_origin"
         case .getMe: "me"
         case .getClient: "client.get"
         case .getClients: "client.list"
