@@ -30,7 +30,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use sysinfo::System as SysinfoSystem;
 use system_stats::{SystemProbe, count_open_files, count_open_files_without_scan};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// The last completed process-wide sample. CPU deltas cover the sampler interval.
 /// Slow probes leave the previous sample available without delaying shard readers.
@@ -107,11 +107,26 @@ pub fn init_stats_data_path(path: PathBuf) {
 /// ten seconds or printer interval.
 /// Sampling time extends these intervals; readers always get the last completed sample.
 /// Call before [`start_system_stats_sampler`], whose first sample decides
-/// whether the node boots short. A reserve of 0 installs nothing.
+/// whether the node boots short. A reserve of 0 installs nothing, and
+/// neither does a data disk that reports no size.
 pub fn init_free_space_reserve(reserve_bytes: u64) {
-    if reserve_bytes > 0 {
-        let _ = FREE_SPACE_RESERVE.set(Arc::new(FreeSpaceReserve::new(reserve_bytes, &DISK_USAGE)));
+    if reserve_bytes == 0 {
+        return;
     }
+    // ramfs, and tmpfs mounted with size=0, report 0 blocks however much they
+    // hold, so every sample would read as a disk with nothing free.
+    let sizeless = STATS_DATA_PATH
+        .get()
+        .and_then(|path| fs2::statvfs(path).ok())
+        .is_some_and(|stats| stats.total_space() == 0);
+    if sizeless {
+        warn!(
+            reserve_bytes,
+            "data disk reports no size, as ramfs does; the free-space reserve is disabled"
+        );
+        return;
+    }
+    let _ = FREE_SPACE_RESERVE.set(Arc::new(FreeSpaceReserve::new(reserve_bytes, &DISK_USAGE)));
 }
 
 /// The reserve every partition of this node checks, or `None` when disabled.
