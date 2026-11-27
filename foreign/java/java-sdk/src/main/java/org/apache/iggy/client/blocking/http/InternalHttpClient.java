@@ -476,6 +476,13 @@ final class InternalHttpClient implements Closeable {
         });
     }
 
+    byte[] executeWithBytesResponse(ClassicHttpRequest request) {
+        return executeRequest(request, response -> {
+            handleErrorResponse(response);
+            return response.getEntity().getContent().readAllBytes();
+        });
+    }
+
     private static CloseableHttpClient createDeferredHttpClient(
             Optional<Duration> connectionTimeout, Optional<File> tlsCertificate) {
         var connectionConfigBuilder = ConnectionConfig.custom();

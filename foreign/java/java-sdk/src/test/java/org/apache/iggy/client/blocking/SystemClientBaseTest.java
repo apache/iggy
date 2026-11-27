@@ -45,6 +45,8 @@ import org.apache.iggy.system.MetadataChangesQuery;
 import org.apache.iggy.system.MetadataCurrentItem;
 import org.apache.iggy.system.OptionSpec;
 import org.apache.iggy.system.OptionsScope;
+import org.apache.iggy.system.SnapshotCompression;
+import org.apache.iggy.system.SystemSnapshotType;
 import org.apache.iggy.user.GlobalPermissions;
 import org.apache.iggy.user.Permissions;
 import org.apache.iggy.user.UserOptionKey;
@@ -54,6 +56,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import tools.jackson.databind.JsonNode;
 
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
 import java.math.BigInteger;
 import java.security.SecureRandom;
 import java.util.ArrayList;
@@ -64,6 +68,8 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 
 import static org.apache.iggy.ResourceOptionsFixture.section;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -147,6 +153,57 @@ public abstract class SystemClientBaseTest extends IntegrationTest {
         assertThat(stats.totalDiskSpace()).isNotNull();
         assertThat(stats.openFilesCount()).isNotNull();
         assertThat(stats.openFilesLimit()).isNotNull();
+    }
+
+    @Test
+    void shouldGetSnapshot() throws IOException {
+        // when
+        var snapshot = systemClient.snapshot(SnapshotCompression.Deflated, List.of(SystemSnapshotType.Test));
+
+        // then
+        assertSnapshotEntry(snapshot.data(), "test.txt", ZipEntry.DEFLATED);
+    }
+
+    @Test
+    void shouldGetStoredSnapshot() throws IOException {
+        // when
+        var snapshot = systemClient.snapshot(SnapshotCompression.Stored, List.of(SystemSnapshotType.Test));
+
+        // then
+        assertSnapshotEntry(snapshot.data(), "test.txt", ZipEntry.STORED);
+    }
+
+    @Test
+    void givenAllCombinedWithAnotherTypeWhenTakingSnapshotShouldBeRefusedAsInvalidCommand() {
+        // when
+        var types = List.of(SystemSnapshotType.All, SystemSnapshotType.Test);
+
+        // then the server accepts All only on its own
+        assertThatThrownBy(() -> systemClient.snapshot(SnapshotCompression.Deflated, types))
+                .isInstanceOfSatisfying(
+                        IggyServerException.class,
+                        refusal -> assertThat(refusal.getErrorCode()).isEqualTo(IggyErrorCode.INVALID_COMMAND));
+    }
+
+    @Test
+    void givenUserWithoutManageServersWhenTakingSnapshotShouldBeRefusedAsUnauthorized() {
+        // given
+        String username = unique("snapshot-reader");
+        var permissions = new Permissions(
+                new GlobalPermissions(false, true, false, false, false, false, false, false, false, false), Map.of());
+        var user = client.users()
+                .createUser(
+                        username, "snapshot-secret", UserStatus.Active, Optional.of(permissions), UserOptions.empty());
+        trackUser(user.id());
+        var reader = getClient();
+        reader.users().login(username, "snapshot-secret");
+
+        // then
+        assertThatThrownBy(
+                        () -> reader.system().snapshot(SnapshotCompression.Deflated, List.of(SystemSnapshotType.Test)))
+                .isInstanceOfSatisfying(
+                        IggyServerException.class,
+                        refusal -> assertThat(refusal.getErrorCode()).isEqualTo(IggyErrorCode.UNAUTHORIZED));
     }
 
     @Test
@@ -566,5 +623,15 @@ public abstract class SystemClientBaseTest extends IntegrationTest {
 
     private static String unique(String prefix) {
         return prefix + "-" + UUID.randomUUID().toString().replace("-", "");
+    }
+
+    private static void assertSnapshotEntry(byte[] data, String expectedName, int expectedMethod) throws IOException {
+        try (var archive = new ZipInputStream(new ByteArrayInputStream(data))) {
+            var entry = archive.getNextEntry();
+            assertThat(entry).isNotNull();
+            assertThat(entry.getName()).isEqualTo(expectedName);
+            assertThat(entry.getMethod()).isEqualTo(expectedMethod);
+            assertThat(archive.readAllBytes()).isNotEmpty();
+        }
     }
 }

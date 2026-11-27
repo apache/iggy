@@ -26,7 +26,10 @@ import org.apache.iggy.system.MetadataChanges;
 import org.apache.iggy.system.MetadataChangesQuery;
 import org.apache.iggy.system.OptionSpec;
 import org.apache.iggy.system.OptionsScope;
+import org.apache.iggy.system.Snapshot;
+import org.apache.iggy.system.SnapshotCompression;
 import org.apache.iggy.system.Stats;
+import org.apache.iggy.system.SystemSnapshotType;
 
 import java.util.List;
 
@@ -45,6 +48,15 @@ public interface SystemClient {
      * keys yet returns an empty list.
      */
     List<OptionSpec> describeOptions(OptionsScope scope);
+
+    /**
+     * Captures a diagnostic snapshot of the server state, such as logs, config and resource usage, as a
+     * compressed ZIP archive.
+     *
+     * <p>The request requires root or the global {@code manageServers} permission.
+     * When present, {@link SystemSnapshotType#All} must be the only entry.
+     */
+    Snapshot snapshot(SnapshotCompression compression, List<SystemSnapshotType> snapshotTypes);
 
     /**
      * Reads one page of the node's metadata change log, or of its current state.

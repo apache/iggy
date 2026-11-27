@@ -30,7 +30,10 @@ import org.apache.iggy.system.MetadataChanges;
 import org.apache.iggy.system.MetadataChangesQuery;
 import org.apache.iggy.system.OptionSpec;
 import org.apache.iggy.system.OptionsScope;
+import org.apache.iggy.system.Snapshot;
+import org.apache.iggy.system.SnapshotCompression;
 import org.apache.iggy.system.Stats;
+import org.apache.iggy.system.SystemSnapshotType;
 import tools.jackson.core.type.TypeReference;
 import tools.jackson.databind.JsonNode;
 
@@ -47,6 +50,7 @@ class SystemHttpClient implements SystemClient {
     private static final String OPTIONS = "/options";
     private static final String METADATA_CHANGES = "/metadata/changes";
     private static final String GEO_ORIGINS = "/geo/origins";
+    private static final String SNAPSHOT = "/snapshot";
     private final InternalHttpClient httpClient;
 
     public SystemHttpClient(InternalHttpClient httpClient) {
@@ -70,6 +74,15 @@ class SystemHttpClient implements SystemClient {
         var request = httpClient.prepareGetRequest(OPTIONS + "/" + scope.name().toLowerCase(Locale.ROOT));
         List<HttpOptionSpec> specs = httpClient.execute(request, new TypeReference<>() {});
         return specs.stream().map(HttpOptionSpec::toOptionSpec).toList();
+    }
+
+    @Override
+    public Snapshot snapshot(SnapshotCompression compression, List<SystemSnapshotType> snapshotTypes) {
+        var body = new SnapshotRequest(
+                compression.name(),
+                snapshotTypes.stream().map(SystemSnapshotType::name).toList());
+        var request = httpClient.preparePostRequest(SNAPSHOT, body);
+        return new Snapshot(httpClient.executeWithBytesResponse(request));
     }
 
     @Override
@@ -107,6 +120,12 @@ class SystemHttpClient implements SystemClient {
         var request = httpClient.prepareGetRequest(PING);
         return httpClient.executeWithStringResponse(request);
     }
+
+    /**
+     * The REST body of a snapshot request. The server expects the variant names as written, such as
+     * {@code Deflated}, while this mapper lowercases enums, so the names are sent as plain strings.
+     */
+    private record SnapshotRequest(String compression, List<String> snapshotTypes) {}
 
     /**
      * The REST shape of a catalog entry: the kind arrives as its lowercase name, the default as a JSON
