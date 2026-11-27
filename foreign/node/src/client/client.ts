@@ -15,24 +15,64 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import type { RawClient, ClientConfig, ClientConfigOrString } from './client.type.js';
-import { getRawClient } from './client.socket.js';
+import type { RawClient, ClientConfig, ClientConfigOrString, ClientEventMap } from './client.type.js';
+import { CommandResponseStream, getRawClient } from './client.socket.js';
 import { CommandAPI } from '../wire/command-set.js';
 import { normalizeClientConfig } from './client.config.js';
 
 /** Every facade call shares one session and its independently multiplexed replica links. */
 export class Client extends CommandAPI {
   readonly _config: ClientConfig;
+  private readonly events: CommandResponseStream;
+  private readonly eventListeners = new WeakMap<object, object>();
+  private readonly destroyPromise: Promise<void>;
 
   constructor(config: ClientConfigOrString) {
     const normalized = normalizeClientConfig(config);
-    const client = getRawClient(normalized);
+    const client = new CommandResponseStream(normalized);
     super(async () => client);
     this._config = normalized;
+    this.events = client;
+    this.destroyPromise = new Promise<void>((resolve) => client.once('end', resolve));
   }
 
-  async destroy(): Promise<void> {
-    (await this.clientProvider()).destroy();
+  /** Registers a listener for a connection lifecycle event. */
+  on<E extends keyof ClientEventMap>(event: E, listener: (this: this, ...args: ClientEventMap[E]) => void): this {
+    this.events.on(event === 'error' ? 'connectionError' : event, this.bindListener(listener));
+    return this;
+  }
+
+  /** Registers a listener for the next occurrence only. */
+  once<E extends keyof ClientEventMap>(event: E, listener: (this: this, ...args: ClientEventMap[E]) => void): this {
+    this.events.once(event === 'error' ? 'connectionError' : event, this.bindListener(listener));
+    return this;
+  }
+
+  /** Removes a listener registered with `on` or `once`. */
+  off<E extends keyof ClientEventMap>(event: E, listener: (...args: ClientEventMap[E]) => void): this {
+    const bound = this.eventListeners.get(listener);
+    if (bound) this.events.off(event === 'error' ? 'connectionError' : event, bound as typeof listener);
+    return this;
+  }
+
+  /** Alias for `off`. */
+  removeListener<E extends keyof ClientEventMap>(event: E, listener: (...args: ClientEventMap[E]) => void): this {
+    return this.off(event, listener);
+  }
+
+  /** Cancels calls immediately and resolves after the final `end` event. */
+  destroy(): Promise<void> {
+    this.events.destroy();
+    return this.destroyPromise;
+  }
+
+  private bindListener<E extends keyof ClientEventMap>(listener: (this: this, ...args: ClientEventMap[E]) => void) {
+    let bound = this.eventListeners.get(listener);
+    if (!bound) {
+      bound = listener.bind(this);
+      this.eventListeners.set(listener, bound);
+    }
+    return bound as typeof listener;
   }
 }
 
@@ -57,7 +97,7 @@ export class SimpleClient extends CommandAPI {
    */
   async destroy() {
     const client = await this.clientProvider();
-    client.destroy();
+    await client.destroy();
   }
 
 }
