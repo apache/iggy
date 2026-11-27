@@ -275,7 +275,7 @@ pub struct SweepFindings {
 }
 
 impl SweepFindings {
-    /// The findings of `listing`, judged as [`verdict`] judges them.
+    /// The findings of `listing`, judged as `verdict` judges them.
     #[must_use]
     pub fn of(listing: &RootListing, revision: u64, holds: impl Fn(&ObjectPrefix) -> bool) -> Self {
         let mut findings = Self::default();

@@ -1385,6 +1385,9 @@ pub async fn given_an_abandoned_upload_when_sweeping_should_remove_it_only_past_
 
     let young = sweep_all(store, &layout, Duration::from_hours(1)).await;
     assert_eq!(young, 0, "a young upload stays");
+    // GCS reads the store's clock from the `Date` header, in whole seconds,
+    // so an upload of the same second would still look younger than it.
+    compio::time::sleep(Duration::from_millis(1_100)).await;
     // Past any skew of the clocks, so every upload of this root is old.
     let all = sweep_all(store, &layout, Duration::ZERO).await;
     assert!(all >= 1, "the abandoned upload goes");
