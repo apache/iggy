@@ -44,8 +44,9 @@ import static org.apache.iggy.system.OptionKey.MAX_NAME_LENGTH;
  * settings are fixed at create, so they have no field here. A zero expiry, size cap or local retention
  * limit changes nothing, {@code reset} is what returns a key to its default.
  *
- * <p>On a geo topic the six durations from {@code freshUploadInterval} to {@code longTermRewriteMaxInterval}
- * are the only settings an update changes, and the server refuses them on a normal topic. Zero is a value
+ * <p>The six durations from {@code freshUploadInterval} to {@code longTermRewriteMaxInterval} change only on a
+ * geo topic, and the server refuses them on a normal topic. {@code readCacheSize} and {@code readAhead}
+ * change on any topic. On a geo topic these eight are the only settings an update changes. Zero is a value
  * for them and is sent. They have no default, so they cannot be reset.
  *
  * <p>An update the server would refuse for its shape is refused before anything is sent, with the server's
@@ -73,6 +74,10 @@ import static org.apache.iggy.system.OptionKey.MAX_NAME_LENGTH;
  *     node starts, in microseconds
  * @param longTermRewriteMaxInterval the longest wait between two long-term rewrites of the geo topic's
  *     partition, in microseconds, at least one second
+ * @param readCacheSize the memory in bytes that each node keeps for what the topic's reads fetch from the
+ *     object store, zero keeping nothing, otherwise at least 512 KiB
+ * @param readAhead the most bytes that readahead fetches in front of a sequential reader of the topic, zero
+ *     turning readahead off, otherwise at least 128 KiB
  */
 public record TopicUpdate(
         Optional<String> name,
@@ -89,7 +94,9 @@ public record TopicUpdate(
         Optional<BigInteger> positionsPublishInterval,
         Optional<BigInteger> tombstoneGrace,
         Optional<BigInteger> positionsResumeTimeout,
-        Optional<BigInteger> longTermRewriteMaxInterval) {
+        Optional<BigInteger> longTermRewriteMaxInterval,
+        Optional<BigInteger> readCacheSize,
+        Optional<BigInteger> readAhead) {
 
     public TopicUpdate {
         reset = copyOf(reset);
@@ -110,6 +117,8 @@ public record TopicUpdate(
                                 tombstoneGrace,
                                 positionsResumeTimeout,
                                 longTermRewriteMaxInterval,
+                                readCacheSize,
+                                readAhead,
                                 raw)
                         .keySet(),
                 reset,
@@ -121,6 +130,44 @@ public record TopicUpdate(
                     TopicOptionKey.NAME.value(), value, 1, MAX_NAME_LENGTH, IggyErrorCode.INVALID_TOPIC_NAME));
             tieredStorage.ifPresent(enabled -> OptionKey.requireEnabled(TopicOptionKey.TIERED_STORAGE, enabled));
         }
+    }
+
+    /** An update of the keys that predate the read cache sizes. */
+    @SuppressWarnings("checkstyle:ParameterNumber")
+    public TopicUpdate(
+            Optional<String> name,
+            Optional<BigInteger> messageExpiry,
+            Optional<BigInteger> maxTopicSize,
+            Set<TopicOptionKey> reset,
+            Map<String, HeaderValue> raw,
+            Set<String> rawReset,
+            Optional<BigInteger> localRetentionAge,
+            Optional<BigInteger> localRetentionSize,
+            Optional<Boolean> tieredStorage,
+            Optional<BigInteger> freshUploadInterval,
+            Optional<BigInteger> consumerOffsetUploadInterval,
+            Optional<BigInteger> positionsPublishInterval,
+            Optional<BigInteger> tombstoneGrace,
+            Optional<BigInteger> positionsResumeTimeout,
+            Optional<BigInteger> longTermRewriteMaxInterval) {
+        this(
+                name,
+                messageExpiry,
+                maxTopicSize,
+                reset,
+                raw,
+                rawReset,
+                localRetentionAge,
+                localRetentionSize,
+                tieredStorage,
+                freshUploadInterval,
+                consumerOffsetUploadInterval,
+                positionsPublishInterval,
+                tombstoneGrace,
+                positionsResumeTimeout,
+                longTermRewriteMaxInterval,
+                Optional.empty(),
+                Optional.empty());
     }
 
     /** An update of the keys that predate the durations of a geo topic. */
@@ -192,6 +239,8 @@ public record TopicUpdate(
                 tombstoneGrace,
                 positionsResumeTimeout,
                 longTermRewriteMaxInterval,
+                readCacheSize,
+                readAhead,
                 raw);
     }
 
@@ -209,6 +258,8 @@ public record TopicUpdate(
             Optional<BigInteger> tombstoneGrace,
             Optional<BigInteger> positionsResumeTimeout,
             Optional<BigInteger> longTermRewriteMaxInterval,
+            Optional<BigInteger> readCacheSize,
+            Optional<BigInteger> readAhead,
             Map<String, HeaderValue> raw) {
         Map<String, HeaderValue> entries = new LinkedHashMap<>(raw);
         name.ifPresent(
@@ -235,6 +286,9 @@ public record TopicUpdate(
         putDuration(entries, TopicOptionKey.TOMBSTONE_GRACE, tombstoneGrace);
         putDuration(entries, TopicOptionKey.POSITIONS_RESUME_TIMEOUT, positionsResumeTimeout);
         putDuration(entries, TopicOptionKey.LONG_TERM_REWRITE_MAX_INTERVAL, longTermRewriteMaxInterval);
+        readCacheSize.ifPresent(
+                bytes -> entries.put(TopicOptionKey.READ_CACHE_SIZE.value(), HeaderValue.fromUint64(bytes)));
+        readAhead.ifPresent(bytes -> entries.put(TopicOptionKey.READ_AHEAD.value(), HeaderValue.fromUint64(bytes)));
         return Collections.unmodifiableMap(entries);
     }
 
@@ -252,7 +306,8 @@ public record TopicUpdate(
                 + tieredStorage + ", freshUploadInterval=" + freshUploadInterval + ", consumerOffsetUploadInterval="
                 + consumerOffsetUploadInterval + ", positionsPublishInterval=" + positionsPublishInterval
                 + ", tombstoneGrace=" + tombstoneGrace + ", positionsResumeTimeout=" + positionsResumeTimeout
-                + ", longTermRewriteMaxInterval=" + longTermRewriteMaxInterval + "]";
+                + ", longTermRewriteMaxInterval=" + longTermRewriteMaxInterval + ", readCacheSize=" + readCacheSize
+                + ", readAhead=" + readAhead + "]";
     }
 
     private static Set<TopicOptionKey> copyOf(Set<TopicOptionKey> keys) {
@@ -283,6 +338,8 @@ public record TopicUpdate(
         private Optional<BigInteger> tombstoneGrace = Optional.empty();
         private Optional<BigInteger> positionsResumeTimeout = Optional.empty();
         private Optional<BigInteger> longTermRewriteMaxInterval = Optional.empty();
+        private Optional<BigInteger> readCacheSize = Optional.empty();
+        private Optional<BigInteger> readAhead = Optional.empty();
 
         private Builder() {}
 
@@ -348,6 +405,17 @@ public record TopicUpdate(
             return this;
         }
 
+        /** Sent as written, zero included. This and {@link #readAhead} act on a normal or a geo topic. */
+        public Builder readCacheSize(BigInteger bytes) {
+            this.readCacheSize = Optional.of(bytes);
+            return this;
+        }
+
+        public Builder readAhead(BigInteger bytes) {
+            this.readAhead = Optional.of(bytes);
+            return this;
+        }
+
         public Builder reset(TopicOptionKey key) {
             reset.add(key);
             return this;
@@ -384,7 +452,9 @@ public record TopicUpdate(
                     positionsPublishInterval,
                     tombstoneGrace,
                     positionsResumeTimeout,
-                    longTermRewriteMaxInterval);
+                    longTermRewriteMaxInterval,
+                    readCacheSize,
+                    readAhead);
         }
     }
 }

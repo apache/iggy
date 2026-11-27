@@ -44,6 +44,7 @@ export {
   TopicType,
   GeoMode,
   type GeoTopicDurations,
+  type TopicReadCache,
   EncryptionKeySource,
   OptionsScope,
   StreamOptionKey,

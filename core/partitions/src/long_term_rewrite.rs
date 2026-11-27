@@ -260,7 +260,7 @@ impl SegmentRewrite {
                 range: 0..record.size,
             };
             remote
-                .carry_long_term(&segment, &log, &index, &self.read.read_settings)
+                .carry_long_term(&segment, &log, &index, &self.read.read_settings.current())
                 .await;
         }
         Ok(ManifestSegment {

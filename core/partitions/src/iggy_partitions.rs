@@ -1680,26 +1680,20 @@ where
         consumer: PollingConsumer,
         args: &PollingArgs,
     ) -> Option<PollPlan> {
-        self.build_poll_snapshot_within(
-            namespace,
-            consumer,
-            args,
-            usize::MAX,
-            &crate::PartitionReadSettings::SHARD,
-        )
+        self.build_poll_snapshot_within(namespace, consumer, args, usize::MAX)
     }
 
     /// [`Self::build_poll_snapshot`] for a poll whose reply holds at most
     /// `byte_budget` bytes of messages, so the snapshot stops at the segment
-    /// that covers them instead of at the partition's tail, and whose reads
-    /// of the store use the shard's cache with `read_settings`.
+    /// that covers them instead of at the partition's tail. The caller hands
+    /// the settings of its reads of the store to
+    /// [`PollPlan::read_store_with`].
     pub fn build_poll_snapshot_within(
         &self,
         namespace: &IggyNamespace,
         consumer: PollingConsumer,
         args: &PollingArgs,
         byte_budget: usize,
-        read_settings: &crate::PartitionReadSettings,
     ) -> Option<PollPlan> {
         // `build_poll_plan` touches the partition's sealed-read-handle LRU, so it
         // needs `&mut`. Sound on the pump: it is fully synchronous (no `.await`
@@ -1707,13 +1701,7 @@ where
         // Read the knob first: the `&mut` borrow below covers `self.config` too.
         let validate_checksum = self.config.validate_checksum;
         let partition = self.get_mut_with_remote(namespace)?;
-        Some(partition.build_poll_plan_reading(
-            consumer,
-            args,
-            validate_checksum,
-            byte_budget,
-            read_settings,
-        ))
+        Some(partition.build_poll_plan_within(consumer, args, validate_checksum, byte_budget))
     }
 
     /// Validate and accept a poll synchronously on the owning pump.
@@ -2328,7 +2316,8 @@ mod tests {
                 .get_by_ns(&namespace)
                 .unwrap()
                 .placed_read_plan(None)
-                .read_settings;
+                .read_settings
+                .current();
             let segment = crate::remote_segments::RemoteRange {
                 key: iggy_object_store::SegmentKey {
                     prefix: crate::object_prefix(namespace, created_revision),

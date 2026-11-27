@@ -91,6 +91,7 @@ use iggy_common::{
     NodeStatsSample, OptionKey, OptionValue, OptionsProvenance, OptionsScope,
     PartitionResizePolicy, PartitionStats, ResourceOptions, StreamStats, TopicCreateOptions,
     TopicResolvedOptions, TopicStats, TopicType, WrapSet, public_options, stream_wrap_set,
+    validate_read_cache,
 };
 use serde::{Deserialize, Serialize};
 use server_common::sharding::{IggyNamespace, MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS};
@@ -4165,13 +4166,14 @@ impl StateHandler for UpdateTopicResolvedRequest {
             return ApplyReply::err(UpdateTopicResult::TopicNotFound);
         };
         // A geo topic keeps the name and the options it was created with, all
-        // but its durations, and only a geo topic has those. The edge refuses
-        // such a patch by key when it can read the topic, and this refuses one
-        // that reached the primary without that read.
+        // but its durations and its read cache settings, and only a geo topic
+        // has durations. The edge refuses such a patch by key when it can read
+        // the topic, and this refuses one that reached the primary without
+        // that read.
         if topic.resolved.topic_type == TopicType::Geo {
             if self.name.is_some()
                 || !self.derived_options.is_empty()
-                || !sets_only_geo_durations(&self.explicit_options)
+                || !sets_only_geo_updatable(&self.explicit_options)
             {
                 return ApplyReply::err(UpdateTopicResult::OptionNotUpdatable);
             }
@@ -4212,6 +4214,11 @@ impl StateHandler for UpdateTopicResolvedRequest {
             && max_topic_size.as_bytes_u64() < segment_size.as_bytes_u64()
         {
             return ApplyReply::err(UpdateTopicResult::InvalidTopicSize);
+        }
+        // Two patches admitted on the same stored pair can each meet the rule
+        // and break it together, so the pair this commit leaves decides.
+        if validate_read_cache(&options).is_err() {
+            return ApplyReply::err(UpdateTopicResult::InvalidOptionValue);
         }
         // An equal patch stores nothing new, so it must not copy a stream
         // that a checkpoint capture shares.
@@ -4341,6 +4348,29 @@ pub(crate) enum PatchError {
     TooLarge,
 }
 
+/// Whether every key that `explicit` sets names one that an update can change
+/// on a geo topic. The names alone decide, so every build gives the same
+/// verdict for them.
+fn sets_only_geo_updatable(explicit: &WireOptions) -> bool {
+    explicit
+        .into_iter()
+        .all(|entry| names_a(entry.key, OptionKey::is_geo_updatable))
+}
+
+/// Whether a key that `explicit` sets names a duration of a geo topic.
+fn sets_a_geo_duration(explicit: &WireOptions) -> bool {
+    explicit
+        .into_iter()
+        .any(|entry| names_a(entry.key, OptionKey::is_geo_duration))
+}
+
+fn names_a(key: &[u8], kind: fn(OptionKey) -> bool) -> bool {
+    str::from_utf8(key)
+        .ok()
+        .and_then(|name| name.parse::<OptionKey>().ok())
+        .is_some_and(kind)
+}
+
 /// `current` with the patch applied: derived resets first, then the explicit
 /// set entries, each replacing the stored entry of the same key. The patch's
 /// `critical_keys` names are added to the stored marker instead.
@@ -4349,28 +4379,6 @@ pub(crate) enum PatchError {
 /// encoder enforces, so a stored map can always be read back. It depends only
 /// on the committed blocks and state, so every replica reaches the same
 /// verdict.
-/// Whether every key that `explicit` sets names a duration of a geo topic.
-/// The names alone decide, so every build gives the same verdict for them.
-fn sets_only_geo_durations(explicit: &WireOptions) -> bool {
-    explicit
-        .into_iter()
-        .all(|entry| names_a_geo_duration(entry.key))
-}
-
-/// Whether a key that `explicit` sets names a duration of a geo topic.
-fn sets_a_geo_duration(explicit: &WireOptions) -> bool {
-    explicit
-        .into_iter()
-        .any(|entry| names_a_geo_duration(entry.key))
-}
-
-fn names_a_geo_duration(key: &[u8]) -> bool {
-    str::from_utf8(key)
-        .ok()
-        .and_then(|name| name.parse::<OptionKey>().ok())
-        .is_some_and(OptionKey::is_geo_duration)
-}
-
 pub(crate) fn patched_options(
     current: &ResourceOptions,
     explicit: &WireOptions,
@@ -6780,6 +6788,156 @@ pub(crate) mod tests {
             IggyError::InvalidOptionValue(String::new()).as_code(),
             "a normal topic has no durations"
         );
+    }
+
+    #[test]
+    fn given_a_patch_of_the_read_cache_when_applying_it_should_take_it_on_a_normal_and_a_geo_topic()
+    {
+        const MIB: u64 = 1 << 20;
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        assert_eq!(
+            apply_create_topic(&mut inner, 0, "geo", &geo_topic(), 1).code,
+            0
+        );
+        let normal = TopicCreateOptions::default();
+        assert_eq!(
+            apply_create_topic(&mut inner, 0, "normal", &normal, 2).code,
+            0
+        );
+        let explicit = |entries: &[(OptionKey, u64)]| -> WireOptions {
+            let options: ResourceOptions = entries
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        HeaderKey::from(*key),
+                        OptionValue::explicit(HeaderValue::from(*value)),
+                    )
+                })
+                .collect();
+            resource_options_to_wire(&options, OptionsProvenance::All).unwrap()
+        };
+        let patch = |topic_id: u32, entries: &[(OptionKey, u64)]| UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(topic_id),
+            name: None,
+            explicit_options: explicit(entries),
+            derived_options: WireOptions::empty(),
+        };
+        let apply = |inner: &mut StreamsInner, request: &UpdateTopicResolvedRequest| {
+            StateHandler::apply(request, inner, IggyTimestamp::now()).code
+        };
+        let read_cache = [(OptionKey::ReadCacheSize, 0), (OptionKey::ReadAhead, MIB)];
+        let expected = iggy_common::TopicReadCache {
+            size: Some(iggy_common::IggyByteSize::from(0u64)),
+            read_ahead: Some(iggy_common::IggyByteSize::from(MIB)),
+        };
+
+        for topic_id in [0, 1] {
+            assert_eq!(apply(&mut inner, &patch(topic_id, &read_cache)), 0);
+            assert_eq!(
+                inner.items[0].topics[topic_id as usize].resolved.read_cache, expected,
+                "topic {topic_id}"
+            );
+        }
+        assert_eq!(
+            apply(
+                &mut inner,
+                &patch(
+                    0,
+                    &[
+                        (OptionKey::ReadCacheSize, 8 * MIB),
+                        (OptionKey::TombstoneGrace, 60_000_000),
+                    ]
+                )
+            ),
+            0,
+            "a geo topic takes its read cache beside its durations"
+        );
+        assert_eq!(
+            inner.items[0].topics[0].resolved.read_cache.size,
+            Some(iggy_common::IggyByteSize::from(8 * MIB))
+        );
+        assert_eq!(
+            apply(
+                &mut inner,
+                &patch(
+                    0,
+                    &[
+                        (OptionKey::ReadAhead, 0),
+                        (OptionKey::MessageExpiry, 9_000_000),
+                    ]
+                )
+            ),
+            IggyError::OptionNotUpdatable(String::new()).as_code(),
+            "nor beside any other key"
+        );
+        assert_eq!(
+            inner.items[0].topics[0].resolved.read_cache.read_ahead,
+            Some(iggy_common::IggyByteSize::from(MIB))
+        );
+    }
+
+    /// Two patches that each meet the readahead rule against the stored pair
+    /// break it together, in either order, so the one applied second is
+    /// refused and the topic keeps what the first left.
+    #[test]
+    fn given_two_patches_that_each_fit_the_stored_read_cache_when_applying_both_should_refuse_the_second()
+     {
+        const MIB: u64 = 1 << 20;
+        let bytes = |value: u64| Some(iggy_common::IggyByteSize::from(value));
+        let read_cache = |size: u64, read_ahead: u64| iggy_common::TopicReadCache {
+            size: bytes(size),
+            read_ahead: bytes(read_ahead),
+        };
+        let patch = |topic_id: u32, (key, value): (OptionKey, u64)| UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(topic_id),
+            name: None,
+            explicit_options: resource_options_to_wire(
+                &[(
+                    HeaderKey::from(key),
+                    OptionValue::explicit(HeaderValue::from(value)),
+                )]
+                .into(),
+                OptionsProvenance::All,
+            )
+            .unwrap(),
+            derived_options: WireOptions::empty(),
+        };
+        let smaller_cache = (OptionKey::ReadCacheSize, 8 * MIB);
+        let larger_read_ahead = (OptionKey::ReadAhead, 4 * MIB);
+        let refused = u32::from(UpdateTopicResult::InvalidOptionValue);
+
+        for (first, second, kept) in [
+            (smaller_cache, larger_read_ahead, read_cache(8 * MIB, MIB)),
+            (
+                larger_read_ahead,
+                smaller_cache,
+                read_cache(64 * MIB, 4 * MIB),
+            ),
+        ] {
+            let mut inner = StreamsInner::new();
+            create_stream(&mut inner, "stream");
+            let created = TopicCreateOptions {
+                read_cache: read_cache(64 * MIB, MIB),
+                ..TopicCreateOptions::default()
+            };
+            for (group, name) in [(1, "both"), (2, "second alone")] {
+                assert_eq!(
+                    apply_create_topic(&mut inner, 0, name, &created, group).code,
+                    0
+                );
+            }
+            let mut apply = |topic_id: u32, entry: (OptionKey, u64)| {
+                StateHandler::apply(&patch(topic_id, entry), &mut inner, IggyTimestamp::now()).code
+            };
+
+            assert_eq!(apply(1, second), 0, "{} alone fits", second.0);
+            assert_eq!(apply(0, first), 0);
+            assert_eq!(apply(0, second), refused, "{} after {}", second.0, first.0);
+            assert_eq!(inner.items[0].topics[0].resolved.read_cache, kept);
+        }
     }
 
     #[test]

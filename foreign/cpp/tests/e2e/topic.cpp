@@ -332,6 +332,9 @@ TEST_F(E2E_Topic, CreateTopicWithTypedOptionHelpersReportsThemAsExplicitOptions)
     EXPECT_FALSE(topic_details.TombstoneGrace().has_value());
     EXPECT_FALSE(topic_details.PositionsResumeTimeout().has_value());
     EXPECT_FALSE(topic_details.LongTermRewriteMaxInterval().has_value());
+    // A topic that sets no read cache leaves it to each node's setting.
+    EXPECT_FALSE(topic_details.ReadCacheSize().has_value());
+    EXPECT_FALSE(topic_details.ReadAhead().has_value());
 
     auto check_kind = [&](const std::string &key, iggy::HeaderKind expected) {
         auto it = explicit_options.find(key);

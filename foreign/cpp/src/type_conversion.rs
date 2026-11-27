@@ -41,9 +41,9 @@ use iggy::prelude::{
     StreamEncryptionSource as RustStreamEncryptionSource,
     StreamUpdateOptions as RustStreamUpdateOptions, Topic as RustTopic,
     TopicCreateOptions as RustTopicCreateOptions, TopicDetails as RustTopicDetails,
-    TopicType as RustTopicType, TopicUpdateOptions as RustTopicUpdateOptions,
-    UserCreateOptions as RustUserCreateOptions, UserUpdateOptions as RustUserUpdateOptions,
-    Validatable,
+    TopicReadCache as RustTopicReadCache, TopicType as RustTopicType,
+    TopicUpdateOptions as RustTopicUpdateOptions, UserCreateOptions as RustUserCreateOptions,
+    UserUpdateOptions as RustUserUpdateOptions, Validatable,
 };
 use iggy_binary_protocol::WireUserHeaders;
 use iggy_binary_protocol::primitives::metadata_changes::{
@@ -821,6 +821,7 @@ impl TryFrom<ffi::TopicCreateOptions> for RustTopicCreateOptions {
             topic_type,
             geo_mode,
             geo_durations: options.geo_durations.into(),
+            read_cache: options.read_cache.into(),
             raw,
         })
     }
@@ -868,6 +869,7 @@ impl TryFrom<ffi::TopicUpdateOptions> for RustTopicUpdateOptions {
             local_retention_age,
             local_retention_size,
             geo_durations: options.geo_durations.into(),
+            read_cache: options.read_cache.into(),
             reset: ffi_reset_keys(options.reset)?,
             raw_reset: options.raw_reset.into_iter().collect(),
             raw: ffi_options_to_raw(options.raw_options)?,
@@ -999,6 +1001,28 @@ impl From<RustGeoTopicDurations> for ffi::GeoTopicDurations {
     }
 }
 
+impl From<ffi::TopicReadCache> for RustTopicReadCache {
+    fn from(read_cache: ffi::TopicReadCache) -> Self {
+        let size = |has_value: bool, bytes: u64| has_value.then(|| RustIggyByteSize::from(bytes));
+        RustTopicReadCache {
+            size: size(read_cache.has_read_cache_size, read_cache.read_cache_size),
+            read_ahead: size(read_cache.has_read_ahead, read_cache.read_ahead),
+        }
+    }
+}
+
+impl From<RustTopicReadCache> for ffi::TopicReadCache {
+    fn from(read_cache: RustTopicReadCache) -> Self {
+        let bytes = |size: Option<RustIggyByteSize>| size.map_or(0, |size| size.as_bytes_u64());
+        ffi::TopicReadCache {
+            has_read_cache_size: read_cache.size.is_some(),
+            read_cache_size: bytes(read_cache.size),
+            has_read_ahead: read_cache.read_ahead.is_some(),
+            read_ahead: bytes(read_cache.read_ahead),
+        }
+    }
+}
+
 impl From<RustTopic> for ffi::Topic {
     fn from(topic: RustTopic) -> Self {
         let resolved = topic.resolved_options();
@@ -1014,6 +1038,7 @@ impl From<RustTopic> for ffi::Topic {
             has_geo_mode: resolved.geo_mode.is_some(),
             geo_mode: resolved.geo_mode.unwrap_or_default().into(),
             geo_durations: resolved.geo_durations.into(),
+            read_cache: resolved.read_cache.into(),
             messages_count: topic.messages_count,
             partitions_count: topic.partitions_count,
             options: resource_options_to_ffi(&topic.options, true),
@@ -1037,6 +1062,7 @@ impl From<RustTopicDetails> for ffi::TopicDetails {
             has_geo_mode: resolved.geo_mode.is_some(),
             geo_mode: resolved.geo_mode.unwrap_or_default().into(),
             geo_durations: resolved.geo_durations.into(),
+            read_cache: resolved.read_cache.into(),
             messages_count: topic.messages_count,
             partitions_count: topic.partitions_count,
             partitions: topic
@@ -2247,6 +2273,10 @@ mod tests {
                 fresh_upload_interval_micros: 5,
                 ..ffi::GeoTopicDurations::default()
             },
+            read_cache: ffi::TopicReadCache {
+                read_ahead: 5,
+                ..ffi::TopicReadCache::default()
+            },
             reset: vec!["max_topic_size".to_owned()],
             raw_reset: Vec::new(),
             raw_options: Vec::new(),
@@ -2334,6 +2364,7 @@ mod tests {
             has_local_retention_size: false,
             local_retention_size: String::new(),
             geo_durations: ffi::GeoTopicDurations::default(),
+            read_cache: ffi::TopicReadCache::default(),
             reset: vec!["max_topic_size".to_owned()],
             raw_reset: vec!["future_key".to_owned()],
             raw_options: Vec::new(),
@@ -2367,6 +2398,7 @@ mod tests {
             has_local_retention_size: true,
             local_retention_size: size.to_owned(),
             geo_durations: ffi::GeoTopicDurations::default(),
+            read_cache: ffi::TopicReadCache::default(),
             reset: Vec::new(),
             raw_reset: Vec::new(),
             raw_options: Vec::new(),
@@ -2495,8 +2527,10 @@ mod tests {
     }
 
     #[test]
-    fn given_topic_response_vectors_when_bridging_should_match_type_mode_and_geo_durations() {
+    fn given_topic_response_vectors_when_bridging_should_match_type_mode_geo_durations_and_read_cache()
+     {
         let mut geo_topics = 0;
+        let mut read_cache_topics = 0;
         for vector in fixture_vectors("topic_responses") {
             let case = &vector["case"];
             let bytes = decode_hex(&vector["response_hex"]);
@@ -2516,9 +2550,17 @@ mod tests {
             for (key, micros) in bridged_geo_durations(&topic.geo_durations) {
                 assert_eq!(micros, decimal(&expected[key]), "{case} {key}");
             }
+            for (key, bytes) in bridged_read_cache(&topic.read_cache) {
+                assert_eq!(bytes, decimal(&expected[key]), "{case} {key}");
+            }
             geo_topics += usize::from(geo);
+            read_cache_topics += usize::from(topic.read_cache != ffi::TopicReadCache::default());
         }
         assert_eq!(geo_topics, 1, "one response vector reads a geo topic");
+        assert_eq!(
+            read_cache_topics, 1,
+            "one response vector reads a topic that sets its read cache"
+        );
     }
 
     #[test]
@@ -2533,6 +2575,7 @@ mod tests {
                 HeaderValue::from_str(RustGeoMode::GeoTiered.as_ref()).expect("mode"),
             ),
             (OptionKey::PositionsResumeTimeout, HeaderValue::from(0u64)),
+            (OptionKey::ReadCacheSize, HeaderValue::from(0u64)),
         ]
         .into_iter()
         .map(|(key, value)| (HeaderKey::from(key), OptionValue::explicit(value)))
@@ -2560,15 +2603,21 @@ mod tests {
             has_positions_resume_timeout: true,
             ..ffi::GeoTopicDurations::default()
         };
+        let zero_read_cache_size = ffi::TopicReadCache {
+            has_read_cache_size: true,
+            ..ffi::TopicReadCache::default()
+        };
 
         assert!(topic.topic_type == ffi::TopicType::Geo);
         assert!(topic.has_geo_mode);
         assert!(topic.geo_mode == ffi::GeoMode::GeoTiered);
         assert_eq!(topic.geo_durations, zero_resume_timeout);
+        assert_eq!(topic.read_cache, zero_read_cache_size);
         assert!(details.topic_type == ffi::TopicType::Geo);
         assert!(details.has_geo_mode);
         assert!(details.geo_mode == ffi::GeoMode::GeoTiered);
         assert_eq!(details.geo_durations, zero_resume_timeout);
+        assert_eq!(details.read_cache, zero_read_cache_size);
     }
 
     #[test]
@@ -2616,11 +2665,12 @@ mod tests {
             .iter()
             .filter(|vector| vector["scope"] == "topic")
             .collect();
-        assert!(
-            topic_vectors
-                .iter()
-                .any(|vector| vector["case"] == "topic_set_geo_durations")
-        );
+        for case in ["topic_set_geo_durations", "topic_set_read_cache"] {
+            assert!(
+                topic_vectors.iter().any(|vector| vector["case"] == case),
+                "{case}"
+            );
+        }
         for vector in topic_vectors {
             let case = &vector["case"];
             let target = &vector["target"];
@@ -2648,22 +2698,26 @@ mod tests {
     }
 
     #[test]
-    fn given_geo_durations_update_when_bridging_should_put_them_as_numbers_over_http() {
-        let vector = fixture_vectors("update_resource")
-            .into_iter()
-            .find(|vector| vector["case"] == "topic_set_geo_durations")
-            .expect("geo durations vector");
-        let input = vector["input"].as_object().expect("update input");
-        let options = RustTopicUpdateOptions::try_from(bridged_update_options(&vector["input"]))
-            .expect("options convert");
+    fn given_geo_durations_and_read_cache_updates_when_bridging_should_put_them_as_numbers_over_http()
+     {
+        for case in ["topic_set_geo_durations", "topic_set_read_cache"] {
+            let vector = fixture_vectors("update_resource")
+                .into_iter()
+                .find(|vector| vector["case"] == case)
+                .expect("update vector");
+            let input = vector["input"].as_object().expect("update input");
+            let options =
+                RustTopicUpdateOptions::try_from(bridged_update_options(&vector["input"]))
+                    .expect("options convert");
 
-        let body = serde_json::to_value(options.to_update_body().expect("HTTP body encodes"))
-            .expect("HTTP body serializes");
-        let numbers: Map<String, Value> = input
-            .iter()
-            .map(|(key, micros)| (key.clone(), Value::from(decimal(micros).expect("micros"))))
-            .collect();
-        assert_eq!(body, Value::Object(numbers));
+            let body = serde_json::to_value(options.to_update_body().expect("HTTP body encodes"))
+                .expect("HTTP body serializes");
+            let numbers: Map<String, Value> = input
+                .iter()
+                .map(|(key, number)| (key.clone(), Value::from(decimal(number).expect("number"))))
+                .collect();
+            assert_eq!(body, Value::Object(numbers), "{case}");
+        }
     }
 
     #[test]
@@ -2715,9 +2769,63 @@ mod tests {
     }
 
     #[test]
+    fn given_zero_and_unset_read_cache_when_bridging_should_send_zero_and_omit_unset() {
+        let read_cache = ffi::TopicReadCache {
+            has_read_ahead: true,
+            read_ahead: 0,
+            // Without its flag, a value beside it is not a setting.
+            read_cache_size: 16_777_216,
+            ..ffi::TopicReadCache::default()
+        };
+        let create = RustTopicCreateOptions::try_from(ffi::TopicCreateOptions {
+            read_cache,
+            ..ffi::TopicCreateOptions::default()
+        })
+        .expect("create options convert");
+        let update = RustTopicUpdateOptions::try_from(ffi::TopicUpdateOptions {
+            read_cache,
+            ..ffi::TopicUpdateOptions::default()
+        })
+        .expect("update options convert");
+        let zero_read_ahead = RustTopicReadCache {
+            read_ahead: Some(RustIggyByteSize::from(0u64)),
+            ..RustTopicReadCache::default()
+        };
+        assert_eq!(create.read_cache, zero_read_ahead);
+        assert_eq!(update.read_cache, zero_read_ahead);
+
+        let created = create.to_wire().expect("create encodes");
+        let patched = update.to_patch().expect("update encodes").set;
+        for sent in [&created, &patched] {
+            let sent = resource_options_from_wire(sent, true).expect("options decode");
+            for key in RustTopicReadCache::KEYS {
+                let value = sent
+                    .get(&HeaderKey::from(key))
+                    .map(|option| option.value.as_uint64().expect("bytes"));
+                let expected = (key == OptionKey::ReadAhead).then_some(0);
+                assert_eq!(value, expected, "{key}");
+            }
+        }
+        let posted = create.to_input_map().expect("HTTP options encode");
+        assert!(matches!(
+            posted.get("read_ahead"),
+            Some(OptionInputValue::U64(0))
+        ));
+        assert!(!posted.contains_key("read_cache_size"));
+    }
+
+    #[test]
     fn given_bridged_geo_durations_when_naming_them_should_follow_catalog_order() {
         let names = bridged_geo_durations(&ffi::GeoTopicDurations::default()).map(|(key, _)| key);
         let catalog = RustGeoTopicDurations::KEYS.map(|key| key.to_string());
+
+        assert_eq!(names.as_slice(), catalog.as_slice());
+    }
+
+    #[test]
+    fn given_bridged_read_cache_when_naming_it_should_follow_catalog_order() {
+        let names = bridged_read_cache(&ffi::TopicReadCache::default()).map(|(key, _)| key);
+        let catalog = RustTopicReadCache::KEYS.map(|key| key.to_string());
 
         assert_eq!(names.as_slice(), catalog.as_slice());
     }
@@ -2765,6 +2873,39 @@ mod tests {
                     .then_some(durations.long_term_rewrite_max_interval_micros),
             ),
         ]
+    }
+
+    /// Each read cache setting the bridge carries, by its catalog key: the
+    /// bytes only when its flag says the topic sets it.
+    fn bridged_read_cache(read_cache: &ffi::TopicReadCache) -> [(&'static str, Option<u64>); 2] {
+        [
+            (
+                "read_cache_size",
+                read_cache
+                    .has_read_cache_size
+                    .then_some(read_cache.read_cache_size),
+            ),
+            (
+                "read_ahead",
+                read_cache.has_read_ahead.then_some(read_cache.read_ahead),
+            ),
+        ]
+    }
+
+    /// Set the read cache setting that `key` names, as its C++ setter does.
+    /// False when `key` names no read cache setting.
+    fn set_read_cache(read_cache: &mut ffi::TopicReadCache, key: &str, bytes: u64) -> bool {
+        let (has_value, value) = match key {
+            "read_cache_size" => (
+                &mut read_cache.has_read_cache_size,
+                &mut read_cache.read_cache_size,
+            ),
+            "read_ahead" => (&mut read_cache.has_read_ahead, &mut read_cache.read_ahead),
+            _ => return false,
+        };
+        *has_value = true;
+        *value = bytes;
+        true
     }
 
     /// Set the duration that `key` names, as its C++ setter does. False when
@@ -2844,14 +2985,14 @@ mod tests {
                     options.has_topic_type = true;
                     options.topic_type = text();
                 }
-                key => assert!(
-                    set_geo_duration(
-                        &mut options.geo_durations,
-                        key,
-                        decimal(value).expect("micros")
-                    ),
-                    "unmapped create input {key}"
-                ),
+                key => {
+                    let number = decimal(value).expect("decimal input");
+                    assert!(
+                        set_geo_duration(&mut options.geo_durations, key, number)
+                            || set_read_cache(&mut options.read_cache, key, number),
+                        "unmapped create input {key}"
+                    );
+                }
             }
         }
         options
@@ -2884,14 +3025,14 @@ mod tests {
                         .map(|name| name.as_str().expect("reset name").to_owned())
                         .collect();
                 }
-                key => assert!(
-                    set_geo_duration(
-                        &mut options.geo_durations,
-                        key,
-                        decimal(value).expect("micros")
-                    ),
-                    "unmapped update input {key}"
-                ),
+                key => {
+                    let number = decimal(value).expect("decimal input");
+                    assert!(
+                        set_geo_duration(&mut options.geo_durations, key, number)
+                            || set_read_cache(&mut options.read_cache, key, number),
+                        "unmapped update input {key}"
+                    );
+                }
             }
         }
         options

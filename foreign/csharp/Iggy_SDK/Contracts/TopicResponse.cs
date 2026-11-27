@@ -175,6 +175,21 @@ public sealed class TopicResponse
         OptionValues.Duration(Options, DerivedOptions, TopicOptionKey.LongTermRewriteMaxInterval);
 
     /// <summary>
+    ///     The memory in bytes that each node keeps for what the topic's reads fetch from the object store, read from
+    ///     the topic's options. Zero keeps nothing. This and <see cref="ReadAhead" /> are null unless the topic sets
+    ///     them, and each node then applies its server setting of the same name.
+    /// </summary>
+    [JsonIgnore]
+    public ulong? ReadCacheSize => OptionValues.Size(Options, DerivedOptions, TopicOptionKey.ReadCacheSize);
+
+    /// <summary>
+    ///     The most bytes that readahead fetches in front of a sequential reader of the topic, read from its options.
+    ///     Zero turns readahead off.
+    /// </summary>
+    [JsonIgnore]
+    public ulong? ReadAhead => OptionValues.Size(Options, DerivedOptions, TopicOptionKey.ReadAhead);
+
+    /// <summary>
     ///     Number of messages in the topic.
     /// </summary>
     public required ulong MessagesCount { get; init; }

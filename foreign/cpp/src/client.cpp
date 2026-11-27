@@ -98,6 +98,21 @@ ffi::GeoTopicDurations ToFfiGeoTopicDurations(const Options &options) {
     return durations;
 }
 
+void SetTopicReadCacheBytes(bool &has_value, std::uint64_t &bytes, std::optional<std::uint64_t> value) {
+    if (value) {
+        has_value = true;
+        bytes     = *value;
+    }
+}
+
+template <typename Options>
+ffi::TopicReadCache ToFfiTopicReadCache(const Options &options) {
+    ffi::TopicReadCache read_cache{};
+    SetTopicReadCacheBytes(read_cache.has_read_cache_size, read_cache.read_cache_size, options.ReadCacheSize());
+    SetTopicReadCacheBytes(read_cache.has_read_ahead, read_cache.read_ahead, options.ReadAhead());
+    return read_cache;
+}
+
 template <typename FfiOptions, typename Options>
 void SetMutableTopicOptions(FfiOptions &ffi_options, const Options &options) {
     if (const auto &value = options.MessageExpiry()) {
@@ -123,6 +138,7 @@ void SetMutableTopicOptions(FfiOptions &ffi_options, const Options &options) {
         ffi_options.local_retention_size     = std::string(value->Value());
     }
     ffi_options.geo_durations = ToFfiGeoTopicDurations(options);
+    ffi_options.read_cache    = ToFfiTopicReadCache(options);
     ffi_options.raw_options   = ToFfiRawOptions(options.RawEntries());
 }
 

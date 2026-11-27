@@ -82,7 +82,7 @@ public sealed class ResourceOptionsTests
         "stream_id", "name", "partitions_count", "compression_algorithm", "message_expiry", "max_topic_size",
         "segment_size", "durability", "consumer_offset_durability", "topic_type", "fresh_upload_interval",
         "consumer_offset_upload_interval", "positions_publish_interval", "tombstone_grace", "positions_resume_timeout",
-        "long_term_rewrite_max_interval"
+        "long_term_rewrite_max_interval", "read_cache_size", "read_ahead"
     ];
 
     private static readonly TopicOptionKey[] GeoDurationKeys =
@@ -312,6 +312,27 @@ public sealed class ResourceOptionsTests
             new TopicUpdate { RawReset = new HashSet<string> { "tombstone_grace" } }.ToPatch().Reset);
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             new TopicUpdate { TombstoneGrace = TimeSpan.FromSeconds(-1) }.ToPatch());
+    }
+
+    [Fact]
+    public void given_read_cache_when_patching_should_send_zero_and_refuse_a_reset()
+    {
+        var patch = new TopicUpdate { ReadCacheSize = 0, ReadAhead = 0, MaxTopicSize = 0 }.ToPatch();
+
+        // A zero size cap is the sentinel for no change, while a zero read cache or readahead is a value.
+        Assert.Equal(["read_ahead", "read_cache_size"], patch.Set.Keys.Order(StringComparer.Ordinal));
+        Assert.All(patch.Set.Values, value =>
+        {
+            Assert.Equal(HeaderKind.Uint64, value.Kind);
+            Assert.Equal(0UL, value.ToUInt64());
+        });
+
+        foreach (var key in new[] { TopicOptionKey.ReadCacheSize, TopicOptionKey.ReadAhead })
+        {
+            var reset = Assert.Throws<IggyInvalidStatusCodeException>(() =>
+                new TopicUpdate { Reset = new HashSet<TopicOptionKey> { key } }.ToPatch());
+            Assert.Equal(VsrError.OPTION_NOT_RESETTABLE, reset.StatusCode);
+        }
     }
 
     [Fact]
@@ -573,7 +594,9 @@ public sealed class ResourceOptionsTests
                     PositionsPublishInterval = TimeSpan.FromSeconds(2),
                     TombstoneGrace = TimeSpan.FromHours(1),
                     PositionsResumeTimeout = TimeSpan.Zero,
-                    LongTermRewriteMaxInterval = TimeSpan.FromSeconds(20)
+                    LongTermRewriteMaxInterval = TimeSpan.FromSeconds(20),
+                    ReadCacheSize = 16_777_216,
+                    ReadAhead = 0
                 }.ToDictionary().Keys.ToHashSet());
                 Assert.Equal(updateKeys, new TopicUpdate
                 {
@@ -588,7 +611,9 @@ public sealed class ResourceOptionsTests
                     PositionsPublishInterval = TimeSpan.FromSeconds(2),
                     TombstoneGrace = TimeSpan.FromHours(1),
                     PositionsResumeTimeout = TimeSpan.Zero,
-                    LongTermRewriteMaxInterval = TimeSpan.FromSeconds(20)
+                    LongTermRewriteMaxInterval = TimeSpan.FromSeconds(20),
+                    ReadCacheSize = 0,
+                    ReadAhead = 1_048_576
                 }.ToPatch().Set.Keys.ToHashSet());
                 AssertEnableOnlyKeys(rows);
                 break;
@@ -921,6 +946,9 @@ public sealed class ResourceOptionsTests
                 Assert.Equal(micros, duration is { } value ? DurationHelpers.ToDuration(value) : (ulong?)null);
             }
 
+            Assert.Equal(Bytes(expected, "read_cache_size"), topic.ReadCacheSize);
+            Assert.Equal(Bytes(expected, "read_ahead"), topic.ReadAhead);
+
             AssertNeverReturned(topic.Options, topic.DerivedOptions);
         }
 
@@ -1022,6 +1050,8 @@ public sealed class ResourceOptionsTests
             TombstoneGrace = Micros(input, "tombstone_grace"),
             PositionsResumeTimeout = Micros(input, "positions_resume_timeout"),
             LongTermRewriteMaxInterval = Micros(input, "long_term_rewrite_max_interval"),
+            ReadCacheSize = Bytes(input, "read_cache_size"),
+            ReadAhead = Bytes(input, "read_ahead"),
             Reset = ResetKeys<TopicOptionKey>(input),
             RawReset = RawResetNames<TopicOptionKey>(input)
         };
@@ -1056,13 +1086,20 @@ public sealed class ResourceOptionsTests
             PositionsPublishInterval = Micros(input, "positions_publish_interval"),
             TombstoneGrace = Micros(input, "tombstone_grace"),
             PositionsResumeTimeout = Micros(input, "positions_resume_timeout"),
-            LongTermRewriteMaxInterval = Micros(input, "long_term_rewrite_max_interval")
+            LongTermRewriteMaxInterval = Micros(input, "long_term_rewrite_max_interval"),
+            ReadCacheSize = Bytes(input, "read_cache_size"),
+            ReadAhead = Bytes(input, "read_ahead")
         };
     }
 
     private static TimeSpan? Micros(JsonElement input, string property)
     {
         return input.TryGetProperty(property, out _) ? DurationHelpers.FromDuration(ParseU64(input, property)) : null;
+    }
+
+    private static ulong? Bytes(JsonElement input, string property)
+    {
+        return input.TryGetProperty(property, out _) ? ParseU64(input, property) : null;
     }
 
     private static Dictionary<string, TimeSpan?> GeoDurations(TopicResponse topic)

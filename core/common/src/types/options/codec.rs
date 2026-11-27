@@ -19,7 +19,8 @@ use super::key::OptionKey;
 use super::{
     CONSUMER_OFFSET_UPLOAD_INTERVAL_MAX, Durability, FRESH_UPLOAD_INTERVAL_MAX, GeoMode,
     LONG_TERM_REWRITE_MAX_INTERVAL_MIN, MAX_MESSAGES_REQUIRED_TO_SAVE, MAX_REPLICATION_FACTOR,
-    MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE, MIN_SEGMENT_MAX_AGE, PartitionResizePolicy, TopicType,
+    MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE, MIN_SEGMENT_MAX_AGE, PartitionResizePolicy,
+    TOPIC_READ_AHEAD_MIN, TOPIC_READ_CACHE_SIZE_MIN, TopicType,
 };
 use crate::types::compression::compression_algorithm::CompressionAlgorithm;
 use crate::types::message::{HeaderKind, HeaderValue};
@@ -157,12 +158,27 @@ impl OptionValueCodec for IggyByteSize {
     const KIND: HeaderKind = HeaderKind::Uint64;
 
     fn decode(key: OptionKey, entry: &WireUserHeaderEntry<'_>) -> Result<Self, IggyError> {
+        // The byte-size parser reads `unlimited` as 0, which for the read
+        // cache keys turns them off, the opposite of what it says.
+        let names_no_bound = |text: &str| {
+            matches!(key, OptionKey::ReadCacheSize | OptionKey::ReadAhead)
+                && text.eq_ignore_ascii_case("unlimited")
+        };
         let bytes = decode_u64_or(key, entry, |text| {
+            if names_no_bound(text) {
+                return None;
+            }
             Self::from_str(text).ok().map(|size| size.as_bytes_u64())
         })?;
-        if key == OptionKey::SizeOfMessagesRequiredToSave
-            && bytes > MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE
-        {
+        let bounded = match key {
+            OptionKey::SizeOfMessagesRequiredToSave => {
+                bytes <= MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE
+            }
+            OptionKey::ReadCacheSize => bytes == 0 || bytes >= TOPIC_READ_CACHE_SIZE_MIN,
+            OptionKey::ReadAhead => bytes == 0 || bytes >= TOPIC_READ_AHEAD_MIN,
+            _ => true,
+        };
+        if !bounded {
             return Err(invalid(key));
         }
         Ok(Self::from(bytes))

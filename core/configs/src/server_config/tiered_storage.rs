@@ -36,6 +36,8 @@ use std::fmt::{self, Debug, Display, Formatter};
 use std::ops::RangeInclusive;
 use std::time::Duration;
 
+pub use iggy_common::{READ_AHEAD_BLOCKS_MIN, READ_AHEAD_CACHE_SHARE, READ_CACHE_BLOCK_SIZE_MIN};
+
 /// Bounds of `request_timeout` and `progress_timeout`. A healthy store can
 /// take seconds to answer, and the upper bound keeps a typo from overflowing
 /// a deadline.
@@ -61,24 +63,10 @@ pub const LONG_TERM_BACKLOG_LIMIT_MIN: u64 = 64 * 1024 * 1024;
 /// each object would wait for the upload interval.
 pub const FRESH_PENDING_BYTES_MIN: u64 = 4 * 1024 * 1024;
 
-/// The smallest `read_cache_block_size`: the smallest piece a poll reads from
-/// the store. Mirrors `partitions::DISK_POLL_CHUNK_MIN`.
-pub const READ_CACHE_BLOCK_SIZE_MIN: u64 = 64 * 1024;
-
 /// The largest `read_cache_block_size`: the largest piece a poll reads from
 /// the store, above which most reads would fetch more than they ask for.
 /// Mirrors `partitions::DISK_POLL_CHUNK_MAX`.
 pub const READ_CACHE_BLOCK_SIZE_MAX: u64 = 1024 * 1024;
-
-/// What `read_ahead` is at most, as a part of `read_cache_size`: one in this
-/// many. Bytes that readahead fetched wait for their reader in that part of
-/// the cache. Mirrors `iggy_object_store::AHEAD_SHARE`.
-pub const READ_AHEAD_CACHE_SHARE: u64 = 8;
-
-/// The fewest blocks of `read_cache_block_size` that a `read_ahead` other
-/// than zero holds: the blocks of the first readahead in front of a reader.
-/// Mirrors `partitions::READ_AHEAD_START_BLOCKS`.
-pub const READ_AHEAD_BLOCKS_MIN: u64 = 2;
 
 /// The object store that tiered storage keeps segments in.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -296,7 +284,8 @@ pub struct TieredStorageConfig {
     /// memory for the next polls of the same bytes, which also hold the
     /// fresh objects it uploads. Zero keeps nothing that reads fetch and
     /// turns readahead off, and the shard still holds what it uploads.
-    /// Otherwise at least [`READ_AHEAD_CACHE_SHARE`] blocks.
+    /// Otherwise at least [`READ_AHEAD_CACHE_SHARE`] blocks. A topic's option
+    /// of the same name limits what its partitions keep of it.
     #[serde(default = "default_read_cache_size")]
     #[config_env(leaf)]
     pub read_cache_size: IggyByteSize,
@@ -310,7 +299,8 @@ pub struct TieredStorageConfig {
     /// asks for them, when polls read a segment in order. Zero turns
     /// readahead off. Otherwise at least [`READ_AHEAD_BLOCKS_MIN`] blocks,
     /// and at most one part in [`READ_AHEAD_CACHE_SHARE`] of
-    /// `read_cache_size`.
+    /// `read_cache_size`. A topic's option of the same name overrides it for
+    /// the topic.
     #[serde(default = "default_read_ahead")]
     #[config_env(leaf)]
     pub read_ahead: IggyByteSize,

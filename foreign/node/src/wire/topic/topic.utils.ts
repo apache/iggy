@@ -79,6 +79,13 @@ export type BaseTopic = {
   tombstoneGrace: bigint | null,
   positionsResumeTimeout: bigint | null,
   longTermRewriteMaxInterval: bigint | null,
+  /**
+   * The read cache settings in bytes, read from the options. Each is `null`
+   * where the topic sets none: each node then applies its own server setting.
+   * `0n` is a value, the setting turned off. See `TopicReadCache`.
+   */
+  readCacheSize: bigint | null,
+  readAhead: bigint | null,
   /** Total size of the topic in bytes */
   sizeBytes: bigint,
   /** Total number of messages in the topic */
@@ -222,6 +229,10 @@ export const deserializeBaseTopic = (p: Buffer, pos = 0): BaseTopicSerialized =>
     const value = setting(key);
     return topicType === TopicType.Geo && typeof value === 'bigint' ? value : null;
   };
+  const byteSize = (key: string) => {
+    const value = setting(key);
+    return typeof value === 'bigint' ? value : null;
+  };
 
   return {
     bytesRead: pos - start,
@@ -245,6 +256,8 @@ export const deserializeBaseTopic = (p: Buffer, pos = 0): BaseTopicSerialized =>
       tombstoneGrace: duration('tombstone_grace'),
       positionsResumeTimeout: duration('positions_resume_timeout'),
       longTermRewriteMaxInterval: duration('long_term_rewrite_max_interval'),
+      readCacheSize: byteSize('read_cache_size'),
+      readAhead: byteSize('read_ahead'),
       messagesCount,
       sizeBytes,
       options: explicit.options,
@@ -382,8 +395,9 @@ export type GeoMode = typeof GeoMode[keyof typeof GeoMode];
  * `updateTopic`. Each overrides the server setting of the same name on every
  * node, and one left out leaves that setting. `0n` is a value here, not the
  * server-default sentinel of `messageExpiry`, so it is sent. An update can set
- * them, the only keys it may change on a geo topic, but cannot reset them. A
- * normal topic refuses them with error 4042, invalid option value.
+ * them but cannot reset them, and on a geo topic they and `TopicReadCache` are
+ * the only keys it may change. A normal topic refuses them with error 4042,
+ * invalid option value.
  */
 export type GeoTopicDurations = {
   /** Longest time a send waits for the upload of its fresh object to start, at most 10 s */
@@ -426,5 +440,47 @@ const GEO_DURATION_KEYS: Readonly<Record<keyof GeoTopicDurations, string>> = {
 export const geoDurationOptions = (durations: GeoTopicDurations): OptionEntry[] =>
   Object.entries(GEO_DURATION_KEYS).flatMap(([field, key]) => {
     const value = durations[field as keyof GeoTopicDurations];
+    return value === undefined ? [] : [{ key, value: HeaderValue.Uint64(value) }];
+  });
+
+/**
+ * The read cache settings of a topic, in bytes, for `createTopic` and
+ * `updateTopic`. They size the cache and the readahead for what the reads of a
+ * normal or a geo topic fetch from the object store. Each overrides the
+ * `[tiered_storage]` server setting of the same name on every node, and one
+ * left out leaves that setting. `0n` turns a setting off and is sent, unlike
+ * the server-default sentinel of `maxTopicSize`. An update can change them on
+ * any topic, geo included, but cannot reset them.
+ */
+export type TopicReadCache = {
+  /**
+   * Memory each node keeps for what the topic's reads fetch, divided between
+   * its partitions as a limit within the read cache of each shard, not a
+   * reservation. `0n` keeps nothing, otherwise at least 512 KiB.
+   */
+  readCacheSize?: bigint,
+  /**
+   * Most bytes that readahead fetches in front of a sequential reader of the
+   * topic. `0n` turns readahead off, otherwise at least 128 KiB and at most an
+   * eighth of a `readCacheSize` above `0n`.
+   */
+  readAhead?: bigint
+};
+
+/** The option key of each read cache setting, in catalog order. */
+const READ_CACHE_KEYS: Readonly<Record<keyof TopicReadCache, string>> = {
+  readCacheSize: 'read_cache_size',
+  readAhead: 'read_ahead'
+};
+
+/**
+ * The option entries of the read cache settings that are set, `0n` included.
+ *
+ * @param readCache - Read cache settings of a topic, in bytes
+ * @returns One uint64 entry per setting that is set
+ */
+export const readCacheOptions = (readCache: TopicReadCache): OptionEntry[] =>
+  Object.entries(READ_CACHE_KEYS).flatMap(([field, key]) => {
+    const value = readCache[field as keyof TopicReadCache];
     return value === undefined ? [] : [{ key, value: HeaderValue.Uint64(value) }];
   });

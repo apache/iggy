@@ -252,9 +252,16 @@ foreach ($client->describeOptions(Iggy\OptionsScope::Topic) as $spec) {
   `fresh_upload_interval_micros`, `consumer_offset_upload_interval_micros`, `positions_publish_interval_micros`,
   `tombstone_grace_micros`, `positions_resume_timeout_micros` and `long_term_rewrite_max_interval_micros`.
   `createTopic()` and `updateTopic()` take each as an int or a decimal string of microseconds. 0 is a value of its own,
-  for example no wait, and null leaves the server setting in force. An update can change them, the only options it can
-  change on a geo topic, but cannot reset them. A normal topic refuses them as `Invalid option value` (code 4042).
+  for example no wait, and null leaves the server setting in force. An update can change them but cannot reset them.
+  A normal topic refuses them as `Invalid option value` (code 4042).
   Topic reads have properties of the same names. If the topic does not set a duration, its property is null.
+- Any topic, geo included, can override two `[tiered_storage]` settings of the same name on each node, taken as an int
+  or a decimal string of bytes. `read_cache_size` is the memory each node keeps for what the topic's reads fetch from
+  the object store, divided between its partitions, and 0 keeps nothing they fetch. `read_ahead` is the most bytes
+  readahead fetches in front of a sequential reader of the topic, and 0 turns readahead off. Null leaves the server
+  setting in force. An update can change both on any topic but cannot reset them. On a geo topic, these and the six
+  durations are the only options an update can change. Topic reads have properties of the same names, null when the
+  topic does not set one.
 - `raw` on create and update sends string-valued keys this build does not know, and `raw_reset` resets keys by name. The server decides whether each one is accepted. A name listed twice across `reset` and `raw_reset` is refused as `Invalid command`.
 - `createTopic()` takes `replication_factor`, how many nodes store each partition: 1 to 32 and at most the cluster's node count. Null lets the server's `[cluster] default_replication_factor` apply. The factor is create-only, and a value out of range is refused as `Invalid replication factor` (code 2018).
 - A topic read's `partitions` holds one `Iggy\Partition` per partition with `id`, `segments_count`, `current_offset`, `size_bytes`, `messages_count`, `members` (the node ids that store the partition) and `in_sync_members` (the members its primary last reported in sync and that are up, empty until it first reports).

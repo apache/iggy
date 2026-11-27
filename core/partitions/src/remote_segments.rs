@@ -52,6 +52,7 @@ use server_common::poll::PollHistoryId;
 use server_common::sharding::IggyNamespace;
 use tracing::{error, warn};
 
+use crate::PartitionLeft;
 use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::io::PartitionIoQuiescence;
 use crate::poll_plan::DiskFault;
@@ -335,6 +336,44 @@ impl FreshReads {
     }
 }
 
+/// The read settings of one incarnation of a partition, which every poll
+/// plan of it shares and reads at each read of the store.
+///
+/// A plan runs off the pump, after plans built later may have run. Reading
+/// the shared value keeps an older plan from putting back a limit that the
+/// partition's topic changed since, and the flag set at the end of the
+/// incarnation keeps a plan that outlived it from reading for a partition
+/// that is gone.
+#[derive(Debug, Clone, Default)]
+pub struct ReadPolicy {
+    topic: Rc<Cell<(Option<usize>, Option<u64>)>>,
+    left: PartitionLeft,
+}
+
+impl ReadPolicy {
+    /// The incarnation reads with the limit and readahead of `settings`
+    /// from now on.
+    pub(crate) fn set(&self, settings: &PartitionReadSettings) {
+        self.topic.set((settings.limit, settings.read_ahead));
+    }
+
+    /// The incarnation left the shard, so its reads start no GET and keep
+    /// nothing.
+    pub(crate) fn end(&self) {
+        self.left.set();
+    }
+
+    /// What a read reads with now.
+    pub(crate) fn current(&self) -> PartitionReadSettings {
+        let (limit, read_ahead) = self.topic.get();
+        PartitionReadSettings {
+            limit,
+            read_ahead,
+            left: Some(self.left.clone()),
+        }
+    }
+}
+
 /// Where the shard reads remote segments from.
 pub struct RemoteSegments {
     objects: Rc<dyn RemoteObjects>,
@@ -542,6 +581,8 @@ impl RemoteSegments {
 
     /// How the partition `prefix` names reads through the cache with
     /// `settings`, `None` without a cache that keeps what it fetches for it.
+    /// Without `settings`, those of an incarnation that left the shard, it
+    /// reads past the cache, so the cache records nothing for it again.
     fn reading(
         &self,
         prefix: ObjectPrefix,

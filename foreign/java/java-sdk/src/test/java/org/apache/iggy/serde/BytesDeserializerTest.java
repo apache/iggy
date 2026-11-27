@@ -373,6 +373,36 @@ class BytesDeserializerTest {
         }
 
         @Test
+        void shouldReadTheReadCacheSizesATopicSetsAndNoneItLeavesUnset() {
+            ByteBuf buffer = Unpooled.buffer();
+            writeTopicData(
+                    buffer,
+                    1,
+                    Map.of(
+                            HeaderKey.fromString("read_cache_size"),
+                            HeaderValue.fromUint64(BigInteger.ZERO),
+                            HeaderKey.fromString("read_ahead"),
+                            HeaderValue.fromUint64(BigInteger.valueOf(2_097_152L))),
+                    Map.of(HeaderKey.fromString("topic_type"), HeaderValue.fromString("normal")));
+            writePartitionData(buffer);
+            ByteBuf topicOnly = buffer.copy();
+            ByteBuf unset = Unpooled.buffer();
+            writeTopicData(
+                    unset, 1, Map.of(), Map.of(HeaderKey.fromString("topic_type"), HeaderValue.fromString("normal")));
+
+            var topic = readTopic(topicOnly);
+            var topicDetails = readTopicDetails(buffer);
+            var topicWithoutSizes = readTopic(unset);
+
+            assertThat(topic.readCacheSize()).contains(BigInteger.ZERO);
+            assertThat(topic.readAhead()).contains(BigInteger.valueOf(2_097_152L));
+            assertThat(topicDetails.readCacheSize()).contains(BigInteger.ZERO);
+            assertThat(topicDetails.readAhead()).contains(BigInteger.valueOf(2_097_152L));
+            assertThat(topicWithoutSizes.readCacheSize()).isEmpty();
+            assertThat(topicWithoutSizes.readAhead()).isEmpty();
+        }
+
+        @Test
         void shouldDeserializeTopicDetails() {
             // given
             ByteBuf buffer = Unpooled.buffer();

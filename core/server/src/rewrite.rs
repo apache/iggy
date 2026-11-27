@@ -66,8 +66,8 @@ use iggy_common::{
     AdmittedOptions, IggyByteSize, IggyError, MaxTopicSize, OptionAdmissionContext, OptionColumns,
     OptionOperation, OptionsProvenance, OptionsScope, ResourceOptions, TopicCreateOptions,
     TopicResolvedOptions, UserStatus, admit, derived_defaults, validate_geo_topic,
-    validate_local_retention, validate_preallocated_topic_bytes, validate_segment_max_age,
-    validate_topic_segment_size,
+    validate_local_retention, validate_preallocated_topic_bytes, validate_read_cache,
+    validate_segment_max_age, validate_topic_segment_size,
 };
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
@@ -418,6 +418,7 @@ where
                 let mut stored = derived_defaults(OptionsScope::Topic, &admitted.explicit)?;
                 stored.extend(admitted.explicit);
                 validate_local_retention(&stored)?;
+                validate_read_cache(&stored)?;
                 let resolved = TopicResolvedOptions::from(&stored);
                 let segment_size = resolved.runtime.effective_segment_size().as_bytes_u64();
                 if resolved.runtime.preallocate_segments == Some(true) {
@@ -637,7 +638,9 @@ where
     if let Some(current) = patched_from {
         // A rule between two keys reads the one this patch leaves alone from
         // the stored map, so a patch of either key meets it.
-        validate_local_retention(&admitted.patched(&current)?)?;
+        let patched = admitted.patched(&current)?;
+        validate_local_retention(&patched)?;
+        validate_read_cache(&patched)?;
     }
     if matches!(patch.target, ResourceTarget::Stream { .. })
         && admitted
@@ -810,8 +813,8 @@ mod tests {
     use iggy_common::{
         GeoMode, GeoTopicDurations, HeaderKey, HeaderValue, IggyDuration, IggyExpiry, OptionKey,
         OptionValue, OptionsUpdate, PartitionResizePolicy, ServerKeyContext, StreamCreateOptions,
-        StreamEncryptionKey, StreamKeyOrigin, TopicType, TopicUpdateOptions, UserUpdateOptions,
-        stream_wrap_set, text,
+        StreamEncryptionKey, StreamKeyOrigin, TopicReadCache, TopicType, TopicUpdateOptions,
+        UserUpdateOptions, stream_wrap_set, text,
     };
     use message_bus::installer::conn_info::ClientTransportKind;
     use metadata::stm::StateMachine as _;
@@ -1598,6 +1601,130 @@ mod tests {
                 &[OptionKey::LocalRetentionAge]
             ),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn given_a_stored_read_cache_when_patching_either_key_should_refuse_a_read_ahead_above_an_eighth_of_it()
+     {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        create_one_partition(&shard);
+        let chain = |set: &[(OptionKey, &str)]| {
+            http_chain(
+                &shard,
+                DEFAULT_ROOT_USER_ID,
+                request_message(Operation::UpdateResource, 1, 1, 1, &topic_patch(set, &[])),
+            )
+            .map(|_| ())
+        };
+        let refused = Err(IggyError::InvalidOptionValue(
+            OptionKey::ReadAhead.to_string(),
+        ));
+
+        // Alone, a readahead is judged against each node's own cache.
+        assert_eq!(chain(&[(OptionKey::ReadAhead, "64 MiB")]), Ok(()));
+        assert_eq!(
+            chain(&[
+                (OptionKey::ReadCacheSize, "8 MiB"),
+                (OptionKey::ReadAhead, "2 MiB")
+            ]),
+            refused
+        );
+        commit_topic_patch(&shard, 3, &[(OptionKey::ReadCacheSize, "8 MiB")]);
+        assert_eq!(chain(&[(OptionKey::ReadAhead, "2 MiB")]), refused);
+        assert_eq!(chain(&[(OptionKey::ReadAhead, "1 MiB")]), Ok(()));
+        // A cache of zero keeps nothing, so no readahead runs to bound.
+        assert_eq!(
+            chain(&[
+                (OptionKey::ReadCacheSize, "0"),
+                (OptionKey::ReadAhead, "2 MiB")
+            ]),
+            Ok(())
+        );
+        commit_topic_patch(&shard, 4, &[(OptionKey::ReadAhead, "1 MiB")]);
+        assert_eq!(chain(&[(OptionKey::ReadCacheSize, "4 MiB")]), refused);
+        assert_eq!(chain(&[(OptionKey::ReadCacheSize, "0")]), Ok(()));
+    }
+
+    /// A geo topic takes a change of its read cache, beside its durations or
+    /// alone, and refuses its reset as no default exists.
+    #[test]
+    fn given_a_geo_topic_when_patching_its_read_cache_should_take_it_and_refuse_a_reset_on_either_chain()
+     {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        create_one_partition(&shard);
+        commit_geo_topic(&shard, 3);
+        let sessions = root_sessions(&shard, 1);
+        let patch_geo = |update: TopicUpdateOptions| {
+            let patch = update.to_patch().expect("the patch encodes");
+            UpdateResourceRequest {
+                target: ResourceTarget::Topic {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(1),
+                },
+                reset: patch.reset,
+                options: patch.set,
+            }
+            .to_bytes()
+        };
+        let both_chains = |body: &Bytes| {
+            let tcp = tcp_chain(
+                &shard,
+                &sessions,
+                1,
+                request_message(Operation::UpdateResource, 1, 1, 1, body),
+            )
+            .map(|_| ())
+            .map_err(|deny| deny.error);
+            let http = http_chain(
+                &shard,
+                DEFAULT_ROOT_USER_ID,
+                request_message(Operation::UpdateResource, 1, 1, 1, body),
+            )
+            .map(|_| ());
+            (tcp, http)
+        };
+        let read_cache = TopicReadCache {
+            size: Some(IggyByteSize::from(0u64)),
+            read_ahead: Some(IggyByteSize::from(1u64 << 20)),
+        };
+
+        for update in [
+            TopicUpdateOptions {
+                read_cache,
+                ..TopicUpdateOptions::default()
+            },
+            TopicUpdateOptions {
+                read_cache,
+                geo_durations: GeoTopicDurations {
+                    tombstone_grace: Some(IggyDuration::from_str("6h").unwrap()),
+                    ..GeoTopicDurations::default()
+                },
+                ..TopicUpdateOptions::default()
+            },
+        ] {
+            assert_eq!(both_chains(&patch_geo(update)), (Ok(()), Ok(())));
+        }
+        let beside_expiry = patch_geo(TopicUpdateOptions {
+            read_cache,
+            message_expiry: Some(IggyExpiry::from_str("1h").unwrap()),
+            ..TopicUpdateOptions::default()
+        });
+        let not_updatable = IggyError::OptionNotUpdatable(OptionKey::MessageExpiry.to_string());
+        assert_eq!(
+            both_chains(&beside_expiry),
+            (Err(not_updatable.clone()), Err(not_updatable))
+        );
+        let reset = patch_geo(TopicUpdateOptions {
+            raw_reset: [OptionKey::ReadCacheSize.to_string()].into(),
+            ..TopicUpdateOptions::default()
+        });
+        let not_resettable = IggyError::OptionNotResettable(OptionKey::ReadCacheSize.to_string());
+        assert_eq!(
+            both_chains(&reset),
+            (Err(not_resettable.clone()), Err(not_resettable))
         );
     }
 

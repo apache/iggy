@@ -616,7 +616,11 @@ async fn given_long_term_segments_polled_through_a_cache_when_limited_or_gone_sh
         cached_pass.iter().all(|key| limited_pass.contains(key)),
         "each object asked again: {keys:?}"
     );
-    Box::pin(polled_all(&mut partition)).await;
+    Box::pin(polled_all_reading(
+        &mut partition,
+        &PartitionReadSettings::SHARD,
+    ))
+    .await;
     assert!(cached(&partition) > 0);
     partition.forget_reads();
 

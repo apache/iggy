@@ -68,9 +68,9 @@ pub use iggy_common::{
     Stream, StreamCreateOptions, StreamDetails, StreamEncryptionKey, StreamEncryptionSource,
     StreamPermissions, StreamUpdateOptions, SystemSnapshotType, TcpClientConfig,
     TcpClientConfigBuilder, TcpClientReconnectionConfig, Topic, TopicCreateOptions, TopicDetails,
-    TopicPermissions, TopicResolvedOptions, TopicType, TopicUpdateOptions, TransportEndpoints,
-    TransportProtocol, UndecodedRecord, UserCreateOptions, UserId, UserInfo, UserInfoDetails,
-    UserStatus, UserUpdateOptions, Validatable, WebSocketClientConfig,
+    TopicPermissions, TopicReadCache, TopicResolvedOptions, TopicType, TopicUpdateOptions,
+    TransportEndpoints, TransportProtocol, UndecodedRecord, UserCreateOptions, UserId, UserInfo,
+    UserInfoDetails, UserStatus, UserUpdateOptions, Validatable, WebSocketClientConfig,
     WebSocketClientConfigBuilder, WebSocketClientReconnectionConfig, WebSocketConfig, defaults,
     locking, topic_option_keys,
 };

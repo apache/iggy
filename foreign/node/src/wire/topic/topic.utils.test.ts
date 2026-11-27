@@ -123,6 +123,22 @@ describe('deserializeBaseTopic', () => {
     assert.equal(topic.localRetentionSize, 0xffff_ffff_ffff_ffffn);
     assert.equal(topic.topicType, TopicType.Normal);
     assert.equal(topic.geoMode, null);
+    assert.equal(topic.readCacheSize, null);
+    assert.equal(topic.readAhead, null);
+  });
+
+  it('reads a 0n read cache size as 0n and an unset readahead as null', () => {
+    const fixed = Buffer.alloc(34);
+    fixed.writeUInt8(1, 32);
+    fixed.write('t', 33);
+    const explicit = serializeOptions([{ key: 'read_cache_size', value: HeaderValue.Uint64(0n) }]);
+    const length = Buffer.alloc(4);
+    length.writeUInt32LE(explicit.length, 0);
+
+    const { data: topic } = deserializeBaseTopic(Buffer.concat([fixed, length, explicit, Buffer.alloc(4)]));
+
+    assert.equal(topic.readCacheSize, 0n);
+    assert.equal(topic.readAhead, null);
   });
 
   it('reads the topic type and the geo mode of a geo topic from either options block', () => {

@@ -88,7 +88,7 @@ use iggy_common::{
     TopicCreateOptions, TopicResolvedOptions, UserId, UserStatus, admit, admit_geo_topic,
     admit_tiered_storage, critical_keys_marker, derived_defaults, drop_options_fixed_by_type,
     stream_wrap_set, topic_option_keys, validate_geo_topic, validate_local_retention,
-    validate_segment_max_age, validate_topic_segment_size,
+    validate_read_cache, validate_segment_max_age, validate_topic_segment_size,
 };
 use journal::local_gate::{LocalGate, LocalGateAcquire, OwnedLocalGateGuard};
 use journal::superblock::{
@@ -6222,6 +6222,7 @@ where
                 admit_geo_topic(&admitted.explicit, self.tiered_storage_cluster_ready())?;
                 admit_tiered_storage(&admitted.explicit, self.tiered_storage_cluster_ready())?;
                 validate_local_retention(&stored)?;
+                validate_read_cache(&stored)?;
                 let derived_options = resource_options_to_wire(&derived, OptionsProvenance::All)?;
                 let mut counts = self.placement_counts()?;
                 let partitions = self
@@ -9842,6 +9843,38 @@ mod tests {
             })
             .is_ok()
         );
+    }
+
+    #[test]
+    fn given_a_read_ahead_above_an_eighth_of_the_read_cache_when_preparing_create_topic_should_refuse_it()
+     {
+        const MIB: u64 = 1 << 20;
+        let read_cache = |size: u64, read_ahead: u64| iggy_common::TopicCreateOptions {
+            read_cache: iggy_common::TopicReadCache {
+                size: Some(iggy_common::IggyByteSize::from(size)),
+                read_ahead: Some(iggy_common::IggyByteSize::from(read_ahead)),
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            prepare_topic_with(&read_cache(8 * MIB, 2 * MIB)).err(),
+            Some(IggyError::InvalidOptionValue("read_ahead".to_owned()))
+        );
+
+        let persisted = prepare_topic_with(&read_cache(0, 2 * MIB))
+            .expect("a topic that caches nothing has no readahead to bound");
+        let stored = TopicResolvedOptions::from(
+            &resource_options_from_wire(&persisted.request.options, true)
+                .expect("explicit block decodes"),
+        );
+        assert_eq!(
+            stored.read_cache,
+            iggy_common::TopicReadCache {
+                size: Some(iggy_common::IggyByteSize::from(0u64)),
+                read_ahead: Some(iggy_common::IggyByteSize::from(2 * MIB)),
+            }
+        );
+        assert!(prepare_topic_with(&read_cache(8 * MIB, MIB)).is_ok());
     }
 
     #[test]

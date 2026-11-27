@@ -81,7 +81,9 @@ export const TopicOptionKey = {
   PositionsPublishInterval: 'positions_publish_interval',
   TombstoneGrace: 'tombstone_grace',
   PositionsResumeTimeout: 'positions_resume_timeout',
-  LongTermRewriteMaxInterval: 'long_term_rewrite_max_interval'
+  LongTermRewriteMaxInterval: 'long_term_rewrite_max_interval',
+  ReadCacheSize: 'read_cache_size',
+  ReadAhead: 'read_ahead'
 } as const;
 
 export type TopicOptionKey = typeof TopicOptionKey[keyof typeof TopicOptionKey];
@@ -144,6 +146,8 @@ export const OPTION_CATALOG: ReadonlyMap<string, OptionDescriptor> = new Map([
   ['tombstone_grace', { scopes: [Topic], flags: Updatable, internal: false }],
   ['positions_resume_timeout', { scopes: [Topic], flags: Updatable, internal: false }],
   ['long_term_rewrite_max_interval', { scopes: [Topic], flags: Updatable, internal: false }],
+  ['read_cache_size', { scopes: [Topic], flags: Updatable, internal: false }],
+  ['read_ahead', { scopes: [Topic], flags: Updatable, internal: false }],
   ['shadow_origin', { scopes: [Stream], flags: ReadOnly, internal: false }],
   ['critical_keys', { scopes: [Stream, Topic, User], flags: 0, internal: true }]
 ]);

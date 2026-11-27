@@ -6390,19 +6390,27 @@ where
 
     /// How the polls of `namespace` read the store through the shard's read
     /// cache: the limit and the readahead that its topic sets for each of
-    /// its partitions, from the topic's options and partition count. No
-    /// topic sets them yet, so every partition reads with the shard's own
-    /// settings, and only the shard's budget binds.
+    /// its partitions. The topic's `read_cache_size` is shared evenly between
+    /// its partitions, as `local_retention_size` is. What the topic does not
+    /// set, and every setting of a topic that is gone, is left to the shard,
+    /// so only the shard's budget binds there.
     #[must_use]
-    #[allow(
-        clippy::unused_self,
-        reason = "the topic options that set them read the shard's metadata"
-    )]
-    const fn partition_read_settings(
+    pub fn partition_read_settings(
         &self,
-        _namespace: IggyNamespace,
-    ) -> partitions::PartitionReadSettings {
-        partitions::PartitionReadSettings::SHARD
+        namespace: IggyNamespace,
+    ) -> partitions::PartitionReadSettings
+    where
+        M: StreamsFrontend,
+    {
+        self.plane.metadata().mux_stm.streams().read(|inner| {
+            inner
+                .items
+                .get(namespace.stream_id())
+                .and_then(|stream| stream.topics.get(namespace.topic_id()))
+                .map_or(partitions::PartitionReadSettings::SHARD, |topic| {
+                    read_settings_of(topic.resolved.read_cache, topic.partitions.len())
+                })
+        })
     }
 
     /// Simulator-only: mutates `IggyPartitions` off the pump task, bypassing the
@@ -16848,6 +16856,21 @@ fn sendable_while_awaiting_transfer(action: &VsrAction) -> bool {
         action,
         VsrAction::SendRequestStartView { .. } | VsrAction::SendCommitReply { .. }
     ) || action.is_empty_vote()
+}
+
+/// What one of the `partition_count` partitions of a topic that sets
+/// `read_cache` reads with.
+fn read_settings_of(
+    read_cache: iggy_common::TopicReadCache,
+    partition_count: usize,
+) -> partitions::PartitionReadSettings {
+    let partition_count = u64::try_from(partition_count.max(1)).unwrap_or(u64::MAX);
+    partitions::PartitionReadSettings::new(
+        read_cache.size.map(|size| {
+            usize::try_from(size.as_bytes_u64() / partition_count).unwrap_or(usize::MAX)
+        }),
+        read_cache.read_ahead.map(|bytes| bytes.as_bytes_u64()),
+    )
 }
 
 #[allow(

@@ -90,6 +90,9 @@ final class ResourceOptionsTest extends TestCase
     ];
     // Only a geo topic has a mode or durations, so a normal topic reads none.
     private const GEO_TOPIC_KEYS = ['geo_mode', ...self::GEO_DURATION_KEYS];
+    // The read cache settings any topic can set, in catalog order. Neither has a default, so a
+    // topic reads one only when it sets it.
+    private const READ_CACHE_KEYS = ['read_cache_size', 'read_ahead'];
 
     private array $createdStreams = [];
 
@@ -467,6 +470,58 @@ final class ResourceOptionsTest extends TestCase
         self::assertGeoDurations($after, []);
     }
 
+    #[DataProvider('transports')]
+    #[TestDox('The read cache vectors set both settings on a normal topic, 0 reads back as a value, and neither resets on $transport')]
+    public function testGivenReadCacheVectorsWhenCreatingAndUpdatingShouldReadZeroBackAndRefuseReset(string $transport): void
+    {
+        $input = self::fixtureCase('create_topic', 'topic_with_read_cache')['input'];
+        $created = self::readCacheValues($input);
+        $updated = self::readCacheValues(self::fixtureCase('update_resource', 'topic_set_read_cache')['input']);
+        assert_same(self::READ_CACHE_KEYS, array_keys($created));
+        assert_same(self::READ_CACHE_KEYS, array_keys($updated));
+        $client = new_transport_client($transport);
+        $stream = $this->createStream($client, unique_name('read-cache'));
+        $client->createTopic($stream->id, 'unset', 1, null, null, null, null);
+        $unset = $client->getTopic($stream->id, 'unset');
+        assert_not_null($unset);
+        self::assertReadCache($unset, []);
+
+        $client->createTopic(
+            $stream->id,
+            $input['name'],
+            $input['partitions_count'],
+            null,
+            null,
+            null,
+            null,
+            Durability::from($input['durability']),
+            Durability::from($input['consumer_offset_durability']),
+            ...$created,
+        );
+
+        $topic = $client->getTopic($stream->id, $input['name']);
+        assert_not_null($topic);
+        self::assertReadCache($topic, $created);
+        $listed = $client->getTopicsPage($stream->id, name: $input['name'])->items;
+        assert_count(1, $listed);
+        self::assertReadCache($listed[0], $created);
+
+        $client->updateTopic($stream->id, $input['name'], ...$updated);
+        $topic = $client->getTopic($stream->id, $input['name']);
+        assert_not_null($topic);
+        self::assertReadCache($topic, $updated);
+        foreach (self::READ_CACHE_KEYS as $key) {
+            self::assertRefused(
+                static fn () => $client->updateTopic($stream->id, $input['name'], reset: [TopicOptionKey::from($key)]),
+                'option_not_resettable',
+            );
+            self::assertRefused(
+                static fn () => $client->updateTopic($stream->id, $input['name'], raw_reset: [$key]),
+                'option_not_resettable',
+            );
+        }
+    }
+
     #[TestDox('The geo topic vectors set every duration through typed arguments and read back as the response projection')]
     public function testGivenGeoTopicVectorsWhenCreatingAndUpdatingShouldReadDurationsBack(): void
     {
@@ -713,7 +768,7 @@ final class ResourceOptionsTest extends TestCase
         assert_same($explicit, self::sorted($topic->options));
         $mapKeys = [];
         foreach (self::catalogRows('topic') as $key => $row) {
-            if ($row['storage'] === 'map' && !in_array($key, self::GEO_TOPIC_KEYS, true)) {
+            if ($row['storage'] === 'map' && !in_array($key, [...self::GEO_TOPIC_KEYS, ...self::READ_CACHE_KEYS], true)) {
                 $mapKeys[] = $key;
             }
         }
@@ -753,6 +808,28 @@ final class ResourceOptionsTest extends TestCase
         }
 
         return $durations;
+    }
+
+    private static function assertReadCache(TopicDetails|Topic $topic, array $expected): void
+    {
+        foreach (self::READ_CACHE_KEYS as $key) {
+            assert_same($expected[$key] ?? null, $topic->$key, $key);
+            assert_same($expected[$key] ?? null, $topic->options[$key] ?? null, "$key option");
+        }
+    }
+
+    // The read cache settings a fixture input sets, both as the createTopic() and updateTopic()
+    // arguments, which share their names, and as the topic getters read them.
+    private static function readCacheValues(array $values): array
+    {
+        $settings = [];
+        foreach (self::READ_CACHE_KEYS as $key) {
+            if (array_key_exists($key, $values)) {
+                $settings[$key] = self::integerOrString($values[$key]);
+            }
+        }
+
+        return $settings;
     }
 
     private static function phpOptions(array $wireOptions): array

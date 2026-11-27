@@ -26,6 +26,7 @@ use iggy_common::Identifier;
 use iggy_common::IggyExpiry;
 use iggy_common::OptionKey;
 use iggy_common::TopicDetails;
+use iggy_common::TopicReadCache;
 use tracing::{Level, event};
 
 pub enum GetTopicOutput {
@@ -127,6 +128,9 @@ fn topic_table(topic: &TopicDetails, origin: Option<&str>) -> Table {
     for (label, duration) in geo_duration_rows(&resolved.geo_durations) {
         table.add_row(vec![label, duration.as_str()]);
     }
+    for (label, bytes) in read_cache_rows(&resolved.read_cache) {
+        table.add_row(vec![label, bytes.as_str()]);
+    }
     table.add_row(vec!["Topic size", format!("{}", topic.size).as_str()]);
     table.add_row(vec![
         "Compression",
@@ -201,6 +205,27 @@ fn geo_duration_rows(durations: &GeoTopicDurations) -> Vec<(&'static str, String
                 (OptionKey::ConsumerOffsetUploadInterval, true) => "disabled".to_owned(),
                 (_, true) => "0".to_owned(),
                 (_, false) => duration.to_string(),
+            };
+            Some((label, shown))
+        })
+        .collect()
+}
+
+/// The read cache settings that a topic sets for itself, each with its
+/// label. As with the durations, the node's settings have no row.
+fn read_cache_rows(read_cache: &TopicReadCache) -> Vec<(&'static str, String)> {
+    TopicReadCache::KEYS
+        .into_iter()
+        .filter_map(|key| {
+            let bytes = read_cache.get(key)?;
+            let label = match key {
+                OptionKey::ReadCacheSize => "Read cache size",
+                _ => "Read ahead",
+            };
+            let shown = if bytes.as_bytes_u64() == 0 {
+                "disabled".to_owned()
+            } else {
+                bytes.to_string()
             };
             Some((label, shown))
         })
@@ -397,6 +422,38 @@ mod tests {
         ] {
             assert_eq!(row(unset), None, "{unset} in {table}");
         }
+    }
+
+    #[test]
+    fn given_a_topic_with_its_own_read_cache_should_show_the_settings_it_sets() {
+        let table_with = |options: &[(&str, u64)]| {
+            let mut fixture = topic();
+            fixture.options = options
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        HeaderKey::try_from(*key).unwrap(),
+                        OptionValue::explicit(HeaderValue::from(*value)),
+                    )
+                })
+                .collect();
+            topic_table(&fixture, None).to_string()
+        };
+        let row = |table: &str, label: &str| {
+            table
+                .lines()
+                .find(|line| line.contains(label))
+                .map(|line| line.split('|').nth(2).unwrap_or_default().trim().to_owned())
+        };
+
+        let table = table_with(&[("read_cache_size", 0), ("read_ahead", 2_000_000)]);
+        assert_eq!(row(&table, "Read cache size").as_deref(), Some("disabled"));
+        assert_eq!(row(&table, "Read ahead").as_deref(), Some("2.00 MB"));
+        let table = table_with(&[("read_cache_size", 16_000_000)]);
+        assert_eq!(row(&table, "Read cache size").as_deref(), Some("16.00 MB"));
+        assert_eq!(row(&table, "Read ahead"), None, "{table}");
+        let table = table_with(&[]);
+        assert_eq!(row(&table, "Read cache size"), None, "{table}");
     }
 
     #[test]

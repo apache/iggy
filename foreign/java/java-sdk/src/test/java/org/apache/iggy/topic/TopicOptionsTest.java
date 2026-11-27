@@ -67,6 +67,8 @@ class TopicOptionsTest {
                 .tombstoneGrace(BigInteger.valueOf(3_600_000_000L))
                 .positionsResumeTimeout(BigInteger.valueOf(30_000_000))
                 .longTermRewriteMaxInterval(BigInteger.valueOf(20_000_000))
+                .readCacheSize(BigInteger.valueOf(16_777_216))
+                .readAhead(BigInteger.valueOf(1_048_576))
                 .build()
                 .entries();
 
@@ -90,7 +92,9 @@ class TopicOptionsTest {
                         "positions_publish_interval",
                         "tombstone_grace",
                         "positions_resume_timeout",
-                        "long_term_rewrite_max_interval");
+                        "long_term_rewrite_max_interval",
+                        "read_cache_size",
+                        "read_ahead");
         assertThat(options.get("fresh_upload_interval")).isEqualTo(HeaderValue.fromUint64(BigInteger.valueOf(50_000)));
         assertThat(options.get("consumer_offset_upload_interval"))
                 .isEqualTo(HeaderValue.fromUint64(BigInteger.valueOf(20_000)));
@@ -102,6 +106,8 @@ class TopicOptionsTest {
                 .isEqualTo(HeaderValue.fromUint64(BigInteger.valueOf(30_000_000)));
         assertThat(options.get("long_term_rewrite_max_interval"))
                 .isEqualTo(HeaderValue.fromUint64(BigInteger.valueOf(20_000_000)));
+        assertThat(options.get("read_cache_size")).isEqualTo(HeaderValue.fromUint64(BigInteger.valueOf(16_777_216)));
+        assertThat(options.get("read_ahead")).isEqualTo(HeaderValue.fromUint64(BigInteger.valueOf(1_048_576)));
         assertThat(options.get("segment_size").kind()).isEqualTo(HeaderKind.Uint64);
         assertThat(options.get("messages_required_to_save").kind()).isEqualTo(HeaderKind.Uint32);
         assertThat(options.get("size_of_messages_required_to_save").kind()).isEqualTo(HeaderKind.Uint64);
@@ -144,6 +150,19 @@ class TopicOptionsTest {
                         "positions_resume_timeout");
         assertThat(options.get("fresh_upload_interval")).isEqualTo(HeaderValue.fromUint64(BigInteger.ZERO));
         assertThat(options.get("positions_resume_timeout")).isEqualTo(HeaderValue.fromUint64(BigInteger.ZERO));
+    }
+
+    @Test
+    void shouldSendAZeroReadCacheSizeAndLeaveAnUnsetOneOut() {
+        var options = TopicOptions.builder()
+                .readAhead(BigInteger.ZERO)
+                .maxTopicSize(BigInteger.ZERO)
+                .build()
+                .entries();
+
+        // A zero size cap leaves the key to the server default, while a zero read cache size is a value.
+        assertThat(options).containsOnlyKeys("durability", "consumer_offset_durability", "read_ahead");
+        assertThat(options.get("read_ahead")).isEqualTo(HeaderValue.fromUint64(BigInteger.ZERO));
     }
 
     @Test

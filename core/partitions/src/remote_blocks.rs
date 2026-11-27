@@ -136,6 +136,17 @@ impl PartitionReadSettings {
         left: None,
     };
 
+    /// What a topic sets: `limit` and `read_ahead`, `None` to leave either
+    /// to the shard.
+    #[must_use]
+    pub const fn new(limit: Option<usize>, read_ahead: Option<u64>) -> Self {
+        Self {
+            limit,
+            read_ahead,
+            left: None,
+        }
+    }
+
     /// Whether the partition that reads with these left the shard: it keeps
     /// nothing in the cache from then on, and starts no GET.
     pub(crate) fn left_shard(&self) -> bool {
@@ -3705,6 +3716,47 @@ mod tests {
             assert_eq!(
                 reach.div_ceil(BLOCK).saturating_sub(12),
                 blocks_ahead,
+                "{row}"
+            );
+        }
+    }
+
+    /// A partition's own readahead keeps within an eighth of the shard's
+    /// cache when its limit is unset or above that cache.
+    #[compio::test]
+    async fn given_a_partition_readahead_above_an_eighth_of_the_shard_cache_when_reading_in_order_should_fetch_ahead_within_it()
+     {
+        const SHARD_CACHE_BYTES: usize = 32 * BLOCK_LEN;
+        for (row, limit) in [
+            ("no limit", None),
+            ("a limit above the cache", Some(2 * SHARD_CACHE_BYTES)),
+        ] {
+            let len = 40 * BLOCK;
+            let (store, ahead) = (Store::holding(len), Store::holding(len));
+            let remote = remote(&store, Rc::clone(&ahead) as _, SHARD_CACHE_BYTES, 2 * BLOCK);
+            let source = partition_source(1, len);
+            let settings = PartitionReadSettings {
+                limit,
+                read_ahead: Some(16 * BLOCK),
+                left: None,
+            };
+            for block in 0..12 {
+                read_as(
+                    &remote,
+                    &source,
+                    block * BLOCK..(block + 1) * BLOCK,
+                    &settings,
+                )
+                .await
+                .unwrap();
+                settle().await;
+            }
+
+            let reach = ahead.asked().iter().map(|(_, end)| *end).max().unwrap_or(0);
+            let an_eighth_of_the_cache = (SHARD_CACHE_BYTES / AHEAD_SHARE / BLOCK_LEN) as u64;
+            assert_eq!(
+                reach.div_ceil(BLOCK).saturating_sub(12),
+                an_eighth_of_the_cache,
                 "{row}"
             );
         }
