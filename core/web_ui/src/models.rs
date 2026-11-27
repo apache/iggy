@@ -92,6 +92,9 @@ pub struct Stats {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct OptionValue {
     pub value: String,
+    /// Set by the client, as opposed to filled in from a server default.
+    #[serde(default)]
+    pub explicit: bool,
 }
 
 pub type ResourceOptions = BTreeMap<String, OptionValue>;
@@ -115,6 +118,8 @@ pub struct StreamDetails {
     pub messages_count: u64,
     pub topics_count: u32,
     pub topics: Vec<Topic>,
+    #[serde(default)]
+    pub options: ResourceOptions,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -140,6 +145,71 @@ pub struct TopicDetails {
     pub partitions: Vec<Partition>,
     #[serde(default)]
     pub options: ResourceOptions,
+}
+
+/// Option values in requests use the text a config file accepts, such as
+/// `"7 days"` or `"1 GiB"`, and the server parses them.
+pub type OptionInputs = BTreeMap<String, String>;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateStream {
+    pub name: String,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub options: OptionInputs,
+}
+
+/// The `PUT` body that renames a stream, read as `iggy_common::OptionsUpdate`.
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamUpdate<'a> {
+    pub name: &'a str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateTopic {
+    pub name: String,
+    pub partitions_count: u32,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub options: OptionInputs,
+}
+
+/// A sparse `PUT` body, which the server reads as `iggy_common::OptionsUpdate`:
+/// absent fields stay as they are, and `reset` returns options to the server
+/// default.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct TopicUpdate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_expiry: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_topic_size: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reset: Vec<String>,
+}
+
+impl TopicUpdate {
+    /// The server refuses an update that changes nothing.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct CreatePartitions {
+    pub partitions_count: u32,
+}
+
+/// The query of a partitions `DELETE`, read as
+/// `iggy_common::delete_partitions::DeletePartitions`.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct DeletePartitions {
+    pub partitions_count: u32,
+}
+
+impl DeletePartitions {
+    pub fn query(&self) -> [(&'static str, String); 1] {
+        [("partitions_count", self.partitions_count.to_string())]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -181,8 +251,9 @@ mod tests {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
     use iggy_common::{
-        HeaderKey, HeaderValue, IggyByteSize, IggyDuration, IggyTimestamp, OptionKey,
-        PartitionContext, UserStatus,
+        HeaderKey, HeaderValue, IggyByteSize, IggyDuration, IggyTimestamp, OptionAdmissionContext,
+        OptionKey, OptionOperation, OptionsScope, PartitionContext, TopicCreateOptions, UserStatus,
+        admit,
     };
     use serde::de::DeserializeOwned;
 
@@ -377,6 +448,104 @@ mod tests {
             (mirror.open_files_count, mirror.open_files_limit),
             (3, 1_024)
         );
+    }
+
+    #[test]
+    fn given_ui_create_stream_should_decode_as_server_create_stream() {
+        let mirror = CreateStream {
+            name: "orders".to_owned(),
+            options: OptionInputs::from([("encryption_key".to_owned(), "server".to_owned())]),
+        };
+        let server: iggy_common::create_stream::CreateStream = decode(&mirror);
+        assert_eq!(server.name, "orders");
+        assert_eq!(
+            server.options.0.keys().collect::<Vec<_>>(),
+            ["encryption_key"]
+        );
+    }
+
+    #[test]
+    fn given_ui_create_topic_should_decode_as_server_create_topic() {
+        let mirror = CreateTopic {
+            name: "events".to_owned(),
+            partitions_count: 3,
+            options: OptionInputs::from([
+                ("compression_algorithm".to_owned(), "gzip".to_owned()),
+                ("max_topic_size".to_owned(), "1 GiB".to_owned()),
+                ("message_expiry".to_owned(), "7 days".to_owned()),
+            ]),
+        };
+        let server: iggy_common::create_topic::CreateTopic = decode(&mirror);
+        assert_eq!(
+            (server.name.as_str(), server.partitions_count),
+            ("events", 3)
+        );
+        let wire = server.options.to_wire().expect("valid option names");
+        TopicCreateOptions::parse(&wire)
+            .expect("the topic catalog accepts the keys and values the form sends");
+    }
+
+    #[test]
+    fn given_misspelled_topic_option_should_fail_the_catalog_check() {
+        let mirror = CreateTopic {
+            name: "events".to_owned(),
+            partitions_count: 1,
+            options: OptionInputs::from([("message_expiri".to_owned(), "7 days".to_owned())]),
+        };
+        let server: iggy_common::create_topic::CreateTopic = decode(&mirror);
+        let wire = server.options.to_wire().expect("valid option names");
+        assert!(TopicCreateOptions::parse(&wire).is_err());
+    }
+
+    #[test]
+    fn given_ui_topic_update_should_decode_as_server_options_update() {
+        let mirror = TopicUpdate {
+            name: Some("renamed".to_owned()),
+            message_expiry: Some("1 day".to_owned()),
+            max_topic_size: None,
+            reset: vec!["max_topic_size".to_owned()],
+        };
+        let server: iggy_common::OptionsUpdate = decode(&mirror);
+        assert_eq!(
+            server.set.keys().collect::<Vec<_>>(),
+            ["message_expiry", "name"]
+        );
+        assert_eq!(server.reset.iter().collect::<Vec<_>>(), ["max_topic_size"]);
+        let patch = server.to_patch().expect("valid option names");
+        let reset: Vec<String> = server.reset.iter().cloned().collect();
+        admit(
+            OptionsScope::Topic,
+            OptionOperation::Update,
+            &patch.set,
+            &reset,
+            &OptionAdmissionContext::default(),
+        )
+        .expect("topic admission accepts the update the form sends");
+    }
+
+    #[test]
+    fn given_ui_stream_rename_should_decode_as_server_options_update() {
+        let server: iggy_common::OptionsUpdate = decode(&StreamUpdate { name: "renamed" });
+        assert_eq!(server.set.keys().collect::<Vec<_>>(), ["name"]);
+        assert!(server.reset.is_empty());
+    }
+
+    #[test]
+    fn given_ui_delete_partitions_query_should_decode_as_server_delete_partitions() {
+        let mirror = DeletePartitions {
+            partitions_count: 2,
+        };
+        let server: iggy_common::delete_partitions::DeletePartitions = decode(&mirror);
+        assert_eq!(server.partitions_count, 2);
+        assert_eq!(mirror.query(), [("partitions_count", "2".to_owned())]);
+    }
+
+    #[test]
+    fn given_ui_create_partitions_should_decode_as_server_create_partitions() {
+        let server: iggy_common::create_partitions::CreatePartitions = decode(&CreatePartitions {
+            partitions_count: 2,
+        });
+        assert_eq!(server.partitions_count, 2);
     }
 
     fn server_topic() -> iggy_common::Topic {
