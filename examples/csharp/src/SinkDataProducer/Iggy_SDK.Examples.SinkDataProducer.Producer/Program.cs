@@ -67,8 +67,15 @@ await ExampleHelpers.EnsureTopicExists(
 );
 
 var totalMessages = 0;
-for (var batch = 0; batch < settings.MessageBatchesLimit; batch++)
+var sentBatches = 0;
+while (true)
 {
+    if (settings.MessageBatchesLimit > 0 && sentBatches == settings.MessageBatchesLimit)
+    {
+        logger.LogInformation("Sent {SentBatches} batches of messages, exiting.", sentBatches);
+        break;
+    }
+
     var recordsCount = Random.Shared.Next(settings.MinRecordsPerBatch, settings.MaxRecordsPerBatch);
     var messages = new List<Message>(recordsCount);
     for (var i = 0; i < recordsCount; i++)
@@ -80,6 +87,7 @@ for (var batch = 0; batch < settings.MessageBatchesLimit; batch++)
     await client.SendMessagesAsync(streamId, topicId, Partitioning.None(), messages);
     logger.LogInformation("Sent {RecordsCount} messages", recordsCount);
     totalMessages += recordsCount;
+    sentBatches++;
 }
 
 logger.LogInformation("Reached maximum batches count");
@@ -90,9 +98,9 @@ UserRecord RandomRecord()
     return new UserRecord(
         $"user_{Random.Shared.Next(1, 100)}",
         Random.Shared.Next(1, 5),
-        $"{RandomAlphanumeric(Random.Shared.Next(3, 20))}@{Random.Shared.GetItems(domains, 1)[0]}",
-        Random.Shared.GetItems(sources, 1)[0],
-        Random.Shared.GetItems(states, 1)[0],
+        $"{RandomAlphanumeric(Random.Shared.Next(3, 20))}@{domains[Random.Shared.Next(domains.Length)]}",
+        sources[Random.Shared.Next(sources.Length)],
+        states[Random.Shared.Next(states.Length)],
         RandomAlphanumeric(Random.Shared.Next(10, 100)),
         DateTimeOffset.UtcNow - TimeSpan.FromDays(Random.Shared.Next(1000))
     );
