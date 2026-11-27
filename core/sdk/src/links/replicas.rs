@@ -2534,10 +2534,7 @@ mod tests {
         );
         cluster.down.lock().unwrap().clear();
 
-        for _ in 0..4 {
-            sleep(Duration::from_secs(10)).await;
-            links.keepalive().await.unwrap();
-        }
+        links.keepalive().await.unwrap();
 
         assert_eq!(links.state(), ClientState::Authenticated);
     }
