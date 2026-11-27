@@ -2116,6 +2116,7 @@ mod repair_protocol;
 mod retention;
 mod segment_chain;
 mod segment_upload;
+mod segment_verify;
 mod session_retirement;
 mod state_machines;
 mod state_transfer_offer;

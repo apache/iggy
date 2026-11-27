@@ -73,7 +73,7 @@ use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::stream::{Streams, StreamsInner};
 use partitions::{
     FreshObjectSweeper, FreshObjectUploader, LongTermMerger, LongTermWriter, ManifestPublisher,
-    ObjectDeleter, SegmentUploader, StoreViewReader, TopicObjects,
+    ObjectDeleter, SegmentUploader, SegmentVerifier, StoreViewReader, TopicObjects,
 };
 use shard::Receiver;
 use shard::metrics::ShardMetrics;
@@ -157,8 +157,8 @@ enum Verdict {
 /// the writer and the merger of its long-term segments, the sweeper of fresh
 /// objects and the jobs on geo topic objects. The shard holds them only while
 /// its node passes the store identity check, and so the reader that rebuilds
-/// a lost segment chain from the store, which must not take another
-/// cluster's objects for its own.
+/// a lost segment chain from the store and the verifier of stored segments,
+/// which must not take another cluster's objects for their own.
 pub struct TierHandlers {
     uploader: Rc<dyn SegmentUploader>,
     deleter: Rc<dyn ObjectDeleter>,
@@ -169,6 +169,7 @@ pub struct TierHandlers {
     fresh_sweeper: Rc<dyn FreshObjectSweeper>,
     topic_objects: Rc<dyn TopicObjects>,
     store_view_reader: Rc<dyn StoreViewReader>,
+    segment_verifier: Rc<dyn SegmentVerifier>,
     held: bool,
 }
 
@@ -566,6 +567,7 @@ impl TierHandlers {
         fresh_sweeper: Rc<dyn FreshObjectSweeper>,
         topic_objects: Rc<dyn TopicObjects>,
         store_view_reader: Rc<dyn StoreViewReader>,
+        segment_verifier: Rc<dyn SegmentVerifier>,
     ) -> Self {
         Self {
             uploader,
@@ -577,6 +579,7 @@ impl TierHandlers {
             fresh_sweeper,
             topic_objects,
             store_view_reader,
+            segment_verifier,
             held: false,
         }
     }
@@ -607,6 +610,7 @@ impl TierHandlers {
         shard.set_fresh_sweeper(verified.then(|| Rc::clone(&self.fresh_sweeper)));
         shard.set_topic_objects(verified.then(|| Rc::clone(&self.topic_objects)));
         shard.set_store_view_reader(verified.then(|| Rc::clone(&self.store_view_reader)));
+        shard.set_segment_verifier(verified.then(|| Rc::clone(&self.segment_verifier)));
         self.held = verified;
     }
 }
@@ -631,8 +635,8 @@ mod tests {
     use metadata::stm::{StateHandler, StateMachine as _};
     use partitions::{
         ExecutorDeleter, ExecutorFreshSweeper, ExecutorFreshUploader, ExecutorLongTermMerger,
-        ExecutorLongTermWriter, ExecutorManifestPublisher, ExecutorStoreViewReader,
-        ExecutorTopicObjects, ExecutorUploader,
+        ExecutorLongTermWriter, ExecutorManifestPublisher, ExecutorSegmentVerifier,
+        ExecutorStoreViewReader, ExecutorTopicObjects, ExecutorUploader,
     };
 
     use super::test_stores::IgnoresCondition;
@@ -896,6 +900,10 @@ mod tests {
                 InlineTierExecutor::new(MemoryStore::new()),
                 layout(),
             )),
+            Rc::new(ExecutorSegmentVerifier::new(
+                InlineTierExecutor::new(MemoryStore::new()),
+                layout(),
+            )),
         );
         let held = |handlers: &mut TierHandlers, verified: bool| {
             handlers.sync(&shard, verified.then_some(OURS));
@@ -909,20 +917,21 @@ mod tests {
                 shard.fresh_sweeper().is_some(),
                 shard.topic_objects().is_some(),
                 shard.store_view_reader().is_some(),
+                shard.segment_verifier().is_some(),
             ]
         };
 
-        assert_eq!(held(&mut handlers, false), [false; 9]);
+        assert_eq!(held(&mut handlers, false), [false; 10]);
         assert_eq!(shard.fresh_cluster_uid(), 0);
-        assert_eq!(held(&mut handlers, true), [true; 9]);
+        assert_eq!(held(&mut handlers, true), [true; 10]);
         assert_eq!(
             shard.fresh_cluster_uid(),
             OURS,
             "fresh objects name the cluster the check verified"
         );
-        assert_eq!(held(&mut handlers, true), [true; 9]);
-        assert_eq!(held(&mut handlers, false), [false; 9]);
-        assert_eq!(held(&mut handlers, true), [true; 9]);
+        assert_eq!(held(&mut handlers, true), [true; 10]);
+        assert_eq!(held(&mut handlers, false), [false; 10]);
+        assert_eq!(held(&mut handlers, true), [true; 10]);
     }
 
     #[test]

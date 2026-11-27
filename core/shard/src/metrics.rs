@@ -431,6 +431,11 @@ pub struct ShardMetrics {
     partition_chain_rebuilds_total: Counter,
     partition_chain_rebuild_refusals_total: Counter,
     partitions_awaiting_chain_rebuild: Gauge,
+    partition_segment_verify_passes_total: Counter,
+    partition_stored_segments_verified_total: Counter,
+    partition_segment_verify_unanswered_total: Counter,
+    partition_stored_segments_missing: Gauge,
+    partition_stored_segments_diverged: Gauge,
     partitions_untrusted_log: Gauge,
     partitions_in_view_change: Gauge,
     partition_view_change_votes_held: Gauge,
@@ -723,6 +728,11 @@ impl ShardMetrics {
             partition_chain_rebuilds_total: Counter::default(),
             partition_chain_rebuild_refusals_total: Counter::default(),
             partitions_awaiting_chain_rebuild: Gauge::default(),
+            partition_segment_verify_passes_total: Counter::default(),
+            partition_stored_segments_verified_total: Counter::default(),
+            partition_segment_verify_unanswered_total: Counter::default(),
+            partition_stored_segments_missing: Gauge::default(),
+            partition_stored_segments_diverged: Gauge::default(),
             partitions_untrusted_log: Gauge::default(),
             partitions_in_view_change: Gauge::default(),
             partition_view_change_votes_held: Gauge::default(),
@@ -1601,6 +1611,10 @@ impl ShardMetrics {
             .set(i64::try_from(levels.repair_ring_entries).unwrap_or(i64::MAX));
         self.partition_repair_ring_bytes
             .set(i64::try_from(levels.repair_ring_bytes).unwrap_or(i64::MAX));
+        self.partition_stored_segments_missing
+            .set(i64::try_from(levels.stored_segments_missing).unwrap_or(i64::MAX));
+        self.partition_stored_segments_diverged
+            .set(i64::try_from(levels.stored_segments_diverged).unwrap_or(i64::MAX));
     }
 
     pub fn set_wal_reload_budget(&self, bytes_max: u64) {
@@ -1893,6 +1907,25 @@ impl ShardMetrics {
     pub fn set_partitions_awaiting_chain_rebuild(&self, waiting: usize) {
         self.partitions_awaiting_chain_rebuild
             .set(i64::try_from(waiting).unwrap_or(i64::MAX));
+    }
+
+    /// Bumped when a verify pass over the segments a partition stored has
+    /// asked for the last of them, whether or not the store answered for
+    /// each.
+    pub fn record_segment_verify_pass(&self) {
+        self.partition_segment_verify_passes_total.inc();
+    }
+
+    /// Bumped by the segments a verify job compared with the store's answers.
+    pub fn record_stored_segments_verified(&self, segments: usize) {
+        self.partition_stored_segments_verified_total
+            .inc_by(u64::try_from(segments).unwrap_or(u64::MAX));
+    }
+
+    /// Bumped by each verify job that the store left a HEAD of without an
+    /// answer.
+    pub fn record_segment_verify_unanswered(&self) {
+        self.partition_segment_verify_unanswered_total.inc();
     }
 
     /// Republished by every partition sweep: how many of this shard's
@@ -2669,6 +2702,36 @@ impl ShardMetrics {
             "partitions_awaiting_chain_rebuild",
             "tiered partitions whose segment chain is gone and that wait for the object store",
             self.partitions_awaiting_chain_rebuild.clone(),
+        );
+        registry.register(
+            "partition_segment_verify_passes",
+            "verify passes that asked the object store for every segment a tiered partition \
+             this shard leads stored; a pass also ends when the store answered no HEAD for \
+             some of them, which partition_segment_verify_unanswered counts",
+            self.partition_segment_verify_passes_total.clone(),
+        );
+        registry.register(
+            "partition_segment_verify_unanswered",
+            "verify jobs that the object store left a HEAD of without an answer, whose segment \
+             counts as neither verified nor missing",
+            self.partition_segment_verify_unanswered_total.clone(),
+        );
+        registry.register(
+            "partition_stored_segments_verified",
+            "stored segments whose objects a verify pass compared with the partition's record",
+            self.partition_stored_segments_verified_total.clone(),
+        );
+        registry.register(
+            "partition_stored_segments_missing",
+            "stored segments of the partitions this shard leads with an object the object \
+             store no longer holds",
+            self.partition_stored_segments_missing.clone(),
+        );
+        registry.register(
+            "partition_stored_segments_diverged",
+            "stored segments of the partitions this shard leads with an object that differs \
+             from the partition's record",
+            self.partition_stored_segments_diverged.clone(),
         );
         registry.register(
             "partitions_untrusted_log",

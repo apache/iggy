@@ -630,6 +630,59 @@ files aside and rejoins by state transfer. Each shard exports
 `partition_chain_rebuilds_total`, `partition_chain_rebuild_refusals_total` and
 `partitions_awaiting_chain_rebuild`, the partitions that wait for the store.
 
+The primary of each partition of a tiered topic checks once a day that the
+store still holds the segments its chain records as stored, and once more each
+time it becomes the primary, as after a restart. A pass checks the segments
+stored when it started, and the ones stored later wait for the next pass. The
+check sends one HEAD for the `.log` and one for the `.index` of each segment,
+at most 64 segments a job, in the housekeeping jobs that wait for fetches and
+uploads. Each shard runs at most 4 such jobs at once, and a partition that
+finds them all running waits its turn behind the ones that found them running
+before it. The check lists nothing and leaves the read cache alone. On the
+`fs` backend a HEAD reads the first 8 KiB of the object's file, which holds
+its header and can hold the first bytes of the segment. On the other backends
+it reads no byte of the object. An object the store does not hold counts as
+missing, and the `.index` of a missing `.log` is not asked for. A `.log` of
+another size than the chain records, with another CRC32C than the one the
+store computed when it took the upload, or with metadata that does not decode
+or describes another segment than the chain records, counts as diverged, and
+so does an `.index` that is not a whole number of entries. The metadata is
+compared even when the CRC32C matches, as rebuilding a lost chain from the
+store reads it. The node logs each such segment once as an error when it finds
+it, and once more when a later check finds it as recorded again. It repairs,
+deletes and fences nothing.
+
+A store error is no finding, and the segment counts as neither missing nor
+verified, unless the HEAD of the `.log` already showed a finding, which counts.
+After a timeout, a 5xx answer or throttling, the next job asks for the segment
+again, until 3 jobs in a row got no answer for it. The pass then goes on with
+the next segments, and asks for it once more after the last of them. After any
+other error, or when that last ask fails too, the next pass checks the
+segment. A pass that left segments without an answer still ends and counts as
+a pass. When the node fails the store identity check, the jobs in flight count
+for nothing, and once it passes again each partition starts a new pass.
+
+Each shard exports `partition_segment_verify_passes_total`,
+`partition_stored_segments_verified_total`,
+`partition_segment_verify_unanswered_total`, the jobs that got no answer for a
+HEAD, and the gauges `partition_stored_segments_missing` and
+`partition_stored_segments_diverged` over the partitions it leads, which drop
+to 0 when it stops leading them. No provider computes a CRC32C again on a
+HEAD, so the check compares what the store recorded when it took the object,
+not the bytes it holds now: a byte that flips inside an object file of the
+`fs` backend is not found.
+
+On an S3 general purpose bucket, the server needs `s3:ListBucket` on the
+bucket besides `s3:GetObject` for a HEAD of a missing object to answer 404.
+Without it S3 answers 403, which the check takes for an error, not for a
+missing object, so it finds no missing segment.
+
+Each run of the message cleaner starts the next job of each partition's pass,
+from the same request that starts its object deletes. A node with
+`cleaner_enabled = false` in `[data_maintenance.messages]` checks no segment,
+and its `partition_stored_segments_missing` and
+`partition_stored_segments_diverged` stay at 0 whatever the store lost.
+
 The `fs` backend keeps the objects in a directory. The `s3` backend keeps them
 in a bucket on AWS S3 or on a store with its API, such as Ceph RGW or R2. With
 an empty `endpoint`, it uses AWS in `region`. `url_style` picks whether the

@@ -42,6 +42,7 @@ use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::remote_segments::IndexCheck;
 use crate::segment_chain::{SegmentHasher, SegmentRecord};
 use crate::segment_recovery::MAX_RECOVERABLE_BATCH_BYTES;
+use crate::segment_verify::{index_divergence, log_divergence};
 use crate::state_transfer::{ChunkHasher, hash_segment_range};
 
 /// Bytes of a file that one piece of a put body holds.
@@ -258,7 +259,7 @@ pub async fn store_segment<S: ObjectStore>(
         Ok(()) => {}
         Err(ObjectStoreError::PreconditionFailed { .. }) => {
             let held = store.head(&log_key).await.map_err(UploadError::Store)?;
-            if !is_recorded_log(&held, record) {
+            if log_divergence(&held, record).is_some() {
                 return Err(UploadError::Diverged { key: log_key });
             }
         }
@@ -276,7 +277,7 @@ pub async fn store_segment<S: ObjectStore>(
         // stored only has to be one.
         Err(ObjectStoreError::PreconditionFailed { .. }) => {
             let held = store.head(index_key).await.map_err(UploadError::Store)?;
-            if !is_whole_index(&held) {
+            if index_divergence(&held).is_some() {
                 return Err(UploadError::Diverged {
                     key: index_key.to_owned(),
                 });

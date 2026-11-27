@@ -1202,6 +1202,36 @@ impl SegmentChain {
             .take_while(|segment| self.confirmed.contains(&segment.start_offset))
     }
 
+    /// The sealed segments from `start_offset` on whose hash a floor advance
+    /// matched, in offset order.
+    pub(crate) fn confirmed_from(
+        &self,
+        start_offset: u64,
+    ) -> impl Iterator<Item = SegmentRecord> + '_ {
+        self.confirmed
+            .range(start_offset..)
+            .filter_map(|start_offset| self.sealed.get(start_offset).copied())
+    }
+
+    /// The start offset of the last sealed segment whose hash a floor advance
+    /// matched.
+    pub(crate) fn last_confirmed(&self) -> Option<u64> {
+        self.confirmed
+            .iter()
+            .rev()
+            .find(|start_offset| self.sealed.contains_key(start_offset))
+            .copied()
+    }
+
+    /// The record of the sealed segment starting at `start_offset`, when a
+    /// floor advance matched its hash.
+    pub(crate) fn confirmed_record(&self, start_offset: u64) -> Option<SegmentRecord> {
+        self.sealed
+            .get(&start_offset)
+            .filter(|_| self.confirmed.contains(&start_offset))
+            .copied()
+    }
+
     /// The trim point retention appends before it unlinks the segment ending at
     /// `end_offset`, `None` when the chain already holds one at least as high.
     pub(crate) fn trim(&self, end_offset: u64) -> Option<ChainAppend> {
