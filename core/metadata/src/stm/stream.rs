@@ -90,8 +90,8 @@ use iggy_common::{
     HeaderKey, HeaderValue, IggyByteSize, IggyExpiry, IggyTimestamp, MaxTopicSize, NodeStats,
     NodeStatsSample, OptionKey, OptionValue, OptionsProvenance, OptionsScope,
     PartitionResizePolicy, PartitionStats, ResourceOptions, StreamStats, TopicCreateOptions,
-    TopicResolvedOptions, TopicStats, TopicType, WrapSet, public_options, stream_wrap_set,
-    validate_read_cache,
+    TopicResolvedOptions, TopicStats, TopicType, WrapSet, public_options, store_fixed_durability,
+    stream_wrap_set, validate_read_cache,
 };
 use serde::{Deserialize, Serialize};
 use server_common::sharding::{IggyNamespace, MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS};
@@ -560,9 +560,11 @@ impl Topic {
         }
     }
 
-    /// Replace the stored options and rebuild the typed view from them.
-    pub fn set_options(&mut self, options: ResourceOptions) {
-        self.resolved = TopicResolvedOptions::from(&options);
+    /// Replace the stored options and rebuild the typed view from them, with
+    /// the durability that the topic's mode fixes.
+    pub fn set_options(&mut self, mut options: ResourceOptions) {
+        self.resolved =
+            store_fixed_durability(&mut options, self.shadow.map(|shadow| shadow.geo_mode));
         self.options = options;
     }
 
@@ -3978,11 +3980,13 @@ pub(crate) fn create_topic(
         return ApplyReply::err(CreateTopicResult::StreamNotFound);
     };
 
+    let shadow = fixed.and_then(FixedTopic::shadow);
+    let resolved = store_fixed_durability(&mut options, shadow.map(|shadow| shadow.geo_mode));
     let topic = Topic {
         id: topic_id,
         name: name_arc.clone(),
         created_at: timestamp,
-        resolved: TopicResolvedOptions::from(&options),
+        resolved,
         options,
         stats: topic_stats,
         partitions: Vec::new(),
@@ -3992,7 +3996,7 @@ pub(crate) fn create_topic(
         next_consumer_group_id: 0,
         consumer_group_catalog_op: 0,
         created_op: state.apply_context.metadata_op,
-        shadow: fixed.and_then(FixedTopic::shadow),
+        shadow,
         recovered_from: fixed.and_then(FixedTopic::recovered_from),
     };
 
@@ -5285,12 +5289,17 @@ impl StreamsInner {
                 let topic_stats =
                     stats_registry.topic(slab_key, topic_slab_key, stream_stats.clone());
                 let topic_name: Arc<str> = Arc::from(topic_snap.name.as_str());
+                let mut options = topic_snap.options;
+                let resolved = store_fixed_durability(
+                    &mut options,
+                    topic_snap.shadow.map(|shadow| shadow.geo_mode),
+                );
                 let topic = Topic {
                     id: topic_snap.id,
                     name: topic_name.clone(),
                     created_at: topic_snap.created_at,
-                    resolved: TopicResolvedOptions::from(&topic_snap.options),
-                    options: topic_snap.options,
+                    resolved,
+                    options,
                     stats: topic_stats,
                     partitions: topic_snap
                         .partitions
@@ -5434,7 +5443,8 @@ pub(crate) mod tests {
     use iggy_common::{
         CompressionAlgorithm, DEFAULT_SEGMENT_SIZE, Durability, GeoMode, HeaderKey, HeaderKind,
         IggyError, OptionKey, OptionValue, OptionValueCodec, ServerKeyContext, StreamEncryptionKey,
-        StreamKeyOrigin, WrappedStreamKey, derived_defaults, topic_option_keys,
+        StreamKeyOrigin, TopicRuntimeOptions, WrappedStreamKey, derived_defaults,
+        project_shadow_topic, topic_option_keys,
     };
     use std::str::FromStr;
     use std::time::Duration;
@@ -6447,23 +6457,57 @@ pub(crate) mod tests {
         block
     }
 
-    /// The durability `topic_id` in stream 0 runs with, and its stored entry.
-    fn stored_durability(inner: &StreamsInner, topic_id: usize) -> (Durability, OptionValue) {
+    /// The durability `topic_id` in stream 0 runs with and its stored entry,
+    /// for its messages and for its consumer offsets.
+    fn stored_durability(inner: &StreamsInner, topic_id: usize) -> [(Durability, OptionValue); 2] {
         let topic = &inner.items[0].topics[topic_id];
-        let stored = topic
-            .options
-            .get(&HeaderKey::from(OptionKey::Durability))
-            .expect("a create stores the durability")
-            .clone();
-        (topic.resolved.runtime.durability, stored)
+        let runtime = topic.resolved.runtime;
+        let stored = |key: OptionKey| {
+            topic
+                .options
+                .get(&HeaderKey::from(key))
+                .expect("a create stores both durabilities")
+                .clone()
+        };
+        [
+            (runtime.durability, stored(OptionKey::Durability)),
+            (
+                runtime.consumer_offset_durability,
+                stored(OptionKey::ConsumerOffsetDurability),
+            ),
+        ]
     }
 
-    fn durability_entry(durability: Durability, explicit: bool) -> OptionValue {
-        let value = durability.encode().unwrap();
-        if explicit {
-            OptionValue::explicit(value)
-        } else {
-            OptionValue::derived(value)
+    /// What [`stored_durability`] returns for a topic that runs with
+    /// `durability` for its messages and its consumer offsets.
+    fn stored_entries(durability: Durability) -> [(Durability, OptionValue); 2] {
+        let entry = OptionValue::derived(durability.encode().unwrap());
+        [(durability, entry.clone()), (durability, entry)]
+    }
+
+    /// The durability that the partitions of `topic` run with, and the one
+    /// that a read of it reports, for its messages and its consumer offsets.
+    pub fn running_and_reported_durability(topic: &Topic) -> ([Durability; 2], [Durability; 2]) {
+        let running = TopicRuntimeOptions::from_resource_options(&topic.options);
+        let mut public = public_options(OptionsScope::Topic, &topic.options).unwrap();
+        if let Some(shadow) = topic.shadow {
+            project_shadow_topic(&mut public, shadow.geo_mode).unwrap();
+        }
+        let reported = TopicCreateOptions::from_resource_options(&public);
+        (
+            [running.durability, running.consumer_offset_durability],
+            [reported.durability, reported.consumer_offset_durability],
+        )
+    }
+
+    /// The options that a build which let a geo topic name its durability
+    /// stored for the topic: `replicated`, explicit, for both keys.
+    pub fn store_replicated_durability(options: &mut ResourceOptions) {
+        for key in Durability::KEYS {
+            options.insert(
+                HeaderKey::from(key),
+                OptionValue::explicit(Durability::Replicated.encode().unwrap()),
+            );
         }
     }
 
@@ -6485,34 +6529,20 @@ pub(crate) mod tests {
 
         assert_eq!(
             stored_durability(&inner, 0),
-            (
-                Durability::Persisted,
-                durability_entry(Durability::Persisted, false)
-            )
+            stored_entries(Durability::Persisted)
         );
         assert_eq!(
             stored_durability(&inner, 1),
-            (
-                Durability::Replicated,
-                durability_entry(Durability::Replicated, false)
-            )
+            stored_entries(Durability::Replicated)
         );
-        let offsets = HeaderKey::from(OptionKey::ConsumerOffsetDurability);
-        for topic in [0, 1] {
-            assert_eq!(
-                inner.items[0].topics[topic].options.get(&offsets),
-                Some(&durability_entry(Durability::Replicated, false)),
-                "only message durability depends on the topic type"
-            );
-        }
     }
 
-    /// Apply stores what the primary committed and recomputes nothing, so a
-    /// geo topic created before its mode fixed the durability keeps the one
-    /// it was created with through a replay.
+    /// A create that a primary committed before the topic's mode fixed the
+    /// durability names it explicitly, and a snapshot taken then stores it.
     #[test]
-    fn given_a_committed_geo_create_naming_a_durability_when_replaying_should_store_it_as_committed()
+    fn given_a_geo_topic_stored_with_replicated_offsets_when_replayed_or_restored_should_run_and_report_persisted()
      {
+        let persisted = [Durability::Persisted; 2];
         let mut inner = StreamsInner::new();
         create_stream(&mut inner, "stream");
         for (topic_id, consensus_group_id, durability) in [
@@ -6521,6 +6551,7 @@ pub(crate) mod tests {
         ] {
             let explicit = TopicCreateOptions {
                 durability,
+                consumer_offset_durability: durability,
                 ..geo_topic()
             };
             let name = format!("geo-{durability}");
@@ -6530,7 +6561,32 @@ pub(crate) mod tests {
             );
             assert_eq!(
                 stored_durability(&inner, topic_id),
-                (durability, durability_entry(durability, true))
+                stored_entries(Durability::Persisted),
+                "replayed {durability}"
+            );
+            assert_eq!(
+                running_and_reported_durability(&inner.items[0].topics[topic_id]),
+                (persisted, persisted),
+                "replayed {durability}"
+            );
+        }
+
+        let mut snapshot = Streams::from(inner).to_snapshot();
+        for (_, topic) in &mut snapshot.items[0].1.topics {
+            store_replicated_durability(&mut topic.options);
+        }
+        let restored = StreamsInner::inner_from_snapshot(snapshot, Arc::default());
+
+        for topic_id in [0, 1] {
+            assert_eq!(
+                stored_durability(&restored, topic_id),
+                stored_entries(Durability::Persisted),
+                "restored topic {topic_id}"
+            );
+            assert_eq!(
+                running_and_reported_durability(&restored.items[0].topics[topic_id]),
+                (persisted, persisted),
+                "restored topic {topic_id}"
             );
         }
     }
@@ -6563,10 +6619,6 @@ pub(crate) mod tests {
             OptionKey::MessageExpiry,
             IggyExpiry::from(9_000_000u64).encode().unwrap(),
         );
-        let replicated = explicit(
-            OptionKey::Durability,
-            Durability::Replicated.encode().unwrap(),
-        );
         // A geo topic's durations are the only options an update can change.
         let grace = explicit(
             OptionKey::TombstoneGrace,
@@ -6574,7 +6626,10 @@ pub(crate) mod tests {
         );
 
         assert_eq!(apply(&mut inner, &expiry), not_updatable);
-        assert_eq!(apply(&mut inner, &replicated), not_updatable);
+        for key in Durability::KEYS {
+            let replicated = explicit(key, Durability::Replicated.encode().unwrap());
+            assert_eq!(apply(&mut inner, &replicated), not_updatable, "{key}");
+        }
         assert_eq!(apply(&mut inner, &grace), 0);
         assert!(
             inner.items[0].topics[0]
@@ -6585,10 +6640,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             stored_durability(&inner, 0),
-            (
-                Durability::Persisted,
-                durability_entry(Durability::Persisted, false)
-            )
+            stored_entries(Durability::Persisted)
         );
     }
 

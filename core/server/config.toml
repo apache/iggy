@@ -1082,7 +1082,7 @@ change_log_activity_capacity = 16384
 # Topic durability and flush scheduling are set at creation and returned by GetTopic.
 # durability controls message completion. consumer_offset_durability controls explicit offset stores and deletes.
 # Both independently default to "replicated". Neither inherits the other.
-# A geo topic in the geo mode is always "persisted": its create's durability is ignored.
+# A geo topic in the geo mode is always "persisted" for both: its create's values for them are ignored.
 # Every disk-backed partition uses a WAL for recovery and retries.
 # WAL references retain segment bodies by hard link until reclamation.
 # Full message payloads count against wal_bytes_max under both durability policies.

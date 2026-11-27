@@ -1111,7 +1111,8 @@ fn adopt(
 }
 
 /// The create of the shadow topic of `object`, without the partition
-/// assignments that the metadata primary fills in.
+/// assignments that the metadata primary fills in. The metadata stores the
+/// durability that the origin's `geo_mode` fixes when it applies the create.
 fn adoption(stream_id: usize, object: &TopicObject) -> Option<CreateTopicWithAssignmentsRequest> {
     let options = TopicCreateOptions {
         compression_algorithm: Some(match object.compression {
@@ -2051,6 +2052,26 @@ mod tests {
 
         assert!(!runtime.places_batches);
         assert!(!runtime.geo_topic);
+    }
+
+    #[test]
+    fn given_the_shadow_of_a_topic_in_each_mode_when_deriving_its_runtime_options_should_run_the_durability_the_mode_fixes()
+     {
+        for (geo_mode, expected) in [
+            (TopicGeoMode::Geo, iggy_common::Durability::Persisted),
+            (TopicGeoMode::GeoTiered, iggy_common::Durability::Replicated),
+        ] {
+            let (inner, stream_id) = adopted_from(TopicObject {
+                geo_mode,
+                ..object(key(), "orders", 10)
+            });
+            let topic = &inner.items[stream_id as usize].topics[PEER_TOPIC_SLOT];
+
+            let runtime = iggy_common::TopicRuntimeOptions::from_resource_options(&topic.options);
+
+            assert_eq!(runtime.durability, expected, "{geo_mode:?}");
+            assert_eq!(runtime.consumer_offset_durability, expected, "{geo_mode:?}");
+        }
     }
 
     #[test]

@@ -25,7 +25,7 @@ use super::{
     MAX_PREALLOCATED_TOPIC_BYTES, MAX_REPLICATION_FACTOR, MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
     MAX_TOPIC_SEGMENT_SIZE, MIN_SEGMENT_MAX_AGE, MIN_TOPIC_SEGMENT_SIZE, OptionValue, OptionsScope,
     PartitionResizePolicy, READ_AHEAD_CACHE_SHARE, ResourceOptions, TOPIC_READ_AHEAD_MIN,
-    TOPIC_READ_CACHE_SIZE_MIN, TopicCreateOptions, TopicType, erase_options,
+    TOPIC_READ_CACHE_SIZE_MIN, TopicCreateOptions, TopicResolvedOptions, TopicType, erase_options,
 };
 use crate::http::users::defaults::{MAX_USERNAME_LENGTH, MIN_USERNAME_LENGTH};
 use crate::types::compression::compression_algorithm::CompressionAlgorithm;
@@ -910,8 +910,8 @@ pub fn descriptors_for(scope: OptionsScope) -> impl Iterator<Item = &'static Opt
 ///
 /// A geo topic's values differ from the catalog's: its partition count is
 /// `fixed`, it has the `geo` mode unless `explicit` names one, and its mode
-/// can fix its `durability`, which [`drop_options_fixed_by_type`] removed
-/// from `explicit`.
+/// can fix both of [`Durability::KEYS`], which [`drop_options_fixed_by_type`]
+/// removed from `explicit`.
 ///
 /// # Errors
 ///
@@ -941,7 +941,9 @@ pub fn derived_defaults(
         }
         let default = match descriptor.key {
             OptionKey::PartitionResizePolicy if geo => Some(PartitionResizePolicy::Fixed.encode()?),
-            OptionKey::Durability if fixed_durability.is_some() => fixed_durability.clone(),
+            key if fixed_durability.is_some() && Durability::KEYS.contains(&key) => {
+                fixed_durability.clone()
+            }
             OptionKey::GeoMode if geo => Some(GeoMode::Geo.encode()?),
             _ => descriptor.default_value()?,
         };
@@ -956,9 +958,10 @@ pub fn derived_defaults(
 /// and mode fix, so [`derived_defaults`] stores their fixed values as derived.
 /// Returns whether it removed any.
 ///
-/// A geo topic in the `geo` mode has no durability choice. Every client sends
-/// `durability` on a create, `replicated` unless told otherwise, so the key is
-/// ignored rather than refused.
+/// A geo topic in the `geo` mode has no durability choice, for its messages
+/// or its consumer offsets. Every client sends both keys on a create,
+/// `replicated` unless told otherwise, so they are ignored rather than
+/// refused.
 pub fn drop_options_fixed_by_type(explicit: &mut ResourceOptions) -> bool {
     if TopicCreateOptions::from_resource_options(explicit)
         .fixed_durability()
@@ -966,9 +969,42 @@ pub fn drop_options_fixed_by_type(explicit: &mut ResourceOptions) -> bool {
     {
         return false;
     }
-    explicit
-        .remove(&HeaderKey::from(OptionKey::Durability))
-        .is_some()
+    let mut dropped = false;
+    for key in Durability::KEYS {
+        dropped |= explicit.remove(&HeaderKey::from(key)).is_some();
+    }
+    dropped
+}
+
+/// Resolve a topic's stored options, after storing the durability that its
+/// mode fixes, if it fixes one, as the derived entry of each of
+/// [`Durability::KEYS`], which its partitions and every read of it take.
+///
+/// A topic created before its mode fixed them holds another value in a
+/// snapshot or in the log, so this runs whenever a topic's options are
+/// loaded, not only on a create. `shadow` is the mode of the peer's topic
+/// for a topic of a shadow stream, which is stored as a normal topic.
+#[must_use]
+pub fn store_fixed_durability(
+    options: &mut ResourceOptions,
+    shadow: Option<GeoMode>,
+) -> TopicResolvedOptions {
+    let mut resolved = TopicResolvedOptions::from(&*options);
+    let Some(durability) = shadow
+        .or(resolved.geo_mode)
+        .and_then(GeoMode::fixed_durability)
+    else {
+        return resolved;
+    };
+    for key in Durability::KEYS {
+        options.insert(
+            HeaderKey::from(key),
+            OptionValue::derived(HeaderValue::from(durability)),
+        );
+    }
+    resolved.runtime.durability = durability;
+    resolved.runtime.consumer_offset_durability = durability;
+    resolved
 }
 
 /// Validate and canonicalize a create or update options block.
@@ -1271,14 +1307,17 @@ pub fn project_shadow_origin(public: &mut ResourceOptions, origin: &str) -> Resu
 }
 
 /// Report a topic of a shadow stream as the geo topic it shadows, with the
-/// peer's `geo_mode` and the durability that mode fixes, as derived entries.
-/// The topic is stored as a normal topic, so this cluster runs none of a geo
-/// topic's write path for it.
+/// peer's `geo_mode`, as derived entries. The topic is stored as a normal
+/// topic, so this cluster runs none of a geo topic's write path for it.
+///
+/// The durability that the mode fixes is not added here: the stored options
+/// hold it (see [`store_fixed_durability`]), so a read reports the value the
+/// topic's partitions run with.
 ///
 /// # Errors
 ///
-/// `InvalidFormat` when a value does not encode, which no topic type, mode
-/// or durability does.
+/// `InvalidFormat` when a value does not encode, which no topic type or mode
+/// does.
 pub fn project_shadow_topic(
     public: &mut ResourceOptions,
     geo_mode: GeoMode,
@@ -1291,12 +1330,6 @@ pub fn project_shadow_topic(
         HeaderKey::from(OptionKey::GeoMode),
         OptionValue::derived(geo_mode.encode()?),
     );
-    if let Some(durability) = geo_mode.fixed_durability() {
-        public.insert(
-            HeaderKey::from(OptionKey::Durability),
-            OptionValue::derived(durability.encode()?),
-        );
-    }
     Ok(())
 }
 
@@ -1874,15 +1907,17 @@ mod tests {
     #[test]
     fn given_a_topic_without_durability_when_deriving_defaults_should_derive_what_its_type_and_mode_set()
      {
-        let durability = HeaderKey::from(OptionKey::Durability);
-        let offsets = HeaderKey::from(OptionKey::ConsumerOffsetDurability);
-
         for geo in [
             derived_for(&[(OptionKey::TopicType, "geo")]),
             derived_for(&[(OptionKey::TopicType, "geo"), (OptionKey::GeoMode, "geo")]),
         ] {
-            assert_eq!(geo.get(&durability).cloned(), derived_entry("persisted"));
-            assert_eq!(geo.get(&offsets).cloned(), derived_entry("replicated"));
+            for key in Durability::KEYS {
+                assert_eq!(
+                    geo.get(&HeaderKey::from(key)).cloned(),
+                    derived_entry("persisted"),
+                    "{key}"
+                );
+            }
         }
         let tiered = ResourceOptions::from([(
             HeaderKey::from(OptionKey::TieredStorage),
@@ -1903,10 +1938,34 @@ mod tests {
                 derived_defaults(OptionsScope::Topic, &tiered).unwrap(),
             ),
         ] {
+            for key in Durability::KEYS {
+                assert_eq!(
+                    derived.get(&HeaderKey::from(key)).cloned(),
+                    derived_entry("replicated"),
+                    "{case} {key}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn given_a_geo_create_naming_a_malformed_durability_when_admitted_should_refuse_it() {
+        for key in Durability::KEYS {
+            let entries = [
+                (OptionKey::TopicType, HeaderValue::try_from("geo").unwrap()),
+                (key, HeaderValue::try_from("fast").unwrap()),
+            ];
+            let result = admit(
+                OptionsScope::Topic,
+                OptionOperation::Create,
+                &block(&entries),
+                &[],
+                &OptionAdmissionContext::default(),
+            );
             assert_eq!(
-                derived.get(&durability).cloned(),
-                derived_entry("replicated"),
-                "{case}"
+                result.err(),
+                Some(IggyError::InvalidOptionValue(key.to_string())),
+                "{key}"
             );
         }
     }
@@ -1914,7 +1973,6 @@ mod tests {
     #[test]
     fn given_a_create_naming_a_durability_when_admitted_should_ignore_it_only_on_a_geo_topic_in_the_geo_mode()
      {
-        let durability = HeaderKey::from(OptionKey::Durability);
         let admitted = |entries: &[(OptionKey, &str)]| {
             let entries: Vec<(OptionKey, HeaderValue)> = entries
                 .iter()
@@ -1932,70 +1990,113 @@ mod tests {
         };
 
         for named in ["replicated", "persisted"] {
+            let durabilities = [
+                (OptionKey::Durability, named),
+                (OptionKey::ConsumerOffsetDurability, named),
+            ];
+            let with_durabilities = |entries: &[(OptionKey, &'static str)]| {
+                admitted(&[entries, &durabilities[..]].concat())
+            };
             for geo in [
-                admitted(&[
-                    (OptionKey::TopicType, "geo"),
-                    (OptionKey::Durability, named),
-                ]),
-                admitted(&[
-                    (OptionKey::TopicType, "geo"),
-                    (OptionKey::GeoMode, "geo"),
-                    (OptionKey::Durability, named),
-                ]),
+                with_durabilities(&[(OptionKey::TopicType, "geo")]),
+                with_durabilities(&[(OptionKey::TopicType, "geo"), (OptionKey::GeoMode, "geo")]),
             ] {
-                assert!(!geo.contains_key(&durability), "{named} is ignored");
-                assert_eq!(
-                    derived_defaults(OptionsScope::Topic, &geo)
-                        .unwrap()
-                        .get(&durability)
-                        .cloned(),
-                    derived_entry("persisted"),
-                    "{named}"
-                );
+                let derived = derived_defaults(OptionsScope::Topic, &geo).unwrap();
+                for key in Durability::KEYS {
+                    let key = HeaderKey::from(key);
+                    assert!(!geo.contains_key(&key), "{named} {key:?} is ignored");
+                    assert_eq!(
+                        derived.get(&key).cloned(),
+                        derived_entry("persisted"),
+                        "{named} {key:?}"
+                    );
+                }
             }
             for (case, kept) in [
                 (
                     "geo_tiered",
-                    admitted(&[
+                    with_durabilities(&[
                         (OptionKey::TopicType, "geo"),
                         (OptionKey::GeoMode, "geo_tiered"),
-                        (OptionKey::Durability, named),
                     ]),
                 ),
-                ("no type", admitted(&[(OptionKey::Durability, named)])),
+                ("no type", with_durabilities(&[])),
                 (
                     "normal",
-                    admitted(&[
-                        (OptionKey::TopicType, "normal"),
-                        (OptionKey::Durability, named),
-                    ]),
+                    with_durabilities(&[(OptionKey::TopicType, "normal")]),
                 ),
             ] {
-                assert_eq!(
-                    kept.get(&durability),
-                    Some(&OptionValue::explicit(
-                        HeaderValue::try_from(named).unwrap()
-                    )),
-                    "{case} keeps {named}"
-                );
+                for key in Durability::KEYS {
+                    assert_eq!(
+                        kept.get(&HeaderKey::from(key)),
+                        Some(&OptionValue::explicit(
+                            HeaderValue::try_from(named).unwrap()
+                        )),
+                        "{case} keeps {named} {key}"
+                    );
+                }
             }
         }
     }
 
     #[test]
-    fn given_a_shadow_topic_when_projected_should_report_the_durability_its_mode_fixes() {
-        let durability = HeaderKey::from(OptionKey::Durability);
-        let stored = ResourceOptions::from([(
-            durability.clone(),
-            OptionValue::explicit(HeaderValue::try_from("replicated").unwrap()),
-        )]);
+    fn given_stored_replicated_durabilities_when_storing_the_fixed_durability_should_replace_them_only_where_the_mode_fixes_them()
+     {
+        let stored = |entries: &[(OptionKey, &str)]| -> ResourceOptions {
+            entries
+                .iter()
+                .chain(&[
+                    (OptionKey::Durability, "replicated"),
+                    (OptionKey::ConsumerOffsetDurability, "replicated"),
+                ])
+                .map(|(key, value)| {
+                    (
+                        HeaderKey::from(*key),
+                        OptionValue::explicit(HeaderValue::try_from(*value).unwrap()),
+                    )
+                })
+                .collect()
+        };
+        let geo = stored(&[(OptionKey::TopicType, "geo")]);
+        let geo_tiered = stored(&[
+            (OptionKey::TopicType, "geo"),
+            (OptionKey::GeoMode, "geo_tiered"),
+        ]);
+        let normal = stored(&[]);
 
-        let mut geo = stored.clone();
-        project_shadow_topic(&mut geo, GeoMode::Geo).unwrap();
-        assert_eq!(geo.get(&durability).cloned(), derived_entry("persisted"));
-        let mut geo_tiered = stored.clone();
-        project_shadow_topic(&mut geo_tiered, GeoMode::GeoTiered).unwrap();
-        assert_eq!(geo_tiered.get(&durability), stored.get(&durability));
+        for (case, mut options, shadow, fixed) in [
+            ("geo", geo, None, true),
+            ("geo_tiered", geo_tiered, None, false),
+            ("normal", normal.clone(), None, false),
+            ("shadow of geo", normal.clone(), Some(GeoMode::Geo), true),
+            (
+                "shadow of geo_tiered",
+                normal,
+                Some(GeoMode::GeoTiered),
+                false,
+            ),
+        ] {
+            let before = options.clone();
+            let resolved = store_fixed_durability(&mut options, shadow);
+            assert_eq!(
+                resolved,
+                TopicResolvedOptions::from(&options),
+                "{case} resolves what it stores"
+            );
+            if let Some(geo_mode) = shadow {
+                // A read of a shadow topic reports what is stored.
+                project_shadow_topic(&mut options, geo_mode).unwrap();
+            }
+            for key in Durability::KEYS {
+                let key = HeaderKey::from(key);
+                let expected = if fixed {
+                    derived_entry("persisted")
+                } else {
+                    before.get(&key).cloned()
+                };
+                assert_eq!(options.get(&key).cloned(), expected, "{case} {key:?}");
+            }
+        }
     }
 
     #[test]

@@ -1112,6 +1112,7 @@ mod tests {
         UpdateTopicResult,
     };
     use crate::stm::snapshot::Snapshotable;
+    use crate::stm::stream::tests::{running_and_reported_durability, store_replicated_durability};
     use crate::stm::stream::{Streams, TruncatePartitionRequest};
     use iggy_binary_protocol::WireOptions;
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
@@ -1123,7 +1124,7 @@ mod tests {
         CreateStreamRequest, UpdateStreamResolvedRequest,
     };
     use iggy_binary_protocol::requests::topics::{CreateTopicRequest, UpdateTopicResolvedRequest};
-    use iggy_common::{IggyByteSize, IggyError, TopicReadCache};
+    use iggy_common::{Durability, IggyByteSize, IggyError, TopicCreateOptions, TopicReadCache};
 
     const PEER: &str = "dc-b";
     const PEER_CLUSTER: u128 = 0x0b0b_0b0b_0b0b_0b0b_0b0b_0b0b_0b0b_0b0b;
@@ -1528,6 +1529,64 @@ mod tests {
 
         assert_eq!(inner.revision, revision);
         assert_eq!(inner.items[stream_id as usize].topics.len(), 1);
+    }
+
+    /// An adoption that a build proposed before the peer's mode fixed the
+    /// durability names `replicated`, as every create does unless told
+    /// otherwise, and a snapshot taken then stores it.
+    #[test]
+    fn given_a_shadow_topic_stored_with_replicated_offsets_when_replayed_or_restored_should_run_and_report_its_modes_durability()
+     {
+        for (geo_mode, durability) in [
+            (GeoMode::Geo, Durability::Persisted),
+            (GeoMode::GeoTiered, Durability::Replicated),
+        ] {
+            let expected = ([durability; 2], [durability; 2]);
+            let mut inner = StreamsInner::new();
+            let create = ShadowTopicRequest::CreateStream {
+                source: source(),
+                name: name(SHADOW_NAME),
+            };
+            assert_eq!(apply(&mut inner, 1, &create).code, 0);
+            let stream_id = u32::try_from(inner.index[SHADOW_NAME]).unwrap();
+            let adopt = ShadowTopicRequest::AdoptTopic {
+                target: target(stream_id),
+                create: Box::new(CreateTopicWithAssignmentsRequest {
+                    request: CreateTopicRequest {
+                        stream_id: WireIdentifier::numeric(stream_id),
+                        partitions_count: 1,
+                        name: name("payments"),
+                        options: TopicCreateOptions::default().to_wire().unwrap(),
+                    },
+                    derived_options: WireOptions::empty(),
+                    partitions: assignments(1),
+                }),
+                retention: RETENTION,
+                geo_mode,
+            };
+            assert_eq!(apply(&mut inner, 2, &adopt).code, 0);
+
+            let replayed = &inner.items[stream_id as usize].topics[PEER_TOPIC as usize];
+            assert_eq!(
+                running_and_reported_durability(replayed),
+                expected,
+                "replayed {geo_mode:?}"
+            );
+
+            let mut snapshot = Streams::from(inner).to_snapshot();
+            for (_, stream) in &mut snapshot.items {
+                for (_, topic) in &mut stream.topics {
+                    store_replicated_durability(&mut topic.options);
+                }
+            }
+            let restored = StreamsInner::inner_from_snapshot(snapshot, Arc::default());
+            let restored = &restored.items[stream_id as usize].topics[PEER_TOPIC as usize];
+            assert_eq!(
+                running_and_reported_durability(restored),
+                expected,
+                "restored {geo_mode:?}"
+            );
+        }
     }
 
     #[test]

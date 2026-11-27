@@ -95,11 +95,17 @@ async fn given_a_geo_topic_in_a_peer_when_followed_should_adopt_it_refuse_writes
     assert_eq!(resolved.topic_type, TopicType::Geo);
     assert_eq!(resolved.geo_mode, Some(GeoMode::Geo));
     assert_eq!(resolved.runtime.durability, Durability::Persisted);
-    let durability = topic
-        .options
-        .get(&HeaderKey::from(OptionKey::Durability))
-        .expect("the shadow reports a durability");
-    assert!(!durability.explicit, "the peer's geo mode set it");
+    assert_eq!(
+        resolved.runtime.consumer_offset_durability,
+        Durability::Persisted
+    );
+    for key in [OptionKey::Durability, OptionKey::ConsumerOffsetDurability] {
+        let durability = topic
+            .options
+            .get(&HeaderKey::from(key))
+            .expect("the shadow reports both durabilities");
+        assert!(!durability.explicit, "the peer's geo mode set {key}");
+    }
     assert_eq!(shadow.shadow_origin().as_deref(), Some("dc-a"));
     let origins: Vec<(String, Option<String>)> = follower
         .get_streams()

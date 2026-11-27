@@ -8972,8 +8972,8 @@ mod tests {
             derived_options: WireOptions::empty(),
             partitions: Vec::new(),
         };
-        let durability = HeaderKey::from(OptionKey::Durability);
         let replicated = OptionValue::explicit(Durability::Replicated.encode().unwrap());
+        let persisted = OptionValue::derived(Durability::Persisted.encode().unwrap());
 
         let mut restored = create(&TopicCreateOptions {
             topic_type: Some(TopicType::Geo),
@@ -8983,19 +8983,20 @@ mod tests {
         metadata.assign_shadow_partitions(&mut restored).unwrap();
         let explicit = resource_options_from_wire(&restored.request.options, true).unwrap();
         let derived = resource_options_from_wire(&restored.derived_options, false).unwrap();
-        assert!(!explicit.contains_key(&durability));
-        assert_eq!(
-            derived.get(&durability),
-            Some(&OptionValue::derived(
-                Durability::Persisted.encode().unwrap()
-            ))
-        );
+        for key in Durability::KEYS {
+            let key = HeaderKey::from(key);
+            assert!(!explicit.contains_key(&key), "{key:?}");
+            assert_eq!(derived.get(&key), Some(&persisted), "{key:?}");
+        }
 
         // A shadow adoption is stored as a normal topic and keeps its block.
         let mut adopted = create(&TopicCreateOptions::default());
         metadata.assign_shadow_partitions(&mut adopted).unwrap();
         let explicit = resource_options_from_wire(&adopted.request.options, true).unwrap();
-        assert_eq!(explicit.get(&durability), Some(&replicated));
+        for key in Durability::KEYS {
+            let key = HeaderKey::from(key);
+            assert_eq!(explicit.get(&key), Some(&replicated), "{key:?}");
+        }
     }
 
     #[test]
@@ -9747,7 +9748,6 @@ mod tests {
     #[test]
     fn given_a_geo_topic_naming_a_durability_when_preparing_should_ignore_it_and_derive_persisted()
     {
-        let durability = HeaderKey::from(OptionKey::Durability);
         for named in [Durability::Replicated, Durability::Persisted] {
             let plane = metadata_plane();
             plane.observe_tiered_storage_readiness(true);
@@ -9756,6 +9756,7 @@ mod tests {
                 &iggy_common::TopicCreateOptions {
                     topic_type: Some(TopicType::Geo),
                     durability: named,
+                    consumer_offset_durability: named,
                     ..Default::default()
                 },
             )
@@ -9764,27 +9765,33 @@ mod tests {
                 .expect("explicit block decodes");
             let derived = resource_options_from_wire(&persisted.derived_options, false)
                 .expect("derived block decodes");
-            assert!(!explicit.contains_key(&durability), "{named} is ignored");
-            assert_eq!(
-                derived.get(&durability),
-                Some(&OptionValue::derived(
-                    Durability::Persisted.encode().unwrap()
-                )),
-                "{named}"
-            );
+            for key in Durability::KEYS {
+                let key = HeaderKey::from(key);
+                assert!(!explicit.contains_key(&key), "{named} {key:?} is ignored");
+                assert_eq!(
+                    derived.get(&key),
+                    Some(&OptionValue::derived(
+                        Durability::Persisted.encode().unwrap()
+                    )),
+                    "{named} {key:?}"
+                );
+            }
         }
 
         let normal = prepare_topic_with(&iggy_common::TopicCreateOptions::default())
             .expect("a normal topic is admitted");
         let explicit = resource_options_from_wire(&normal.request.options, true)
             .expect("explicit block decodes");
-        assert_eq!(
-            explicit.get(&durability),
-            Some(&OptionValue::explicit(
-                Durability::Replicated.encode().unwrap()
-            )),
-            "a normal topic keeps the durability it names"
-        );
+        for key in Durability::KEYS {
+            let key = HeaderKey::from(key);
+            assert_eq!(
+                explicit.get(&key),
+                Some(&OptionValue::explicit(
+                    Durability::Replicated.encode().unwrap()
+                )),
+                "a normal topic keeps the {key:?} it names"
+            );
+        }
     }
 
     #[test]

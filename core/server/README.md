@@ -372,7 +372,8 @@ write to settle. Waiters acquire the in-flight permit after the partition gate,
 so they do not consume the session's budget for other partitions.
 
 Durability defaults remain `Replicated`. A geo topic in the `geo` mode has no
-choice: it is always `Persisted`, and the option is ignored on create. See
+choice: its messages and consumer offsets are always `Persisted`, and both
+options are ignored on create. See
 [geo topics](docs/GEO_TOPICS.md#create-a-geo-topic).
 Ordinary SDK sends and explicit offset writes support the configured policy.
 Crash-safe send retries require `Persisted`; crash-safe explicit offset retries
