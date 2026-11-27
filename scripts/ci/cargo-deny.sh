@@ -29,17 +29,22 @@ if ! command -v cargo-deny >/dev/null 2>&1; then
   exit 1
 fi
 
-case "${1:-policy}" in
+mode=${1:-policy}
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+
+case "$mode" in
   policy)
     echo "Running blocking cargo-deny policy checks..."
-    cargo deny check licenses bans sources
+    cargo deny --all-features --locked "$@" check licenses bans sources
     ;;
   advisories)
     echo "Running cargo-deny advisory checks..."
-    cargo deny check advisories
+    cargo deny --all-features --locked "$@" check advisories
     ;;
   *)
-    echo "Usage: $0 [policy|advisories]" >&2
+    echo "Usage: $0 [policy|advisories] [cargo-deny options]" >&2
     exit 2
     ;;
 esac

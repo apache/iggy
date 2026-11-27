@@ -77,7 +77,8 @@ runs:
         save-cache: ${{ inputs.save-cache }}
         # Artifact builders do not pull test containers. Test shards have ~78 GB
         # free when tests start and use ~15 GB, so the cleanup costs minutes.
-        free-disk-space: ${{ (inputs.task == 'runtime' || inputs.task == 'test-build' || inputs.task == 'test' || startsWith(inputs.task, 'miri') || inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'clippy' || inputs.task == 'check' || inputs.task == 'check-msrv' || inputs.task == 'machete' || inputs.task == 'deny' || inputs.task == 'doctest' || inputs.task == 'build-web-ui')
+        free-disk-space: ${{ (inputs.task == 'runtime' || inputs.task == 'test-build' || inputs.task == 'test' || startsWith(inputs.task, 'miri') || inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'clippy' || inputs.task == 'check' || inputs.task == 'check-msrv' || inputs.task == 'machete' || inputs.task == 'deny' || inputs.task == 'doctest' || inputs.task == 'build-web-ui') && 'false' || 'true' }}
+
     - name: Install cargo-sort
       if: inputs.task == 'sort'
       shell: bash
@@ -103,7 +104,7 @@ runs:
       uses: taiki-e/install-action@v2
       with:
         tool: cargo-deny
-        
+
     # dx is not in taiki-e/install-action's manifests, so the script fetches
     # the pinned Dioxus release, like the cargo-sort step above. It also pins
     # the wasm-bindgen, wasm-opt and esbuild that dx bundle would download.

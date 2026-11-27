@@ -53,8 +53,11 @@ jobs:
         shell: bash
         run: |
           status=0
-          ./scripts/ci/cargo-deny.sh advisories 2>&1 | tee advisory-output.log || status=$?
-          advisory_ids=$(grep -oE 'RUSTSEC-[0-9]{4}-[0-9]+' advisory-output.log | sort -u | paste -sd ',' - | sed 's/,/, /g' || true)
+          ./scripts/ci/cargo-deny.sh advisories --format json 2>&1 | tee advisory-output.log || status=$?
+          advisory_ids=$(jq -Rnr '
+            [inputs | fromjson? | select(.type == "diagnostic" and .fields.severity == "error")
+              | .fields.advisory.id | strings] | unique | join(", ")
+          ' advisory-output.log)
           echo "advisory_ids=$advisory_ids" >> "$GITHUB_OUTPUT"
           exit "$status"
 
