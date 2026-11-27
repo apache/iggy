@@ -50,6 +50,10 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Iggy_SDK.Examples.MultiTena
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Iggy_SDK.Examples.MultiTenant.Consumer", "src\MultiTenant\Iggy_SDK.Examples.MultiTenant.Consumer\Iggy_SDK.Examples.MultiTenant.Consumer.csproj", "{03AC8460-E28D-4A41-A16B-4048255D3385}"
 EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "SinkDataProducer", "SinkDataProducer", "{06DA210C-35BB-4C29-B3B4-68BC9D7EA34E}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Iggy_SDK.Examples.SinkDataProducer.Producer", "src\SinkDataProducer\Iggy_SDK.Examples.SinkDataProducer.Producer\Iggy_SDK.Examples.SinkDataProducer.Producer.csproj", "{69A3122C-9395-47C9-82A5-096D16477F98}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -123,6 +127,10 @@ Global
 		{03AC8460-E28D-4A41-A16B-4048255D3385}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{03AC8460-E28D-4A41-A16B-4048255D3385}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{03AC8460-E28D-4A41-A16B-4048255D3385}.Release|Any CPU.Build.0 = Release|Any CPU
+		{69A3122C-9395-47C9-82A5-096D16477F98}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{69A3122C-9395-47C9-82A5-096D16477F98}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{69A3122C-9395-47C9-82A5-096D16477F98}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{69A3122C-9395-47C9-82A5-096D16477F98}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(NestedProjects) = preSolution
 		{6CA0C169-109F-4A43-A21F-0792C1F865C8} = {3576C181-8BD5-4845-9CDA-835B33A29A29}
@@ -147,6 +155,8 @@ Global
 		{E60CFC3B-B539-425F-8DF0-785ADD2E8F55} = {3576C181-8BD5-4845-9CDA-835B33A29A29}
 		{A29FE365-F20E-4C47-A960-58FE482F90D8} = {E60CFC3B-B539-425F-8DF0-785ADD2E8F55}
 		{03AC8460-E28D-4A41-A16B-4048255D3385} = {E60CFC3B-B539-425F-8DF0-785ADD2E8F55}
+		{06DA210C-35BB-4C29-B3B4-68BC9D7EA34E} = {3576C181-8BD5-4845-9CDA-835B33A29A29}
+		{69A3122C-9395-47C9-82A5-096D16477F98} = {06DA210C-35BB-4C29-B3B4-68BC9D7EA34E}
 	EndGlobalSection
 EndGlobal
 
