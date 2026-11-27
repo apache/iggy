@@ -24,6 +24,16 @@ components:
       - "rust-toolchain.toml"
       - ".cargo/**"
 
+  # Dependency policy applies across the workspace, including optional features.
+  rust-deny:
+    paths:
+      - "**/Cargo.toml"
+      - "!foreign/**"
+      - "Cargo.lock"
+      - "deny.toml"
+      - "scripts/ci/cargo-deny.sh"
+    tasks: ["deny"]
+
   # crates.io publish chain verification. Runs scripts/verify-crates-publish.sh,
   # which spins up cargo-http-registry as a local alt-registry and chain-publishes
   # the four crates we ship to crates.io. Catches the class of bug that broke

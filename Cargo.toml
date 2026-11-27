@@ -65,7 +65,16 @@ warnings = "deny"
 [workspace.dependencies]
 actix-cors = "0.7.2"
 actix-files = "0.7.3"
-actix-web = "4.18.1"
+actix-web = { version = "4.18.1", default-features = false, features = [
+    "macros",
+    "cookies",
+    "ws",
+    "unicode",
+    "compat",
+    "compress-brotli",
+    "compress-gzip",
+    "compress-zstd",
+] }
 aes-gcm = { version = "0.11.1", features = ["zeroize"] }
 aes-gcm-siv = { version = "0.12.1", features = ["zeroize"] }
 ahash = { version = "0.8.12", features = ["serde"] }

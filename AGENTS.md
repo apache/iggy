@@ -173,6 +173,7 @@ for target preparation and client-specific agent tools. Run
 | --------------------------------------------- | ------------------------------------------- |
 | `cargo fmt`, `cargo sort`, `cargo clippy`     | pre-commit + CI                             |
 | `cargo machete`                               | CI `machete` task                           |
+| `cargo deny`                                  | pre-push + CI `deny` task                   |
 | `cargo nextest` + `cargo-rail`                | CI `test-*` DAG-scoped                      |
 | `cargo llvm-cov`                              | CI coverage                                 |
 | `cargo http-registry`                         | CI `verify-publish`                         |
