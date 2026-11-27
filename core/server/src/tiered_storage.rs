@@ -42,8 +42,8 @@ use iggy_object_store::{
 use message_bus::IggyMessageBus;
 use partitions::{
     ExecutorDeleter, ExecutorFreshSweeper, ExecutorFreshUploader, ExecutorLongTermMerger,
-    ExecutorLongTermWriter, ExecutorManifestPublisher, ExecutorTopicObjects, ExecutorUploader,
-    ReadCache, ReadCacheSettings, RemoteSegments,
+    ExecutorLongTermWriter, ExecutorManifestPublisher, ExecutorStoreViewReader,
+    ExecutorTopicObjects, ExecutorUploader, ReadCache, ReadCacheSettings, RemoteSegments,
 };
 use shard::tier_service::{ClassLimits, StoreCallPolicy, TierService, TierServiceConfig};
 use shard::{Sender, channel};
@@ -308,7 +308,8 @@ pub fn start(
         Rc::new(ExecutorLongTermWriter::new(service.clone(), layout.clone())),
         Rc::new(ExecutorLongTermMerger::new(service.clone(), layout.clone())),
         Rc::new(ExecutorFreshSweeper::new(service.clone(), layout.clone())),
-        Rc::new(ExecutorTopicObjects::new(service, layout.clone())),
+        Rc::new(ExecutorTopicObjects::new(service.clone(), layout.clone())),
+        Rc::new(ExecutorStoreViewReader::new(service, layout.clone())),
     );
     // The check gets a store of its own, outside the service, so no queued
     // job and no retry delays what it finds.

@@ -28,11 +28,13 @@
 //! recovery panic). This module is that writer's matching loader, kept in the
 //! same crate and reading the same 24-byte format it emits.
 
+use crate::chain_rebuild::{ChainLost, ChainLostReason};
 use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::segment::SegmentLocation;
 use crate::segment_anchor::ANCHOR_EXTENSION;
 use crate::segment_chain::{
-    Chain, ChainError, ChainRecord, ObjectPrefix, SegmentRecord, read_chain, truncate_chain,
+    Chain, ChainError, ChainRecord, ObjectPrefix, SegmentRecord, chain_path, read_chain,
+    truncate_chain,
 };
 use crate::state_transfer::{STAGING_SUFFIX, segment_dir_entries};
 use crate::{IggyIndex, IggyIndexReader, PartitionsConfig, Segment};
@@ -46,7 +48,7 @@ use server_common::fs_utils::truncate_file;
 use server_common::send_messages::{BatchHeader, COMMAND_HEADER_SIZE, decode_batch_slice};
 use server_common::sharding::IggyNamespace;
 use server_common::{DISK_USAGE, SegmentStorage, yield_to_reactor};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use tracing::{debug, error, info, warn};
@@ -313,6 +315,24 @@ pub enum PartitionRecoveryRefusal {
     /// The chain starts above the trim point: a front this replica's own
     /// retention never removed is gone.
     FrontAboveTrimPoint { first_start: u64, trim_point: u64 },
+    /// The chain file of a tiered partition is gone, and the offsets from
+    /// `from` to `to` below the local front are accounted for neither on
+    /// disk nor in the store.
+    ChainLost {
+        from: u64,
+        to: u64,
+        reason: ChainLostReason,
+    },
+}
+
+impl From<ChainLost> for PartitionRecoveryRefusal {
+    fn from(lost: ChainLost) -> Self {
+        Self::ChainLost {
+            from: lost.from,
+            to: lost.to,
+            reason: lost.reason,
+        }
+    }
 }
 
 impl std::fmt::Display for PartitionRecoveryRefusal {
@@ -496,6 +516,20 @@ impl std::fmt::Display for PartitionRecoveryRefusal {
                 "the chain starts at {first_start}, above trim point {trim_point}, so \
                  a front this replica never removed is gone"
             ),
+            Self::ChainLost {
+                from,
+                reason: reason @ ChainLostReason::NoLocalLog,
+                ..
+            } => write!(
+                f,
+                "the segment chain is gone and {reason}, so the offsets from {from} on are not \
+                 accounted for"
+            ),
+            Self::ChainLost { from, to, reason } => write!(
+                f,
+                "the segment chain is gone and the offsets {from} to {to} below the local log \
+                 are not accounted for: {reason}"
+            ),
         }
     }
 }
@@ -647,6 +681,10 @@ pub struct RecoveredLog {
     pub segments: Vec<RecoveredSegment>,
     /// The partition's `remote.chain`, `None` when it keeps none.
     pub chain: Option<Chain>,
+    /// The start offsets of the `.index` and `.anchor` files below the first
+    /// `.log` that [`load_tiered_segments`] kept without a `.log`, because no
+    /// chain names their segments. Empty from every other loader.
+    pub stems_without_log: Vec<u64>,
 }
 
 /// Loads every persisted segment for a partition, sorted by start offset.
@@ -734,9 +772,85 @@ pub async fn load_persisted_segments_with_checkpoint(
         durable_segments,
         stats,
         checkpoint,
-        false,
+        SegmentFiles::Logs,
     )
     .await
+}
+
+/// [`load_persisted_segments_with_checkpoint`] for a partition of a tiered
+/// topic.
+///
+/// Without a chain, the `.index` and `.anchor` files below the first `.log`
+/// stay on disk, and their start offsets come back in
+/// [`RecoveredLog::stems_without_log`]: an eviction keeps exactly those
+/// files, so they are the only local trace of a front that left the disk.
+/// With no `.log` at all, every one of them stays.
+///
+/// # Errors
+///
+/// As [`load_persisted_segments_with_checkpoint`].
+pub async fn load_tiered_segments(
+    config: &PartitionsConfig,
+    namespace: IggyNamespace,
+    segment_size: IggyByteSize,
+    durable_segments: bool,
+    stats: &PartitionStats,
+    checkpoint: Option<journal::partition_journal::SegmentPosition>,
+) -> Result<RecoveredLog, PartitionRecoveryError> {
+    load_segments(
+        config,
+        namespace,
+        segment_size,
+        durable_segments,
+        stats,
+        checkpoint,
+        SegmentFiles::TieredLogs,
+    )
+    .await
+}
+
+/// Whether the directory of the partition `namespace` holds neither a
+/// `remote.chain` nor any segment `.log`. A missing directory holds neither.
+///
+/// Opening the prepare WAL recreates the `.log` of the segment its frontier
+/// ends in, so only a check made before it tells a partition that kept a log
+/// from one that lost every one.
+///
+/// # Errors
+///
+/// A stat or a listing that failed for another reason than a missing file.
+pub async fn holds_neither_chain_nor_log(
+    config: &PartitionsConfig,
+    namespace: IggyNamespace,
+) -> Result<bool, PartitionRecoveryError> {
+    let partition_path = config.get_partition_path(
+        namespace.stream_id(),
+        namespace.topic_id(),
+        namespace.partition_id(),
+    );
+    match fs::metadata(chain_path(&partition_path)).await {
+        Ok(_) => return Ok(false),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            error!(partition_path, error = %source, "failed to stat the segment chain during recovery");
+            return Err(IggyError::CannotReadFileMetadata.into());
+        }
+    }
+    let entries = match segment_dir_entries(&partition_path).await {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(source) => {
+            error!(partition_path, error = %source, "failed to list the partition directory during recovery");
+            return Err(IggyError::CannotReadPartitions.into());
+        }
+    };
+    Ok(!entries.iter().any(|path| {
+        path.extension().and_then(|extension| extension.to_str()) == Some(LOG_EXTENSION)
+            && path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| stem.parse::<u64>().is_ok())
+    }))
 }
 
 /// [`load_persisted_segments_with_checkpoint`] for a partition that places
@@ -765,9 +879,22 @@ pub async fn load_placed_segments(
         false,
         stats,
         checkpoint,
-        true,
+        SegmentFiles::PlacedBatches,
     )
     .await
+}
+
+/// What the segment files of a partition hold, which decides how boot reads
+/// them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SegmentFiles {
+    /// Messages.
+    Logs,
+    /// Messages of a partition whose evicted segments leave their `.index`
+    /// and `.anchor` behind.
+    TieredLogs,
+    /// Placed batches.
+    PlacedBatches,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -778,8 +905,9 @@ async fn load_segments(
     durable_segments: bool,
     stats: &PartitionStats,
     checkpoint: Option<journal::partition_journal::SegmentPosition>,
-    placed: bool,
+    files: SegmentFiles,
 ) -> Result<RecoveredLog, PartitionRecoveryError> {
+    let placed = files == SegmentFiles::PlacedBatches;
     let stream_id = namespace.stream_id();
     let topic_id = namespace.topic_id();
     let partition_id = namespace.partition_id();
@@ -794,13 +922,16 @@ async fn load_segments(
     // every segment whose `.log` left the disk.
     let mut chain = read_partition_chain(identity).await?;
     let remote = chain.as_ref().map_or_default(remote_segments);
+    let keep_front_stems = files == SegmentFiles::TieredLogs && chain.is_none();
     // ONE directory walk feeds both: the sweep only ever unlinks `.staging` and
     // orphan `.index` files, never a `.log`, so the log stems it already
     // collects ARE the post-sweep start-offset set. Note the error policy is
     // the collect side's (NotFound => empty, anything else => refuse boot); the
     // sweep's silent return would swallow an EACCES that must not be ignored.
-    let mut start_offsets =
-        sweep_scratch_files_and_collect_offsets(&partition_path, &remote).await?;
+    let SweptDirectory {
+        mut start_offsets,
+        stems_without_log,
+    } = sweep_scratch_files_and_collect_offsets(&partition_path, &remote, keep_front_stems).await?;
     start_offsets.sort_unstable();
     let tiered = tiered_prefix(identity, &remote, &start_offsets, checkpoint)?;
     if let Some(checkpoint) = checkpoint {
@@ -1101,6 +1232,7 @@ async fn load_segments(
     Ok(RecoveredLog {
         segments: recovered,
         chain,
+        stems_without_log,
     })
 }
 
@@ -1532,10 +1664,15 @@ async fn ensure_contiguous_chain(
 /// Sweeps boot-time scratch (`.staging` spill, orphan `.index`) and returns the
 /// start offset parsed out of every remaining zero-padded `.log` file name. A
 /// missing directory means a never-persisted partition.
+///
+/// With `keep_front_stems`, an orphan below the first `.log`, or any orphan
+/// when there is no `.log`, stays, and its start offset comes back beside
+/// them: without a chain it is the only trace of an evicted segment.
 async fn sweep_scratch_files_and_collect_offsets(
     partition_path: &str,
     remote: &BTreeMap<u64, SegmentRecord>,
-) -> Result<Vec<u64>, PartitionRecoveryError> {
+    keep_front_stems: bool,
+) -> Result<SweptDirectory, PartitionRecoveryError> {
     // The recovery opens are read-only, but a failed one fails the partition
     // load, which stops the server at boot, so they count like write opens.
     let entries = match segment_dir_entries(partition_path)
@@ -1543,7 +1680,9 @@ async fn sweep_scratch_files_and_collect_offsets(
         .note_descriptor_exhaustion(|| format!("listing directory {partition_path}"))
     {
         Ok(entries) => entries,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SweptDirectory::default());
+        }
         Err(source) => {
             error!(
                 partition_path,
@@ -1582,17 +1721,24 @@ async fn sweep_scratch_files_and_collect_offsets(
             _ => {}
         }
     }
+    let first_log = start_offsets.iter().min().copied();
+    let mut stems_without_log = BTreeSet::new();
     // A remote segment keeps its `.index` and `.anchor` without a `.log`.
     swept.extend(orphan_candidates.into_iter().filter(|path| {
-        !path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .is_some_and(|stem| {
-                log_stems.contains(stem)
-                    || stem
-                        .parse::<u64>()
-                        .is_ok_and(|start_offset| remote.contains_key(&start_offset))
-            })
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            return true;
+        };
+        if log_stems.contains(stem) {
+            return false;
+        }
+        let Ok(start_offset) = stem.parse::<u64>() else {
+            return true;
+        };
+        if keep_front_stems && first_log.is_none_or(|first_log| start_offset < first_log) {
+            stems_without_log.insert(start_offset);
+            return false;
+        }
+        !remote.contains_key(&start_offset)
     }));
     for path in swept {
         if let Err(error) = fs::remove_file(&path).await {
@@ -1604,7 +1750,19 @@ async fn sweep_scratch_files_and_collect_offsets(
             );
         }
     }
-    Ok(start_offsets)
+    Ok(SweptDirectory {
+        start_offsets,
+        stems_without_log: stems_without_log.into_iter().collect(),
+    })
+}
+
+/// What the boot sweep leaves of a partition directory.
+#[derive(Default)]
+struct SweptDirectory {
+    /// The start offset of every `.log`.
+    start_offsets: Vec<u64>,
+    /// The start offsets of the orphans it kept, ascending.
+    stems_without_log: Vec<u64>,
 }
 
 /// Byte length of a segment file, a missing file reading as empty.

@@ -578,9 +578,57 @@ partition. Such a reader takes only the segments that the manifest lists. Any
 other object under the partition's prefix can belong to an upload that never
 committed, or to a segment that retention removed. The partition's primary
 writes it on each run of the message cleaner, when a segment was uploaded or
-removed since the last one. The cluster never reads its own manifests back.
-The objects of a removed segment are deleted only once the manifest no longer
-lists it.
+removed since the last one. The cluster reads its own manifests back only to
+check a chain file it rebuilds, as the next paragraphs describe, and never
+takes a segment from one. The objects of a removed segment are deleted only
+once the manifest no longer lists it.
+
+Each replica of a partition of a tiered topic records its segments in the file
+`remote.chain` in the partition's directory, which is the only local record of
+the segments whose `.log` left the disk. A node that finds no chain file for
+such a partition, when the directory held its history before, decides from
+what is left on disk:
+
+- No segment `.log` is left: the node refuses the partition. The store holds
+  only the segments that were uploaded, never everything that was
+  acknowledged, so it never stands in for a lost log.
+- The first `.log` starts at the first offset that retention kept, so nothing
+  can be missing: the partition starts a new chain, as when a topic turns
+  tiering on.
+- The first `.log` starts later, and the partition has no tiered floor and no
+  `.index` or `.anchor` left below it, so nothing left the disk: retention
+  that ran before tiering took effect commits no truncation and leaves such a
+  front. The partition starts a new chain that records that front.
+- Otherwise the node rebuilds the chain from the store before the partition
+  serves. It lists the partition's objects, reads the metadata of each segment
+  from the first offset retention kept up to the first local `.log`, and
+  follows each segment to the next one. Every segment it takes must start where
+  the one before it ended, or past a gap that a local `.anchor` names, end at or
+  below the tiered floor and below the first local `.log` and the segment the
+  WAL checkpoint names, hold bytes, have an index, and agree with the manifest
+  when the manifest lists it. The manifest is only a check: it can trail the
+  store by a minute, so a segment it does not list yet is taken from the
+  store. The trim point of the rebuilt chain is the truncation that metadata
+  committed, so the rebuild drives no truncation and no delete. When
+  retention removed the segment before a gap that an `.anchor` names, the walk
+  starts past the gap, and the trim point is the offset before it.
+
+The rebuild waits until the node passes the store identity check, and costs
+one listing of the partition's objects, one HEAD of each segment it reads,
+several at a time, and one read of at most the first 16 MiB of the manifest.
+The reads run in the background, at most two partitions at a time on a shard,
+as jobs of the demand fetch class, and the 16 MiB are held only while the
+manifest is read. A failed HEAD of a segment the walk takes, or a store that
+does not answer, makes the partition wait and read again later. A manifest
+larger than 16 MiB is not decoded, and the rebuild goes on without checking
+against it. A deletion of the topic does not wait for the store: a partition
+that waits for it is retired like one recovery refused. A range of offsets
+below the first local `.log` that the store does not account for refuses the
+partition, and the log names it. A partition with one replica then stays down
+with its files as they were and no new chain file. A replicated one sets its
+files aside and rejoins by state transfer. Each shard exports
+`partition_chain_rebuilds_total`, `partition_chain_rebuild_refusals_total` and
+`partitions_awaiting_chain_rebuild`, the partitions that wait for the store.
 
 The `fs` backend keeps the objects in a directory. The `s3` backend keeps them
 in a bucket on AWS S3 or on a store with its API, such as Ceph RGW or R2. With

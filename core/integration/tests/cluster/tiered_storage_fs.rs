@@ -260,6 +260,120 @@ async fn given_stored_segments_kept_on_the_primary_when_a_member_rebuilds_its_pa
     assert_lacks_stored_segments(&harness, rebuilt, &stored, "after it served them");
 }
 
+/// A member that lost the chain file of a partition whose front left its
+/// disk gets the front back, from the store or by a state transfer, and
+/// serves every message once it leads the partition.
+#[tokio::test]
+async fn given_a_member_that_lost_its_chain_file_when_it_returns_should_serve_every_message_once_it_leads()
+ {
+    let store = tempfile::tempdir().expect("a directory for the object store");
+    let mut harness = cluster_with_fs_store(store.path());
+    harness.start().await.expect("the cluster boots");
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+    let stream = Identifier::named(STREAM).expect("stream identifier");
+    let topic = Identifier::named(TOPIC).expect("topic identifier");
+    client
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .expect("create stream");
+    create_tiered_topic(&client, &stream).await;
+    send_every_message(&client, &stream, &topic).await;
+    wait_for_eviction_on_every_node(&harness, store.path()).await;
+    let primary = usize::from(
+        partition_primary(&client, &stream, &topic, PARTITION_ID)
+            .await
+            .expect("route the partition"),
+    );
+    // Views go round the nodes in order, so the survivors elect this member
+    // once the primary stops.
+    let member = (primary + 1) % NODES;
+
+    harness.stop_node(member).expect("stop the member");
+    let chain = walk(&harness.node(member).data_path(), &mut |path| {
+        path.file_name().is_some_and(|name| name == "remote.chain")
+    })
+    .expect("the member keeps a chain file");
+    std::fs::remove_file(&chain).expect("delete the chain file of the member");
+    harness.start_node(member).expect("restart the member");
+    let session = HttpClient::login_root_no_redirect(node_url(&harness, member)).await;
+    let deadline = Instant::now() + ELECTION_DEADLINE;
+    let (rebuilds, refusals) = loop {
+        let outcome = (
+            summed_metric(&session, "partition_chain_rebuilds_total").await,
+            summed_metric(&session, "partition_chain_rebuild_refusals_total").await,
+        );
+        if outcome != (0, 0) {
+            break outcome;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "within {ELECTION_DEADLINE:?} node {member} neither rebuilt nor refused the chain"
+        );
+        sleep(POLL_INTERVAL).await;
+    };
+    if refusals > 0 {
+        await_marker(&harness, member, INSTALL_MARKER).await;
+    } else {
+        assert!(chain.exists(), "node {member} rebuilt no chain file");
+    }
+    await_partition_rejoined(&harness, member).await;
+
+    drop(client);
+    harness.stop_node(primary).expect("stop the primary");
+    let client = wait_for_partition_primary(&harness, &stream, &topic, member).await;
+    let deadline = Instant::now() + ELECTION_DEADLINE;
+    while let Err(error) = read_every_message(&client, &stream, &topic).await {
+        assert!(
+            Instant::now() < deadline,
+            "within {ELECTION_DEADLINE:?} node {member} led the partition but did not serve \
+             every message: {error}"
+        );
+        sleep(POLL_INTERVAL).await;
+    }
+    assert_eq!(
+        (rebuilds, refusals),
+        (1, 0),
+        "node {member} took another path than the rebuild from the store"
+    );
+}
+
+/// Waits until the partition on `node` reports normal status since the
+/// node's last start, so it rejoined its group.
+async fn await_partition_rejoined(harness: &TestHarness, node: usize) {
+    let deadline = Instant::now() + ELECTION_DEADLINE;
+    loop {
+        let rejoined = harness.node(node).stdout_plain().lines().any(|line| {
+            line.contains("sim_event=\"ReplicaStateChanged\" plane=\"partitions\"")
+                && line.contains("status=\"normal\"")
+        });
+        if rejoined {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "within {ELECTION_DEADLINE:?} the partition on node {node} did not rejoin its group"
+        );
+        sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// The sum over the shards of `series` on the node behind `session`.
+async fn summed_metric(session: &HttpClient, series: &str) -> u64 {
+    let text = session
+        .get("/metrics")
+        .await
+        .text()
+        .await
+        .unwrap_or_default();
+    text.lines()
+        .filter(|line| {
+            line.strip_prefix(series)
+                .is_some_and(|rest| rest.starts_with('{') || rest.starts_with(' '))
+        })
+        .filter_map(|line| line.rsplit(' ').next()?.parse::<u64>().ok())
+        .sum()
+}
+
 fn cluster_with_fs_store(store: &Path) -> TestHarness {
     let mut envs = fs_store_envs(store);
     envs.extend(

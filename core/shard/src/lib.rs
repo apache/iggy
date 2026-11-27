@@ -49,6 +49,7 @@ mod router;
 mod segment_uploads;
 mod served_reads;
 pub mod shards_table;
+mod store_view_reads;
 #[cfg(test)]
 mod test_support;
 pub mod tier_service;
@@ -2356,6 +2357,11 @@ where
     /// the next delete pass takes them from here.
     undelivered_object_deletes: Rc<RefCell<Vec<FinishedObjectDelete>>>,
 
+    /// Late-bound reader of what the store holds of a partition incarnation,
+    /// which rebuilds a lost segment chain. `None` on a shard without an
+    /// object store, and before its node passes the store identity check.
+    store_view_reader: RefCell<Option<Rc<dyn partitions::StoreViewReader>>>,
+
     /// Late-bound publisher of the manifests of tiered partitions. `None` on
     /// a shard without an object store, where every manifest pass is a no-op.
     manifest_publisher: RefCell<Option<Rc<dyn partitions::ManifestPublisher>>>,
@@ -2789,6 +2795,7 @@ where
             undelivered_segment_uploads: Rc::default(),
             upload_pacing: RefCell::new(upload_pacing::UploadPacing::new(Instant::now())),
             object_deleter: RefCell::new(None),
+            store_view_reader: RefCell::new(None),
             undelivered_object_deletes: Rc::default(),
             manifest_publisher: RefCell::new(None),
             undelivered_manifest_publishes: Rc::default(),
@@ -3930,6 +3937,7 @@ where
             undelivered_segment_uploads: Rc::default(),
             upload_pacing: RefCell::new(upload_pacing::UploadPacing::new(Instant::now())),
             object_deleter: RefCell::new(None),
+            store_view_reader: RefCell::new(None),
             undelivered_object_deletes: Rc::default(),
             manifest_publisher: RefCell::new(None),
             undelivered_manifest_publishes: Rc::default(),

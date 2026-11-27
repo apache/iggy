@@ -138,6 +138,23 @@ impl Fixture {
         .await
     }
 
+    /// [`Self::recover`] for a partition of a tiered topic.
+    async fn recover_tiered(&self) -> Result<RecoveredLog, PartitionRecoveryError> {
+        load_tiered_segments(
+            &self.config,
+            IggyNamespace::new(STREAM_ID, TOPIC_ID, PARTITION_ID),
+            IggyByteSize::from(SEGMENT_MAX_SIZE),
+            false,
+            &PartitionStats::default(),
+            None,
+        )
+        .await
+    }
+
+    fn anchor_path(&self, start_offset: u64) -> String {
+        anchor_path(&self.directory, start_offset)
+    }
+
     async fn refusal(&self, checkpoint: Option<SegmentPosition>) -> PartitionRecoveryRefusal {
         match self.recover(checkpoint, &PartitionStats::default()).await {
             Err(PartitionRecoveryError::Refused { reason, .. }) => reason,
@@ -498,5 +515,112 @@ async fn given_fetched_indexes_named_by_one_offset_and_by_both_when_recovering_s
 
     for path in &fetched {
         assert!(!Path::new(path).exists(), "{path}");
+    }
+}
+
+/// The front of a tiered partition left the disk, and its chain went with
+/// it. The `.index` and `.anchor` of the evicted segments are all that says
+/// so, and they must survive the boot that finds no chain.
+#[compio::test]
+async fn given_a_tiered_partition_without_a_chain_when_recovering_should_keep_the_files_below_the_first_log()
+ {
+    let fixture = fixture_at(&[0, 3, 6, 9]);
+    write_anchor(
+        &fixture.directory,
+        SegmentAnchor {
+            planted_start: 3,
+            sealed_start: 0,
+            sealed_end: 2,
+        },
+    )
+    .await
+    .unwrap();
+    fixture.unlink_log(0);
+    fixture.unlink_log(3);
+    // An orphan above the first log is scratch whatever the topic.
+    fixture.unlink_log(9);
+
+    let recovered = fixture.recover_tiered().await.unwrap();
+
+    assert_eq!(
+        layout(&recovered),
+        [(6, 8, SegmentLocation::Local)],
+        "boot serves nothing from the files without a log"
+    );
+    assert_eq!(recovered.stems_without_log, [0, 3]);
+    assert!(recovered.chain.is_none());
+    for path in [
+        fixture.index_path(0),
+        fixture.index_path(3),
+        fixture.anchor_path(3),
+    ] {
+        assert!(Path::new(&path).exists(), "{path} was swept");
+    }
+    assert!(!Path::new(&fixture.index_path(9)).exists());
+}
+
+/// Without any `.log`, every orphan is below the local log.
+#[compio::test]
+async fn given_a_tiered_partition_without_a_chain_or_a_log_when_recovering_should_keep_every_orphan()
+ {
+    let fixture = fixture();
+    for start in STARTS {
+        fixture.unlink_log(start);
+    }
+
+    let recovered = fixture.recover_tiered().await.unwrap();
+
+    assert!(recovered.segments.is_empty());
+    assert_eq!(recovered.stems_without_log, STARTS);
+    for start in STARTS {
+        assert!(Path::new(&fixture.index_path(start)).exists());
+    }
+}
+
+/// A chain names every segment that left the disk, so the orphans it does
+/// not name are scratch, as before.
+#[compio::test]
+async fn given_a_tiered_partition_with_a_chain_when_recovering_should_sweep_the_orphans_it_does_not_name()
+ {
+    let fixture = fixture();
+    fixture.write_chain(&[]).await;
+    fixture.unlink_log(0);
+
+    let recovered = fixture.recover_tiered().await.unwrap();
+
+    assert_eq!(recovered.stems_without_log, Vec::<u64>::new());
+    assert!(!Path::new(&fixture.index_path(0)).exists());
+}
+
+/// A partition that is not tiered evicts nothing, so its orphans are scratch.
+#[compio::test]
+async fn given_a_partition_that_is_not_tiered_when_recovering_should_sweep_the_orphans_below_the_first_log()
+ {
+    let fixture = fixture();
+    write_anchor(
+        &fixture.directory,
+        SegmentAnchor {
+            planted_start: 3,
+            sealed_start: 0,
+            sealed_end: 2,
+        },
+    )
+    .await
+    .unwrap();
+    fixture.unlink_log(0);
+    fixture.unlink_log(3);
+
+    let recovered = fixture
+        .recover(None, &PartitionStats::default())
+        .await
+        .unwrap();
+
+    assert_eq!(recovered.stems_without_log, Vec::<u64>::new());
+    for path in [
+        fixture.index_path(0),
+        fixture.index_path(3),
+        fixture.anchor_path(3),
+    ] {
+        assert!(!Path::new(&path).exists(), "{path} was kept");
     }
 }
