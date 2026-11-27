@@ -282,7 +282,9 @@ func TestParseConnectionString_RejectsMalformedConnectionStrings(t *testing.T) {
 		"iggy://iggy:secret@localhost",
 		"iggy://iggy:secret@:8090",
 		"iggy://iggy:secret@localhost:port",
-		"iggy://iggy:secret@localhost:70000",
+		"iggy://iggy:secret@localhost:65536",
+		"iggy://iggy:secret@localhost:0",
+		"iggy://iggy:secret@[::1]:0",
 		"iggy://iggy:secret@localhost:8090?unknown=value",
 		"iggy://iggy:secret@localhost:8090?tls=maybe",
 		"iggy://iggy:secret@localhost:8090?reconnection_retries=three",
@@ -308,14 +310,16 @@ func TestParseConnectionString_RejectsMalformedConnectionStrings(t *testing.T) {
 	}
 }
 
-// TestParseConnectionString_AcceptsPortZero pins the u16 port rule the
-// other SDKs share: port 0 parses, because the port is only a u16 on the
-// wire and the dial fails later instead of the parse.
-func TestParseConnectionString_AcceptsPortZero(t *testing.T) {
-	opts, err := ParseConnectionString("iggy://iggy:secret@localhost:0")
-	require.NoError(t, err)
-	client := applyOptions(t, opts)
-	assert.Equal(t, "localhost:0", client.GetConnectionInfo().ServerAddress)
+// TestParseConnectionString_AcceptsLowestAndHighestPorts pins both ends of
+// the port range, so a rule stricter than the Rust and Node ones cannot
+// creep in unnoticed.
+func TestParseConnectionString_AcceptsLowestAndHighestPorts(t *testing.T) {
+	for _, port := range []string{"1", "65535"} {
+		opts, err := ParseConnectionString("iggy://iggy:secret@localhost:" + port)
+		require.NoError(t, err)
+		client := applyOptions(t, opts)
+		assert.Equal(t, "localhost:"+port, client.GetConnectionInfo().ServerAddress)
+	}
 }
 
 // TestParseConnectionString_AcceptsFractionalAndMultiUnitDurations pins

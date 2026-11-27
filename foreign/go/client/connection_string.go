@@ -54,7 +54,8 @@ const (
 // plain TCP and TLS. Credentials are username:password or a single
 // personal access token before the @; either way auto-login is configured,
 // matching what the Rust and Node SDKs do with a connection string. The
-// host may be a bracketed IPv6 literal, as in [::1]:8090.
+// host may be a bracketed IPv6 literal, as in [::1]:8090, and the port
+// must be in 1-65535.
 //
 // Query options follow the grammar the other SDKs share:
 //
@@ -139,10 +140,10 @@ func ParseConnectionString(connectionString string) ([]tcp.Option, error) {
 	if err != nil || host == "" {
 		return nil, ierror.InvalidConnectionString{}
 	}
-	// Node and Rust accept any u16 port, 0 included; the dial fails later
-	// instead of the parse. A bad port reports the same error as every other
-	// parse failure, which is what the Rust SDK returns here.
-	if _, err := strconv.ParseUint(portStr, 10, 16); err != nil {
+	// Rust and Node reject port 0 as well as out-of-range ports. Keep the
+	// same rule here so one connection string is either valid everywhere
+	// or nowhere, as documented above.
+	if port, err := strconv.ParseUint(portStr, 10, 16); err != nil || port == 0 {
 		return nil, ierror.InvalidConnectionString{}
 	}
 
