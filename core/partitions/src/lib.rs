@@ -49,6 +49,8 @@ pub use persistence::{
     PartitionPersistence, PersistenceCompletion, PersistenceMetrics, PersistenceNotifier,
 };
 pub use repair_memory::{RepairMemoryBudget, RepairRingBudget, RepairRingShed, RepairRingUsage};
+mod remote_blocks;
+pub use remote_blocks::{READ_AHEAD_START_BLOCKS, ReadCacheSettings, RemoteReadMetrics};
 mod remote_segments;
 pub use remote_segments::{
     ExecutorObjects, FRESH_CACHE_BYTES, RemoteObjects, RemoteRange, RemoteSegments,
@@ -187,7 +189,7 @@ pub use partition_storage::{
     hydrate_partition_log, read_created_revision, read_revision_record, recover_consumer_offsets,
     recover_consumer_offsets_with_storage, write_created_revision, write_revision_record,
 };
-pub use poll_plan::{DISK_POLL_CHUNK_MAX, PollPlan, PollReadResult};
+pub use poll_plan::{DISK_POLL_CHUNK_MAX, DISK_POLL_CHUNK_MIN, PollPlan, PollReadResult};
 pub use segment::{Segment, SegmentLocation};
 pub use segment_recovery::{
     PartitionRecoveryError, PartitionRecoveryRefusal, RecoveredLog, RecoveredSegment,

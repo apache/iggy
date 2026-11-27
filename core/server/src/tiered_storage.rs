@@ -42,8 +42,8 @@ use iggy_object_store::{
 use message_bus::IggyMessageBus;
 use partitions::{
     ExecutorDeleter, ExecutorFreshSweeper, ExecutorFreshUploader, ExecutorLongTermMerger,
-    ExecutorLongTermWriter, ExecutorManifestPublisher, ExecutorObjects, ExecutorTopicObjects,
-    ExecutorUploader, RemoteSegments,
+    ExecutorLongTermWriter, ExecutorManifestPublisher, ExecutorTopicObjects, ExecutorUploader,
+    ReadCacheSettings, RemoteSegments,
 };
 use shard::tier_service::{ClassLimits, StoreCallPolicy, TierService, TierServiceConfig};
 use shard::{Sender, channel};
@@ -272,9 +272,18 @@ pub fn start(
     shard
         .plane
         .partitions()
-        .set_remote_segments(Rc::new(RemoteSegments::new(
-            Rc::new(ExecutorObjects::new(service.clone())),
+        .set_remote_segments(Rc::new(RemoteSegments::cached(
+            service.clone(),
             layout.clone(),
+            ReadCacheSettings {
+                cache_bytes: usize::try_from(config.read_cache_size.as_bytes_u64())
+                    .unwrap_or(usize::MAX),
+                block_bytes: config.read_cache_block_size.as_bytes_u64(),
+                read_ahead: config.read_ahead.as_bytes_u64(),
+                read_ahead_fetches: usize::try_from(config.jobs.speculative_fetches)
+                    .unwrap_or(usize::MAX),
+                read_ahead_fetch_bytes: config.jobs.speculative_fetch_bytes.as_bytes_u64(),
+            },
         )));
     shard
         .plane

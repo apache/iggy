@@ -42,6 +42,7 @@
 #![allow(clippy::future_not_send)]
 
 mod backend;
+mod byte_cache;
 pub mod contract;
 pub mod credentials;
 mod error;
@@ -68,6 +69,7 @@ mod tier;
 mod topic;
 
 pub use backend::Backend;
+pub use byte_cache::{AHEAD_SHARE, Admission, ByteCache, Lookup};
 pub use error::{ErrorClass, ObjectStoreError};
 pub use fresh::{FreshObject, FreshObjectId, is_fresh_object};
 pub use fresh_index::{

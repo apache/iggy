@@ -547,6 +547,31 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn given_bare_byte_counts_for_the_read_cache_env_vars_when_loading_should_read_bytes() {
+        let cfg = load_with_env_vars(&[
+            ("IGGY_TIERED_STORAGE_READ_CACHE_SIZE", "33554432"),
+            ("IGGY_TIERED_STORAGE_READ_CACHE_BLOCK_SIZE", "65536"),
+            ("IGGY_TIERED_STORAGE_READ_AHEAD", "0"),
+        ])
+        .expect("config with bare byte counts for the read cache deserializes");
+
+        assert_eq!(cfg.tiered_storage.read_cache_size.as_bytes_u64(), 32 << 20);
+        assert_eq!(
+            cfg.tiered_storage.read_cache_block_size.as_bytes_u64(),
+            64 << 10
+        );
+        assert_eq!(cfg.tiered_storage.read_ahead.as_bytes_u64(), 0);
+        TieredStorageConfig {
+            backend: TieredStorageBackend::Fs,
+            path: "/var/lib/iggy-tiered".to_owned(),
+            ..cfg.tiered_storage
+        }
+        .validate()
+        .expect("a read cache without readahead validates");
+    }
+
+    #[test]
     fn given_a_config_file_without_the_partition_skip_key_when_loading_should_place_partitions_on_every_shard()
      {
         const KEY_LINE: &str = "skip_shard_zero_for_partitions = false\n";

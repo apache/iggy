@@ -10854,6 +10854,12 @@ where
             self.metrics.set_wal_reload_budget(bytes_max);
         }
         self.metrics.set_partition_levels(&partitions.gauge_sums());
+        if let Some(reads) = partitions
+            .remote_segments()
+            .and_then(|remote| remote.take_read_metrics())
+        {
+            self.metrics.record_remote_reads(&reads);
+        }
         self.check_sleeping_partitions();
     }
 

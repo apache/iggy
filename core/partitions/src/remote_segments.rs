@@ -18,7 +18,8 @@
 //! Reads of segments whose `.log` left the disk.
 //!
 //! A poll plan names a remote segment by an object and a byte range in it,
-//! and the walk reads that range with ranged GETs straight from the store.
+//! and the walk reads that range with ranged GETs from the store, through a
+//! cache of the object's blocks on the shard's own store.
 //! The segment's sparse index is the local `.index` while one is usable, and
 //! otherwise the `.index` object, fetched once and kept on disk. The fetch
 //! runs in a task of its own (see [`IndexFetch`]), apart from the polls that
@@ -52,6 +53,7 @@ use tracing::{error, warn};
 use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::io::PartitionIoQuiescence;
 use crate::poll_plan::DiskFault;
+use crate::remote_blocks::{ReadCacheSettings, RemoteBlocks, RemoteReadMetrics};
 use crate::segment_chain::SegmentRecord;
 use crate::segment_upload::{is_recorded_log, is_whole_index};
 use crate::state_transfer::{STAGING_SUFFIX, fsync_dir};
@@ -84,6 +86,23 @@ pub trait RemoteObjects {
         key: &'a str,
         range: Range<u64>,
     ) -> LocalBoxFuture<'a, Result<ObjectRange, ObjectStoreError>>;
+
+    /// As [`Self::get_range`], if `wanted` still says so when the read
+    /// starts. `None` when it does not, and the store is not asked.
+    fn get_range_if<'a>(
+        &'a self,
+        key: &'a str,
+        range: Range<u64>,
+        wanted: Box<dyn FnOnce() -> bool>,
+    ) -> LocalBoxFuture<'a, Result<Option<ObjectRange>, ObjectStoreError>> {
+        async move {
+            if !wanted() {
+                return Ok(None);
+            }
+            self.get_range(key, range).await.map(Some)
+        }
+        .boxed_local()
+    }
 
     /// See [`ObjectStore::head`]. A source that does not implement it answers
     /// [`ObjectStoreError::Unsupported`].
@@ -147,11 +166,33 @@ impl<E: TierExecutor> RemoteObjects for ExecutorObjects<E> {
         key: &'a str,
         range: Range<u64>,
     ) -> LocalBoxFuture<'a, Result<ObjectRange, ObjectStoreError>> {
-        let request = TierJobRequest::new(self.class, self.scope.token())
-            .with_bytes(range.end.saturating_sub(range.start));
+        let request = self.request(&range);
         let key = key.to_owned();
         let job = self.executor.submit(request, move |store| async move {
             ObjectStore::get_range(&*store, &key, range).await
+        });
+        async move {
+            job.await
+                .unwrap_or_else(|cancelled| Err(ObjectStoreError::Transport(cancelled.to_string())))
+        }
+        .boxed_local()
+    }
+
+    /// `wanted` is asked when the job starts, which can be long after it
+    /// queued.
+    fn get_range_if<'a>(
+        &'a self,
+        key: &'a str,
+        range: Range<u64>,
+        wanted: Box<dyn FnOnce() -> bool>,
+    ) -> LocalBoxFuture<'a, Result<Option<ObjectRange>, ObjectStoreError>> {
+        let request = self.request(&range);
+        let key = key.to_owned();
+        let job = self.executor.submit(request, move |store| async move {
+            if !wanted() {
+                return Ok(None);
+            }
+            ObjectStore::get_range(&*store, &key, range).await.map(Some)
         });
         async move {
             job.await
@@ -174,6 +215,13 @@ impl<E: TierExecutor> RemoteObjects for ExecutorObjects<E> {
                 .unwrap_or_else(|cancelled| Err(ObjectStoreError::Transport(cancelled.to_string())))
         }
         .boxed_local()
+    }
+}
+
+impl<E> ExecutorObjects<E> {
+    fn request(&self, range: &Range<u64>) -> TierJobRequest {
+        TierJobRequest::new(self.class, self.scope.token())
+            .with_bytes(range.end.saturating_sub(range.start))
     }
 }
 
@@ -504,6 +552,9 @@ pub struct RemoteSegments {
     /// See [`INDEX_GET_TIMEOUT`].
     pub(crate) index_get_timeout: Duration,
     fresh: RefCell<FreshCache>,
+    /// The blocks of `.log` objects, `None` for reads that go to the store
+    /// for exactly their range.
+    pub(crate) blocks: Option<Rc<RemoteBlocks>>,
 }
 
 impl RemoteSegments {
@@ -514,7 +565,66 @@ impl RemoteSegments {
             layout,
             index_get_timeout: INDEX_GET_TIMEOUT,
             fresh: RefCell::new(FreshCache::new(FRESH_CACHE_BYTES)),
+            blocks: None,
         }
+    }
+
+    /// Reads of the node's own store through the tier service `executor`,
+    /// which keep the `.log` objects they read in memory and fetch ahead of a
+    /// poll that reads a segment in order, as `settings` say. With no cache
+    /// bytes they read as [`Self::new`] does.
+    #[must_use]
+    pub fn cached<E>(executor: E, layout: KeyLayout, settings: ReadCacheSettings) -> Self
+    where
+        E: TierExecutor + Clone + 'static,
+    {
+        let ahead = Rc::new(ExecutorObjects::with_class(
+            executor.clone(),
+            TierJobClass::SpeculativeFetch,
+        ));
+        Self::new(Rc::new(ExecutorObjects::new(executor)), layout).with_blocks(ahead, settings)
+    }
+
+    /// Keep `.log` objects in blocks, and fetch ahead through `ahead`, as
+    /// `settings` say.
+    pub(crate) fn with_blocks(
+        mut self,
+        ahead: Rc<dyn RemoteObjects>,
+        settings: ReadCacheSettings,
+    ) -> Self {
+        self.blocks = (settings.cache_bytes > 0)
+            .then(|| Rc::new(RemoteBlocks::new(Rc::clone(&self.objects), ahead, settings)));
+        self
+    }
+
+    /// Whether the cache of `.log` blocks holds all `len` bytes of the
+    /// segment in `source` from byte `position`, so that a read of them asks
+    /// the store nothing.
+    pub(crate) fn holds(&self, source: &RemoteRange, position: u64, len: usize) -> bool {
+        let start = source.range.start + position;
+        let end = start + len as u64;
+        end <= source.range.end
+            && self
+                .blocks
+                .as_ref()
+                .is_some_and(|blocks| blocks.holds(source, &(start..end)))
+    }
+
+    /// Drop what the cache of `.log` blocks holds of the `len` bytes of the
+    /// segment in `source` from byte `position`, which are not the batches
+    /// that the store holds there, so that the next read fetches them again.
+    pub(crate) fn forget_cached(&self, source: &RemoteRange, position: u64, len: usize) {
+        if let Some(blocks) = &self.blocks {
+            let start = source.range.start + position;
+            blocks.forget(source, &(start..start + len as u64));
+        }
+    }
+
+    /// What the reads of `.log` objects did since the last take, `None`
+    /// when they keep no blocks.
+    #[must_use]
+    pub fn take_read_metrics(&self) -> Option<RemoteReadMetrics> {
+        self.blocks.as_ref().map(|blocks| blocks.take_metrics())
     }
 
     /// Keep at most `budget` bytes of fresh objects in memory.
@@ -688,7 +798,8 @@ impl RemoteSegments {
     }
 
     /// Exactly `len` bytes of the segment in `source`, from byte `position`
-    /// of the segment.
+    /// of the segment, for a poll that reads `poll_offset` next when it
+    /// knows that offset.
     ///
     /// An error the store may not repeat is retryable. Anything else is not:
     /// a missing object, a refusal, or fewer bytes than the segment holds.
@@ -697,13 +808,18 @@ impl RemoteSegments {
         source: &RemoteRange,
         position: u64,
         len: usize,
+        poll_offset: Option<u64>,
     ) -> Result<Frozen<4096>, DiskFault> {
-        let key = self.object_key(source, source.key.object);
         let start = source.range.start + position;
         let end = start + len as u64;
         if end > source.range.end {
             return Err(DiskFault::Tiered);
         }
+        if let Some(blocks) = &self.blocks {
+            let key_of = || self.object_key(source, source.key.object);
+            return blocks.read(source, &key_of, start..end, poll_offset).await;
+        }
+        let key = self.object_key(source, source.key.object);
         let object = self
             .objects
             .get_range(&key, start..end)
@@ -932,7 +1048,9 @@ fn field(entry: &[u8; IGGY_INDEX_SIZE], slot: usize) -> u64 {
     u64::from_le_bytes(bytes)
 }
 
-fn fault(key: &str, error: &ObjectStoreError) -> DiskFault {
+/// What a store that failed a read of `key` with `error` means for the poll,
+/// logged: retryable for a transient error, tiered for any other.
+pub fn fault(key: &str, error: &ObjectStoreError) -> DiskFault {
     warn!(
         target: "iggy.partitions.diag",
         plane = "partitions",
