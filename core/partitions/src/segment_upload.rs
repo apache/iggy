@@ -32,9 +32,9 @@ use futures::future::LocalBoxFuture;
 use futures::{FutureExt, Stream};
 use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BatchHeader};
 use iggy_object_store::{
-    ErrorClass, KeyLayout, ObjectPrefix, ObjectStore, ObjectStoreError, PutBody, PutMode,
-    PutOptions, SegmentKey, SegmentMetadata, SegmentObject, TierExecutor, TierJobCancelled,
-    TierJobClass, TierJobRequest, TierScopeToken, UserMetadata,
+    ErrorClass, KeyLayout, ObjectMeta, ObjectPrefix, ObjectStore, ObjectStoreError, PutBody,
+    PutMode, PutOptions, SegmentKey, SegmentMetadata, SegmentObject, TierExecutor,
+    TierJobCancelled, TierJobClass, TierJobRequest, TierScopeToken, UserMetadata,
 };
 use server_common::send_messages::decode_batch_slice;
 
@@ -258,14 +258,7 @@ pub async fn store_segment<S: ObjectStore>(
         Ok(()) => {}
         Err(ObjectStoreError::PreconditionFailed { .. }) => {
             let held = store.head(&log_key).await.map_err(UploadError::Store)?;
-            let same_bytes = held.crc32c.map_or_else(
-                || {
-                    SegmentMetadata::try_from(&held.metadata)
-                        .is_ok_and(|metadata| metadata.hash == record.hash)
-                },
-                |crc32c| crc32c == record.crc32c,
-            );
-            if held.size != record.size || !same_bytes {
+            if !is_recorded_log(&held, record) {
                 return Err(UploadError::Diverged { key: log_key });
             }
         }
@@ -283,7 +276,7 @@ pub async fn store_segment<S: ObjectStore>(
         // stored only has to be one.
         Err(ObjectStoreError::PreconditionFailed { .. }) => {
             let held = store.head(index_key).await.map_err(UploadError::Store)?;
-            if held.size == 0 || held.size % IGGY_INDEX_SIZE as u64 != 0 {
+            if !is_whole_index(&held) {
                 return Err(UploadError::Diverged {
                     key: index_key.to_owned(),
                 });
@@ -292,6 +285,27 @@ pub async fn store_segment<S: ObjectStore>(
         }
         Err(error) => Err(UploadError::Store(error)),
     }
+}
+
+/// Whether `held`, the object under a segment's `.log` key, is the one
+/// `record` describes: of the recorded size, with the recorded CRC32C, or
+/// with the recorded hash in its metadata when the store keeps no CRC32C.
+pub fn is_recorded_log(held: &ObjectMeta, record: &SegmentRecord) -> bool {
+    let same_bytes = held.crc32c.map_or_else(
+        || {
+            SegmentMetadata::try_from(&held.metadata)
+                .is_ok_and(|metadata| metadata.hash == record.hash)
+        },
+        |crc32c| crc32c == record.crc32c,
+    );
+    held.size == record.size && same_bytes
+}
+
+/// Whether `held`, the object under a segment's `.index` key, holds whole
+/// index entries, at least one. Sparse indexes differ between replicas, so
+/// no record says more of it.
+pub const fn is_whole_index(held: &ObjectMeta) -> bool {
+    held.size != 0 && held.size.is_multiple_of(IGGY_INDEX_SIZE as u64)
 }
 
 /// Put `body` under `key`, unless an object is there already.

@@ -806,9 +806,10 @@ mod tests {
     use std::time::Duration;
 
     use consensus::{
-        ArtifactProgress, Consensus, DvcSuffix, HeartbeatSchedule, LocalPipeline, PartitionsHandle,
-        Pipeline, Plane, PlaneKind, REPLICATION_BATCH_BYTES_MAX, ReplicationSend, Sequencer,
-        StateArtifact, StateTransferStage, TimeoutManager, VsrAction, VsrConsensus, artifact_kind,
+        ArtifactProgress, Consensus, DvcSuffix, HeartbeatSchedule, LocalPipeline, MetadataHandle,
+        PartitionsHandle, Pipeline, Plane, PlaneKind, REPLICATION_BATCH_BYTES_MAX, ReplicationSend,
+        Sequencer, StateArtifact, StateTransferStage, TimeoutManager, VsrAction, VsrConsensus,
+        artifact_kind,
     };
     use futures::FutureExt;
     use futures::channel::oneshot;
@@ -4766,6 +4767,115 @@ mod tests {
             ),
             (cap, LAGGING_GROUPS - cap, true),
             "(armed, deferred, deferred groups unchanged a round later) per group: {spent:?}"
+        );
+    }
+
+    /// A lagging replica of a tiered topic, its node's store state set as
+    /// given, armed for a transfer against the primary.
+    #[allow(clippy::future_not_send)]
+    async fn arm_transfer_with_store(
+        tiered: bool,
+        store_usable: bool,
+    ) -> (IoTestShard, TaggedSender, IggyNamespace) {
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, sender) = test_owner(&bus, None);
+        owner.set_repair_retry_ticks(1);
+        let frontier = owner.plane.metadata().applied_frontier();
+        frontier.set_tiered_storage_ready(true);
+        frontier.set_store_identity_verified(store_usable);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let mut partition = repairing_replica(
+            &bus,
+            namespace,
+            (PAIR_BACKUP, 2),
+            REPAIR_PRIMARY,
+            LAGGING_COMMIT_MIN,
+            LAGGING_COMMIT_MAX,
+        );
+        partition.set_runtime_options(TopicRuntimeOptions {
+            tiered_storage: tiered,
+            ..Default::default()
+        });
+        let partitions = owner.plane.partitions();
+        partitions.insert(namespace, partition);
+        let partition = partitions.get_mut_by_ns(&namespace).unwrap();
+        partition.consensus().begin_state_transfer_await();
+        owner
+            .arm_partition_transfer(partition, REPAIR_PRIMARY)
+            .await;
+        (owner, sender, namespace)
+    }
+
+    /// (transfer peer, re-arm pending, stage) of the partition at `namespace`.
+    fn transfer_arm_state(
+        owner: &IoTestShard,
+        namespace: IggyNamespace,
+    ) -> (Option<u8>, bool, StateTransferStage) {
+        let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
+        (
+            partition.transfer().map(|session| session.peer),
+            partition.transfer_rearm.is_some(),
+            partition.consensus().state_transfer_stage(),
+        )
+    }
+
+    #[compio::test]
+    async fn given_tiered_partition_when_store_is_not_usable_should_not_request_transfer() {
+        let (owner, _sender, namespace) = Box::pin(arm_transfer_with_store(true, false)).await;
+
+        assert_eq!(
+            transfer_arm_state(&owner, namespace),
+            (None, true, StateTransferStage::Idle)
+        );
+        assert_eq!(owner.plane.partitions().transfers_inflight(), 0);
+    }
+
+    #[compio::test]
+    async fn given_tiered_partition_waiting_for_store_when_store_becomes_usable_should_request_transfer()
+     {
+        let (owner, _sender, namespace) = Box::pin(arm_transfer_with_store(true, false)).await;
+        for _ in 0..4 {
+            assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
+        }
+        assert_eq!(
+            transfer_arm_state(&owner, namespace),
+            (None, true, StateTransferStage::Idle),
+            "the partition must keep waiting while the store is not usable"
+        );
+
+        owner
+            .plane
+            .metadata()
+            .applied_frontier()
+            .set_store_identity_verified(true);
+        for _ in 0..4 {
+            assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
+            if transfer_arm_state(&owner, namespace).0.is_some() {
+                break;
+            }
+        }
+
+        assert_eq!(
+            transfer_arm_state(&owner, namespace),
+            (
+                Some(REPAIR_PRIMARY),
+                false,
+                StateTransferStage::AwaitingTarget
+            )
+        );
+    }
+
+    #[compio::test]
+    async fn given_partition_not_tiered_when_store_is_not_usable_should_request_transfer() {
+        let (owner, _sender, namespace) = Box::pin(arm_transfer_with_store(false, false)).await;
+
+        assert_eq!(
+            transfer_arm_state(&owner, namespace),
+            (
+                Some(REPAIR_PRIMARY),
+                false,
+                StateTransferStage::AwaitingTarget
+            )
         );
     }
 

@@ -976,8 +976,11 @@ impl SegmentChain {
             prefix: chain.prefix,
             valid_len: chain.valid_len,
             sealed: chain.sealed,
+            // A segment leaves a disk only after an advance matched it, so a
+            // remote record is the proof on its own. A replica rebuilt by a
+            // state transfer holds such records without their advances.
+            confirmed: chain.remote.clone(),
             remote: chain.remote,
-            confirmed: BTreeSet::new(),
             advances: BTreeMap::new(),
             diverged: BTreeSet::new(),
             trim_point: chain.trim_point,
@@ -1119,9 +1122,9 @@ impl SegmentChain {
     /// chain may not hold the latest yet.
     ///
     /// A segment is remote only when `without_log`, ascending, holds its start
-    /// offset. The chain's own remote records do not decide it: an eviction cut
-    /// short after its record leaves the `.log` in place, and that segment
-    /// travels as bytes.
+    /// offset. A transfer leaves out the bytes of the stored front alone, the
+    /// unbroken run of stored segments from the first one, so a stored segment
+    /// behind that run is sealed here even when the chain records it remote.
     fn snapshot<'a>(
         &self,
         without_log: &[u64],

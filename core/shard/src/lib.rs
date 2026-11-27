@@ -12285,13 +12285,14 @@ where
                         );
                         Some(offer)
                     }
-                    // Only the plan pin is missing, and an I/O turn pins it
-                    // soon. The build slot stays claimed, as for any resumable
-                    // refusal, and the tick answers the request.
-                    Err(partitions::state_transfer::PartitionTransferUnavailable::FlushPending)
-                        if waited_ticks
-                            < self.repair_retry_ticks.get()
-                                / PARKED_TRANSFER_REQUEST_WAIT_DIVISOR =>
+                    // Only the plan pin or the store's answer is missing, and
+                    // each comes soon. The build slot stays claimed, as for any
+                    // resumable refusal, and the tick answers the request.
+                    Err(
+                        partitions::state_transfer::PartitionTransferUnavailable::FlushPending
+                        | partitions::state_transfer::PartitionTransferUnavailable::StoreCheckPending,
+                    ) if waited_ticks
+                        < self.repair_retry_ticks.get() / PARKED_TRANSFER_REQUEST_WAIT_DIVISOR =>
                     {
                         self.parked_partition_transfer_requests.borrow_mut().insert(
                             (header.group, header.replica),
@@ -12888,6 +12889,10 @@ where
     /// converts to a scheduled re-arm (no failure charged -- the local slot
     /// shortage is not the peer's fault) and the stage returns to Idle, which
     /// is the stage the re-arm fires from.
+    ///
+    /// Refuses the same way while the partition is tiered and this node
+    /// cannot read its object store: the peer sends stored segments as chain
+    /// records alone, and this replica could not read them after the install.
     #[allow(clippy::future_not_send)]
     async fn arm_partition_transfer(&self, partition: &mut IggyPartition<B, SB>, peer: u8)
     where
@@ -12895,6 +12900,34 @@ where
     {
         if self.shutting_down.get() || partition.is_shutting_down() {
             return;
+        }
+        if partition.transfer_reads_store()
+            && !self
+                .plane
+                .metadata()
+                .applied_frontier()
+                .tiered_storage_ready()
+        {
+            if partition.note_transfer_waits_for_store(true) {
+                tracing::warn!(
+                    shard = self.id,
+                    namespace_raw = partition.consensus().group(),
+                    peer,
+                    "this node cannot read its object store, so the tiered partition waits for \
+                     it before it requests a state transfer"
+                );
+            }
+            self.defer_partition_transfer_arm(partition, peer);
+            return;
+        }
+        if partition.note_transfer_waits_for_store(false) {
+            tracing::info!(
+                shard = self.id,
+                namespace_raw = partition.consensus().group(),
+                peer,
+                "this node can read its object store, so the tiered partition requests its \
+                 state transfer"
+            );
         }
         let partitions = self.plane.partitions();
         if partition.transfer().is_none()
@@ -12906,15 +12939,7 @@ where
                 cap = Self::PARTITION_TRANSFERS_INFLIGHT_MAX,
                 "partition transfer slots exhausted; deferring this arm"
             );
-            let consensus = partition.consensus();
-            if consensus.state_transfer_stage() != consensus::StateTransferStage::Idle {
-                consensus.set_state_transfer_stage(consensus::StateTransferStage::Idle);
-            }
-            partition.note_transfer_rearm_scheduled();
-            partition.transfer_rearm = Some(partitions::state_transfer::PendingTransferRearm {
-                peer,
-                after_ticks: self.repair_retry_ticks.get(),
-            });
+            self.defer_partition_transfer_arm(partition, peer);
             return;
         }
         partition.set_repair(None);
@@ -12935,6 +12960,22 @@ where
         }));
         self.send_request_state_transfer(partition.consensus(), peer, nonce)
             .await;
+    }
+
+    /// Put off an arm against `peer` by one retry interval: no session, the
+    /// stage back to Idle and a re-arm the tick sweep fires. No failure is
+    /// charged, since the peer did nothing wrong.
+    fn defer_partition_transfer_arm(&self, partition: &mut IggyPartition<B, SB>, peer: u8) {
+        partition.set_transfer(None);
+        let consensus = partition.consensus();
+        if consensus.state_transfer_stage() != consensus::StateTransferStage::Idle {
+            consensus.set_state_transfer_stage(consensus::StateTransferStage::Idle);
+        }
+        partition.note_transfer_rearm_scheduled();
+        partition.transfer_rearm = Some(partitions::state_transfer::PendingTransferRearm {
+            peer,
+            after_ticks: self.repair_retry_ticks.get(),
+        });
     }
 
     /// Arm partition journal repair when this replica is lagging its group

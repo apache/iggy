@@ -26,6 +26,11 @@
 //! ordinary journal repair. Artifacts ride the plane-agnostic manifest/chunk
 //! protocol from `core/consensus`; everything in this module is the
 //! partition-specific payload handling on either end.
+//!
+//! A tiered partition's segments that the store holds travel as their chain
+//! records alone, and the receiver reads them from the store. A replica that
+//! cannot read its store waits for it before it requests the transfer of a
+//! tiered partition, and stays behind its group until then.
 
 use crate::IggyPartition;
 use crate::iggy_partition::{InstalledConsumerGroupOwner, InstalledPartitionHistory};
@@ -36,7 +41,7 @@ use crate::partition_storage::{read_revision_record, write_revision_record};
 use crate::producer_state::{
     PRODUCER_BATCHES_RETAINED, PRODUCERS_MAX, ProducerBatch, ProducerEntry,
 };
-use crate::segment::SegmentLocation;
+use crate::segment::{Segment, SegmentLocation};
 use crate::segment_anchor::ANCHOR_SUFFIX;
 use crate::segment_chain::{
     CHAIN_FILE, Chain, ChainRecord, LiveChain, ObjectPrefix, SegmentRecord, decode_chain,
@@ -1626,8 +1631,11 @@ pub struct PartitionStateTransferOffer {
     /// `commit_min` when the offer's `TransferPlan` was pinned: the segments
     /// hold every op through it and none after it.
     pub commit_op: u64,
-    /// Ascending base offset; one artifact per non-empty local segment. A
-    /// segment whose `.log` left the disk travels only as its chain record.
+    /// Ascending base offset; one artifact per non-empty segment after the
+    /// stored front, the unbroken run of stored segments from the first one,
+    /// which travel as their chain records alone. A segment whose `.log` left
+    /// the sender's disk has no bytes to send. One still there joins the run
+    /// only when the store confirmed it while the offer was built.
     pub segments: Vec<SegmentArtifactSource>,
     /// The tiered partition's chain, `None` for a partition without one.
     pub chain: Option<(consensus::StateArtifact, std::rc::Rc<Vec<u8>>)>,
@@ -1684,7 +1692,7 @@ impl PartitionStateTransferOffer {
 /// these lengths, so hash rounds that span them still describe `commit_op`.
 pub(crate) struct TransferPlan {
     commit_op: u64,
-    /// Each non-empty local segment, in chain order.
+    /// Each non-empty segment after the stored front, in chain order.
     segments: Vec<PlannedSegment>,
     /// The chain as of `commit_op`, `None` for a partition without one.
     chain: Option<Chain>,
@@ -1701,6 +1709,34 @@ pub(crate) struct PlannedSegment {
     /// It is kept here because appends after the pin move the memo of the
     /// active segment past `len`, so a later round cannot read it there.
     checksum: Cell<Option<u64>>,
+}
+
+/// What the store answered, for one offer build, about the stored segments
+/// whose `.log` is still on this disk. Filled by a detached task.
+#[derive(Default)]
+pub(crate) struct StoredFrontCheck {
+    held: Rc<RefCell<Option<Vec<SegmentRecord>>>>,
+}
+
+impl StoredFrontCheck {
+    /// An answered check that holds no segment, for a build with nothing to
+    /// ask or no store to ask.
+    fn answered_empty() -> Self {
+        Self {
+            held: Rc::new(RefCell::new(Some(Vec::new()))),
+        }
+    }
+
+    fn answered(&self) -> bool {
+        self.held.borrow().is_some()
+    }
+
+    fn holds(&self, record: &SegmentRecord) -> bool {
+        self.held
+            .borrow()
+            .as_ref()
+            .is_some_and(|held| held.contains(record))
+    }
 }
 
 /// How far a serving partition got toward the plan its offer rounds share.
@@ -1765,6 +1801,9 @@ pub enum PartitionTransferUnavailable {
         remaining: u64,
     },
     FlushPending,
+    /// The store has not answered yet whether it holds the stored segments
+    /// that this replica still keeps on its disk.
+    StoreCheckPending,
     FlushFailed(iggy_common::IggyError),
     SegmentUnreadable {
         start_offset: u64,
@@ -1790,6 +1829,7 @@ impl PartitionTransferUnavailable {
             | Self::SegmentSetChanged
             | Self::RepairTailExpired
             | Self::FlushPending
+            | Self::StoreCheckPending
             | Self::OfferBuildInProgress { .. } => true,
             Self::NoPartitionDir
             | Self::MissingPrepareChecksum { .. }
@@ -1806,7 +1846,10 @@ impl PartitionTransferUnavailable {
     /// these keep the shard's admission slot and the partition's plan.
     #[must_use]
     pub const fn resumable(&self) -> bool {
-        matches!(self, Self::FlushPending | Self::OfferBuildInProgress { .. })
+        matches!(
+            self,
+            Self::FlushPending | Self::StoreCheckPending | Self::OfferBuildInProgress { .. }
+        )
     }
 }
 
@@ -1845,6 +1888,10 @@ impl fmt::Display for PartitionTransferUnavailable {
                  resuming on the next request"
             ),
             Self::FlushPending => write!(f, "committed partition flush is pending"),
+            Self::StoreCheckPending => write!(
+                f,
+                "the object store has not confirmed the stored segments still on this disk"
+            ),
             Self::FlushFailed(source) => {
                 write!(f, "flushing the committed prefix failed: {source}")
             }
@@ -2697,6 +2744,7 @@ where
             .is_err_and(PartitionTransferUnavailable::resumable)
         {
             self.drop_transfer_plan();
+            self.stored_front_check.borrow_mut().take();
         }
         offer
     }
@@ -2788,6 +2836,9 @@ where
             // round -- the chunk serve fails `Stale` and the eviction path
             // re-enumerates -- which is the cheaper side of the trade.
             return Ok(Rc::clone(cached));
+        }
+        if !self.check_stored_front() {
+            return Err(PartitionTransferUnavailable::StoreCheckPending);
         }
         let Some(plan) = self.request_transfer_plan(config).await? else {
             return Err(PartitionTransferUnavailable::FlushPending);
@@ -2945,12 +2996,21 @@ where
         &self,
     ) -> Result<TransferPlan, PartitionTransferUnavailable> {
         let memos = self.segment_checksum_cache.borrow();
+        let check = self.stored_front_check.borrow();
         let mut segments = Vec::with_capacity(self.log.segments().len());
         let mut without_log = Vec::new();
+        // The receiver takes its remote segments as the front of its log, so
+        // only an unbroken run from the front may travel without bytes.
+        let mut in_stored_front = true;
         for (segment, storage) in self.log.segments().iter().zip(self.log.storages()) {
             let size = segment.size.as_bytes_u64();
-            // A segment whose `.log` left the disk travels as its chain record.
-            if segment.location == SegmentLocation::Remote {
+            // A segment whose `.log` left this disk has no bytes to send. One
+            // still here travels as its chain record only when the store
+            // confirmed it for this build, since the receiver reads it there.
+            in_stored_front = in_stored_front
+                && (segment.location == SegmentLocation::Remote
+                    || self.store_confirmed(segment, check.as_ref()));
+            if in_stored_front {
                 without_log.push(segment.start_offset);
                 continue;
             }
@@ -2983,6 +3043,69 @@ where
             chain: self.segment_chain_snapshot(&without_log),
             offsets: self.offsets_wire_snapshot()?,
         })
+    }
+
+    /// Start this build's check of the stored segments still on this disk,
+    /// and say whether the store answered it. Without a store to ask, the
+    /// answer is that it holds none of them.
+    fn check_stored_front(&self) -> bool {
+        if let Some(check) = self.stored_front_check.borrow().as_ref() {
+            return check.answered();
+        }
+        let on_disk = self.stored_front_on_disk();
+        let check = match (self.remote_segments(), self.object_prefix()) {
+            (Some(remote), Some(prefix)) if !on_disk.is_empty() => {
+                let check = StoredFrontCheck::default();
+                let held = Rc::clone(&check.held);
+                let remote = Rc::clone(remote);
+                // Off the frame body: the store's answer takes a network round
+                // trip, and the build's next round reads it.
+                self.consensus().message_bus().spawn(async move {
+                    let front = remote.stored_front(prefix, on_disk).await;
+                    *held.borrow_mut() = Some(front);
+                });
+                check
+            }
+            _ => StoredFrontCheck::answered_empty(),
+        };
+        let answered = check.answered();
+        *self.stored_front_check.borrow_mut() = Some(check);
+        answered
+    }
+
+    /// The records of the segments of the stored front whose `.log` is still
+    /// on this disk, in offset order.
+    fn stored_front_on_disk(&self) -> Vec<SegmentRecord> {
+        self.log
+            .segments()
+            .iter()
+            .take_while(|segment| {
+                segment.location == SegmentLocation::Remote || self.stores_segment(segment)
+            })
+            .filter(|segment| segment.location != SegmentLocation::Remote)
+            .filter_map(|segment| self.sealed_segment_record(segment.start_offset))
+            .collect()
+    }
+
+    /// Whether `segment`, still on this disk, may travel as its chain record:
+    /// a floor advance matched it, and `check` found it in the store.
+    fn store_confirmed(&self, segment: &Segment, check: Option<&StoredFrontCheck>) -> bool {
+        self.stores_segment(segment)
+            && check.is_some_and(|check| {
+                self.sealed_segment_record(segment.start_offset)
+                    .is_some_and(|record| check.holds(&record))
+            })
+    }
+
+    /// Whether a floor advance confirmed that the store took `segment` as this
+    /// replica has it: it is sealed, the chain records it and the advance
+    /// matched its hash. The object may have left the store since.
+    fn stores_segment(&self, segment: &Segment) -> bool {
+        segment.sealed
+            && self
+                .segment_chain
+                .as_ref()
+                .is_some_and(|chain| chain.evictable(segment.start_offset, segment.end_offset))
     }
 
     /// Bytes of `planned` already hashed, clamped per segment to the planned
@@ -3136,11 +3259,13 @@ where
     }
 
     /// Release the cached offer once no requester holds one (the shard's
-    /// offer-expiry sweep), and the plan of a build in progress with it: both
-    /// name segments that retention may be about to unlink.
+    /// offer-expiry sweep), and the plan and the store check of a build in
+    /// progress with it: they name segments that retention may be about to
+    /// unlink, and the store's answer ages.
     pub fn clear_state_transfer_offer_cache(&self) {
         self.transfer_offer_cache.borrow_mut().take();
         self.drop_transfer_plan();
+        self.stored_front_check.borrow_mut().take();
     }
 
     fn validate_consumer_offset_transfer_counts(&self) -> Result<(), PartitionTransferUnavailable> {

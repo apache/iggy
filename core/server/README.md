@@ -517,6 +517,11 @@ The cluster accepts `tiered_storage` on a topic only while every node has a
 backend and passes the store identity check described below. Until then the
 request fails with `FeatureUnavailable`.
 
+A replica rebuilt by state transfer gets only the records of the segments
+that the store holds, and reads those segments from the store. A replica that
+cannot read its store waits for it before it rebuilds a tiered partition, and
+stays behind its group until then.
+
 Each partition of a tiered topic also has a manifest object,
 `<prefix>/meta/<stream>/<topic>/<partition>/<created_revision>/manifest.bin`.
 It lists the segments that the store holds, with their offsets, timestamps,

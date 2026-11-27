@@ -78,7 +78,7 @@ const CONVERSION_MARKER: &str = "partition repair floor unreachable; converting 
 /// A wiped member whose storage began more than the storage-epoch skew after
 /// the partition was created joins awaiting a transfer instead of repairing.
 const LOST_STORAGE_MARKER: &str = "waiting for a member that kept its history";
-const INSTALL_MARKER: &str = "partition state transfer installed";
+pub(super) const INSTALL_MARKER: &str = "partition state transfer installed";
 const INSTALL_FAILED_MARKER: &str = "partition state transfer install failed";
 /// The `OfferErasesHeldOps` reason, logged inside an [`INSTALL_FAILED_MARKER`]
 /// line.
@@ -86,7 +86,7 @@ const HELD_OPS_INSTALL_MARKER: &str = "would erase held ops";
 /// Logged once per transfer, at the last byte of the last artifact. The
 /// descriptor-time "serving" line only proves a request ARRIVED; this proves the
 /// pull ran.
-const FULLY_SERVED_MARKER: &str = "partition state transfer fully served";
+pub(super) const FULLY_SERVED_MARKER: &str = "partition state transfer fully served";
 const ABANDON_MARKER: &str =
     "partition state transfer stalled past its retry budget; abandoning with a backed-off re-arm";
 /// The second route off a dead transfer peer. A replica parked in
@@ -1363,7 +1363,7 @@ async fn await_marker_any(harness: &TestHarness, nodes: &[usize], marker: &str) 
     }
 }
 
-async fn await_marker(harness: &TestHarness, node: usize, marker: &str) {
+pub(super) async fn await_marker(harness: &TestHarness, node: usize, marker: &str) {
     let deadline = Instant::now() + TRANSFER_BUDGET;
     while !harness.node(node).stdout_contains(marker) {
         assert!(
