@@ -47,6 +47,8 @@ import org.apache.iggy.system.NamedPageQuery;
 import org.apache.iggy.system.OptionsScope;
 import org.apache.iggy.system.PageCursor;
 import org.apache.iggy.system.PageQuery;
+import org.apache.iggy.system.SnapshotCompression;
+import org.apache.iggy.system.SystemSnapshotType;
 import org.apache.iggy.topic.TopicUpdate;
 import org.apache.iggy.user.GlobalPermissions;
 import org.apache.iggy.user.Permissions;
@@ -282,6 +284,23 @@ public final class BytesSerializer {
     public static ByteBuf toCreateStream(String name, Map<String, HeaderValue> options) {
         var payload = toBytes(name, "name");
         writeAndRelease(payload, toOptionsBlock(options));
+        return payload;
+    }
+
+    /**
+     * Encodes a get snapshot request: the compression code, the count of types, then one code per type.
+     *
+     * @throws IggyInvalidArgumentException if the list has more types than its one byte count holds
+     */
+    public static ByteBuf toGetSnapshot(SnapshotCompression compression, List<SystemSnapshotType> snapshotTypes) {
+        var compressionCode = compression.asCode();
+        var validatedTypes = SystemSnapshotType.validatedCopyOf(snapshotTypes);
+        var payload = Unpooled.buffer(2 + validatedTypes.size());
+        payload.writeByte(compressionCode);
+        payload.writeByte(validatedTypes.size());
+        for (var type : validatedTypes) {
+            payload.writeByte(type.asCode());
+        }
         return payload;
     }
 

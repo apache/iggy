@@ -19,9 +19,11 @@
 
 package org.apache.iggy.client.async.tcp;
 
+import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.async.SystemClient;
 import org.apache.iggy.cluster.ClusterMetadata;
+import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyValidationException;
 import org.apache.iggy.serde.BytesDeserializer;
 import org.apache.iggy.serde.BytesSerializer;
@@ -32,7 +34,10 @@ import org.apache.iggy.system.MetadataChanges;
 import org.apache.iggy.system.MetadataChangesQuery;
 import org.apache.iggy.system.OptionSpec;
 import org.apache.iggy.system.OptionsScope;
+import org.apache.iggy.system.Snapshot;
+import org.apache.iggy.system.SnapshotCompression;
 import org.apache.iggy.system.Stats;
+import org.apache.iggy.system.SystemSnapshotType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -83,6 +88,30 @@ public class SystemTcpClient implements SystemClient {
                 connection().send(CommandCode.System.DESCRIBE_OPTIONS.getValue(), payload), response -> {
                     try {
                         return BytesDeserializer.readOptionSpecs(response);
+                    } finally {
+                        response.release();
+                    }
+                });
+    }
+
+    @Override
+    public CompletableFuture<Snapshot> snapshot(
+            SnapshotCompression compression, List<SystemSnapshotType> snapshotTypes) {
+        ByteBuf payload;
+        try {
+            payload = BytesSerializer.toGetSnapshot(compression, snapshotTypes);
+        } catch (IggyInvalidArgumentException refused) {
+            return CompletableFuture.failedFuture(refused);
+        }
+
+        log.debug("Getting {} snapshot of {}", compression, snapshotTypes);
+
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.System.GET_SNAPSHOT.getValue(), payload), response -> {
+                    try {
+                        var data = new byte[response.readableBytes()];
+                        response.readBytes(data);
+                        return new Snapshot(data);
                     } finally {
                         response.release();
                     }

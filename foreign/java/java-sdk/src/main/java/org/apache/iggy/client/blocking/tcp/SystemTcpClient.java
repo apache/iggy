@@ -27,7 +27,10 @@ import org.apache.iggy.system.MetadataChanges;
 import org.apache.iggy.system.MetadataChangesQuery;
 import org.apache.iggy.system.OptionSpec;
 import org.apache.iggy.system.OptionsScope;
+import org.apache.iggy.system.Snapshot;
+import org.apache.iggy.system.SnapshotCompression;
 import org.apache.iggy.system.Stats;
+import org.apache.iggy.system.SystemSnapshotType;
 
 import java.util.List;
 
@@ -52,6 +55,11 @@ final class SystemTcpClient implements SystemClient {
     @Override
     public List<OptionSpec> describeOptions(OptionsScope scope) {
         return FutureUtil.resolve(delegate.describeOptions(scope));
+    }
+
+    @Override
+    public Snapshot snapshot(SnapshotCompression compression, List<SystemSnapshotType> snapshotTypes) {
+        return FutureUtil.resolve(delegate.snapshot(compression, snapshotTypes));
     }
 
     @Override

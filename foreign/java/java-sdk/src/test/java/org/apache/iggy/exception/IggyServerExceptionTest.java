@@ -249,6 +249,12 @@ class IggyServerExceptionTest {
                         IggyValidationException.class,
                         new IggyValidationException(IggyErrorCode.INVALID_COMMAND, 3, "foo", empty, empty)),
                 Arguments.of(
+                        9000,
+                        null,
+                        IggyServerException.class,
+                        new IggyServerException(
+                                IggyErrorCode.SNAPSHOT_FILE_COMPLETION_FAILED, 9000, "Server error", empty, empty)),
+                Arguments.of(
                         12345678,
                         new byte[] {102, 111, 111},
                         IggyServerException.class,
@@ -336,6 +342,18 @@ class IggyServerExceptionTest {
                                 "invalidCommand",
                                 Optional.of("fld"),
                                 Optional.of("id"))),
+                Arguments.of(
+                        "9000",
+                        "snapshot_file_completion_failed",
+                        "Snapshot file completion failed",
+                        null,
+                        IggyServerException.class,
+                        new IggyServerException(
+                                IggyErrorCode.SNAPSHOT_FILE_COMPLETION_FAILED,
+                                9000,
+                                "Snapshot file completion failed",
+                                Optional.empty(),
+                                Optional.of("9000"))),
                 Arguments.of(
                         "id",
                         "123456789",

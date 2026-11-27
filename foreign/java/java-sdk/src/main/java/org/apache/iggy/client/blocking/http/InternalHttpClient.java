@@ -19,9 +19,11 @@
 
 package org.apache.iggy.client.blocking.http;
 
+import org.apache.hc.client5.http.classic.ExecChain;
 import org.apache.hc.client5.http.classic.methods.HttpUriRequestBase;
 import org.apache.hc.client5.http.config.ConnectionConfig;
 import org.apache.hc.client5.http.config.RequestConfig;
+import org.apache.hc.client5.http.impl.ChainElement;
 import org.apache.hc.client5.http.impl.DefaultHttpRequestRetryStrategy;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
@@ -106,6 +108,8 @@ final class InternalHttpClient implements Closeable {
     private static final String UNCERTAIN_ATTEMPT = "iggy.uncertain-attempt";
     private static final String ATTEMPTED = "iggy.attempted";
     private static final String AUTO_COMMIT = "auto_commit";
+    private static final String SNAPSHOT_RESPONSE = "iggy.snapshot-response";
+    private static final int MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024;
     private static final Set<IggyErrorCode> SETTLED_REFUSALS = EnumSet.of(
             IggyErrorCode.HISTORY_UNAVAILABLE,
             IggyErrorCode.LIFECYCLE_BUSY,
@@ -130,6 +134,7 @@ final class InternalHttpClient implements Closeable {
     private final String url;
     private final ObjectMapper objectMapper = ObjectMapperFactory.getInstance();
     private final CloseableHttpClient httpClient;
+    private final RequestConfig snapshotRequestConfig;
     private final CloseableHttpClient deferredHttpClient;
     private final ScheduledThreadPoolExecutor deadlines = createDeadlineTimer();
     private final AtomicInteger pendingDeferred = new AtomicInteger();
@@ -147,12 +152,19 @@ final class InternalHttpClient implements Closeable {
             Optional<File> tlsCertificate) {
         UrlValidator.validateHttpUrl(url);
         this.url = url;
-        this.httpClient = createHttpClient(connectionTimeout, requestTimeout, tlsCertificate);
+        var requestConfigBuilder = RequestConfig.custom();
+        requestTimeout.ifPresent(timeout -> requestConfigBuilder.setResponseTimeout(Timeout.of(timeout)));
+        var requestConfig = requestConfigBuilder.build();
+        this.httpClient = createHttpClient(connectionTimeout, requestConfig, tlsCertificate);
+        // Snapshot requests carry a Bearer token and need no HTTP authentication negotiation.
+        this.snapshotRequestConfig = RequestConfig.copy(requestConfig)
+                .setAuthenticationEnabled(false)
+                .build();
         this.deferredHttpClient = createDeferredHttpClient(connectionTimeout, tlsCertificate);
     }
 
     private static CloseableHttpClient createHttpClient(
-            Optional<Duration> connectionTimeout, Optional<Duration> requestTimeout, Optional<File> tlsCertificate) {
+            Optional<Duration> connectionTimeout, RequestConfig requestConfig, Optional<File> tlsCertificate) {
         var connectionConfigBuilder = ConnectionConfig.custom();
         connectionTimeout.ifPresent(timeout -> connectionConfigBuilder.setConnectTimeout(Timeout.of(timeout)));
 
@@ -161,14 +173,13 @@ final class InternalHttpClient implements Closeable {
 
         applyTlsCertificate(connectionManagerBuilder, tlsCertificate);
 
-        var requestConfigBuilder = RequestConfig.custom();
-        requestTimeout.ifPresent(timeout -> requestConfigBuilder.setResponseTimeout(Timeout.of(timeout)));
-
         return HttpClients.custom()
                 .setConnectionManager(connectionManagerBuilder.build())
-                .setDefaultRequestConfig(requestConfigBuilder.build())
+                .setDefaultRequestConfig(requestConfig)
                 .setRequestExecutor(new AttemptRecordingExecutor())
                 .setRetryStrategy(new UncertainAttempts())
+                .addExecInterceptorAfter(
+                        ChainElement.RETRY.name(), SNAPSHOT_RESPONSE, InternalHttpClient::boundSnapshot)
                 .build();
     }
 
@@ -476,6 +487,78 @@ final class InternalHttpClient implements Closeable {
         });
     }
 
+    byte[] executeSnapshot(ClassicHttpRequest request) {
+        return executeSnapshot(request, MAX_SNAPSHOT_BYTES);
+    }
+
+    byte[] executeSnapshot(ClassicHttpRequest request, int maxBodyBytes) {
+        var context = HttpClientContext.create();
+        context.setRequestConfig(snapshotRequestConfig);
+        var snapshot = new SnapshotResponse(maxBodyBytes);
+        context.setAttribute(SNAPSHOT_RESPONSE, snapshot);
+        try {
+            // The snapshot POST is a read, even when an earlier attempt received a 503.
+            return httpClient.execute(request, context, response -> {
+                if (!isSuccessful(response.getCode())) {
+                    throw errorResponse(response.getCode(), snapshot.body);
+                }
+                return snapshot.body;
+            });
+        } catch (IOException e) {
+            throw new IggyConnectionException("HTTP request failed", e);
+        }
+    }
+
+    private static ClassicHttpResponse boundSnapshot(ClassicHttpRequest request, ExecChain.Scope scope, ExecChain chain)
+            throws IOException, HttpException {
+        var snapshot = (SnapshotResponse) scope.clientContext.getAttribute(SNAPSHOT_RESPONSE);
+        if (snapshot == null) {
+            return chain.proceed(request, scope);
+        }
+
+        // The retry and redirect handlers close intermediate responses before the final handler runs.
+        snapshot.body = null;
+        var response = chain.proceed(request, scope);
+        try {
+            snapshot.body = readSnapshotBody(response.getEntity(), snapshot.maxBodyBytes);
+            response.setEntity(null);
+        } catch (IOException | RuntimeException unread) {
+            ((ModalCloseable) response).close(CloseMode.IMMEDIATE);
+            throw unread;
+        }
+        return response;
+    }
+
+    private static byte[] readSnapshotBody(HttpEntity entity, int maxBodyBytes) throws IOException {
+        if (entity == null) {
+            return new byte[0];
+        }
+        long length = entity.getContentLength();
+        if (length > maxBodyBytes) {
+            throw oversizedSnapshot(maxBodyBytes);
+        }
+
+        InputStream content = entity.getContent();
+        byte[] body;
+        if (length >= 0) {
+            body = new byte[(int) length];
+            if (content.readNBytes(body, 0, body.length) != body.length) {
+                throw new IggyMalformedResponseException("Snapshot response is shorter than its declared length");
+            }
+        } else {
+            body = content.readNBytes(maxBodyBytes + 1);
+            if (body.length > maxBodyBytes) {
+                throw oversizedSnapshot(maxBodyBytes);
+            }
+        }
+        content.close();
+        return body;
+    }
+
+    private static IggyMalformedResponseException oversizedSnapshot(int maxBodyBytes) {
+        return new IggyMalformedResponseException("Snapshot response exceeds the limit of " + maxBodyBytes + " bytes");
+    }
+
     private static CloseableHttpClient createDeferredHttpClient(
             Optional<Duration> connectionTimeout, Optional<File> tlsCertificate) {
         var connectionConfigBuilder = ConnectionConfig.custom();
@@ -620,6 +703,15 @@ final class InternalHttpClient implements Closeable {
 
     private static boolean isSuccessful(int statusCode) {
         return statusCode >= 200 && statusCode < 300;
+    }
+
+    private static final class SnapshotResponse {
+        private final int maxBodyBytes;
+        private byte[] body;
+
+        SnapshotResponse(int maxBodyBytes) {
+            this.maxBodyBytes = maxBodyBytes;
+        }
     }
 
     private static final class AttemptRecordingExecutor extends HttpRequestExecutor {

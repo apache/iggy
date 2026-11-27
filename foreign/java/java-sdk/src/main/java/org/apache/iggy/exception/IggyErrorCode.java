@@ -22,6 +22,7 @@ package org.apache.iggy.exception;
 import org.apache.commons.lang3.StringUtils;
 
 import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -161,6 +162,9 @@ public enum IggyErrorCode {
     CONSUMER_GROUP_PARTITION_NOT_OWNED(5009),
     TOO_MANY_CONSUMER_GROUPS(5010),
 
+    // Snapshot errors
+    SNAPSHOT_FILE_COMPLETION_FAILED(9000),
+
     // VSR protocol errors
     INCOMPATIBLE_PROTOCOL_VERSION(14003),
     SESSION_MISMATCH(14004),
@@ -222,7 +226,7 @@ public enum IggyErrorCode {
             return fromCode(numericCode);
         } catch (NumberFormatException e) {
             try {
-                return valueOf(code.toUpperCase().replace(".", "_").replace(" ", "_"));
+                return valueOf(code.toUpperCase(Locale.ROOT).replace(".", "_").replace(" ", "_"));
             } catch (IllegalArgumentException ex) {
                 return UNKNOWN;
             }

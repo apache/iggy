@@ -223,6 +223,30 @@ The TCP builders accept `fromConnectionString`. Only `iggy://` and `iggy+tcp://`
 
 `getMetadataChanges` follows metadata history, and raw requests can target a named replica. See [Metadata changes](/docs/sdk/metadata-changes) and [Client failover](/docs/clustering/client-failover).
 
+## System snapshots
+
+Build the Java SDK and server from the same checkout to use `snapshot()`. It returns a ZIP archive of server
+diagnostics. The request requires root access or the global `manageServers` permission.
+
+For example, use an authenticated blocking client to save the server logs:
+
+```java
+import org.apache.iggy.system.SnapshotCompression;
+import org.apache.iggy.system.SystemSnapshotType;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+
+var snapshot = client.system().snapshot(
+        SnapshotCompression.Deflated, List.of(SystemSnapshotType.ServerLogs));
+Files.write(Path.of("iggy-snapshot.zip"), snapshot.data());
+```
+
+Blocking TCP and HTTP clients return a `Snapshot`. The async TCP client returns a `CompletableFuture<Snapshot>`.
+Use `SystemSnapshotType.All` on its own to request every diagnostics type. The Java HTTP client accepts archives up to
+64 MiB.
+
 ## Examples
 
 Runnable examples covering the async client, message headers and envelopes, multi-tenant setups, and TLS live in [examples/java](https://github.com/apache/iggy/tree/server-0.10.0/examples/java). See the [examples page](/docs/sdk/java/examples) for how to run them.
