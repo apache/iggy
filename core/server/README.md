@@ -2,7 +2,7 @@
 
 The core server component of Apache Iggy: a persistent, append-only log for message streaming. It runs thread-per-core and shared-nothing on `io_uring` (through `compio`), and commits every write through Viewstamped Replication (VSR), so the same binary serves a standalone node and a multi-node cluster.
 
-Clients connect over TCP (custom binary protocol), QUIC, WebSocket, or the HTTP REST API.
+Clients connect over TCP (custom binary protocol), QUIC, WebSocket, or the HTTP REST API, which [openapi.json](openapi.json) describes.
 
 ## Running
 
