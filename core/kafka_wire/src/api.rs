@@ -188,6 +188,9 @@ pub const ERROR_INVALID_PRODUCER_EPOCH: i16 = ResponseError::InvalidProducerEpoc
 /// Produce: the partition no longer holds the producer, and the batch does not start at
 /// sequence 0. The Java producer moves to a new epoch and sends the batch again from 0.
 pub const ERROR_UNKNOWN_PRODUCER_ID: i16 = ResponseError::UnknownProducerId.code();
+/// Produce: the data disk of the partition primary is below its free-space reserve, so nothing
+/// was written. Kafka clients retry it, as they do when a broker cannot write its log.
+pub const ERROR_KAFKA_STORAGE_ERROR: i16 = ResponseError::KafkaStorageError.code();
 /// Produce: a record or batch this gateway cannot map.
 ///
 /// Not `CORRUPT_MESSAGE` (2), whose text fits but which `kafka-protocol`'s table marks

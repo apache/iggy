@@ -563,6 +563,7 @@ actor ClientCore {
         let isLogin = CommandCode.isRegister(code)
         var walk = RosterWalk()
         var refused: IggyError?
+        var reserveBackoff = PollRouter.Backoff()
         while true {
             if let refused, deadline - clock.now < Self.notReadyRetryInterval {
                 // An attempt sent with a sliver of the budget would time out,
@@ -580,6 +581,18 @@ actor ClientCore {
                 return reply
             case .failure(let failure):
                 let error = outcome.observe(Self.graded(failure))
+                if error.code == .freeSpaceReserveReached, clock.now < deadline {
+                    // The primary has no room on its data disk and stored
+                    // nothing. It is still the primary, so the request goes
+                    // out again without a failover. The pause runs outside the
+                    // exchange lock, so other calls of the client go on, and
+                    // the request is stamped afresh, as a queued caller may
+                    // have spent a later id meanwhile.
+                    refused = error
+                    request = nil
+                    try await reserveBackoff.pause(after: error, before: deadline)
+                    continue
+                }
                 guard error.code == .transientNotAccepted || failure.code == .notPrimary, !isLogin, clock.now < deadline else {
                     dropConnection(after: failure, epoch: epoch)
                     // A lost connection goes back as it is, so the caller
@@ -809,7 +822,9 @@ actor ClientCore {
                 // server attaches this connection to no session, so it refuses
                 // every replay on it.
                 let endsSession = answer.code == .staleClient || (answer.code == .unauthenticated && evicted)
-                let transient = answer.code == .transientNotCommitted || answer.code == .transientNotAccepted || answer.code == .notPrimary
+                let transient =
+                    answer.code == .transientNotCommitted || answer.code == .transientNotAccepted || answer.code == .notPrimary
+                    || answer.code == .freeSpaceReserveReached
                 // Once one attempt left the outcome unknown, a later refusal
                 // of the same request no longer proves it never committed.
                 let error = outcome.observe(answer, committed: VSRFrame.hasCommittedResult(header))

@@ -240,6 +240,9 @@ class IggyErrorCodeTest {
         "4024, EMPTY_MESSAGE_PAYLOAD",
         "4027, INVALID_MESSAGE_CHECKSUM",
 
+        // Storage errors
+        "4109, FREE_SPACE_RESERVE_REACHED",
+
         // Consumer group errors
         "5000, CONSUMER_GROUP_ID_NOT_FOUND",
         "5002, INVALID_CONSUMER_GROUP_ID",

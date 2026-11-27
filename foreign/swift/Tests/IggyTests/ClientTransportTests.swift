@@ -809,6 +809,82 @@ struct ClientTransportTests {
         await client.shutdown()
     }
 
+    /// A primary below its free-space reserve stored nothing and is still the
+    /// primary, so the send goes out again on the same connection, stamped
+    /// afresh, until the primary has room again.
+    @Test func aSendBelowTheFreeSpaceReserveIsSentAgainUntilThereIsRoom() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let counter = Locked(0)
+        await server.respond { request in
+            if request.code == CommandCode.sendMessages.rawValue {
+                let seen = counter.withLock {
+                    $0 += 1; return $0
+                }
+                if seen <= 2 {
+                    return .status(IggyErrorCode.freeSpaceReserveReached.rawValue)
+                }
+            }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let client = makeClient(server)
+        try await client.connect()
+
+        try await client.sendBatch(streamID: 1, topicID: 2, partitioning: .partition(1), messages: ["a"])
+
+        let sends = await server.requests.filter { $0.code == CommandCode.sendMessages.rawValue }
+        #expect(sends.count == 3)
+        let first = try #require(sends.first)
+        #expect(sends.allSatisfy { $0.payload == first.payload })
+        #expect(await server.connectionCount == 1)
+        await client.shutdown()
+    }
+
+    /// The deadline of a send that the primary kept refusing for lack of disk
+    /// space ends it with that refusal.
+    @Test func aSendBelowTheFreeSpaceReserveEndsWithTheRefusalAtTheDeadline() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        await server.respond { request in
+            request.code == CommandCode.sendMessages.rawValue
+                ? .status(IggyErrorCode.freeSpaceReserveReached.rawValue) : FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let client = makeClient(server, requestTimeout: shortTimeout)
+        try await client.connect()
+
+        await expectCode(.freeSpaceReserveReached) {
+            try await client.sendBatch(streamID: 1, topicID: 2, partitioning: .partition(1), messages: ["a"])
+        }
+
+        let sends = await server.requests.filter { $0.code == CommandCode.sendMessages.rawValue }
+        #expect(sends.count > 1)
+        await client.shutdown()
+    }
+
+    /// The pause after a free-space refusal runs outside the exchange lock,
+    /// so another call of the same client goes out meanwhile.
+    @Test func aSendBelowTheFreeSpaceReserveLetsOtherCallsOfTheClientThrough() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        await server.respond { request in
+            request.code == CommandCode.sendMessages.rawValue
+                ? .status(IggyErrorCode.freeSpaceReserveReached.rawValue) : FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let client = makeClient(server, requestTimeout: .seconds(3))
+        try await client.connect()
+        let send = Task {
+            try await client.sendBatch(streamID: 1, topicID: 2, partitioning: .partition(1), messages: ["a"])
+        }
+        #expect(await eventually { await server.requests.contains { $0.code == CommandCode.sendMessages.rawValue } })
+
+        let elapsed = try await ContinuousClock().measure { try await client.ping() }
+
+        #expect(elapsed < .seconds(1))
+        send.cancel()
+        _ = await send.result
+        await client.shutdown()
+    }
+
     /// The replay after the failover check is stamped afresh. The refused
     /// request frees the exchange lock for that check, a caller queued behind
     /// it spends the next request id, and the server refuses an id older than
@@ -1417,7 +1493,8 @@ struct ClientTransportTests {
     /// the call at once with the unknown outcome, since every replay of the
     /// same request id gets the same answer.
     @Test(arguments: [
-        (IggyErrorCode.transientNotAccepted, true), (.notPrimary, true), (.requestTooOld, false), (.lifecycleBusy, false),
+        (IggyErrorCode.transientNotAccepted, true), (.notPrimary, true), (.freeSpaceReserveReached, true), (.requestTooOld, false),
+        (.lifecycleBusy, false),
         (.historyUnavailable, false), (.consumerGroupPartitionNotOwned, false), (.invalidCredentials, false),
     ])
     func anUncommittedSendReplaysOnlyWhileItsReplayIsAnsweredTransiently(_ refusal: IggyErrorCode, _ keepsReplaying: Bool) async throws {

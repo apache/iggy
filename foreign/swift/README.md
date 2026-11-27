@@ -530,10 +530,14 @@ func handle(_ error: IggyError) {
 }
 ```
 
-Three codes tell what happened to a request that did not complete:
+These codes tell what happened to a request that did not complete:
 
 - `transientNotAccepted` (58): the server did not admit the request, so a retry is
   safe.
+- `freeSpaceReserveReached` (4109): the free space on the data disk of the partition
+  primary is below `[node] free_space_reserve`, and the server stored nothing. The
+  client already sent the request again until its request timeout. A retry is safe,
+  and it succeeds once the space returns.
 - `transientNotCommitted` (57): the outcome is unknown, and the server possibly applied
   the write. Read the state before you write it again.
 - `fetchProgressUncertain` (14010): a poll or fetch with `.onRead` lost its reply, so the

@@ -1145,6 +1145,10 @@
   code: 4108
   format: "cannot modify root user"
   fields: []
+- name: FreeSpaceReserveReached
+  code: 4109
+  format: "free space on the data disk is below [node] free_space_reserve; retry after backoff on the same replica"
+  fields: []
 - name: ConsumerGroupIdNotFound
   code: 5000
   format: "consumer group with id: %d for topic with id: %d was not found."

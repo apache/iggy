@@ -274,7 +274,8 @@ extension BackgroundSendOptions {
 ///
 /// The first request of `failed` may have committed, and the server does not
 /// deduplicate a resend. It provably never committed only when `cause` is
-/// ``IggyErrorCode/transientNotAccepted``, ``IggyErrorCode/notConnected``,
+/// ``IggyErrorCode/transientNotAccepted``, ``IggyErrorCode/freeSpaceReserveReached``,
+/// ``IggyErrorCode/notConnected``,
 /// ``IggyErrorCode/cannotEstablishConnection``,
 /// ``IggyErrorCode/cannotSendMessagesDueToClientDisconnection``, or
 /// ``IggyErrorCode/producerClosed``, or when `underlying` is the

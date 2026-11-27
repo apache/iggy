@@ -1127,6 +1127,59 @@ func TestSendBinaryRequest_StampsTheSendContextOnEveryAttempt(t *testing.T) {
 	}
 }
 
+// A primary below its free-space reserve stored nothing and is still the
+// primary, so the same request goes to it again without a roster refresh.
+func TestSendBinaryRequest_ResendsToTheSamePrimaryBelowTheFreeSpaceReserve(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	sends := 0
+	server := servePartitionOperations(t, serverConn, func(_ int, _ request) []byte {
+		sends++
+		if sends <= 2 {
+			return statusReplyFrame(vsr.OperationSendMessages, uint32(ierror.FreeSpaceReserveReachedCode), nil)
+		}
+		return replyFrame(vsr.OperationSendMessages, binary.LittleEndian.AppendUint32(nil, 0))
+	})
+	stream, topic, _ := groupConsumer(t)
+	payload := rawSendPayload(t, stream, topic, iggcon.PartitionId(3))
+
+	_, err := client.SendBinaryRequest(context.Background(), uint32(command.SendMessagesCode), payload)
+	require.NoError(t, err)
+
+	recorded := server.recorded()
+	require.Len(t, recorded, 4)
+	require.Equal(t, uint32(command.GetPartitionRouteCode), recorded[0].code())
+	for _, send := range recorded[1:] {
+		assert.Equal(t, vsr.OperationSendMessages, send.operation())
+		assert.Equal(t, recorded[1].requestID(), send.requestID())
+		assert.Equal(t, payload, send.payload)
+	}
+}
+
+// At its deadline a send that the primary kept refusing for lack of disk
+// space ends with that refusal, not with TransientNotAccepted.
+func TestSendBinaryRequest_EndsWithFreeSpaceReserveReachedAtItsDeadline(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	server := servePartitionOperations(t, serverConn, func(_ int, _ request) []byte {
+		return statusReplyFrame(vsr.OperationSendMessages, uint32(ierror.FreeSpaceReserveReachedCode), nil)
+	})
+	stream, topic, _ := groupConsumer(t)
+	payload := rawSendPayload(t, stream, topic, iggcon.PartitionId(3))
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	_, err := client.SendBinaryRequest(ctx, uint32(command.SendMessagesCode), payload)
+	require.ErrorIs(t, err, ierror.ErrFreeSpaceReserveReached)
+
+	recorded := server.recorded()
+	require.Equal(t, uint32(command.GetPartitionRouteCode), recorded[0].code())
+	sends := recorded[1:]
+	require.Greater(t, len(sends), 1, "the send is retried before its deadline")
+	for _, send := range sends {
+		assert.Equal(t, vsr.OperationSendMessages, send.operation())
+		assert.Equal(t, sends[0].requestID(), send.requestID())
+	}
+}
+
 // A raw send cannot pick a partition the way the typed send does, and a zero
 // context is always refused, so nothing may reach the wire.
 func TestSendBinaryRequest_RefusesASendWithoutAnExplicitPartition(t *testing.T) {

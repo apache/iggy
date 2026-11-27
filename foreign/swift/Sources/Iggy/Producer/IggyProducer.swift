@@ -453,7 +453,7 @@ actor ProducerCore: ProducerCoreBackend {
     /// reconnect, and a lost replay reaches the caller as `disconnected`.
     static func stopsSendRetries(_ error: IggyError) -> Bool {
         switch error.code {
-        case .transientNotAccepted, .notConnected, .cannotEstablishConnection:
+        case .transientNotAccepted, .freeSpaceReserveReached, .notConnected, .cannotEstablishConnection:
             false
         default:
             true

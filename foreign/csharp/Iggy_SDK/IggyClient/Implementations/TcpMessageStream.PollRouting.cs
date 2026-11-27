@@ -587,7 +587,8 @@ public sealed partial class TcpMessageStream
                             operation.Uncertain = true;
                         }
                         if (operation is { Uncertain: true } && !status.Committed
-                            && status.StatusCode is not (VsrError.TRANSIENT_NOT_COMMITTED or VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.NOT_PRIMARY))
+                            && status.StatusCode is not (VsrError.TRANSIENT_NOT_COMMITTED or VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.NOT_PRIMARY
+                                or VsrError.FREE_SPACE_RESERVE_REACHED))
                         {
                             throw new VsrRequestOutcomeUnknownException(status, operation.Identity.RequestId);
                         }
@@ -640,7 +641,7 @@ public sealed partial class TcpMessageStream
                 // which one moved, so the caller looks up every route of the call again.
                 catch (IggyInvalidStatusCodeException error) when (error.StatusCode is
                     VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.TRANSIENT_NOT_COMMITTED
-                    or VsrError.DEFERRED_POLL_CAPACITY_EXCEEDED
+                    or VsrError.DEFERRED_POLL_CAPACITY_EXCEEDED or VsrError.FREE_SPACE_RESERVE_REACHED
                     || error.StatusCode == VsrError.NOT_PRIMARY && replica is null
                     && code != CommandCodes.FETCH_MESSAGES_CODE)
                 {
@@ -677,8 +678,11 @@ public sealed partial class TcpMessageStream
                         }
                         throw;
                     }
-                    // A full server refuses a deferred request on the right route, so the route is kept.
-                    if (target is { } failed && error.StatusCode != VsrError.DEFERRED_POLL_CAPACITY_EXCEEDED)
+                    // A full server refuses a deferred request, and a primary below its free-space reserve a send, on
+                    // the right route, so the route is kept.
+                    if (target is { } failed
+                        && error.StatusCode is not (VsrError.DEFERRED_POLL_CAPACITY_EXCEEDED
+                            or VsrError.FREE_SPACE_RESERVE_REACHED))
                     {
                         RemovePartitionRoute(failed.Key, error.StatusCode == VsrError.NOT_PRIMARY ? route : null);
                     }

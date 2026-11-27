@@ -1932,8 +1932,11 @@ handshake_grace = "10 s"
 #advertised_address = "broker-1.example.com"
 
 # Free space this node keeps on the disk of its data directory. While less is
-# free, the node refuses new messages for the partitions it leads with a
-# transient error that SDKs retry, and accepts them again once space returns.
+# free, the node refuses new messages for the partitions it leads with
+# FreeSpaceReserveReached (4109), HTTP 507 over HTTP, and accepts them again
+# once space returns. Nothing of a refused send is stored, so binary SDK
+# clients send it again to the same node until the request deadline, and then
+# return 4109. HTTP clients send it again as they do after a 503.
 # Retention, segment deletion and consumer offsets keep working, so the node
 # can still free space. Without the reserve a full disk fails a WAL write and
 # stops the node.

@@ -1463,6 +1463,65 @@ public sealed partial class NativeRecoveryTests
         Assert.All(attempts, attempt => Assert.Equal(attempts[0].RequestId, attempt.RequestId));
     }
 
+    [Fact]
+    public async Task given_an_uncertain_send_when_the_primary_is_below_its_free_space_reserve_should_resend_until_it_settles()
+    {
+        using var cluster = new RecoveryCluster();
+        cluster.OnSend = request => cluster.Sends.Count switch
+        {
+            1 => Reply(request.Operation, [], VsrError.TRANSIENT_NOT_COMMITTED),
+            2 => Reply(request.Operation, [], VsrError.FREE_SPACE_RESERVE_REACHED),
+            _ => Reply(request.Operation, new byte[4])
+        };
+        using var client = await cluster.ConnectAsync();
+
+        await client.SendMessagesAsync(Stream, Topic, Partitioning.PartitionId(0),
+            new Message(Guid.NewGuid(), "payload"u8.ToArray()), cluster.Token);
+
+        var attempts = cluster.Sends.ToArray();
+        Assert.Equal(3, attempts.Length);
+        Assert.All(attempts, attempt => Assert.Equal(attempts[0].RequestId, attempt.RequestId));
+    }
+
+    [Fact]
+    public async Task given_a_primary_below_its_free_space_reserve_when_sending_should_resend_the_request_on_the_same_route()
+    {
+        using var cluster = new RecoveryCluster();
+        cluster.OnSend = request => cluster.Sends.Count <= 2
+            ? Reply(request.Operation, [], VsrError.FREE_SPACE_RESERVE_REACHED) : Reply(request.Operation, new byte[4]);
+        using var client = await cluster.ConnectAsync();
+
+        await client.SendMessagesAsync(Stream, Topic, Partitioning.PartitionId(0),
+            new Message(Guid.NewGuid(), "payload"u8.ToArray()), cluster.Token);
+
+        var attempts = cluster.Sends.ToArray();
+        Assert.Equal(3, attempts.Length);
+        Assert.All(attempts, attempt => Assert.Equal(attempts[0].RequestId, attempt.RequestId));
+        Assert.Equal(1, cluster.RouteLookups);
+    }
+
+    [Fact]
+    public async Task given_a_primary_below_its_free_space_reserve_until_the_deadline_when_sending_should_report_the_refusal()
+    {
+        const int DeadlineMs = 1_000;
+        using var cluster = new RecoveryCluster();
+        using var client = await cluster.ConnectAsync();
+        // A public send gives the body that the call with the earlier deadline sends.
+        await client.SendMessagesAsync(Stream, Topic, Partitioning.PartitionId(0),
+            new Message(Guid.NewGuid(), "payload"u8.ToArray()), cluster.Token);
+        var send = Assert.Single(cluster.Sends).Body;
+        var lookups = cluster.RouteLookups;
+        cluster.OnSend = request => Reply(request.Operation, [], VsrError.FREE_SPACE_RESERVE_REACHED);
+
+        var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => SendWithinAsync(client,
+            CommandCodes.SEND_MESSAGES_CODE, send, TimeSpan.FromMilliseconds(DeadlineMs), cluster.Token));
+
+        Assert.Equal(VsrError.FREE_SPACE_RESERVE_REACHED, error.StatusCode);
+        Assert.True(error.FromServer);
+        Assert.True(cluster.Sends.Count > 2);
+        Assert.Equal(lookups, cluster.RouteLookups);
+    }
+
     [Theory]
     [InlineData(true)]
     [InlineData(false)]

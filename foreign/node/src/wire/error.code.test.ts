@@ -61,6 +61,10 @@ it('translates the shadow stream write refusal', () => {
   );
 });
 
+it('translates the free-space reserve refusal', () => {
+  assert.equal(translateErrorCode(4109), 'Free space on the data disk is below [node] free_space_reserve; retry after backoff on the same replica');
+});
+
 it('translates the consumer-offset capacity error', () => {
   assert.equal(translateErrorCode(3024), 'Consumer offset limit reached for partition, raise [partition] consumer_offsets_max');
 });

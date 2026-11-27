@@ -151,6 +151,9 @@ public enum IggyErrorCode {
     UNSUPPORTED_CRITICAL_OPTION(4107),
     CANNOT_MODIFY_ROOT_USER(4108),
 
+    // Storage errors
+    FREE_SPACE_RESERVE_REACHED(4109),
+
     // Consumer group errors
     CONSUMER_GROUP_ID_NOT_FOUND(5000),
     INVALID_CONSUMER_GROUP_ID(5002),

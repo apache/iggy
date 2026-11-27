@@ -313,6 +313,19 @@ func TestPollMessagesDeferred_RetriesACapacityRefusalWithinItsBudget(t *testing.
 	assert.GreaterOrEqual(t, secondTimeout-secondWait, iggcon.MinDeferredPollReplyMargin)
 }
 
+// A poll refused for capacity until its budget runs out ends with that
+// refusal, as in the Rust SDK, not with TransientNotAccepted.
+func TestPollMessagesDeferred_EndsWithTheCapacityRefusalWhenItsBudgetRunsOut(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	servePartitionOperations(t, serverConn, func(_ int, _ request) []byte {
+		return statusReplyFrame(vsr.OperationNonReplicated, uint32(ierror.DeferredPollCapacityExceededCode), nil)
+	})
+
+	_, err := pollDeferred(context.Background(), t, client, 1, deferredOptions(0, 1500*time.Millisecond))
+
+	require.ErrorIs(t, err, ierror.ErrDeferredPollCapacityExceeded)
+}
+
 func TestPollMessagesDeferred_EndsAtItsRequestTimeoutAndCancelsThePoll(t *testing.T) {
 	client, serverConn := newPipeClient(t)
 	parked := make(chan request, 1)

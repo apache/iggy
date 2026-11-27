@@ -1115,12 +1115,7 @@ final class PollRouter {
             retryLifecycle(poll, refusal);
             return;
         }
-        if (!poll.terminalRoutingRefusal
-                && (isNotAccepted(error)
-                        || notPrimary
-                        || (refusal != null
-                                && refusal.getRawErrorCode()
-                                        == IggyErrorCode.DEFERRED_POLL_CAPACITY_EXCEEDED.getCode()))) {
+        if (!poll.terminalRoutingRefusal && (isNotAccepted(error) || notPrimary || isCapacityRefusal(refusal))) {
             retry(poll, notPrimary, refusal);
         } else {
             poll.fail(error);
@@ -1511,6 +1506,16 @@ final class PollRouter {
                 || error instanceof IOException;
     }
 
+    /**
+     * Whether the primary refused for lack of room, deferred poll capacity or the free-space reserve of its data disk.
+     * It stored nothing and is still the primary, so the route stays and the same primary is asked again.
+     */
+    private static boolean isCapacityRefusal(IggyServerException refusal) {
+        return refusal != null
+                && (refusal.getErrorCode() == IggyErrorCode.DEFERRED_POLL_CAPACITY_EXCEEDED
+                        || refusal.getErrorCode() == IggyErrorCode.FREE_SPACE_RESERVE_REACHED);
+    }
+
     private static IggyServerException notAccepted() {
         return IggyServerException.fromTcpResponse(AsyncTcpConnection.TRANSIENT_NOT_ACCEPTED, new byte[0]);
     }
@@ -1714,8 +1719,9 @@ final class PollRouter {
         private final boolean commits;
         private boolean historyRefreshed;
         private boolean retryingRefusal;
-        // The last capacity refusal, which the call reports when its deadline ends the retries. A budget too short
-        // for another attempt also ends them with 58, which would hide it.
+        // The last capacity refusal, deferred poll capacity or the free-space reserve of the primary, which the call
+        // reports when its deadline ends the retries. A budget too short for another attempt also ends them with 58,
+        // which would hide it.
         private IggyServerException capacityRefusal;
         private boolean notPrimarySeen;
         private long notPrimaryRetryMillis = RETRY_INTERVAL_MILLIS;
@@ -1841,7 +1847,7 @@ final class PollRouter {
             if (dataCommand == CommandCode.Messages.POLL_DEFERRED.getValue()) {
                 attemptDeadline = deadline - DeferredPollOptions.REPLY_MARGIN.toNanos();
             }
-            if (refusal != null && refusal.getErrorCode() == IggyErrorCode.DEFERRED_POLL_CAPACITY_EXCEEDED) {
+            if (isCapacityRefusal(refusal)) {
                 capacityRefusal = refusal;
             }
             if (attemptDeadline - System.nanoTime() <= TimeUnit.MILLISECONDS.toNanos(delayMillis)) {

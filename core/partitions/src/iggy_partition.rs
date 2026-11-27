@@ -9114,7 +9114,7 @@ where
                 Self::send_partition_deny_or_log(
                     consensus,
                     message.header(),
-                    IggyError::TransientNotAccepted.as_code(),
+                    IggyError::FreeSpaceReserveReached.as_code(),
                     "data disk is below its free-space reserve",
                     reply.take(),
                 )
@@ -9654,7 +9654,7 @@ where
                 if self
                     .deny_queued_request(
                         &header,
-                        IggyError::TransientNotAccepted.as_code(),
+                        IggyError::FreeSpaceReserveReached.as_code(),
                         "data disk fell below its free-space reserve",
                         reply_sender.take(),
                         &mut consecutive_denials,

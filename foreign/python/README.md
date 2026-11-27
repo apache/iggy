@@ -480,9 +480,10 @@ only after the next prepare or commit broadcast. When no other write follows,
 this delay is at most `cluster.commit_busy_heartbeat_interval` (500 ms by default).
 See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
 
-Every error that the Rust SDK reports reaches Python as `IggyError`, a `RuntimeError` subclass. Its `code` is the numeric Iggy error code, the same code that the other SDKs report, and its message is the SDK's error text, so branch on `code` rather than on the message. Three codes tell what happened to a request that did not complete:
+Every error that the Rust SDK reports reaches Python as `IggyError`, a `RuntimeError` subclass. Its `code` is the numeric Iggy error code, the same code that the other SDKs report, and its message is the SDK's error text, so branch on `code` rather than on the message. These codes tell what happened to a request that did not complete:
 
 - 58 (`TransientNotAccepted`): the server did not admit the request, so a retry is safe.
+- 4109 (`FreeSpaceReserveReached`): the free space on the data disk of the partition primary is below `[node] free_space_reserve`, and the server stored nothing. The SDK already sent the request again until its deadline. A retry is safe, and it succeeds once the space returns.
 - 57 (`TransientNotCommitted`): the outcome is unknown, and the server possibly applied the write. Read the state before you write it again.
 - 40 (`Unauthenticated`): the request needs a session. Sign in, then retry.
 

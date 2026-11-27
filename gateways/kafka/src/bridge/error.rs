@@ -23,9 +23,10 @@ use crate::cluster_id::InvalidClusterId;
 use crate::protocol::api::{
     ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_INVALID_PARTITIONS, ERROR_INVALID_PRODUCER_EPOCH,
     ERROR_INVALID_REPLICATION_FACTOR, ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION,
-    ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER, ERROR_POLICY_VIOLATION,
-    ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_ALREADY_EXISTS, ERROR_TOPIC_AUTHORIZATION_FAILED,
-    ERROR_UNKNOWN_PRODUCER_ID, ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    ERROR_KAFKA_STORAGE_ERROR, ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER,
+    ERROR_POLICY_VIOLATION, ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_ALREADY_EXISTS,
+    ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_PRODUCER_ID, ERROR_UNKNOWN_SERVER_ERROR,
+    ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
 
 /// Errors from the `IggyBridge`: connection lifecycle, config, and Iggy SDK calls.
@@ -225,8 +226,8 @@ impl BridgeError {
         }
     }
 
-    /// True when the same call can succeed later: Kafka clients retry its code, 6 or 7. A wrong
-    /// password, a missing permission or a bad configuration is not.
+    /// True when the same call can succeed later: Kafka clients retry its code, 6, 7 or 56. A
+    /// wrong password, a missing permission or a bad configuration is not.
     #[must_use]
     pub fn is_retriable(&self) -> bool {
         match self {
@@ -235,7 +236,7 @@ impl BridgeError {
             }
             _ => matches!(
                 self.to_kafka_error_code(),
-                ERROR_NOT_LEADER_OR_FOLLOWER | ERROR_REQUEST_TIMED_OUT
+                ERROR_NOT_LEADER_OR_FOLLOWER | ERROR_REQUEST_TIMED_OUT | ERROR_KAFKA_STORAGE_ERROR
             ),
         }
     }
@@ -318,6 +319,9 @@ const fn iggy_error_to_kafka_code(err: &IggyError) -> i16 {
         IggyError::TransientNotCommitted
         | IggyError::OperationUncertain(_)
         | IggyError::OperationNotRetained(_) => ERROR_REQUEST_TIMED_OUT,
+        // The primary wrote nothing because its data disk is below the free-space reserve.
+        // Redpanda answers a full disk with the same retriable code.
+        IggyError::FreeSpaceReserveReached => ERROR_KAFKA_STORAGE_ERROR,
         // The outcome was forgotten; a retry after client eviction could duplicate the write.
         // UNKNOWN_SERVER_ERROR is non-retryable in the Kafka protocol.
         IggyError::RequestTooOld => ERROR_UNKNOWN_SERVER_ERROR,
@@ -631,6 +635,14 @@ mod tests {
             err.to_offset_error_code(),
             ERROR_COORDINATOR_LOAD_IN_PROGRESS
         );
+    }
+
+    #[test]
+    fn given_a_send_refused_below_the_free_space_reserve_should_answer_a_retriable_storage_error() {
+        let err = BridgeError::Iggy(IggyError::FreeSpaceReserveReached);
+        assert_eq!(err.to_kafka_error_code(), ERROR_KAFKA_STORAGE_ERROR);
+        assert_eq!(err.to_produce_error_code(), ERROR_KAFKA_STORAGE_ERROR);
+        assert!(err.is_retriable());
     }
 
     #[test]

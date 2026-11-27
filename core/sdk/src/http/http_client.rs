@@ -881,13 +881,16 @@ impl RetryableStrategy for SafeResends {
 }
 
 /// HTTP has no request dedup, so a resend is a new request that can apply a write twice. A 503
-/// refuses a request before the server takes it, and a request that was never built or never
-/// connected was never sent.
+/// refuses a request before the server takes it, a 507 refuses a send before the server stores
+/// it, and a request that was never built or never connected was never sent.
 fn may_have_committed(result: &Result<Response, reqwest_middleware::Error>) -> bool {
     match result {
         Ok(response) => {
             response.status().is_server_error()
-                && response.status() != StatusCode::SERVICE_UNAVAILABLE
+                && !matches!(
+                    response.status(),
+                    StatusCode::SERVICE_UNAVAILABLE | StatusCode::INSUFFICIENT_STORAGE
+                )
         }
         Err(reqwest_middleware::Error::Reqwest(error)) => {
             !error.is_builder() && !error.is_connect()
@@ -908,8 +911,9 @@ fn deferred_reply_limit(max_bytes: u32) -> usize {
 /// refreshes its context once on `HistoryUnavailable`, `LifecycleBusy` is retried,
 /// non-admission and capacity refusals permit a retry without risking duplicate progress, a
 /// poll refused for its byte limit returns `InvalidSizeBytes`, and a topic refused for a factor
-/// above the node count returns `InvalidReplicationFactor`, and a read of tiered data that the
-/// object store refused for good returns `TieredReadFailed`, as over the binary transports.
+/// above the node count returns `InvalidReplicationFactor`, a read of tiered data that the
+/// object store refused for good returns `TieredReadFailed`, and a send refused below the
+/// free-space reserve returns `FreeSpaceReserveReached`, as over the binary transports.
 fn typed_refusal(body: &str) -> Option<IggyError> {
     let id = error_id(body)?;
     [
@@ -921,6 +925,7 @@ fn typed_refusal(body: &str) -> Option<IggyError> {
         IggyError::InvalidSizeBytes,
         IggyError::InvalidReplicationFactor,
         IggyError::TieredReadFailed,
+        IggyError::FreeSpaceReserveReached,
     ]
     .into_iter()
     .find(|error| error.as_code() == id)
@@ -1136,6 +1141,7 @@ mod tests {
             IggyError::InvalidSizeBytes,
             IggyError::InvalidReplicationFactor,
             IggyError::TieredReadFailed,
+            IggyError::FreeSpaceReserveReached,
         ] {
             let body = format!(r#"{{"id":{},"reason":"unavailable"}}"#, error.as_code());
             assert_eq!(typed_refusal(&body), Some(error));

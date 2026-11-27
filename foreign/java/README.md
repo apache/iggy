@@ -632,7 +632,7 @@ The HTTP client sends a poll or an offset store whose context is all zero withou
 
 The SDK's custom exception types inherit from `IggyException`. When you join a failed future, the cause can come back inside a `CompletionException`. The HTTP client's `close()` method declares `IOException`. Handle these two boundaries as well as the specific SDK errors.
 
-The HTTP client treats 503 `relay_refused` through Apache HttpClient's ordinary 429/503 retry strategy. That behavior does not provide retained-operation recovery over HTTP. A `pollMessages` with auto-commit is the `POST` above, which the client never sends again after the request may have reached the server, and whose unknown outcome fails with `FETCH_PROGRESS_UNCERTAIN` (14010).
+The HTTP client treats 503 `relay_refused` through Apache HttpClient's ordinary 429/503 retry strategy, which also resends a 507: a send refused below the free-space reserve of the partition primary, which stored nothing. That behavior does not provide retained-operation recovery over HTTP. A `pollMessages` with auto-commit is the `POST` above, which the client never sends again after the request may have reached the server, and whose unknown outcome fails with `FETCH_PROGRESS_UNCERTAIN` (14010).
 
 On a multi-node cluster, an HTTP call often reaches a node that is not the
 partition primary. For message sends, polls and consumer offset calls, that
