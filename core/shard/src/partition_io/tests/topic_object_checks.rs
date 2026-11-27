@@ -88,6 +88,8 @@ async fn publish(owner: &IoTestShard, objects: &Objects) {
         published_at: 1,
         state: TopicState::Live,
         tombstone_grace: 0,
+        read_cache_size: None,
+        read_ahead: None,
     }
     .put(objects.executor().store(), &layout())
     .await

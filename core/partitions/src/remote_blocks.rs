@@ -54,7 +54,7 @@ use iggy_object_store::{
 use server_common::iobuf::{Frozen, Owned};
 use server_common::sharding::IggyNamespace;
 use server_common::yield_to_reactor;
-use tracing::error;
+use tracing::{error, info};
 
 use crate::placed_read::REWRITE_YIELD_BYTES;
 use crate::poll_plan::DiskFault;
@@ -316,6 +316,19 @@ impl ReadCache {
         let budget = {
             let mut cache = self.cache.borrow_mut();
             if cache.limit(&owner) != limit {
+                // Logged when the effective limit becomes zero, not on each
+                // update: a share that changes while it stays below the
+                // minimum keeps the limit at zero and logs nothing again.
+                if let (Some(0), Some(share @ 1..)) = (limit, settings.limit) {
+                    info!(
+                        prefix = ?owner.prefix,
+                        share,
+                        kept_at_least,
+                        "a partition's share of its topic's read_cache_size is below \
+                         {LIMIT_BLOCKS_MIN} blocks of this node's read_cache_block_size, so it \
+                         keeps nothing that its reads fetch"
+                    );
+                }
                 cache.set_limit(owner, limit);
             }
             cache.budget()

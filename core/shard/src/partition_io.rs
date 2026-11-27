@@ -815,8 +815,12 @@ mod tests {
     use futures::channel::oneshot;
     use iggy_binary_protocol::namespace::METADATA_GROUP;
     use iggy_binary_protocol::primitives::consumer::WireConsumer;
+    use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
+    use iggy_binary_protocol::requests::topics::{
+        CreateTopicRequest, CreateTopicWithAssignmentsRequest,
+    };
     use iggy_binary_protocol::requests::users::CreateUserRequest;
     use iggy_binary_protocol::requests::users::login_register::{CredentialProof, RegisterRequest};
     use iggy_binary_protocol::{
@@ -835,6 +839,10 @@ mod tests {
     use journal::prepare_journal::PrepareJournal;
     use journal::superblock::{SuperblockContents, SuperblockStore};
     use message_bus::{IggyMessageBus, MessageBus, SendError};
+    use metadata::stm::StateMachine;
+    use metadata::stm::shadow::{
+        ShadowReadCache, ShadowRetention, ShadowStream, ShadowTopicRequest, ShadowTopicTarget,
+    };
     use metadata::stm::stream::{Partition, Stream, Streams, StreamsInner, Topic};
     use metadata::stm::user::{Users, UsersInner};
     use metadata::{IggyMetadata, MuxStateMachine};
@@ -12935,6 +12943,125 @@ mod tests {
             partitions::PartitionReadSettings::new(None, Some(MIB)),
             "an unset size sets no limit, whatever the shard's cache is"
         );
+    }
+
+    /// Commit the shadow topic operation `request` at `op` on `owner`.
+    fn apply_shadow_topic<B: MessageBus + Clone + 'static>(
+        owner: &IoTestShard<B>,
+        op: u64,
+        request: &ShadowTopicRequest,
+    ) {
+        let body = request.to_bytes();
+        let size = size_of::<PrepareHeader>() + body.len();
+        let mut prepare = Message::<PrepareHeader>::new(size);
+        prepare.as_mut_slice()[size_of::<PrepareHeader>()..].copy_from_slice(&body);
+        let prepare = prepare.transmute_header(|_, header: &mut PrepareHeader| {
+            header.command = Command::Prepare;
+            header.operation = Operation::ShadowTopic;
+            header.op = op;
+            header.size = u32::try_from(size).unwrap();
+        });
+        let reply = owner.plane.metadata().mux_stm.update(prepare).unwrap();
+        assert_eq!(reply.code, 0, "{request:?}");
+    }
+
+    /// A shadow topic reads with the read cache that its peer's topic sets:
+    /// what its adoption carries, and then what each change carries, from
+    /// the next poll on. A value that this node's cache cannot keep is
+    /// passed on as the peer set it, for the cache to bound.
+    #[test]
+    fn given_a_shadow_topic_when_its_peer_changes_the_read_cache_should_read_with_it_from_the_next_poll()
+     {
+        const MIB: u64 = 1 << 20;
+        const PARTITIONS: u32 = 2;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _) = test_owner_shaped(&bus, None, (None, None), |_| {});
+        let target = ShadowTopicTarget {
+            stream_id: 1,
+            source: ShadowStream {
+                origin: "dc-b".to_owned(),
+                cluster_uid: 0x0b0b,
+                stream_id: 7,
+            },
+            topic_id: 3,
+            created_revision: 41,
+        };
+        apply_shadow_topic(
+            &owner,
+            1,
+            &ShadowTopicRequest::CreateStream {
+                source: target.source.clone(),
+                name: WireName::new("__shadow_dc-b_orders").unwrap(),
+            },
+        );
+        let options = iggy_common::TopicCreateOptions {
+            read_cache: iggy_common::TopicReadCache {
+                size: Some(IggyByteSize::from(16 * MIB)),
+                read_ahead: Some(IggyByteSize::from(MIB)),
+            },
+            ..iggy_common::TopicCreateOptions::default()
+        };
+        let create = CreateTopicWithAssignmentsRequest {
+            request: CreateTopicRequest {
+                stream_id: WireIdentifier::numeric(target.stream_id),
+                partitions_count: PARTITIONS,
+                name: WireName::new("payments").unwrap(),
+                options: options.to_wire().unwrap(),
+            },
+            derived_options: WireOptions::empty(),
+            partitions: (0..PARTITIONS)
+                .map(|partition_id| CreatedPartitionAssignment {
+                    partition_id,
+                    consensus_group_id: 100 + u64::from(partition_id),
+                    initial_view: 0,
+                    members: Vec::new(),
+                })
+                .collect(),
+        };
+        apply_shadow_topic(
+            &owner,
+            2,
+            &ShadowTopicRequest::AdoptTopic {
+                target: target.clone(),
+                create: Box::new(create),
+                retention: ShadowRetention::default(),
+                geo_mode: iggy_common::GeoMode::Geo,
+            },
+        );
+        let namespace = IggyNamespace::new(1, 3, 1);
+        let mib = |count: u64| usize::try_from(count * MIB).unwrap();
+
+        assert_eq!(
+            owner.partition_read_settings(namespace),
+            partitions::PartitionReadSettings::new(Some(mib(8)), Some(MIB)),
+            "what the adoption carried"
+        );
+
+        let changes = [
+            (Some(0), None, Some(0), None),
+            (
+                Some(512 * 1024),
+                Some(4 * MIB),
+                Some(256 * 1024),
+                Some(4 * MIB),
+            ),
+            (None, None, None, None),
+        ];
+        for (op, (size, read_ahead, limit, partition_read_ahead)) in (3..).zip(changes) {
+            apply_shadow_topic(
+                &owner,
+                op,
+                &ShadowTopicRequest::SetReadCache {
+                    target: target.clone(),
+                    read_cache: ShadowReadCache { size, read_ahead },
+                },
+            );
+            assert_eq!(
+                owner.partition_read_settings(namespace),
+                partitions::PartitionReadSettings::new(limit, partition_read_ahead),
+                "{size:?}, {read_ahead:?}"
+            );
+        }
     }
 
     mod fresh_proofs;

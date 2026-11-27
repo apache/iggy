@@ -514,7 +514,7 @@ A value is a number of microseconds or a duration like `50 ms`. The meaning of e
 - An update cannot reset a duration to the node's setting. To follow the node again, set the
   node's value.
 - A normal topic refuses them. A shadow topic has none: its cluster applies its own settings,
-  because the options of a topic do not go to other datacenters.
+  because the durations of a topic do not go to other datacenters.
 - The topic's object records its `tombstone_grace`, so the grace still applies after the delete,
   when the topic is gone from metadata.
 
@@ -545,6 +545,18 @@ fresh objects that a shard uploaded stay in memory for the polls at the tail wha
 sets. An update can change both and cannot reset them. See [tiered
 storage](../README.md#tiered-storage) in the server README.
 
+The topic's object carries both keys, so each shadow topic of the topic in another datacenter
+reads with the same values: it takes them at its adoption, and follows each update. A key that
+the geo topic does not set is unset on the shadow topic too, and the nodes that hold the shadow
+apply their own settings. The values are kept as the origin set them, also when they do not fit
+the nodes of the other cluster: a share of `read_cache_size` below 8 blocks of a node's
+`read_cache_block_size` keeps nothing on that node, which logs it once for each such partition,
+and a partition reads ahead at most an eighth of its share. A client cannot set them on a shadow
+topic. An update typically reaches the shadow topics within about 35 seconds, and later while
+earlier shadow operations are queued, see [Delays](#delays). After a recovery of the origin, a
+shadow topic follows the successor's updates. While the origin's bucket does not answer, and after
+its origin retired, a shadow topic keeps the last values it took.
+
 ### What happens after a create
 
 1. The metadata primary stores the topic's object,
@@ -554,7 +566,8 @@ storage](../README.md#tiered-storage) in the server README.
    warning.
 3. The metadata primary of each peer lists the topic objects of this cluster every 5 seconds. It
    adopts the new topic into the shadow stream `__shadow_<origin>_<stream>`, with the same topic
-   id, topic name and partition ids.
+   id, topic name and partition ids, and the `read_cache_size` and `read_ahead` that the topic
+   sets.
 
 ## Produce and consume
 
@@ -690,6 +703,7 @@ deduplicate on an id of their own, such as the message id that the producer sets
 | Published               | Readable in another datacenter       | Up to `[geo] manifest_poll_interval`, 5 s by default, until the peer lists the manifest, then one read of the manifest and one commit in the peer.                                                                                                                   |
 | Committed               | Readable in another datacenter       | The two rows above added up, seconds: the next rewrite and manifest, then the peer's next listing. Nothing else brings a message there.                                                                                                                              |
 | Geo topic created       | Shadow topic in each peer            | About a second to store the topic object, then up to 5 s until a peer lists it.                                                                                                                                                                                      |
+| Read cache updated      | Shadow topic reads with it           | Typically about a second to store the topic object again, then up to 30 s until a peer reads it again and up to 5 s until its next pass, then one commit in the peer. Earlier shadow operations queued in the peer can delay it by more passes.                      |
 | Group offset store      | Acknowledged, position in the bucket | One commit of the store, one commit of the fold and one put of the node's object of the log. A put that runs, or one that started less than `[geo] consumer_offset_upload_interval` (50 ms by default) before, delays it to the next put.                            |
 | Poll with `auto_commit` | Position stored in the bucket        | Up to `[geo] positions_publish_interval`, 1 s by default, then a commit of the fold and the upload of the object.                                                                                                                                                    |
 | Position stored         | Taken by another datacenter          | Up to `[geo] positions_poll_interval`, 1 s by default, then one read of the object and one commit in that cluster.                                                                                                                                                   |
@@ -887,9 +901,9 @@ Fresh objects of the format before (`IGGYFRS1`) say neither whose batches they h
 where those committed, so their messages come back only when they were published. The
 recovery reports each such object.
 
-A restored topic takes its partitions, compression, retention and its own `tombstone_grace` from
-its topic object, the only one of its durations that the object records. It is in the `geo` mode,
-so it is `persisted`.
+A restored topic takes its partitions, compression, retention, its own `tombstone_grace`, the
+only one of its durations that the object records, and its `read_cache_size` and `read_ahead`
+from its topic object. It is in the `geo` mode, so it is `persisted`.
 
 Nothing else comes back from the bucket: consumer offsets, consumer groups, users and
 permissions, normal topics, and the idempotent producer state of the published messages are
@@ -934,7 +948,9 @@ one starts from the position its peers hold.
 A recovery that fails logs the reason and runs again at the next check, 5 seconds later.
 Each attempt finds what an earlier one stored and goes on. It refuses a topic of another
 `[geo] origin`, a cluster that already holds streams, and a bucket that another cluster
-recovered already.
+recovered already. It also refuses a bucket with a topic object that this build cannot read,
+damaged or in a format it does not know, so that it never recovers only some of the topics.
+The log names the object and its format marker, the first 8 bytes, such as `IGGYTOP3`.
 
 ### What it writes
 
