@@ -30,7 +30,7 @@ import re
 import secrets
 from datetime import timedelta
 from pathlib import Path
-from typing import TypedDict, cast, get_type_hints
+from typing import SupportsInt, TypedDict, cast, get_type_hints
 
 import pytest
 
@@ -624,9 +624,14 @@ class TestSharedVectors:
         self,
     ):
         """Keys added later come after `ShadowOrigin` and renumber none."""
-        assert int(OptionKey.ShadowOrigin) == 30
-        assert int(OptionKey.ReadCacheSize) == 31
-        assert int(OptionKey.ReadAhead) == 32
+        for key, value in (
+            (OptionKey.ShadowOrigin, 30),
+            (OptionKey.ReadCacheSize, 31),
+            (OptionKey.ReadAhead, 32),
+        ):
+            # PyO3 gives a simple enum `__int__`, which the generated stub
+            # leaves out.
+            assert int(cast(SupportsInt, key)) == value
 
     @pytest.mark.unit
     def test_given_shared_vectors_when_encoding_should_match_server_contract(
