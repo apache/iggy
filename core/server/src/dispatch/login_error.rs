@@ -32,15 +32,35 @@ use metadata::MetadataSubmitError;
 #[non_exhaustive]
 pub enum LoginRegisterError {
     InvalidCredentials,
+    /// The username does not exist in the local user store. Distinguished
+    /// from `InvalidCredentials` so the ext-auth guard can enter the callout
+    /// only for unknown users, not for wrong passwords. On the wire both
+    /// surface as `InvalidCredentials`.
+    UserNotFound,
     InvalidToken,
     UserInactive,
     Binding(IggyError),
     /// Recoverable consensus failure. The connection stays `Connected`; the
     /// SDK read-timeout replays.
     Transient(MetadataSubmitError),
+    /// The external auth callout failed transiently (timeout, connect error,
+    /// 5xx, 429, or overloaded). The SDK retries after backoff.
+    ExternalAuthUnavailable,
+    /// The account proof changed during external login. A retry verifies the credential again.
+    CredentialChanged,
 }
 
 impl LoginRegisterError {
+    pub(super) fn after_external_verification(self) -> Self {
+        match self {
+            Self::Transient(MetadataSubmitError::Unauthenticated) => Self::CredentialChanged,
+            Self::Binding(IggyError::Unauthenticated) => {
+                Self::Binding(IggyError::TransientNotCommitted)
+            }
+            error => error,
+        }
+    }
+
     /// `true` for a terminal failure the client cannot fix by retrying (bad
     /// credentials / token / inactive user / session error); `false` for a
     /// transient consensus failure the SDK replays. The handler fast-fails
@@ -57,6 +77,7 @@ impl LoginRegisterError {
                 error,
                 IggyError::TransientNotAccepted | IggyError::TransientNotCommitted
             ),
+            Self::ExternalAuthUnavailable | Self::CredentialChanged => false,
             _ => true,
         }
     }
@@ -65,11 +86,22 @@ impl LoginRegisterError {
 impl std::fmt::Display for LoginRegisterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidCredentials => write!(f, "invalid username or password"),
+            Self::InvalidCredentials | Self::UserNotFound => {
+                write!(f, "invalid username or password")
+            }
             Self::InvalidToken => write!(f, "invalid or expired personal access token"),
             Self::UserInactive => write!(f, "user account is inactive"),
             Self::Binding(error) => write!(f, "session binding: {error}"),
             Self::Transient(e) => write!(f, "transient consensus failure: {e}"),
+            Self::ExternalAuthUnavailable => {
+                write!(f, "external auth service temporarily unavailable")
+            }
+            Self::CredentialChanged => {
+                write!(
+                    f,
+                    "account credentials changed during external verification"
+                )
+            }
         }
     }
 }

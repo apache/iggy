@@ -20,7 +20,9 @@ import { describe, it } from 'node:test';
 import { COMMAND_CODE } from '../wire/command.code.js';
 import { VsrSession } from '../wire/vsr/index.js';
 import { HEADER_SIZE, REQUEST_OFFSET, EMPTY_PARTITION_CONTEXT } from '../wire/vsr/header.js';
-import { MutationLanes, LaneBlockedError, OperationNotRetainedError } from './client.operation.js';
+import {
+  MutationLanes, LaneBlockedError, OperationNotRetainedError, type ClientOperation
+} from './client.operation.js';
 import { ResponseError } from '../wire/error.utils.js';
 
 const body = Buffer.from('frozen body');
@@ -52,7 +54,8 @@ describe('mutation admission and retained ownership', () => {
     const first = await enter(lanes, state, 'first');
     first.uncertain = true;
     lanes.retain(first);
-    await assert.rejects(enter(lanes, state, 'first'), (error: unknown) => error instanceof LaneBlockedError && error.operationId === first.id);
+    await assert.rejects(enter(lanes, state, 'first'), (error: unknown) => error instanceof LaneBlockedError &&
+      error.operationId === first.id && !error.requiresExplicitRecovery && error.errorCode === 14007);
     const other = await enter(lanes, state, 'other');
     let admitted = false;
     const next = enter(lanes, state, 'other').then((operation) => { admitted = true; return operation; });
@@ -128,6 +131,133 @@ describe('mutation admission and retained ownership', () => {
       }
     });
   }
+
+  describe('progress lane', () => {
+    const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
+    const enterPoll = (lanes: MutationLanes, state: VsrSession) => lanes.enter('progress', COMMAND_CODE.PollMessages,
+      body, EMPTY_PARTITION_CONTEXT, false, state, Date.now() + 1_000, new AbortController().signal);
+    const enterStore = (lanes: MutationLanes, state: VsrSession, signal = new AbortController().signal) =>
+      lanes.enter('partition', COMMAND_CODE.StoreOffset, body, EMPTY_PARTITION_CONTEXT, true, state,
+        Date.now() + 1_000, signal, ['progress']);
+    const isBlockedBy = (operation: ClientOperation) => (error: unknown) =>
+      error instanceof LaneBlockedError && error.operationId === operation.id;
+
+    it('keeps the progress lane of a store that waits for a send when a store queued behind it gives up', async () => {
+      const lanes = new MutationLanes(3, 3 * frameSize);
+      const state = session();
+      const admitted: string[] = [];
+      const track = (name: string, pending: Promise<ClientOperation>) =>
+        pending.then((operation) => { admitted.push(name); return operation; });
+      const send = await enter(lanes, state, 'partition');
+      const store = track('store', enterStore(lanes, state));
+      const cancel = new AbortController();
+      const queuedStore = enterStore(lanes, state, cancel.signal);
+      await settle();
+      cancel.abort();
+      await assert.rejects(queuedStore, (error: unknown) => error instanceof Error && error.name === 'AbortError');
+      const poll = track('poll', enterPoll(lanes, state));
+      await settle();
+      assert.deepEqual(admitted, [], 'the poll waits for the store that holds the progress lane');
+      lanes.complete(send);
+      const storeOperation = await store;
+      await settle();
+      assert.deepEqual(admitted, ['store'], 'the store holds the progress lane until it completes');
+      lanes.complete(storeOperation);
+      lanes.complete(await poll);
+      assert.deepEqual(admitted, ['store', 'poll']);
+    });
+
+    it('lets a send pass an offset store that waits for a poll, and then holds both lanes for the store', async () => {
+      const lanes = new MutationLanes(3, 3 * frameSize);
+      const state = session();
+      const admitted: string[] = [];
+      const track = (name: string, pending: Promise<ClientOperation>) =>
+        pending.then((operation) => { admitted.push(name); return operation; });
+      const poll = await enterPoll(lanes, state);
+      const store = track('store', enterStore(lanes, state));
+      const send = await enter(lanes, state, 'partition');
+      const nextPoll = track('poll', enterPoll(lanes, state));
+      lanes.complete(poll);
+      await settle();
+      assert.deepEqual(admitted, [], 'the store holds the progress lane while it waits for the send');
+      lanes.complete(send);
+      const storeOperation = await store;
+      assert.ok(storeOperation.id > send.id, 'the store takes its request id after the send that it waited for');
+      const nextSend = track('send', enter(lanes, state, 'partition'));
+      await settle();
+      assert.deepEqual(admitted, ['store']);
+      lanes.complete(storeOperation);
+      lanes.complete(await nextSend);
+      lanes.complete(await nextPoll);
+    });
+
+    it('is blocked by a retained offset store but not by a retained send', async () => {
+      const lanes = new MutationLanes(2, 2 * frameSize);
+      const state = session();
+      const send = await enter(lanes, state, 'partition');
+      send.uncertain = true;
+      lanes.retain(send);
+      lanes.complete(await enterPoll(lanes, state));
+      await assert.rejects(enterStore(lanes, state), isBlockedBy(send));
+      lanes.complete(await enterPoll(lanes, state));
+      lanes.abandon(send.id);
+
+      const store = await enterStore(lanes, state);
+      const waitingPoll = enterPoll(lanes, state);
+      store.uncertain = true;
+      lanes.retain(store);
+      await assert.rejects(waitingPoll, isBlockedBy(store));
+      await assert.rejects(enter(lanes, state, 'partition'), isBlockedBy(store));
+      lanes.abandon(store.id);
+      lanes.complete(await enterPoll(lanes, state));
+    });
+
+    const enterOn = (lanes: MutationLanes, state: VsrSession, command: number, progressLanes: string[],
+      signal = new AbortController().signal) =>
+      lanes.enter(progressLanes[progressLanes.length - 1], command, body, EMPTY_PARTITION_CONTEXT, false, state,
+        Date.now() + 1_000, signal, progressLanes.slice(0, -1));
+
+    it('holds every progress lane of a fetch, and a fetch that waits holds none of its later lanes', async () => {
+      const lanes = new MutationLanes(3, 3 * frameSize);
+      const state = session();
+      const admitted: string[] = [];
+      const track = (name: string, pending: Promise<ClientOperation>) =>
+        pending.then((operation) => { admitted.push(name); return operation; });
+      const fetch = await enterOn(lanes, state, COMMAND_CODE.FetchMessages, ['progress:1', 'progress:2']);
+      assert.deepEqual([fetch.lane, fetch.heldLanes], ['progress:2', ['progress:1']]);
+      const store = track('store', lanes.enter('partition:2', COMMAND_CODE.StoreOffset, body, EMPTY_PARTITION_CONTEXT,
+        true, state, Date.now() + 1_000, new AbortController().signal, ['progress:2']));
+      const nextFetch = track('fetch', enterOn(lanes, state, COMMAND_CODE.FetchMessages, ['progress:2', 'progress:3']));
+      const poll = track('poll', enterOn(lanes, state, COMMAND_CODE.PollMessages, ['progress:3']));
+      await settle();
+      assert.deepEqual(admitted, ['poll'], 'the waiting fetch leaves its later lane free');
+      lanes.complete(await poll);
+      lanes.complete(fetch);
+      const storeOperation = await store;
+      await settle();
+      assert.deepEqual(admitted, ['poll', 'store'], 'the fetch that waits first follows the store');
+      lanes.complete(storeOperation);
+      lanes.complete(await nextFetch);
+      assert.deepEqual(admitted, ['poll', 'store', 'fetch']);
+    });
+
+    it('frees the lanes that a fetch took when it gives up waiting for the next one', async () => {
+      const lanes = new MutationLanes(3, 3 * frameSize);
+      const state = session();
+      const blocker = await enterOn(lanes, state, COMMAND_CODE.FetchMessages, ['progress:2']);
+      const cancel = new AbortController();
+      const fetch = enterOn(lanes, state, COMMAND_CODE.FetchMessages, ['progress:1', 'progress:2'], cancel.signal);
+      let pollAdmitted = false;
+      const poll = enterOn(lanes, state, COMMAND_CODE.PollMessages, ['progress:1'])
+        .then((operation) => { pollAdmitted = true; return operation; });
+      await settle();
+      assert.equal(pollAdmitted, false, 'the fetch holds the lane that it took while it waits');
+      cancel.abort();
+      await assert.rejects(fetch, (error: unknown) => error instanceof Error && error.name === 'AbortError');
+      lanes.complete(await poll);
+      lanes.complete(blocker);
+    });
+  });
 
   it('admits an independent lane when only a later same-lane waiter fits the free bytes', async () => {
     const sizes = { retained: 900, active: 300, large: 700, small: 500, independent: 500 };

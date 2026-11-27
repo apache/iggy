@@ -18,10 +18,25 @@
 import { deserializePartitionContext, PARTITION_CONTEXT_SIZE, type PartitionContext } from '../vsr/header.js';
 import { toDate } from '../serialize.utils.js';
 import type { ValueOf } from '../../type.utils.js';
-import { deserializePrefixedOptions, type ParsedOptions } from '../options.utils.js';
+import { deserializePrefixedOptions, type OptionEntry, type ParsedOptions } from '../options.utils.js';
+import { HeaderValue } from '../message/header.utils.js';
+import { deserializeError } from '../error.utils.js';
 
-/** Default of `message_expiry` and `max_topic_size`: never expire, no cap. */
+/**
+ * Default of `message_expiry`, `max_topic_size`, `segment_max_age` and
+ * `local_retention_size`: never expire, no cap, never roll by age, no local
+ * cap.
+ */
 const UNLIMITED = 0xffff_ffff_ffff_ffffn;
+
+/** Default of `local_retention_age`: one day in microseconds. */
+const DEFAULT_LOCAL_RETENTION_AGE = 86_400_000_000n;
+
+/** Partition id, counters and context, before the two node lists. */
+const PARTITION_COUNTERS_SIZE = 40 + PARTITION_CONTEXT_SIZE;
+
+/** Smallest partition entry: the counters and two empty node lists. */
+const PARTITION_MIN_SIZE = PARTITION_COUNTERS_SIZE + 2;
 
 /**
  * Basic topic information without partition details.
@@ -41,6 +56,36 @@ export type BaseTopic = {
   messageExpiry: bigint,
   /** Maximum topic size in bytes, read from the options (u64 max = unlimited) */
   maxTopicSize: bigint,
+  /** Segment roll age in microseconds, read from the options (u64 max = never) */
+  segmentMaxAge: bigint,
+  /** Whether sealed segments move to the object store, read from the options */
+  tieredStorage: boolean,
+  /** Local retention of uploaded segments in microseconds, read from the options (u64 max = never) */
+  localRetentionAge: bigint,
+  /** Local cap on uploaded segments in bytes, read from the options (u64 max = unlimited) */
+  localRetentionSize: bigint,
+  /** Whether the topic is normal or geo, read from the options */
+  topicType: TopicType,
+  /** How a geo topic writes its messages, read from the options, `null` on a normal topic */
+  geoMode: GeoMode | null,
+  /**
+   * The durations of a geo topic in microseconds, read from the options. Each
+   * is `null` where the topic sets none and on a normal topic: each node then
+   * applies its own server setting. See `GeoTopicDurations`.
+   */
+  freshUploadInterval: bigint | null,
+  consumerOffsetUploadInterval: bigint | null,
+  positionsPublishInterval: bigint | null,
+  tombstoneGrace: bigint | null,
+  positionsResumeTimeout: bigint | null,
+  longTermRewriteMaxInterval: bigint | null,
+  /**
+   * The read cache settings in bytes, read from the options. Each is `null`
+   * where the topic sets none: each node then applies its own server setting.
+   * `0n` is a value, the setting turned off. See `TopicReadCache`.
+   */
+  readCacheSize: bigint | null,
+  readAhead: bigint | null,
   /** Total size of the topic in bytes */
   sizeBytes: bigint,
   /** Total number of messages in the topic */
@@ -68,7 +113,14 @@ export type Partition = {
   /** Total size of the partition in bytes */
   sizeBytes: bigint,
   /** Total number of messages in the partition */
-  messagesCount: bigint
+  messagesCount: bigint,
+  /** Node ids that store the partition, in member order */
+  members: number[],
+  /**
+   * Node ids among `members` that the partition's primary last reported in
+   * sync and that are up. Empty until the primary first reports.
+   */
+  inSyncMembers: number[]
 };
 
 /** Topic with partition details */
@@ -156,14 +208,31 @@ export const deserializeBaseTopic = (p: Buffer, pos = 0): BaseTopicSerialized =>
   pos += derived.bytesRead;
 
   const setting = (key: string) => explicit.options[key] ?? derived.options[key];
-  const limit = (key: string) => {
+  const limit = (key: string, fallback = UNLIMITED) => {
     const value = setting(key);
-    return typeof value === 'bigint' ? value : UNLIMITED;
+    return typeof value === 'bigint' ? value : fallback;
   };
   const compressionAlgorithm = setting('compression_algorithm') === 'gzip'
     ? CompressionAlgorithm.Gzip : CompressionAlgorithm.None;
   const messageExpiry = limit('message_expiry');
   const maxTopicSize = limit('max_topic_size');
+  const segmentMaxAge = limit('segment_max_age');
+  const tieredStorage = setting('tiered_storage') === true;
+  const localRetentionAge = limit('local_retention_age', DEFAULT_LOCAL_RETENTION_AGE);
+  const localRetentionSize = limit('local_retention_size');
+  const topicType = setting('topic_type') === TopicType.Geo ? TopicType.Geo : TopicType.Normal;
+  // A normal topic refuses a mode and the durations at create, so stored ones
+  // are ignored.
+  const geoMode = topicType === TopicType.Normal ? null
+    : setting('geo_mode') === GeoMode.GeoTiered ? GeoMode.GeoTiered : GeoMode.Geo;
+  const duration = (key: string) => {
+    const value = setting(key);
+    return topicType === TopicType.Geo && typeof value === 'bigint' ? value : null;
+  };
+  const byteSize = (key: string) => {
+    const value = setting(key);
+    return typeof value === 'bigint' ? value : null;
+  };
 
   return {
     bytesRead: pos - start,
@@ -175,6 +244,20 @@ export const deserializeBaseTopic = (p: Buffer, pos = 0): BaseTopicSerialized =>
       compressionAlgorithm,
       maxTopicSize,
       messageExpiry,
+      segmentMaxAge,
+      tieredStorage,
+      localRetentionAge,
+      localRetentionSize,
+      topicType,
+      geoMode,
+      freshUploadInterval: duration('fresh_upload_interval'),
+      consumerOffsetUploadInterval: duration('consumer_offset_upload_interval'),
+      positionsPublishInterval: duration('positions_publish_interval'),
+      tombstoneGrace: duration('tombstone_grace'),
+      positionsResumeTimeout: duration('positions_resume_timeout'),
+      longTermRewriteMaxInterval: duration('long_term_rewrite_max_interval'),
+      readCacheSize: byteSize('read_cache_size'),
+      readAhead: byteSize('read_ahead'),
       messagesCount,
       sizeBytes,
       options: explicit.options,
@@ -186,24 +269,59 @@ export const deserializeBaseTopic = (p: Buffer, pos = 0): BaseTopicSerialized =>
 
 /**
  * Deserializes a partition from a buffer.
+ * Layout: `[id:u32][created_at:u64][segments_count:u32][current_offset:u64]
+ * [size_bytes:u64][messages_count:u64][context:24]` then two node lists,
+ * members and in-sync members, each a `u8` count followed by that many `u8`
+ * node ids. The entry is 66 bytes plus one per listed node.
  *
  * @param p - Buffer containing serialized partition data
  * @param pos - Starting position in the buffer
  * @returns Object with bytes read and deserialized partition data
+ * @throws DeserializeError if the buffer ends inside the entry
  */
 export const deserializePartition = (p: Buffer, pos = 0): PartitionSerialized => {
+  if (p.length - pos < PARTITION_MIN_SIZE)
+    deserializeError('partition', pos, p.length, PARTITION_MIN_SIZE);
+
+  const start = pos;
+  const id = p.readUInt32LE(pos);
+  const createdAt = toDate(p.readBigUint64LE(pos + 4));
+  const segmentsCount = p.readUInt32LE(pos + 12);
+  const currentOffset = p.readBigUint64LE(pos + 16);
+  const sizeBytes = p.readBigUint64LE(pos + 24);
+  const messagesCount = p.readBigUint64LE(pos + 32);
+  const context = deserializePartitionContext(p, pos + 40);
+  pos += PARTITION_COUNTERS_SIZE;
+
+  const members = deserializeNodeIds(p, pos, 'partition members');
+  pos += 1 + members.length;
+  const inSyncMembers = deserializeNodeIds(p, pos, 'partition in-sync members');
+  pos += 1 + inSyncMembers.length;
+
   return {
-    bytesRead: 40 + PARTITION_CONTEXT_SIZE,
+    bytesRead: pos - start,
     data: {
-      id: p.readUInt32LE(pos),
-      createdAt: toDate(p.readBigUint64LE(pos + 4)),
-      segmentsCount: p.readUInt32LE(pos + 12),
-      currentOffset: p.readBigUint64LE(pos + 16),
-      sizeBytes: p.readBigUint64LE(pos + 24),
-      messagesCount: p.readBigUint64LE(pos + 32),
-      context: deserializePartitionContext(p, pos + 40),
+      id,
+      createdAt,
+      segmentsCount,
+      currentOffset,
+      sizeBytes,
+      messagesCount,
+      context,
+      members,
+      inSyncMembers,
     }
   }
+};
+
+/** Reads a `[count:u8][ids:count x u8]` node list at `pos`. */
+const deserializeNodeIds = (p: Buffer, pos: number, name: string): number[] => {
+  if (p.length - pos < 1)
+    deserializeError(name, pos, p.length, 1);
+  const count = p.readUInt8(pos);
+  if (p.length - pos - 1 < count)
+    deserializeError(name, pos, p.length, 1 + count, { count });
+  return Array.from(p.subarray(pos + 1, pos + 1 + count));
 };
 
 
@@ -234,27 +352,6 @@ export const deserializeTopic = (p: Buffer, pos = 0): TopicSerialized => {
   return { bytesRead: pos - start, data: { ...data, partitions } };
 };
 
-
-/**
- * Deserializes a GetTopics response: `[topics_count:u32_le]` prefix followed
- * by count-driven topic headers (no partition details).
- *
- * @param p - Buffer containing serialized topics data
- * @param pos - Starting position in the buffer
- * @returns Array of deserialized topics
- */
-export const deserializeTopics = (p: Buffer, pos = 0): Topic[] => {
-  const topicsCount = p.readUInt32LE(pos);
-  pos += 4;
-  const topics = [];
-  for (let i = 0; i < topicsCount; i++) {
-    const { bytesRead, data } = deserializeBaseTopic(p, pos);
-    topics.push({ ...data, partitions: [] });
-    pos += bytesRead;
-  }
-  return topics;
-};
-
 export const Durability = {
   Replicated: 'replicated',
   Persisted: 'persisted'
@@ -269,3 +366,121 @@ export const PartitionResizePolicy = {
 } as const;
 
 export type PartitionResizePolicy = typeof PartitionResizePolicy[keyof typeof PartitionResizePolicy];
+
+/**
+ * What a topic is, fixed at create. A geo topic's messages also become
+ * readable in the other datacenters through the object store.
+ */
+export const TopicType = {
+  Normal: 'normal',
+  Geo: 'geo'
+} as const;
+
+export type TopicType = typeof TopicType[keyof typeof TopicType];
+
+/**
+ * How a geo topic writes its messages, fixed at create. `geo` uploads a batch
+ * to the object store before it commits, `geo_tiered` replicates it first and
+ * uploads sealed segments later.
+ */
+export const GeoMode = {
+  Geo: 'geo',
+  GeoTiered: 'geo_tiered'
+} as const;
+
+export type GeoMode = typeof GeoMode[keyof typeof GeoMode];
+
+/**
+ * The durations of a geo topic, in microseconds, for `createTopic` and
+ * `updateTopic`. Each overrides the server setting of the same name on every
+ * node, and one left out leaves that setting. `0n` is a value here, not the
+ * server-default sentinel of `messageExpiry`, so it is sent. An update can set
+ * them but cannot reset them, and on a geo topic they and `TopicReadCache` are
+ * the only keys it may change. A normal topic refuses them with error 4042,
+ * invalid option value.
+ */
+export type GeoTopicDurations = {
+  /** Longest time a send waits for the upload of its fresh object to start, at most 10 s */
+  freshUploadInterval?: bigint,
+  /**
+   * Shortest time between two uploads of the positions that an offset the
+   * consumer group stores itself waits for, at most 1 s. `0n` answers such a
+   * store at its local commit.
+   */
+  consumerOffsetUploadInterval?: bigint,
+  /** How often a node uploads the changed positions of the topic's consumer groups, not `0n` */
+  positionsPublishInterval?: bigint,
+  /** How long the tombstone and the objects of the deleted topic stay in the object store, not `0n` */
+  tombstoneGrace?: bigint,
+  /**
+   * How long, after a node starts, the group polls of the topic's partitions
+   * wait for the positions of the geo peers. `0n` does not wait.
+   */
+  positionsResumeTimeout?: bigint,
+  /** Longest wait between two long-term rewrites of a partition, at least 1 s */
+  longTermRewriteMaxInterval?: bigint
+};
+
+/** The option key of each duration of a geo topic, in catalog order. */
+const GEO_DURATION_KEYS: Readonly<Record<keyof GeoTopicDurations, string>> = {
+  freshUploadInterval: 'fresh_upload_interval',
+  consumerOffsetUploadInterval: 'consumer_offset_upload_interval',
+  positionsPublishInterval: 'positions_publish_interval',
+  tombstoneGrace: 'tombstone_grace',
+  positionsResumeTimeout: 'positions_resume_timeout',
+  longTermRewriteMaxInterval: 'long_term_rewrite_max_interval'
+};
+
+/**
+ * The option entries of the durations that are set, `0n` included.
+ *
+ * @param durations - Durations of a geo topic, in microseconds
+ * @returns One uint64 entry per duration that is set
+ */
+export const geoDurationOptions = (durations: GeoTopicDurations): OptionEntry[] =>
+  Object.entries(GEO_DURATION_KEYS).flatMap(([field, key]) => {
+    const value = durations[field as keyof GeoTopicDurations];
+    return value === undefined ? [] : [{ key, value: HeaderValue.Uint64(value) }];
+  });
+
+/**
+ * The read cache settings of a topic, in bytes, for `createTopic` and
+ * `updateTopic`. They size the cache and the readahead for what the reads of a
+ * normal or a geo topic fetch from the object store. Each overrides the
+ * `[tiered_storage]` server setting of the same name on every node, and one
+ * left out leaves that setting. `0n` turns a setting off and is sent, unlike
+ * the server-default sentinel of `maxTopicSize`. An update can change them on
+ * any topic, geo included, but cannot reset them.
+ */
+export type TopicReadCache = {
+  /**
+   * Memory each node keeps for what the topic's reads fetch, divided between
+   * its partitions as a limit within the read cache of each shard, not a
+   * reservation. `0n` keeps nothing, otherwise at least 512 KiB.
+   */
+  readCacheSize?: bigint,
+  /**
+   * Most bytes that readahead fetches in front of a sequential reader of the
+   * topic. `0n` turns readahead off, otherwise at least 128 KiB and at most an
+   * eighth of a `readCacheSize` above `0n`.
+   */
+  readAhead?: bigint
+};
+
+/** The option key of each read cache setting, in catalog order. */
+const READ_CACHE_KEYS: Readonly<Record<keyof TopicReadCache, string>> = {
+  readCacheSize: 'read_cache_size',
+  readAhead: 'read_ahead'
+};
+
+/**
+ * The option entries of the read cache settings that are set, `0n` included.
+ *
+ * @param readCache - Read cache settings of a topic, in bytes
+ * @returns One uint64 entry per setting that is set
+ */
+export const readCacheOptions = (readCache: TopicReadCache): OptionEntry[] =>
+  Object.entries(READ_CACHE_KEYS).flatMap(([field, key]) => {
+    const value = readCache[field as keyof TopicReadCache];
+    return value === undefined ? [] : [{ key, value: HeaderValue.Uint64(value) }];
+  });

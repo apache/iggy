@@ -16,9 +16,13 @@
 // under the License.
 
 export * from "./poll-messages.command.js";
+export * from "./fetch-messages.command.js";
+export * from "./deferred-poll.utils.js";
 export * from "./send-messages.command.js";
 export * from "./message.utils.js";
 export * from "./poll.utils.js";
+export * from "./poll-options.js";
+export { Checkpoint, type Continuation, type PolledBatch } from "./checkpoint.js";
 
 export { Partitioning } from "./partitioning.utils.js";
 export { HeaderValue, HeaderKeyFactory } from "./header.utils.js";

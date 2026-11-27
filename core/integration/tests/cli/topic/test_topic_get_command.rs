@@ -29,7 +29,9 @@ use iggy::prelude::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
 use iggy::prelude::{
     IggyMessage, Partitioning, StreamClient, StreamCreateOptions, TopicClient, TopicCreateOptions,
 };
-use integration::harness::{TestHarnessBuilder, TestServerConfig, wait_for_topic_messages_count};
+use integration::harness::{
+    TestHarnessBuilder, TestServerConfig, cargo_bin_path, wait_for_topic_messages_count,
+};
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
@@ -217,7 +219,7 @@ impl IggyCmdTestCase for TestTopicGetCmd {
         let mut assertion = assertion
             .stdout(contains("Partition id | Created"))
             .stdout(contains("Segments count | Current offset | Size"))
-            .stdout(contains("Messages count"))
+            .stdout(contains("Messages count | Members | In sync"))
             .stdout(contains("Option                            | Value"))
             .stdout(contains("Source"))
             .stdout(contains(
@@ -262,7 +264,7 @@ impl IggyCmdTestCase for TestTopicGetCmd {
             if self.populate_partitions {
                 assert!(row.contains(&format!("| 1 | {index} |")), "{row}");
                 assert!(row.contains(" B |") && !row.contains("| 0 B |"), "{row}");
-                assert!(row.ends_with(&format!("| {} |", index + 1)), "{row}");
+                assert!(row.contains(&format!(" B | {} |", index + 1)), "{row}");
             } else {
                 assert!(row.contains("| 1 | 0 | 0 B | 0 |"), "{row}");
             }
@@ -430,7 +432,7 @@ Examples
  iggy topic get test debugs
  iggy topic get 2 debugs
 
-{USAGE_PREFIX} topic get <STREAM_ID> <TOPIC_ID>
+{USAGE_PREFIX} topic get [OPTIONS] <STREAM_ID> <TOPIC_ID>
 
 Arguments:
   <STREAM_ID>
@@ -444,6 +446,12 @@ Arguments:
           Topic ID can be specified as a topic name or ID
 
 Options:
+  -o, --output <OUTPUT>
+          Output format (table or json)
+{CLAP_INDENT}
+          [default: table]
+          [possible values: table, json]
+
   -h, --help
           Print help (see a summary with '-h')
 "#,
@@ -463,14 +471,15 @@ pub async fn should_short_help_match() {
             format!(
                 r#"Get topic detail for given topic ID and stream ID
 
-{USAGE_PREFIX} topic get <STREAM_ID> <TOPIC_ID>
+{USAGE_PREFIX} topic get [OPTIONS] <STREAM_ID> <TOPIC_ID>
 
 Arguments:
   <STREAM_ID>  Stream ID to get topic
   <TOPIC_ID>   Topic ID to get
 
 Options:
-  -h, --help  Print help (see more with '--help')
+  -o, --output <OUTPUT>  Output format (table or json) [default: table] [possible values: table, json]
+  -h, --help             Print help (see more with '--help')
 "#,
             ),
         ))
@@ -495,8 +504,7 @@ pub async fn should_show_persisted_durability_created_through_cli() {
     let socket_address = harness.server().tcp_addr().unwrap();
     clear_session_entry(socket_address);
     let cli = || {
-        #[allow(deprecated)]
-        let mut command = Command::cargo_bin("iggy").unwrap();
+        let mut command = Command::new(cargo_bin_path("iggy").unwrap());
         command.env("IGGY_TOKEN", "").env("COLUMNS", "200").args([
             "--tcp-server-address",
             &address,

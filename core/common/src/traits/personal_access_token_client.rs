@@ -23,6 +23,7 @@ use async_trait::async_trait;
 
 /// This trait defines the methods to interact with the personal access token module.
 #[async_trait]
+#[whichever::dispatchable]
 pub trait PersonalAccessTokenClient {
     /// Get the info about all the personal access tokens of the currently authenticated user.
     async fn get_personal_access_tokens(&self) -> Result<Vec<PersonalAccessTokenInfo>, IggyError>;

@@ -456,11 +456,13 @@ async fn poll_all(client: &IggyClient, stream: &str) -> Result<Vec<IggyMessage>,
         .poll_messages(
             &Identifier::named(stream).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            10,
-            false,
+            PollOptions {
+                count: 10,
+                ..PollOptions::default()
+            },
         )
         .await?;
     if polled.messages.is_empty() {

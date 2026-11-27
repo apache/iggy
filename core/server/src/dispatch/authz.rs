@@ -31,14 +31,16 @@ use consensus::MetadataHandle;
 use consensus::client_table::SessionAttachment;
 use iggy_binary_protocol::codes::{
     DESCRIBE_OPTIONS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE,
-    GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_STATS_CODE, GET_STREAM_CODE,
-    GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
+    GET_CONSUMER_GROUPS_CODE, GET_PARTITIONS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_STATS_CODE,
+    GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE,
+    GET_USERS_CODE,
 };
 use iggy_binary_protocol::requests::consumer_groups::{
     GetConsumerGroupRequest, GetConsumerGroupsRequest,
 };
+use iggy_binary_protocol::requests::partitions::GetPartitionsRequest;
 use iggy_binary_protocol::requests::streams::GetStreamRequest;
-use iggy_binary_protocol::requests::topics::{GetTopicRequest, GetTopicsRequest};
+use iggy_binary_protocol::requests::topics::GetTopicRequest;
 use iggy_binary_protocol::requests::users::GetUserRequest;
 use iggy_binary_protocol::{Operation, PrepareHeader, WireDecode, WireIdentifier, lookup_command};
 use iggy_common::IggyError;
@@ -58,10 +60,11 @@ use crate::shell::{ShellBus, ShellShard};
 /// await and again after its last one, before it builds the reply.
 pub(in crate::dispatch) fn authorize_attached(
     attachment: Option<&SessionAttachment>,
+    now_micros: u64,
     rule: impl FnOnce() -> Result<(), IggyError>,
 ) -> Result<(), IggyError> {
     match attachment {
-        Some(attachment) if attachment.is_valid() => rule(),
+        Some(attachment) if attachment.is_valid_at(now_micros) => rule(),
         Some(_) => Err(IggyError::StaleClient),
         None => Err(IggyError::Unauthenticated),
     }
@@ -122,9 +125,11 @@ where
                 | Operation::RetireSession
                 | Operation::CompleteLifecycle
                 | Operation::RewrapStreamKeys
+                | Operation::ShadowTopic
                 | Operation::TransitionPartitionHistory
                 | Operation::InstallConsumerGroupOwner
                 | Operation::RetireConsumerGroupOwners
+                | Operation::StateMachineCommand
                 | Operation::CreateStream
                 | Operation::UpdateStreamResolved
                 | Operation::DeleteStream
@@ -145,6 +150,7 @@ where
                 | Operation::CreatePersonalAccessToken
                 | Operation::DeletePersonalAccessToken
                 | Operation::JoinConsumerGroup
+                | Operation::RetireGeoOrigin
                 | Operation::LeaveConsumerGroup => Ok(()),
             });
     decision.err().map(|error| error.as_code())
@@ -232,7 +238,27 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    authorize_attached(attachment, || {
+    authorize_served_topic_read(shard, attachment, namespace, rule)?;
+    authorize_served_incarnation(shard, namespace, incarnation)
+}
+
+/// The session and permission half of [`authorize_served_partition_read`]. A
+/// fetch runs it once, because all of its partitions share one stream and
+/// topic.
+pub(in crate::dispatch) fn authorize_served_topic_read<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    attachment: Option<&SessionAttachment>,
+    namespace: IggyNamespace,
+    rule: impl FnOnce(&Permissioner, u32, usize, usize) -> Result<(), IggyError>,
+) -> Result<(), IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    authorize_attached(attachment, shard.bus.realtime_micros(), || {
         authorize_uid(
             shard,
             attachment.map(SessionAttachment::user_id),
@@ -244,19 +270,35 @@ where
                     namespace.topic_id(),
                 )
             },
-        )?;
-        let current = shard
-            .plane
-            .metadata()
-            .mux_stm
-            .streams()
-            .created_revision_for_namespace(namespace);
-        if current == Some(incarnation) {
-            Ok(())
-        } else {
-            Err(IggyError::TransientNotAccepted)
-        }
+        )
     })
+}
+
+/// The history half of [`authorize_served_partition_read`], which a fetch
+/// runs for each of its sections.
+pub(in crate::dispatch) fn authorize_served_incarnation<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    namespace: IggyNamespace,
+    incarnation: u64,
+) -> Result<(), IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let current = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .created_revision_for_namespace(namespace);
+    if current == Some(incarnation) {
+        Ok(())
+    } else {
+        Err(IggyError::TransientNotAccepted)
+    }
 }
 
 /// Authorize a non-replicated read routed through `build_non_replicated_response`
@@ -301,7 +343,9 @@ where
         // transport with an `Unauthenticated` Reply before it reaches the
         // builder, so this arm only ever fires if that gate is bypassed.
         GET_CLUSTER_METADATA_CODE => user_id.map(|_| ()).ok_or(IggyError::Unauthenticated),
-        GET_STREAMS_CODE => authorize_uid(shard, user_id, Permissioner::get_streams),
+        // Both lists return only the entries the caller may read (see their
+        // builders), so authentication is the whole gate.
+        GET_STREAMS_CODE => user_id.map(|_| ()).ok_or(IggyError::Unauthenticated),
         GET_STREAM_CODE => gate_stream_scoped::<GetStreamRequest, _, _, _, _>(
             shard,
             user_id,
@@ -309,14 +353,16 @@ where
             |request| &request.stream_id,
             Permissioner::get_stream,
         ),
-        GET_TOPICS_CODE => gate_stream_scoped::<GetTopicsRequest, _, _, _, _>(
+        GET_TOPICS_CODE => user_id.map(|_| ()).ok_or(IggyError::Unauthenticated),
+        GET_TOPIC_CODE => gate_topic_scoped::<GetTopicRequest, _, _, _, _>(
             shard,
             user_id,
             body,
-            |request| &request.stream_id,
-            Permissioner::get_topics,
+            |request| (&request.stream_id, &request.topic_id),
+            Permissioner::get_topic,
         ),
-        GET_TOPIC_CODE => gate_topic_scoped::<GetTopicRequest, _, _, _, _>(
+        // A partitions page shows what GetTopic shows about each partition.
+        GET_PARTITIONS_CODE => gate_topic_scoped::<GetPartitionsRequest, _, _, _, _>(
             shard,
             user_id,
             body,
@@ -462,16 +508,18 @@ mod tests {
     use crate::dispatch::test_support::{FIRST_BOOT, SpyBus, TestShard, test_shard};
     use iggy_binary_protocol::COMMAND_TABLE;
     use iggy_binary_protocol::codes::{
-        BIND_SESSION_CODE, CREATE_STREAM_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE,
-        GET_CONSUMER_OFFSET_CODE, GET_ME_CODE, GET_METADATA_CHANGES_CODE, GET_PARTITION_ROUTE_CODE,
-        GET_SNAPSHOT_FILE_CODE, LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, LOGIN_USER_CODE,
+        BIND_SESSION_CODE, CANCEL_DEFERRED_REQUEST_CODE, CREATE_STREAM_CODE, FETCH_MESSAGES_CODE,
+        GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE,
+        GET_METADATA_CHANGES_CODE, GET_PARTITION_ROUTE_CODE, GET_SNAPSHOT_FILE_CODE,
+        LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, LOGIN_USER_CODE,
         LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, LOGOUT_USER_CODE, PING_CODE, POLL_MESSAGES_CODE,
-        SYNC_CONSUMER_GROUP_CODE,
+        POLL_MESSAGES_DEFERRED_CODE, SYNC_CONSUMER_GROUP_CODE,
     };
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 
     /// A code no `COMMAND_TABLE` entry claims.
     const UNKNOWN_CODE: u32 = 9999;
+    const RETIRED_WAIT_FOR_MESSAGES_CODE: u32 = 107;
 
     /// The gate's answer as the wire sees it: status 0 allows, anything else
     /// is the deny code stamped into `ReplyHeader.status`.
@@ -536,11 +584,23 @@ mod tests {
             (POLL_MESSAGES_CODE, invalid_command, invalid_command),
             (BIND_SESSION_CODE, invalid_command, invalid_command),
             (GET_PARTITION_ROUTE_CODE, invalid_command, invalid_command),
+            (
+                POLL_MESSAGES_DEFERRED_CODE,
+                invalid_command,
+                invalid_command,
+            ),
+            (FETCH_MESSAGES_CODE, invalid_command, invalid_command),
+            (
+                CANCEL_DEFERRED_REQUEST_CODE,
+                invalid_command,
+                invalid_command,
+            ),
             (GET_CONSUMER_OFFSET_CODE, invalid_command, invalid_command),
             (GET_STREAM_CODE, allow, allow),
             (GET_STREAMS_CODE, unauthenticated, allow),
             (GET_TOPIC_CODE, allow, allow),
-            (GET_TOPICS_CODE, allow, allow),
+            (GET_TOPICS_CODE, unauthenticated, allow),
+            (GET_PARTITIONS_CODE, allow, allow),
             (GET_CONSUMER_GROUP_CODE, allow, allow),
             (GET_CONSUMER_GROUPS_CODE, allow, allow),
             (SYNC_CONSUMER_GROUP_CODE, invalid_command, invalid_command),
@@ -593,18 +653,20 @@ mod tests {
     }
 
     #[test]
-    fn unknown_code_is_refused_as_invalid_command() {
-        assert!(
-            lookup_command(UNKNOWN_CODE).is_none(),
-            "test needs a code absent from COMMAND_TABLE"
-        );
+    fn unknown_or_retired_code_is_refused_as_invalid_command() {
         let shard = gate_shard();
         let invalid_command = Verdict::Deny(IggyError::InvalidCommand.as_code());
-        assert_eq!(gate(&shard, UNKNOWN_CODE, None), invalid_command);
-        assert_eq!(
-            gate(&shard, UNKNOWN_CODE, Some(DEFAULT_ROOT_USER_ID)),
-            invalid_command
-        );
+        for code in [UNKNOWN_CODE, RETIRED_WAIT_FOR_MESSAGES_CODE] {
+            assert!(
+                lookup_command(code).is_none(),
+                "test needs a code absent from COMMAND_TABLE"
+            );
+            assert_eq!(gate(&shard, code, None), invalid_command);
+            assert_eq!(
+                gate(&shard, code, Some(DEFAULT_ROOT_USER_ID)),
+                invalid_command
+            );
+        }
     }
 
     #[test]

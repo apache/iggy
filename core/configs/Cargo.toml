@@ -36,6 +36,7 @@ serde_with = { workspace = true }
 server_common = { workspace = true }
 static-toml = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 serial_test = { workspace = true }

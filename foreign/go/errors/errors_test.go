@@ -132,6 +132,38 @@ func TestIggyError_TooManyConsumerOffsets(t *testing.T) {
 	}
 }
 
+func TestIggyError_TieredReadFailed(t *testing.T) {
+	err := TieredReadFailed{}
+	if err.Code() != Code(96) || TieredReadFailedCode != Code(96) {
+		t.Errorf("Code() = %v, TieredReadFailedCode = %v, want 96", err.Code(), TieredReadFailedCode)
+	}
+	if err.Error() != "tiered data cannot be read from the object store; a retry does not help" {
+		t.Errorf("Error() = %q", err.Error())
+	}
+	if TieredReadFailedCode.String() != "TieredReadFailed" {
+		t.Errorf("String() = %q", TieredReadFailedCode.String())
+	}
+	if resolved := FromCode(Code(96)); !errors.Is(resolved, ErrTieredReadFailed) {
+		t.Errorf("FromCode(96) = %v, want ErrTieredReadFailed", resolved)
+	}
+}
+
+func TestIggyError_ReplyTooLarge(t *testing.T) {
+	err := ReplyTooLarge{}
+	if err.Code() != Code(97) || ReplyTooLargeCode != Code(97) {
+		t.Errorf("Code() = %v, ReplyTooLargeCode = %v, want 97", err.Code(), ReplyTooLargeCode)
+	}
+	if err.Error() != "the reply is larger than the reply size limit" {
+		t.Errorf("Error() = %q", err.Error())
+	}
+	if ReplyTooLargeCode.String() != "ReplyTooLarge" {
+		t.Errorf("String() = %q", ReplyTooLargeCode.String())
+	}
+	if resolved := FromCode(Code(97)); !errors.Is(resolved, ErrReplyTooLarge) {
+		t.Errorf("FromCode(97) = %v, want ErrReplyTooLarge", resolved)
+	}
+}
+
 func TestFromCode_FallsBackToTheGenericError(t *testing.T) {
 	if resolved := FromCode(Code(0xFFFFFF)); !errors.Is(resolved, ErrError) {
 		t.Errorf("FromCode(unknown) = %v, want ErrError", resolved)

@@ -26,5 +26,6 @@ fn main() {
     println!("cargo:rerun-if-changed=src/lib.rs");
     println!("cargo:rerun-if-changed=src/messages.rs");
     println!("cargo:rerun-if-changed=src/producer.rs");
+    println!("cargo:rerun-if-changed=src/reader.rs");
     println!("cargo:rerun-if-changed=src/type_conversion.rs");
 }

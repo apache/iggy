@@ -68,11 +68,13 @@ async fn given_persisted_auto_creation_when_producer_sends_should_confirm_and_po
         .poll_messages(
             &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();

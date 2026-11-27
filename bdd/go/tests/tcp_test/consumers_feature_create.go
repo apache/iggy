@@ -51,7 +51,7 @@ var _ = ginkgo.Describe("CREATE CONSUMER GROUP:", func() {
 			client := createAuthorizedConnection()
 			_, err := client.CreateConsumerGroup(
 				context.Background(),
-				randomU32Identifier(),
+				nonExistingStreamIdentifier(client),
 				randomU32Identifier(),
 				createRandomString(16),
 			)

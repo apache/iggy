@@ -436,9 +436,9 @@ async fn given_fresh_topic_when_polling_over_http_should_serve_a_context_at_or_a
     let polled = http.poll(STREAM, TOPIC, PARTITION_ID, 0, 10).await;
     assert_eq!(polled.messages.len(), 1, "the sent message must come back");
     assert!(
-        polled.context.metadata_op >= topic_create_op,
+        polled.context().metadata_op >= topic_create_op,
         "the served context {:?} must cover the topic create at op {topic_create_op}",
-        polled.context
+        polled.context()
     );
 }
 
@@ -855,6 +855,89 @@ async fn given_oversized_body_when_producing_should_reject_413(harness: &TestHar
 }
 
 #[iggy_harness]
+async fn given_refused_typed_header_when_producing_should_reject_400_with_header_error(
+    harness: &TestHarness,
+) {
+    let http = HttpClient::login_root(harness).await;
+    http.create_stream_and_topic("http-headers", "typed", 1)
+        .await;
+    let path = "/streams/http-headers/topics/typed/messages";
+    let produce = async |key: serde_json::Value, value: serde_json::Value| {
+        let body = json!({
+            "partitioning": { "kind": "balanced", "value": "" },
+            "messages": [{
+                "id": 1,
+                "payload": "aGVsbG8=",
+                "user_headers": [{ "key": key, "value": value }]
+            }]
+        });
+        http.client
+            .post(http.url(path))
+            .bearer_auth(&http.token)
+            .json(&body)
+            .send()
+            .await
+            .expect("produce request")
+    };
+    let string = |value: &str| json!({ "kind": "string", "value": value });
+    let one_byte_int32 = json!({ "kind": "int32", "value": "AQ==" });
+
+    let cases = [
+        (
+            one_byte_int32.clone(),
+            string("dmFs"),
+            IggyError::InvalidHeaderKey,
+        ),
+        (string(""), string("dmFs"), IggyError::InvalidHeaderKey),
+        (
+            string("a2V5"),
+            one_byte_int32,
+            IggyError::InvalidHeaderValue,
+        ),
+        (
+            string("a2V5"),
+            json!({ "kind": "raw", "value": "" }),
+            IggyError::InvalidHeaderValue,
+        ),
+    ];
+    for (key, value, refusal) in cases {
+        let case = format!("key={key} value={value}");
+        let response = produce(key, value).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{case}");
+        let error: serde_json::Value = response.json().await.expect("decode the error body");
+        assert_eq!(error["id"], refusal.as_code(), "{case}");
+        assert_eq!(error["code"], refusal.as_string(), "{case}");
+    }
+
+    let response = produce(
+        string("a2V5"),
+        json!({ "kind": "int32", "value": "AQAAAA==" }),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "a well-formed typed header must still commit"
+    );
+    let polled = http
+        .poll("http-headers", "typed", PARTITION_ID, 0, 10)
+        .await;
+    assert_eq!(
+        polled.messages.len(),
+        1,
+        "only the well-formed produce must land"
+    );
+    let user_headers = polled.messages[0]
+        .user_headers_map()
+        .expect("headers decode")
+        .expect("the message carries user headers");
+    assert_eq!(
+        user_headers.get(&HeaderKey::try_from("key").expect("header key")),
+        Some(&HeaderValue::from(1i32)),
+    );
+}
+
+#[iggy_harness]
 async fn given_ack_none_when_producing_should_return_202_and_commit(harness: &TestHarness) {
     const BURST_SIZE: u32 = 8;
     let http = HttpClient::login_root(harness).await;
@@ -935,7 +1018,7 @@ async fn given_ack_none_when_denied_before_the_partition_should_answer_the_deny(
         StatusCode::CREATED,
         "produce must commit"
     );
-    let mut context = http.poll(STREAM, TOPIC, PARTITION_ID, 0, 1).await.context;
+    let mut context = http.poll(STREAM, TOPIC, PARTITION_ID, 0, 1).await.context();
     context.metadata_op += UNAPPLIED_METADATA_OPS;
 
     let response = http
@@ -1068,16 +1151,31 @@ async fn given_ungranted_user_when_reading_or_producing_should_be_forbidden(harn
     root.create_user("rbac-nobody", "rbac-nobody-pass").await;
     let nobody = root.login("rbac-nobody", "rbac-nobody-pass").await;
 
-    // A metadata read: 403 for the ungranted user, 200 for root.
+    // A metadata read: 403 for the ungranted user, 200 for root. The stream
+    // list needs no grant and holds only what the caller may read.
     assert_eq!(
-        nobody.get("/streams").await.status(),
+        nobody.get("/streams/rbac-stream").await.status(),
         StatusCode::FORBIDDEN,
         "ungranted read must be 403"
     );
     assert_eq!(
-        root.get("/streams").await.status(),
+        root.get("/streams/rbac-stream").await.status(),
         StatusCode::OK,
         "root read must be 200"
+    );
+    let listed = nobody.get("/streams").await;
+    assert_eq!(
+        listed.status(),
+        StatusCode::OK,
+        "the stream list needs no grant"
+    );
+    assert_eq!(
+        listed
+            .json::<serde_json::Value>()
+            .await
+            .expect("stream list JSON"),
+        serde_json::json!([]),
+        "the ungranted user lists no stream"
     );
 
     // A data-plane produce: 403 for the ungranted user, 201 for root.
@@ -1114,6 +1212,40 @@ async fn given_ungranted_user_when_reading_or_producing_should_be_forbidden(harn
         nobody.get("/cluster/metadata").await.status(),
         StatusCode::OK,
         "cluster metadata is auth-only, never RBAC-gated"
+    );
+}
+
+#[iggy_harness(cluster_nodes = 1, server(
+    http.jwt.encoding_secret = "0123456789abcdef0123456789abcdef",
+    http.jwt.decoding_secret = "0123456789abcdef0123456789abcdef"
+))]
+async fn given_a_persistent_jwt_key_when_restarting_should_accept_tokens_only_from_the_same_history(
+    harness: &mut TestHarness,
+) {
+    let root = HttpClient::login_root(harness).await;
+    root.create_user("reader", "reader-password").await;
+    let reader = root.login("reader", "reader-password").await;
+
+    harness.restart_server().await.unwrap();
+    let restarted = HttpClient::login_root(harness).await;
+    assert_eq!(
+        restarted.refresh(&reader.token).await.status(),
+        StatusCode::OK
+    );
+
+    harness.restart_node_from_clean_slate(0).unwrap();
+    let fresh = HttpClient::login_root(harness).await;
+    assert_eq!(
+        fresh.refresh(&reader.token).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        fresh
+            .with_token(reader.token)
+            .delete("/users/logout")
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
     );
 }
 

@@ -269,6 +269,7 @@ mod tests {
 
     fn node_config(advertised_address: Option<String>) -> ClusterNodeConfig {
         ClusterNodeConfig {
+            rack: None,
             name: "node-0".to_owned(),
             ip: "10.0.0.1".to_owned(),
             advertised_address,

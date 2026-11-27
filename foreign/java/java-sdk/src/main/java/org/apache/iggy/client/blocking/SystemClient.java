@@ -60,6 +60,19 @@ public interface SystemClient {
      */
     MetadataChanges getMetadataChanges(MetadataChangesQuery query);
 
+    /**
+     * Retires the geo peer {@code origin}, a datacenter that never returns.
+     *
+     * <p>The cluster then follows nothing of it again: its shadow topics serve what they hold until their
+     * retention removes it, and a client may delete them. A datacenter that comes back needs another origin
+     * name. Requires root or the global manage servers permission.
+     *
+     * @throws org.apache.iggy.exception.IggyInvalidArgumentException for an origin the request cannot carry,
+     *     before anything is sent
+     * @throws org.apache.iggy.exception.IggyServerException unauthorized without the manage servers permission
+     */
+    void retireGeoOrigin(String origin);
+
     ClientInfoDetails getMe();
 
     ClientInfoDetails getClient(Long clientId);

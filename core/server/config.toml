@@ -190,6 +190,16 @@ enabled = true
 # exported only to users with the read_servers or manage_servers permission.
 endpoint = "/metrics"
 
+# Export the per-topic series (`topic_size_bytes`, `topic_messages` and
+# `topic_max_size_bytes`). Each scrape walks every topic to build them, which
+# costs time and memory on a node with many topics. The same switch exports
+# the per-partition series of the geo topics this node leads
+# (`topic_partition_long_term_lag_messages` and
+# `topic_partition_long_term_lag_bytes`).
+# `true` exports them to users who may read the server stats.
+# `false` exports only the node totals.
+topic_gauges = true
+
 # TLS (Transport Layer Security) configuration for HTTP.
 [http.tls]
 # Controls the use of TLS for encrypted HTTP connections.
@@ -338,7 +348,7 @@ enabled = true
 # The consumer groups of an ended session rebalance, and its client must log
 # in again. Each new primary grants a fresh timeout. Incomplete client lists
 # defer expiry across the cluster until a full timeout has passed without an
-# incomplete report. 1.2 x interval must exceed cluster.heartbeat_timeout when
+# incomplete report. 1.2 x interval must exceed cluster.commit_busy_heartbeat_timeout when
 # clustering is enabled, and three consumer_group.heartbeat_interval periods
 # plus two gather (3s) and send (100ms) deadlines, allowing one missed report.
 # So interval must exceed (3 x consumer_group.heartbeat_interval + 6.2s) / 1.2:
@@ -497,20 +507,43 @@ name = "iggy-cluster"
 # whole ticks: values are rounded down to a multiple of 10ms, and anything under
 # 10ms is raised to a single tick rather than firing sooner.
 
-# Backup-side liveness window for a consensus plane's primary (duration).
-# A replica that sees no primary traffic for this long starts a view change.
-# Raise it on oversubscribed hosts where scheduling stalls fake primary
-# death. Must be at least "2s" and at least 4x commit_broadcast_interval: the
-# primary signals liveness through its commit broadcast, and the window must
-# span several broadcasts so one delayed broadcast never trips an election.
-heartbeat_timeout = "5s"
+# The primary of each consensus group sends Commit heartbeats to its backups,
+# batched per peer node. All nodes of a cluster must use the same five values
+# below, or the replica handshake rejects the link. The node does not boot
+# unless these rules hold:
+#   commit_heartbeat_grid is a whole multiple of the 10ms shard tick.
+#   commit_busy_heartbeat_interval is a whole multiple of commit_heartbeat_grid.
+#   commit_busy_heartbeat_timeout >= max(2s, 4x commit_busy_heartbeat_interval).
+#   commit_idle_heartbeat_interval is a whole multiple of
+#   commit_busy_heartbeat_interval.
+#   max(commit_idle_heartbeat_timeout, commit_busy_heartbeat_timeout) >= 4x
+#   commit_idle_heartbeat_interval.
+#   commit_busy_heartbeat_timeout >= 4x commit_idle_heartbeat_interval.
+#   commit_busy_heartbeat_timeout and commit_idle_heartbeat_timeout are at most
+#   4294967295ms (about 49.7 days).
 
-# How often the primary broadcasts its commit point to every backup (duration).
-# This is the cluster's liveness signal: each broadcast resets every backup's
-# heartbeat_timeout window and carries the latest commit point forward. Must be
-# nonzero and, with heartbeat_timeout, satisfy heartbeat_timeout >= 4x this
-# value. Drives the consensus CommitMessage timer.
-commit_broadcast_interval = "500ms"
+# Interval between grid ticks (duration). Heartbeats join a batch only on grid
+# ticks.
+commit_heartbeat_grid = "100ms"
+
+# Interval between the heartbeats of a busy group (duration). A group is busy
+# while its commit point moves.
+commit_busy_heartbeat_interval = "500ms"
+
+# How long the backups of a busy group wait for a heartbeat before they vote
+# for a new primary (duration). It is also the quiet time before a group turns
+# idle, and the quorum window of a busy primary: a primary without heartbeat
+# replies from a quorum in this window steps down. On Linux it is also the
+# TCP_USER_TIMEOUT of every replica link.
+commit_busy_heartbeat_timeout = "5s"
+
+# Interval between the heartbeats of an idle group (duration). The metadata
+# group never turns idle.
+commit_idle_heartbeat_interval = "1s"
+
+# How long the backups of an idle group wait for a heartbeat (duration). They
+# wait the larger of this value and commit_busy_heartbeat_timeout.
+commit_idle_heartbeat_timeout = "12s"
 
 # How often the primary retransmits prepares that backups have not yet acked
 # (duration). Lower values recover faster from a dropped prepare at the cost of
@@ -524,8 +557,10 @@ prepare_retransmit_interval = "250ms"
 view_change_retransmit_interval = "500ms"
 
 # Backstop for a stalled view change (duration): one that does not conclude
-# within this window escalates to a fresh cluster-wide election. Must be nonzero
-# and at least 4x view_change_retransmit_interval, so a few dropped view-change
+# within this window escalates to a fresh cluster-wide election. The window
+# starts once the replica wrote the new view to disk, and each view change in a
+# row doubles it, up to 16x, until a view works again. Must be nonzero and at
+# least 4x view_change_retransmit_interval, so a few dropped view-change
 # messages retransmit rather than prematurely escalate.
 view_change_status_timeout = "5s"
 
@@ -586,6 +621,15 @@ repair_chunk_max = 128
 # it also disables the file-job deadline. Nonzero values must be at least 30s so
 # a transient disk hiccup cannot kill the process.
 superblock_wedged_fatal_timeout = "2m"
+
+# Replication factor of a topic created without one ("all" or an integer).
+# "all" stores each of its partitions on every node, the layout from before
+# per-topic replication factors, so clients that never send the option keep it.
+# An integer from 1 to 32 stores each partition on that many nodes, lowered to
+# the node count when larger, so "3" keeps three copies on clusters of any size.
+# Read by the metadata primary when it admits the create, which stores the
+# resolved factor with the topic: set the same value on every node.
+default_replication_factor = "all"
 
 # Superblock compatibility: version 2 atomically records adopted view/head/header
 # identity separately from WAL body certification. Legacy version 1 records with
@@ -649,21 +693,48 @@ ca_file = ""
 
 # Shard-0 coordinator placement.
 [cluster.coordinator]
-# When the server runs more than one shard, exclude shard 0 from replica
-# placement. Shard 0 already hosts the coordinator, the metadata writer, and
-# both listeners; replica connections are long-lived steady flows, so they are
-# offloaded to peer shards by default.
+# Keep replica links off shard 0 while the shard range of link 0 has another
+# shard. Shard 0 already hosts the coordinator, the metadata writer, and both
+# listeners; replica links are long-lived steady flows, so they are offloaded
+# to peer shards by default.
 skip_shard_zero_for_replicas = true
+
+# TCP links to each peer replica, at most the shard count. Link j carries the
+# frames of the shards in range j, so more links spread replication over more
+# shards. Every node must run the same value: the replica handshake refuses a
+# peer that differs. Shard counts may differ between nodes. A range with fewer
+# shards than there are peers puts links to two peers on one shard. With
+# skip_shard_zero_for_replicas on, range 0 keeps its links off shard 0, so it
+# needs one shard more than there are peers.
+replica_connections_per_peer = 1
 
 # When the server runs more than one shard, exclude shard 0 from client
 # placement. Off by default: client connections are short-lived and benefit
 # from shard-0 parallelism more than replicas do.
 skip_shard_zero_for_clients = false
 
+# Place no partition on shard 0, so a stall of the metadata plane there cannot
+# stop the heartbeats of partition groups. Keep skip_shard_zero_for_replicas
+# on with it, or a replica link can still sit on shard 0. With two shards
+# every partition lands on shard 1. A server with one shard refuses to start
+# with this on, because no shard would own a partition. Placement is
+# recomputed at every boot and no shard id is stored, so a restart may change
+# this freely. Run the same value on every node: a node that differs still
+# routes correctly, but frames between it and its peers can take an extra hop
+# between shards, as with differing shard counts. In both cases a peer can
+# send partition frames over link 0, and a node keeps that link on shard 0
+# when the shard range of the link holds only shard 0. Nodes with the same
+# shard count and the same value never do that.
+# Older server binaries reject a TOML config containing this key. Remove the
+# key before a rollback to one.
+skip_shard_zero_for_partitions = false
+
 # Full roster of cluster members. Byte-identical on every node. The running
 # node's identity is resolved at launch from the '--replica-id <N>' CLI
 # flag, which selects the entry in this list that describes the current
 # node. All other entries are remote peers.
+# VSR currently supports at most 32 nodes in this roster; larger rosters
+# are rejected during server startup.
 #
 # 'ip' is the node's roster address. Replica-to-replica traffic and
 # follower-to-primary HTTP forwarding use it. It is not the bind interface for
@@ -721,6 +792,7 @@ skip_shard_zero_for_clients = false
 #   ip = "10.0.1.5"                        # replica plane, literal IP only
 #   advertised_address = "203.0.113.10"    # catch-all for unmatched clients
 #   replica_id = 0
+#   rack = "eu-west-1a"                    # copies of a partition go to different racks
 #   ports = { tcp = 8090, http = 3000, tcp_replica = 9090 }
 #
 #   [[cluster.nodes.advertised_addresses]]
@@ -794,6 +866,25 @@ reply_inbox_capacity = 1024
 # separate capacity. This limits operation count, not retained message bytes.
 poll_completion_capacity = 1024
 
+# Longest wait of a deferred poll or readiness wait (at most 10 minutes). A
+# longer requested wait is shortened to it.
+deferred_poll_max_wait = "30 s"
+# Deferred polls and readiness waits parked on one shard, and the part of
+# them that one session may hold. An HTTP request without a binary session
+# counts against its user. A request above either limit is refused with a
+# retryable error.
+deferred_poll_max_pending = 1024
+deferred_poll_max_pending_per_session = 64
+# A deferred disk read reserves three times the max_bytes of its poll, and at
+# least three times 1 MiB, because one disk read can take a 1 MiB chunk
+# whatever its max_bytes. It reserves no more than the first value. The
+# deferred reads of one shard reserve no more than the second value together
+# (at most 1 GiB). A read that finds no room waits for one, behind the reads
+# that found no room before it. A reply carries no more than the first value,
+# unless its first message alone is wider.
+deferred_poll_max_read_bytes = "16 MiB"
+deferred_poll_max_inflight_bytes = "64 MiB"
+
 # Active partition file jobs plus results awaiting owner acceptance per shard (1..=256).
 # Exhausting either limit queues partition file work until capacity is released.
 # Running jobs use [cluster] superblock_wedged_fatal_timeout, counted in pump ticks.
@@ -818,15 +909,30 @@ shutdown_drain_timeout = "10 s"
 # scheduler overhead. Must be less than or equal to shutdown_drain_timeout.
 shutdown_poll_interval = "50 ms"
 
+# Longest time a node of a cluster spends on handing off the partitions it
+# leads before it shuts down. Without the handoff, each of those partitions
+# waits for a heartbeat timeout to elect a new primary. The handoff ends early
+# when no partition is left to hand off, or on a second stop signal. "0 s"
+# skips it, and so do "disabled", "none" and "unlimited", which also read as
+# zero. A single node never hands off.
+shutdown_primary_handoff_timeout = "15 s"
+
 # Hard wall-clock deadline for joining shard threads at process exit. A
 # shard whose pump or listener wedges past this budget is abandoned with
 # an error log instead of blocking exit forever. Must be at least
 # shutdown_drain_timeout, or shards would be abandoned mid-drain.
 shutdown_join_timeout = "30 s"
 
-# Safety-tick cadence for the partition reconciliation loop. The reconciler
-# also wakes on every metadata commit from shard 0, so this only covers
-# dropped wake-ups and the initial post-bootstrap convergence window.
+# Tick cadence for the partition reconciliation loop. The reconciler also
+# wakes on every metadata commit from shard 0. The tick retries partitions
+# that a pass left unfinished (a backed-off build, an incomplete trim),
+# checks local changes that no commit announces, ages parked requests and
+# covers dropped wake-ups. The reconciler also compares every partition
+# with committed metadata again in the background, and this tick does not
+# change the pace of that. It reads 1,024 entries (streams, topics,
+# partitions, routing rows) every 250 ms, and starts again 10 minutes after
+# it ended. The time for all partitions grows with their number: about 17
+# minutes at one million streams of one partition each.
 reconcile_periodic_interval = "1 s"
 
 # WebSocket listener configuration. The frame-tuning knobs below are the
@@ -881,10 +987,10 @@ key_file = "core/certs/iggy_key.pem"
 # Metadata consensus plane tunables (shard 0's VSR replica: users,
 # streams, topics, sessions). Size these together: a deeper prepare queue
 # admits more concurrent in-flight metadata ops (e.g. login storms), and
-# the journal must hold enough slots that a forced checkpoint (triggered
-# when remaining slots fall to the checkpoint margin, which itself is
-# max(64, prepare_queue_depth)) stays rare. Validation enforces
-# journal_slots >= 4 * max(64, prepare_queue_depth).
+# the journal must hold enough slots that a background checkpoint, started
+# once half of them committed, ends before the remaining slots fall to the
+# checkpoint margin, max(64, prepare_queue_depth), where appends wait for it.
+# Validation enforces journal_slots >= 4 * max(64, prepare_queue_depth).
 [metadata]
 # Depth of the metadata prepare queue: how many uncommitted metadata ops
 # may be in flight at once. Submits beyond it are rejected with the
@@ -895,12 +1001,36 @@ key_file = "core/certs/iggy_key.pem"
 prepare_queue_depth = 32
 
 # Size of the metadata WAL's in-memory index, in slots (one committed but
-# not-yet-snapshotted op per slot). Larger values buy more headroom
-# between forced checkpoints at the cost of memory and bigger WAL
-# rewrites per checkpoint. Reducing this for an existing data directory is
-# refused at boot if the live WAL suffix collides in the smaller index;
-# restore the previous value to recover.
-journal_slots = 1024
+# not-yet-snapshotted op per slot). A background checkpoint starts once half
+# of them committed past the last one; the checkpoint margin is the fallback.
+# Larger values buy rarer checkpoints and more time for each, at the cost of
+# index memory (one prepare header per slot, about 17 MiB at the default) and
+# a longer replay at boot. The maximum is 1048576.
+# Reducing this for an existing data directory is refused at boot if the live
+# WAL suffix collides in the smaller index; restore the previous value to
+# recover. An older server with a smaller default counts as a reduction.
+# Before a rollback to it, set this key to the value that the node runs, also
+# when the boot would pass: without the key the node runs 1024 beside peers
+# with more.
+# Run the same value on every node. A replica that joins by state transfer
+# must hold every op after the snapshot it receives. A replica with fewer
+# slots than the primary refuses a transfer whose tail does not fit and logs
+# an error that names this key.
+# Nodes of different server versions refuse the replica links of each other,
+# so a version upgrade stops every node first: see the Upgrading page of the
+# docs. Two defaults of this key can meet only between builds of one version.
+# A build from before this default uses 1024 when the key is absent. It does
+# not refuse a transfer: it stalls on the tail, takes no later op and sends
+# no ack, until it restarts with at least the value of the primary. To
+# replace such builds node by node, set journal_slots = 1024 on each node as
+# you replace it, so that every node runs 1024 meanwhile. After the last
+# node, raise the value node by node: the backups first, the metadata
+# primary last. The order holds only while the primary stays the same. If a
+# view change makes a raised node the primary before you raised every node,
+# a node with the smaller value can refuse a transfer as described above.
+# Raise that node next: it joins once it restarts with the value of the
+# primary.
+journal_slots = 65536
 
 # Initial capacity of the metadata session registry, shared by binary clients
 # and HTTP sessions. Live and unretired sessions occupy slots. A full registry
@@ -952,12 +1082,15 @@ change_log_activity_capacity = 16384
 # Topic durability and flush scheduling are set at creation and returned by GetTopic.
 # durability controls message completion. consumer_offset_durability controls explicit offset stores and deletes.
 # Both independently default to "replicated". Neither inherits the other.
+# A geo topic in the geo mode is always "persisted" for both: its create's values for them are ignored.
 # Every disk-backed partition uses a WAL for recovery and retries.
 # WAL references retain segment bodies by hard link until reclamation.
 # Full message payloads count against wal_bytes_max under both durability policies.
 # Persistence barriers can also persist co-batched messages.
 # Persisted prepares are limited to 64 MiB including the consensus header. Oversized operations are rejected permanently.
 # Both policies write data to storage. "replicated" waits for VSR commit and application without an additional stable-storage barrier.
+# A "replicated" partition publishes its WAL frontier at checkpoints, durable operations and graceful shutdown.
+# After a crash it recovers up to that frontier, and past it the writes that the OS still holds complete.
 # "persisted" also requires recoverable stable-storage copies at the replication quorum before explicit success.
 # A singleton quorum is one replica. Its persisted completion follows recoverable local persistence.
 # Poll auto-commit remains asynchronous. A successful poll does not confirm that its submitted offset operation committed or became durable.
@@ -1005,7 +1138,18 @@ change_log_activity_capacity = 16384
 # partition_wal_prepares_total over partition_wal_batches_total is the prepares per durable group, and
 # partition_wal_group_commit_waits_total counts the groups that actually took the optional wait
 # below, so a delay that never fires is distinguishable from one that fires and buys nothing.
+# A backup whose log the adopted view has not proven yet repairs it from the
+# head down and holds every batch it fetches in memory until the repair reaches
+# its commit point. Once it holds more than this budget, it stops and catches up
+# by state transfer instead. This bound is per partition, with the shared
+# allocation cap below limiting concurrent walks across all shards.
 wal_bytes_max = "256 MiB"
+
+# Node-wide allocation cap shared by unproven repair walks and snapshot repair
+# tails. Exhausted walks fall back to state transfer; exhausted tails require
+# a fresh snapshot. Normal prepare queues and transfer buffers have separate limits.
+# Must be > 0.
+repair_memory_bytes_max = "1 GiB"
 
 # Bounded wait for more prepares before a persisted partition's WAL writer
 # starts its durability barrier, in microseconds. 0 disables it. Max 10000.
@@ -1083,20 +1227,87 @@ consumer_offsets_max = 4096
 # For superblock compatibility, see superblock_wedged_fatal_timeout in [cluster].
 offset_reservation_lease = 65536
 
-# Entries the evicted ring retains per multi-replica partition for journal
-# repair after a peer rejoins. Larger widens the window a restarting peer can be
-# served from the ring before falling back to bulk sync, at the cost of pinned
-# memory per partition. Must be > 0 and <= 65536. Single-replica partitions
-# retain nothing regardless.
+# Entries the evicted ring retains with their batches in memory per
+# multi-replica partition for journal repair after a peer rejoins. Larger
+# widens the window a restarting peer can be served from memory, at the cost of
+# pinned memory per partition. Must be > 0 and <= 65536. Single-replica
+# partitions retain nothing regardless. The ops whose batches the ring released
+# to their segments do not count here. The ring keeps up to 16384 of them, 288
+# bytes each, and repair reads their batches back from disk.
 evicted_ring_capacity = 65536
 
-# Payload-byte ceiling per partition and replica; the first ring cap reached
-# evicts the lowest ops, retaining the newest entry even if it alone exceeds
-# this budget. Must be > 0 and <= "256 MiB". Allocation capacity, alignment and
-# index overhead are additional memory, especially for small offset commits.
-# There is no node-wide budget. partition_repair_ring_bytes reports payload
-# bytes summed across a shard's partitions, not their allocated memory or RSS.
+# Byte ceiling per partition and replica for the batches the ring holds in
+# memory. Past the cap the oldest batches that a segment holds leave memory
+# first, and repair reads them back from disk. When none can leave, the lowest
+# ops go, but the newest entry stays even if it alone exceeds this budget. Must
+# be > 0 and <= "256 MiB". The ops whose batches left memory take up to
+# 4.5 MiB more. Allocation capacity, alignment and index overhead are
+# additional memory, especially for small offset commits.
+# journal_memory_node_bytes_max bounds the sum across all partitions.
+# partition_repair_ring_bytes reports these bytes plus 288 bytes for each
+# released op, summed across a shard's partitions, not their allocated memory
+# or RSS.
 evicted_ring_bytes_max = "64 MiB"
+
+# Node-wide budget for the journal memory of all partitions. Three holders
+# charge it. The resident journal charges the buffer of each op that waits
+# for its flush, and its index entries. The evicted rings charge the buffer of
+# each batch they hold in memory, and 288 bytes for each slot of the ops whose
+# batch they released to its segment. The held state machine commands charge
+# their buffers, about 4 KiB each. A buffer counts for its whole allocation,
+# which is a multiple of 4 KiB, so a small op costs far more here than its
+# length. The count leaves out the map overhead of the rings, so it is a
+# lower bound. Each shard that owns partitions gets an equal share, because a
+# shard can shed only its own partitions. With
+# cluster.coordinator.skip_shard_zero_for_partitions on, shard 0 owns none.
+# Must be > 0, and the share must be at least 1 byte.
+# Past its share, a shard sheds in three steps on each tick:
+# 1. The rings that grew earliest release batches to their segments, until
+#    the shard is one eighth under the share.
+# 2. The partitions whose committed ops waited longest get a flush through
+#    their commit point. The flush moves those ops to the ring, where step 1
+#    releases their batches. A flush that cannot start, for example in a view
+#    change, counts as coming for 1,000 shard ticks (10 seconds).
+# 3. For the excess that no such flush covers, the rings drop their oldest
+#    entries. Then the partitions release the commands that a WAL checkpoint
+#    covers, and queue a checkpoint for the others. A dropped entry or command
+#    sends a lagging replica to state transfer.
+# Every ring keeps its newest entry. When those entries alone exceed the
+# share, every ring holds that entry only, and the server logs a warning.
+# partition_repair_ring_budget_bytes reports the share of a shard.
+# partition_repair_ring_charged_bytes, partition_journal_resident_bytes and
+# partition_journal_command_bytes report what each holder charges to it, and
+# partition_repair_ring_floor_bytes what the newest ring entries take of it.
+journal_memory_node_bytes_max = "8 GiB"
+
+# WAL checkpoint policy. A partition with an op above its WAL checkpoint comes
+# due for a checkpoint checkpoint_idle_delay after its last op, or
+# checkpoint_max_delay after its first op since its last checkpoint, whichever
+# comes first. A boot loads only the ops above the checkpoint, so these
+# delays bound what a restart loads again. Each shard queues the due
+# partitions and keeps at most 64 of their checkpoints requested or running
+# at a time. A graceful
+# stop checkpoints the partitions it can reach in half of
+# sharding.shutdown_drain_timeout.
+# partition_checkpoint_queue_length, partition_checkpoints_queued_in_flight,
+# partition_wal_checkpoint_starts_total (by trigger) and
+# partition_stop_checkpoints_missed_total report the queue.
+# Both must be > 0, and checkpoint_idle_delay must not exceed
+# checkpoint_max_delay.
+checkpoint_idle_delay = "30 s"
+checkpoint_max_delay = "5 min"
+
+# Node-wide cap on the partition WAL bytes above the checkpoints. A boot loads
+# these bytes into memory again, so this bounds what a restart reloads. Each
+# shard that owns partitions gets an equal share. Past its share, a shard
+# queues checkpoints for the partitions whose first op since their checkpoint
+# is oldest, until the queued bytes cover the excess. The queue paces these checkpoints like the
+# others. A boot reloads at most the share plus what the partitions write
+# while they wait in the queue. Must be > 0, and the share must be at least
+# 1 byte. partition_wal_reload_bytes reports the bytes of a shard,
+# partition_wal_reload_budget_bytes its share, and
+# partition_wal_checkpoint_starts_total{trigger="reload"} the checkpoints.
+wal_reload_node_bytes_max = "4 GiB"
 
 # Byte budget for segment payloads a SERVING shard keeps resident to answer
 # state-transfer chunk requests. PER SHARD, and shard count defaults to core
@@ -1148,7 +1359,8 @@ transfer_artifact_bytes_max = "1088 MiB"
 max_batch = 256
 
 # Wire-level cap on a single framed message. Must fit a consumer session report
-# (at least 280 B). Boot refuses a value above the frozen 256 MiB ceiling:
+# and a Commit batch of one entry (at least 296 B). Boot refuses a value above
+# the frozen 256 MiB ceiling:
 # segment recovery derives fixed scan and allocation
 # limits from the widest LEGAL record, so batches admitted above the ceiling
 # would be refused as implausible on a later boot. Raising it past 64 MiB
@@ -1220,6 +1432,11 @@ close_grace = "2 s"
 # (TCP-TLS rustls accept, WS HTTP-Upgrade, WSS combined TLS+WS, QUIC
 # connecting.await + accept_bi.await) so a slowloris peer cannot pin
 # per-conn channels + registry slot + spawned task indefinitely.
+# A replica link gets one such window for the placement preamble, TLS and
+# the replica handshake together. The window also bounds how long the links
+# to a peer may stay incomplete before they close and redial, so keep it
+# above reconnect_period: below it, the links to a peer form only when all
+# of them connect in one sweep.
 handshake_grace = "10 s"
 
 # Cap on open client sockets of the node: TCP, TCP-TLS, WebSocket, WSS, HTTP
@@ -1235,6 +1452,475 @@ handshake_grace = "10 s"
 # or with ulimit -Hn.
 #connections_max = 10000
 
+# External authentication callout. When enabled, login attempts for usernames
+# not found in the local user store are forwarded to an external HTTP service.
+# The service maps the caller to a pre-provisioned Iggy username or denies the
+# login. Local users authenticate through the built-in path and never hit the
+# callout.
+#
+# ── Callout contract ────────────────────────────────────────────────────
+#
+# The server POSTs JSON to 'url' with a timeout of 'timeout':
+#
+#   {
+#     "transport":     "<transport>",
+#     "client_address": "<ip:port>",
+#     "connection_id":  "<uuid>",
+#     "credentials": {
+#       "type":     "username_password",
+#       "username": "<login name>",
+#       "password": "<cleartext>"
+#     }
+#   }
+#
+# transport is one of: tcp, tcp_tls, ws, wss, quic, http.
+#
+# connection_id on TCP/QUIC/WS is the client's persistent connection id
+# (stable across reconnect retries). On HTTP it is a fresh UUIDv7 per
+# login request because each REST call is stateless.
+#
+# The service must return 2xx JSON. Any non-2xx status is treated as an
+# error (5xx and 429 are retryable; other 4xx are terminal). A 2xx body
+# must carry a "decision" tag:
+#
+#   Allow -- map the caller to a pre-provisioned Iggy user:
+#     {"decision": "allow", "username": "<iggy username>"}
+#
+#   Deny -- reject the login:
+#     {"decision": "deny", "reason": "<optional reason>"}
+#
+# The mapped username must exist as an active, non-root user. The
+# credential (password) is forwarded so the external service can verify
+# the requester; use TLS ('url' starting with https://) to protect it.
+#
+# Callouts fire only on the normal-status primary. Backup nodes and
+# nodes in a view change return a retryable error so the SDK reconnects
+# to the primary. The SDK replays logins after transient failures, so
+# the external service must be idempotent. One-time passwords will not
+# survive a replay.
+#[external_auth]
+#enabled = false
+#url = "https://auth.example.com/iggy/verify"
+#timeout = "5 s"
+# Per-shard cap on concurrent callouts. Each shard thread gets its own
+# counter, so the external service can see up to shards * this value
+# requests in flight.
+#max_concurrent_callouts = 64
+
+# Tiered storage: an object store for the sealed segments of tiered topics and
+# for the messages of geo topics. Without this section, the backend is "none":
+# no topic can turn tiered, and no geo topic can be created. With a backend,
+# the cluster takes both only while every node passes the store identity check
+# that 'prefix' describes, and refuses them with FeatureUnavailable until then.
+#[tiered_storage]
+# "none", "fs" (a directory), "s3" (S3 and stores with its API, such as
+# Ceph RGW and R2), "gcs" (Google Cloud Storage, set up in
+# [tiered_storage.gcs]) or "mock_s3". "mock_s3" keeps every object in the memory
+# of the server, which loses them all when it stops, and answers each call
+# after the latency of [tiered_storage.mock_s3]. It is for benchmarks and
+# tests only, and no geo peer can read it.
+#backend = "none"
+# The key prefix of this cluster's objects. Two clusters can share a bucket
+# under different prefixes, but never under the same one. The cluster claims
+# its prefix with the object "<prefix>/meta/identity". Replica 0 writes it
+# while it is the caught-up metadata primary and no topic keeps data in the
+# store. While another replica leads metadata, nothing claims the prefix:
+# restart the leader until replica 0 leads. A node uploads and deletes
+# objects only while it reads that claim back through its own store, which
+# the gauge object_store_identity_verified shows. Give every node the same
+# store and prefix: the check cannot tell two stores apart when replica 0
+# reaches an empty one and the other nodes reach one that holds an earlier
+# claim of this cluster. At boot the server reads the claim once, and only a
+# missing bucket, rejected credentials or a store that ignores conditional
+# creates stop the boot: once the claim is there, the node puts it again
+# create-only, and the store must refuse that put. The server README says how
+# to keep and restore the claim.
+#prefix = "iggy"
+# The fs backend: the directory that holds the objects.
+#path = "/var/lib/iggy-tiered"
+# The s3 backend: the bucket, the region and, for a store other than AWS,
+# its URL without a path.
+#bucket = "iggy-segments"
+#region = "eu-central-1"
+#endpoint = "https://storage.example.com"
+# Where the bucket goes in a request URL: "path" (endpoint/bucket/key),
+# "virtual_hosted" (bucket.endpoint/key) or "auto", which picks
+# "virtual_hosted" for AWS and "path" for any other endpoint.
+#url_style = "auto"
+# Static s3 credentials. Set them in the environment, with
+# IGGY_TIERED_STORAGE_ACCESS_KEY_ID and IGGY_TIERED_STORAGE_SECRET_ACCESS_KEY,
+# rather than in this file. The printed configuration never shows them.
+# Without static keys, the s3 backend takes temporary credentials, in the
+# order of the AWS SDKs: from web identity (AWS_WEB_IDENTITY_TOKEN_FILE and
+# AWS_ROLE_ARN, as on EKS), and then from the role of the EC2 instance
+# (AWS_EC2_METADATA_DISABLED=true turns that off). The node fetches new
+# credentials 5 minutes before the old ones expire, and every shard uses them.
+#access_key_id = ""
+#secret_access_key = ""
+# The tuning values below are provisional.
+# The longest wait for one attempt at a store call other than a put, from
+# 1 s to 1 h.
+#request_timeout = "30 s"
+# If the store takes no piece of the body of a put that streams from a file,
+# a sealed segment, for this long, or gives no answer for this long after the
+# last piece, the put fails. Such a put has no total deadline and is sent
+# once. Each attempt at an overwrite whose body the node holds in memory, such
+# as a manifest or a positions object, waits the same. From 1 s to 1 h.
+#progress_timeout = "30 s"
+# The most attempts at a store call that keeps failing for a transient
+# reason, the first one included, and the backoff between them, each wait
+# from 1 ms to 1 h. They cover heads, reads, listings, deletes, and the
+# create-only puts whose body the node holds in memory: fresh objects and
+# long-term segments. Each attempt of such a put carries the same "put-id" in
+# the object's metadata, so a create-only put that the store refuses because
+# an earlier attempt stored the object counts as stored. An overwrite, such as
+# a manifest, a positions object or a topic object, is sent again only when
+# its request never left the node, for example when the connection was
+# refused: an attempt that may have reached the store can land after a later
+# overwrite of the same key and roll it back, so any other failure goes to
+# the caller. Every request of a put counts, a second attempt too.
+#max_attempts = 3
+#retry_delay = "200 ms"
+#max_retry_delay = "5 s"
+# An attempt at a create-only put whose body the node holds in memory, a fresh
+# object or a long-term segment, is given up and sent again when the store
+# takes no piece of its body (64 KiB) for 'put_attempt_stall_timeout', or gives
+# no answer for 'put_attempt_answer_timeout' after the last piece. A late
+# create finds the object and stores nothing. An overwrite cut early could land
+# after a later put of other bytes, so it waits 'progress_timeout' instead,
+# and so does every put on the "fs" backend. Each from 100 ms to 1 h.
+#put_attempt_stall_timeout = "1 s"
+#put_attempt_answer_timeout = "5 s"
+# A create-only put whose body the node holds in memory, such as the upload of
+# a fresh object that producers wait for, gets a second attempt on another
+# connection once it has run for 'second_attempt_after' plus
+# 'second_attempt_after_per_mib' for each MiB of its body. The first attempt
+# to store the object wins, and the other is dropped. The defaults are about
+# the 99th percentile of a put of each size measured on GCS, so about one put
+# in a hundred costs a second request. 'jobs.second_attempts' bounds how many
+# run at once. The "fs" backend sends none, since a slow put there means a busy
+# volume. "disabled" sends no second attempt. Otherwise from 1 ms to 1 h, and
+# up to 1 h per MiB.
+#second_attempt_after = "300 ms"
+#second_attempt_after_per_mib = "60 ms"
+# A long-term segment of at least twice 'part_size' goes up in parts on "s3"
+# and "gcs": up to 'jobs.parts_in_flight' parts side by side, each sent again
+# after a failure as a put is but without a second attempt, and then one
+# request creates the object whole and create-only, with a CRC32C of all of it that the store
+# checks. Every other put goes whole, such as a fresh object that producers
+# wait for. On s3 it is a multipart upload with a full object CRC32C. On gcs
+# each part is a temporary object under "<prefix>/meta/uploads/", which a
+# compose joins into a composite whose CRC32C the node checks before a second
+# compose creates the object, and the node then deletes them. Only an https
+# endpoint of Google takes uploads in parts. gcs composes at most 32 parts, so a
+# part takes at least a 32nd of its object there. On gcs, a bucket with soft
+# delete on keeps deleted objects billable for its retention, 7 days by
+# default, so each long-term segment stored in parts is billed about twice for
+# that time. Turning soft delete off on the bucket, or part_size = "0", avoids
+# it. A store that refuses multipart uploads or the full object checksum makes
+# the node put every object whole from then on. "0" puts every object whole.
+# Otherwise from 5 MiB, S3's least part, to 5 GiB.
+#part_size = "8 MiB"
+# How old an upload in parts that never completed must be before shard 0 of
+# the metadata primary removes it: what a crash or a cancelled put leaves, the
+# parts of an S3 multipart upload or the temporary objects of a GCS upload.
+# The sweep runs every hour, or every 'abandoned_upload_grace' when that is
+# shorter, while the node passes the store identity check, and only when the
+# identity object names this cluster. An upload in parts gives up at half the
+# grace, so the sweep never meets a live one, and the other half covers the
+# skew between the clocks of the node and of the store. "disabled" turns the
+# sweep off and leaves an upload in parts without a deadline: on S3, a bucket
+# lifecycle rule that aborts incomplete multipart uploads does the same work.
+# Otherwise at least 30 min, so that the half that covers the skew of the
+# clocks takes the 15 minutes that S3 accepts. On s3 the sweep needs
+# s3:ListBucketMultipartUploads on the bucket (arn:aws:s3:::<bucket>) and
+# s3:AbortMultipartUpload on its objects (arn:aws:s3:::<bucket>/*).
+# Without them it removes nothing, and S3 keeps charging for the parts of
+# every abandoned upload unless such a lifecycle rule aborts them.
+#abandoned_upload_grace = "1 h"
+# The bytes of what one shard reads from object stores that it keeps in
+# memory, so that a poll of bytes another poll read a moment ago does not ask
+# the store again: tiered and long-term segments, the indexes of long-term
+# segments, fresh objects, and the segments of geo peers. The index of a
+# tiered segment is fetched once into a local index file on disk instead. The
+# same budget holds the fresh objects that the shard uploads for geo topics,
+# in up to seven eighths of it, until the long-term rewrite takes their
+# messages, so that a consumer at the tail reads them from memory. A shard
+# with a high upload rate wants 64 MiB or more. Each shard keeps its own, so a
+# node spends this times its shards. "0" keeps nothing that reads fetch and
+# turns readahead off: those reads go to the store each time. It never stops
+# the shard from holding what it uploads, which then takes a fixed 64 MiB of
+# its own. Otherwise at least 8 blocks of 'read_cache_block_size'. Every
+# partition of the shard reads within it. A topic can override it with its own
+# 'read_cache_size' option, which is shared evenly between the topic's
+# partitions. Each share is a limit on what that partition keeps, not a
+# reservation: what a quiet partition leaves unused is there for the others. A
+# topic that sets none is bounded by this budget alone.
+#read_cache_size = "64 MiB"
+# The piece of a segment that the cache fetches and keeps. A smaller block
+# wastes less on a small or random read. A larger block means fewer entries
+# and suits consumers that read forward. Adjacent missing blocks are fetched
+# in one request either way. From 64 KiB to 1 MiB.
+#read_cache_block_size = "256 KiB"
+# When polls read a segment in order, the shard fetches up to this many bytes
+# past the last poll before a poll asks for them, in whole blocks. These
+# fetches take the speculative fetch caps of [tiered_storage.jobs]: at most
+# 'speculative_fetches' of them at once, each at most
+# 'speculative_fetch_bytes'. One starts only while no fetch that a poll waits
+# for is queued, and it can run beside the ones that already run. "0" turns
+# readahead off. Otherwise at least 2 blocks, and at most an eighth of
+# 'read_cache_size', the part of the cache where the fetched bytes wait for
+# their poll. A topic can override it with its own 'read_ahead' option.
+#read_ahead = "2 MiB"
+# The shortest time between the starts of two uploads of fresh objects on one
+# shard, so a shard creates at most one object per interval, plus the objects
+# that fill to 4 MiB before it passes. A send that finds a free upload slot
+# when the last upload started at least this long ago is uploaded at once, so
+# a lone producer does not wait. "0" uploads as soon as a slot of
+# 'jobs.fresh_uploads' is free. A producer that waits for each answer before
+# its next send completes one send per max(interval, upload + commit). A longer
+# interval means fewer and larger objects, so fewer store requests, and a
+# longer wait for every producer. Up to 10 s.
+# A geo topic can set its own with the topic option of the same name.
+#fresh_upload_interval = "10 ms"
+# The bytes of messages one partition that stores them in fresh objects may
+# have committed that its primary has not yet rewritten into long-term
+# segments. Past it, the primary slows the sends to that partition and never
+# refuses them: each send waits before it is taken, 10 ms just past the limit
+# and longer the further past it is, up to 250 ms at twice the limit. A
+# producer that waits for each answer then sends less, and the rewrites catch
+# up. Sends to other partitions are not slowed. The next rewrite of a
+# partition past the limit does not wait out its usual interval, only the
+# shortest one, 1 s after its last rewrite. "0" turns the delay off.
+# Otherwise at least 64 MiB, what one long-term segment holds.
+#long_term_backlog_limit = "1 GiB"
+# The most bytes of messages one shard holds for sends to geo topics that have
+# not reached their partitions yet: in the open upload window, in the fresh
+# objects that upload or wait for a slot, and in stored objects whose partition
+# has no room yet. It bounds the memory a shard spends when the store or a
+# partition stops answering. A send past it is refused for a moment with
+# TransientNotAccepted, and the client sends it again. A send larger than it
+# still gets in while nothing waits on the shard. The uploads of
+# 'jobs.fresh_uploads' hold part of it, so more slots take no more memory. At
+# most a node spends this times its shards on such sends. At least 4 MiB, the
+# size of one fresh object.
+#fresh_pending_bytes = "32 MiB"
+# The most of 'fresh_pending_bytes' that the waiting sends of one partition
+# hold, so a partition that stops answering leaves the rest to the other
+# partitions of the shard. A send past it is refused the same way, and a send
+# larger than it still gets in while nothing of its partition waits. Raise both
+# when producers send batches of several MiB to the same partition at once:
+# with batches of 10 KB to 10 MB from 32 producers on 64 partitions, 17 % of
+# sends were refused once at the defaults. The metrics
+# fresh_sends_denied_partition_share and fresh_sends_denied_shard_cap count the
+# refusals. At least 4 MiB, and at most 'fresh_pending_bytes'.
+#fresh_partition_pending_bytes = "8 MiB"
+# How long the sweeps of the root must find the same objects of a partition
+# incarnation that committed metadata no longer holds before they delete the
+# incarnation. A committed delete of a partition deletes its objects from a
+# queue in memory, so a restart, a change of the metadata primary or a full
+# queue can leave them in the store. Shard 0 of the metadata primary lists the
+# whole root every hour, or every 'orphan_grace' when that is shorter, and
+# counts the grace by its own clock from the second sweep that found the same
+# objects, so a new object of the incarnation starts it again. It never deletes
+# the objects of a live partition, of one created after the sweep read
+# metadata, of a geo topic, objects under 'meta/' other than the manifest of
+# an incarnation it deletes, objects of another cluster, or objects no newer
+# than this cluster's claim of the root. "disabled" turns the sweep off.
+# Otherwise at least 1 s.
+#orphan_grace = "6 h"
+# Per shard: how many jobs of each class run at once, and the bytes that
+# fetches and uploads hold. A segment larger than 'upload_bytes' uploads
+# alone. Polls that read from the store are demand fetches, and readahead
+# ('read_ahead') takes the speculative fetch caps. 'fresh_uploads' are the
+# uploads that producers of geo topics wait for. They have slots of their own
+# and never wait behind 'uploads'. Housekeeping jobs, such as sweeps and the
+# merges of long-term segments, start only while no fetch or upload waits.
+# 'second_attempts' are the second attempts at slow create-only puts that run
+# at once (see 'second_attempt_after'). They take no slot of 'fresh_uploads',
+# and a slow put that finds none free waits for its first attempt.
+# 'parts_in_flight' are the parts of uploads in parts that run at once (see
+# 'part_size'), over every upload of the shard. An upload with no part in flight
+# sends one even when they are all taken.
+#[tiered_storage.jobs]
+#demand_fetches = 16
+#demand_fetch_bytes = "64 MiB"
+#uploads = 2
+#upload_bytes = "2 GiB"
+#fresh_uploads = 16
+#speculative_fetches = 4
+#speculative_fetch_bytes = "32 MiB"
+#deletes = 2
+#housekeeping = 1
+#second_attempts = 4
+#parts_in_flight = 8
+# The gcs backend: Google Cloud Storage, over its JSON API. A put is a
+# create-only upload where it must be (ifGenerationMatch=0), and GCS checks
+# the CRC32C of each body. GCS takes one write per second to one object name,
+# so on gcs set [geo] consumer_offset_upload_interval to "1 s" or more, or
+# "disabled".
+#[tiered_storage.gcs]
+#bucket = "iggy-segments"
+# The URL of the JSON API, without a path. Empty is Google Cloud Storage. An
+# emulator such as fake-gcs-server takes its own URL.
+#endpoint = ""
+# "auto" takes an access token from the first source that the node has, in
+# the order of Google's application default credentials: the service account
+# key file below, then the one that GOOGLE_APPLICATION_CREDENTIALS names, then
+# the metadata server of a Compute Engine instance or a GKE node, which also
+# serves GKE Workload Identity (GCE_METADATA_HOST moves it). The node fetches
+# a new token 5 minutes before the old one expires, and every shard uses it.
+# The service account needs the Storage Object User role on the bucket. "none"
+# sends no credentials, for an emulator.
+#auth = "auto"
+# The path of a service account JSON key file. Only the server may read it.
+#service_account_key = ""
+# The mock_s3 backend: what it adds to each store call. A put waits out its
+# latency after its body arrived and before it commits, and calls in flight
+# wait at the same time, as on a remote store. 'bytes_per_second' adds the
+# time to move the body of a put or the bytes of a read, "0" for no limit.
+# Each latency must be shorter than the timeout of its call: both
+# 'progress_timeout' and 'put_attempt_answer_timeout' for a put,
+# 'request_timeout' for the others. A 'put_latency' past the threshold of
+# 'second_attempt_after' gives every create-only put a second attempt.
+#[tiered_storage.mock_s3]
+#put_latency = "0"
+#get_latency = "0"
+# Heads, deletes and listings.
+#other_latency = "0"
+#bytes_per_second = "0"
+
+# Geo topics: the name of this cluster among the datacenters, its origin, and
+# the object stores of the other clusters that it reads, its peers. Without
+# this section, the cluster has no origin and no peers.
+#[geo]
+# The name of this cluster. Shadow stream names and the objects that this
+# cluster publishes for its peers carry it. It holds 1 to 32 lowercase
+# letters, digits and '-', starts with a letter and does not end with '-'. A
+# cluster with peers or geo topics needs it: without it, the cluster publishes
+# no object for its geo topics, and their partitions refuse every send.
+#origin = "dc-a"
+# How long a deleted geo topic keeps its tombstone and its objects in this
+# cluster's [tiered_storage] store. The cluster publishes one object for each
+# of its geo topics under "<prefix>/meta/topics/". When a geo topic is
+# deleted, the metadata primary turns its object into a tombstone, which tells
+# the peers that the topic is gone. After this grace, it deletes the topic's
+# segments and manifests, and then the tombstone. It checks once a minute, so
+# the objects can stay up to a minute longer. Make it longer than any outage
+# of a peer after which the peer must still see the tombstone. A cluster that
+# reads peers also keeps a detached shadow topic this long after the peer wrote
+# its tombstone.
+# A geo topic can set its own with the topic option of the same name.
+#tombstone_grace = "24 h"
+# How often a node lists the manifests of each peer stream that a shadow
+# stream serves. A shadow partition then commits each changed manifest, so it
+# stays about this far behind its peer. One listing per peer stream and one
+# read per changed manifest go to the peer's store each time.
+#manifest_poll_interval = "5 s"
+# The longest wait between two rewrites of the committed messages of a geo
+# partition into long-term segments. Each partition adjusts its wait between
+# 1 s and this value, toward the wait at which a segment comes out 80% full.
+# A partition with little load waits the longest, so its shadow topics in
+# other datacenters are about this plus manifest_poll_interval behind. A
+# lower value brings messages there sooner, and leaves more and smaller
+# long-term segments on quiet partitions: more merges and more manifest
+# stores, still at most one a second per partition. At least 1 s. "1 s"
+# rewrites every second.
+# A geo topic can set its own with the topic option of the same name.
+#long_term_rewrite_max_interval = "10 s"
+# How often a node stores the positions of the consumer groups of its geo and
+# shadow topics in its bucket, one object per log in which it leads a
+# partition, when they changed. It carries the commits of polls with
+# auto_commit: a group that fails over reads again at most this long, plus the
+# poll interval of the other datacenter.
+# A geo topic can set its own with the topic option of the same name.
+#positions_publish_interval = "1 s"
+# The shortest time between two stores of positions for the offsets that
+# consumer groups store themselves (StoreConsumerOffset). Such a store is
+# answered only once this node's bucket holds its position, so a group that
+# fails over reads none of it again. A store that finds no put running is
+# stored at once, and the stores that arrive during a put or within the
+# interval share the next one. Each put rewrites the node's whole object of
+# the log. "disabled" answers them at the local commit and leaves them to
+# positions_publish_interval. Up to 1 s.
+# A geo topic can set its own with the topic option of the same name.
+#consumer_offset_upload_interval = "50 ms"
+# How often a node lists the consumer group positions that each peer stores,
+# and takes the ones that win over its own.
+#positions_poll_interval = "1 s"
+# How long, after a node starts, the group polls of its geo and shadow
+# partitions wait for the positions of every peer.
+# A geo topic can set its own with the topic option of the same name.
+#positions_resume_timeout = "10 s"
+# The cluster_uid of a cluster that lost every disk, as the store identity
+# object "<prefix>/meta/identity" names it, whose geo topics this cluster
+# takes back from that store. Only replica 0 reads it: set it there, in the
+# cluster rebuilt on empty disks with the same origin and [tiered_storage]
+# section as the lost cluster, only after that cluster is stopped for good.
+# Replica 0 then retires the lost cluster, restores its geo topics with their
+# ids, and claims the store. The other nodes learn from metadata which
+# partitions to take back. Empty, the default, takes nothing back, and a
+# cluster refuses a store that another cluster claimed. Remove it once the
+# recovery report is written. GEO_TOPICS.md describes the procedure.
+#recover_cluster_uid = ""
+# Whether the recovery also takes the batches that no proof in the store
+# names, at the offsets their writer expected: false takes back exactly the
+# messages the store proves committed and drops the rest.
+#recover_unproven = true
+# One table per peer, at most 16. A peer's store is the [tiered_storage] store
+# of the other cluster, with the same keys. The server only reads it: it never
+# puts, deletes or creates an object there, so read-only credentials are
+# enough. Each shard runs one tier service per peer, with the timeouts and job
+# caps of [tiered_storage].
+#
+# Shard 0 reads each peer's store identity object, "<prefix>/meta/identity",
+# at boot and every minute after that. While the node reads nothing from the
+# peer, or the peer's store does not answer, it reads the object every 5
+# seconds. The node reads the peer when the object names a cluster that its
+# shadow streams of the peer came from, or a successor of one that the
+# recovery records under the peer's root prove. While it holds no shadow
+# stream of the peer, the first cluster that the object names counts. If the
+# object names another cluster later, the node reads nothing from the peer
+# until it restarts. A peer that does not answer never stops the boot. The
+# gauges geo_peer_identity_verified and geo_peer_unreachable show each peer by
+# its origin.
+#[[geo.peers]]
+# The peer's own geo.origin.
+#origin = "dc-b"
+# "fs" (a directory), "s3" or "gcs".
+#backend = "s3"
+# The peer's tiered_storage.prefix.
+#prefix = "iggy"
+# The fs backend: the directory that holds the peer's objects.
+#path = "/mnt/iggy-dc-b"
+# The s3 backend: the bucket, the region and, for a store other than AWS, its
+# URL without a path. url_style works as in [tiered_storage].
+#bucket = "iggy-segments-dc-b"
+#region = "us-east-1"
+#endpoint = "https://storage.example.com"
+#url_style = "auto"
+# Static s3 credentials. Set them in the environment, for the first peer with
+# IGGY_GEO_PEERS_0_ACCESS_KEY_ID and IGGY_GEO_PEERS_0_SECRET_ACCESS_KEY, rather
+# than in this file. A variable for one key of a peer replaces the whole list
+# of peers from this file, so set the peer's other keys there too
+# (IGGY_GEO_PEERS_0_ORIGIN, _BACKEND, _BUCKET, _REGION) and leave its table
+# out of this file. The printed configuration never shows the credentials.
+# Without them, an s3 peer reads with the node's web identity or instance
+# role, as the s3 backend does, and that role needs s3:GetObject and
+# s3:ListBucket on the peer's bucket. A peer's credentials never hold up the
+# boot: a role that hands out nothing leaves the peer unreachable, and the
+# node keeps fetching.
+#access_key_id = ""
+#secret_access_key = ""
+# The gcs backend: the peer's bucket and how this node gets a token that
+# reads it, with the keys of [tiered_storage.gcs]. The Storage Object Viewer
+# role is enough. A peer's token never holds up the boot.
+#[geo.peers.gcs]
+#bucket = "iggy-segments-dc-b"
+#endpoint = ""
+#auth = "auto"
+#service_account_key = ""
+
 # This node's own client-facing identity, used when 'cluster.enabled' is false.
 [node]
 # A literal IP or a DNS hostname, without a port. Named to match its roster
@@ -1244,3 +1930,21 @@ handshake_grace = "10 s"
 # out here because the shipped 'tcp.address' binds a concrete address and needs
 # no declaration.
 #advertised_address = "broker-1.example.com"
+
+# Free space this node keeps on the disk of its data directory. While less is
+# free, the node refuses new messages for the partitions it leads with a
+# transient error that SDKs retry, and accepts them again once space returns.
+# Retention, segment deletion and consumer offsets keep working, so the node
+# can still free space. Without the reserve a full disk fails a WAL write and
+# stops the node.
+#
+# The free space is the last sample of the disk, taken once a second, minus
+# what the node wrote since, so a burst between two samples is counted, and
+# minus the messages the node accepted and has not written yet, so the WAL
+# backlogs of its partitions cannot write through the reserve together. A
+# backup does not refuse what its primary replicates: give every node of a
+# cluster the same disk size, or watch 'data_disk_below_free_space_reserve' on
+# each node.
+#
+# "0" disables the reserve.
+free_space_reserve = "1 GiB"

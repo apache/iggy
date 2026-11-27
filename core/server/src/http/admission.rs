@@ -92,7 +92,7 @@ pub(in crate::http) fn admit_partition_write<'a>(
 /// node sends, so held targets never leave this node without a slot to relay
 /// its own callers' requests, and two nodes relaying to each other never
 /// starve each other.
-const MAX_IN_FLIGHT_RELAY_TARGETS: u32 = 128;
+pub(in crate::http) const MAX_IN_FLIGHT_RELAY_TARGETS: u32 = 128;
 
 /// Per-credential share of [`MAX_IN_FLIGHT_RELAY_TARGETS`], equal to the
 /// per-session write cap, so one caller relayed through every peer cannot

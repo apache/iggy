@@ -41,13 +41,8 @@ on:
       binaries:
         type: string
         required: false
-        default: "iggy-server,iggy,iggy-bench,iggy-connectors"
+        default: "iggy-server,iggy,iggy-bench"
         description: "Comma-separated list of binaries to build"
-      connector_plugins:
-        type: string
-        required: false
-        default: "iggy_connector_elasticsearch_sink,iggy_connector_elasticsearch_source,iggy_connector_iceberg_sink,iggy_connector_postgres_sink,iggy_connector_postgres_source,iggy_connector_quickwit_sink,iggy_connector_random_source,iggy_connector_s3_sink,iggy_connector_stdout_sink,iggy_connector_surrealdb_sink, iggy_connector_rabbitmq_sink"
-        description: "Comma-separated list of connector plugin crates to build as shared libraries"
     outputs:
       artifact_name:
         description: "Name of the uploaded artifact containing all artifacts"
@@ -111,7 +106,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: "24"
           package-manager-cache: false
 
       - name: Build Web UI static files
@@ -184,89 +179,9 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
-  build-connector-plugins:
-    name: Connector plugins ${{ matrix.target }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-26.04
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-26.04-arm
-    steps:
-      - name: Download latest copy script from master
-        if: inputs.use_latest_ci
-        run: |
-          curl -fsSL --retry 5 --retry-all-errors "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
-            -o /tmp/copy-latest-from-master.sh
-          chmod +x /tmp/copy-latest-from-master.sh
-
-      - uses: actions/checkout@v7.0.1
-        with:
-          ref: ${{ inputs.commit || github.sha }}
-
-      - name: Apply latest CI from master
-        if: inputs.use_latest_ci
-        run: |
-          /tmp/copy-latest-from-master.sh save .github scripts
-          /tmp/copy-latest-from-master.sh apply
-
-      - name: Setup Rust
-        uses: ./.github/actions/utils/setup-rust
-
-      - name: Add Rust target
-        run: rustup target add ${{ matrix.target }}
-
-      - name: Build connector plugins
-        run: |
-          plugins="${{ inputs.connector_plugins }}"
-          pkg_flags=()
-
-          IFS=',' read -ra pkgs <<< "$plugins"
-          for pkg in "${pkgs[@]}"; do
-            name="$(echo "$pkg" | xargs)"
-            [[ -z "$name" ]] && continue
-            pkg_flags+=(--package "$name")
-          done
-
-          cargo build --locked --release --target ${{ matrix.target }} "${pkg_flags[@]}"
-
-      - name: Package connector plugins
-        id: pkg
-        run: |
-          target="${{ matrix.target }}"
-          version="${{ inputs.version }}"
-          outdir="dist/${target}"
-          mkdir -p "${outdir}"
-
-          plugins="${{ inputs.connector_plugins }}"
-          IFS=',' read -ra pkgs <<< "$plugins"
-          for pkg in "${pkgs[@]}"; do
-            lib_name="$(echo "$pkg" | xargs)"
-            [[ -z "$lib_name" ]] && continue
-            so_file="target/${target}/release/lib${lib_name}.so"
-            [[ -f "$so_file" ]] && cp "$so_file" "${outdir}/"
-          done
-
-          tarball="iggy-connectors-${target}-${version}.tar.gz"
-          tar czf "${tarball}" -C "${outdir}" .
-          echo "tarball=${tarball}" >> "$GITHUB_OUTPUT"
-
-      - name: Upload artifact
-        if: inputs.upload_artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: connector-plugins-${{ matrix.target }}
-          path: ${{ steps.pkg.outputs.tarball }}
-          retention-days: 7
-          if-no-files-found: error
-
   collect:
     name: Collect artifacts
-    needs: [build-binaries, build-connector-plugins]
+    needs: build-binaries
     if: inputs.upload_artifacts
     runs-on: ubuntu-26.04
     outputs:
@@ -298,16 +213,13 @@ jobs:
           {
             echo "## Built Rust Artifacts"
             echo ""
-            echo "| Type | Target | File | Size |"
-            echo "|------|--------|------|------|"
+            echo "| Target | File | Size |"
+            echo "|--------|------|------|"
           } >> "$GITHUB_STEP_SUMMARY"
 
           for tarball in "${tarballs[@]}"; do
             filename=$(basename "$tarball")
             size=$(ls -lh "$tarball" | awk '{print $5}')
-
-            if [[ "$filename" == iggy-connectors-* ]]; then type="plugins"
-            else type="binaries"; fi
 
             if [[ "$filename" == *"x86_64"* ]]; then target="x86_64"
             elif [[ "$filename" == *"aarch64"* ]]; then target="aarch64"
@@ -317,7 +229,7 @@ jobs:
             elif [[ "$filename" == *"gnu"* ]]; then target="$target (glibc)"
             fi
 
-            echo "| $type | $target | \`$filename\` | $size |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| $target | \`$filename\` | $size |" >> "$GITHUB_STEP_SUMMARY"
           done
 
           {

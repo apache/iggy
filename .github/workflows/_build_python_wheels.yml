@@ -83,7 +83,7 @@ jobs:
           /tmp/copy-latest-from-master.sh apply
 
       - name: Setup Python
-        uses: actions/setup-python@v7.0.0
+        uses: actions/setup-python@v7.1.0
         with:
           python-version: "3.11"
 
@@ -153,7 +153,7 @@ jobs:
           /tmp/copy-latest-from-master.sh apply
 
       - name: Setup Python
-        uses: actions/setup-python@v7.0.0
+        uses: actions/setup-python@v7.1.0
         with:
           python-version: "3.11"
 
@@ -162,7 +162,7 @@ jobs:
         run: ./scripts/ci/wheel-interpreters.sh >> "$GITHUB_OUTPUT"
 
       - name: Setup wheel Python versions
-        uses: actions/setup-python@v7.0.0
+        uses: actions/setup-python@v7.1.0
         with:
           python-version: ${{ steps.interpreters.outputs.python_versions }}
 
@@ -235,7 +235,7 @@ jobs:
           /tmp/copy-latest-from-master.sh apply
 
       - name: Setup Python
-        uses: actions/setup-python@v7.0.0
+        uses: actions/setup-python@v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
           architecture: x64
@@ -336,7 +336,7 @@ jobs:
           ref: ${{ inputs.commit }}
 
       - name: Setup Python
-        uses: actions/setup-python@v7.0.0
+        uses: actions/setup-python@v7.1.0
         with:
           python-version: "3.11"
 

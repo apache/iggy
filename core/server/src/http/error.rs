@@ -28,6 +28,7 @@ use axum::response::{IntoResponse, Response};
 use configs::cluster::ResolvedClusterNode;
 use iggy_binary_protocol::Operation;
 use iggy_common::IggyError;
+use serde::de::IntoDeserializer;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::error;
@@ -85,9 +86,13 @@ impl IntoResponse for CustomError {
                     // the op twice: 504, the unknown outcome, never a
                     // retryable 503.
                     IggyError::TransientNotCommitted => StatusCode::GATEWAY_TIMEOUT,
-                    IggyError::TransientNotAccepted | IggyError::NotPrimary => {
-                        StatusCode::SERVICE_UNAVAILABLE
-                    }
+                    // The object store failed for good, not the caller. A 5xx
+                    // would make HTTP clients resend a read that no resend
+                    // changes, so this is a 4xx that names the dependency.
+                    IggyError::TieredReadFailed => StatusCode::FAILED_DEPENDENCY,
+                    IggyError::TransientNotAccepted
+                    | IggyError::DeferredPollCapacityExceeded
+                    | IggyError::NotPrimary => StatusCode::SERVICE_UNAVAILABLE,
                     _ => StatusCode::BAD_REQUEST,
                 };
                 let response =
@@ -97,7 +102,9 @@ impl IntoResponse for CustomError {
                 // (`service_unavailable`, `server_busy`).
                 if matches!(
                     error,
-                    IggyError::TransientNotAccepted | IggyError::NotPrimary
+                    IggyError::TransientNotAccepted
+                        | IggyError::DeferredPollCapacityExceeded
+                        | IggyError::NotPrimary
                 ) {
                     with_retry_after(response)
                 } else {
@@ -160,8 +167,9 @@ impl ErrorResponse {
 pub(in crate::http) enum AuthError {
     Unauthenticated(IggyError),
     /// The Register provably never entered the consensus pipeline (not
-    /// primary, not caught up, or the prepare queue was full), so the request
-    /// is safe to re-issue anywhere. Rendered with the `TransientNotAccepted`
+    /// primary, not caught up, or the prepare queue was full), or this node
+    /// has not applied the account revision the bearer was issued at, so the
+    /// request is safe to re-issue anywhere. Rendered with the `TransientNotAccepted`
     /// body so a forwarding follower recognizes it as retryable against a
     /// re-resolved primary; a plain client sees the same retryable 503 either
     /// way.
@@ -386,7 +394,12 @@ fn not_accepted_response(code: &str, reason: &str) -> Response {
     ))
 }
 
-fn coded_error_response(status: StatusCode, id: u32, code: &str, reason: &str) -> Response {
+pub(in crate::http) fn coded_error_response(
+    status: StatusCode,
+    id: u32,
+    code: &str,
+    reason: &str,
+) -> Response {
     (
         status,
         Json(ErrorResponse {
@@ -471,6 +484,33 @@ pub(in crate::http) struct ConsistencyQuery {
     pub(in crate::http) consistency: Consistency,
 }
 
+const CONSISTENCY_KEY: &str = "consistency";
+
+/// The page keys of a list query, for the strict parser of `PageQuery`.
+pub(in crate::http) type PagePairs<'a> = Vec<(&'a str, &'a str)>;
+
+/// Split the query of a list route into its read consistency and its page
+/// keys. A repeated or unknown `consistency` value is refused.
+pub(in crate::http) fn split_list_query(
+    pairs: &[(String, String)],
+) -> Result<(Consistency, PagePairs<'_>), IggyError> {
+    let mut consistency = None;
+    let mut page_pairs = Vec::with_capacity(pairs.len());
+    for (key, value) in pairs {
+        if key != CONSISTENCY_KEY {
+            page_pairs.push((key.as_str(), value.as_str()));
+            continue;
+        }
+        if consistency.is_some() {
+            return Err(IggyError::InvalidCommand);
+        }
+        let parsed: Result<Consistency, serde::de::value::Error> =
+            Consistency::deserialize(value.as_str().into_deserializer());
+        consistency = Some(parsed.map_err(|_| IggyError::InvalidCommand)?);
+    }
+    Ok((consistency.unwrap_or_default(), page_pairs))
+}
+
 /// Produce acknowledgement selected by the `?ack=` query param.
 ///
 /// `replicated` (the default) answers 201 only after the partition group's
@@ -500,6 +540,10 @@ pub(in crate::http) enum ReadError {
     /// authorization denial) graded through the legacy `IggyError -> status`
     /// map so SDK error bodies stay byte-identical.
     Rejected(IggyError),
+    /// A GET poll with `auto_commit`, rendered as `InvalidCommand` with the
+    /// member named in `field` and the route to use in `reason`, because REST
+    /// has no version handshake to tell an older client why it is refused.
+    CommittingGet,
     /// Requested entity is absent -> 404 with the legacy not-found body.
     NotFound,
     /// A linearizable read reached a follower and the primary's HTTP address was
@@ -535,6 +579,15 @@ impl IntoResponse for ReadError {
     fn into_response(self) -> Response {
         match self {
             Self::Rejected(error) => CustomError::from(error).into_response(),
+            Self::CommittingGet => (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    reason: "A poll with auto_commit stores its offset, so send it as POST /streams/{stream_id}/topics/{topic_id}/messages/deferred".to_owned(),
+                    field: Some("auto_commit".to_owned()),
+                    ..ErrorResponse::from_error(&IggyError::InvalidCommand)
+                }),
+            )
+                .into_response(),
             // Reuse the legacy 404 body so a missing stream renders exactly as
             // the legacy server's `CustomError::ResourceNotFound` does.
             Self::NotFound => CustomError::ResourceNotFound.into_response(),
@@ -667,6 +720,7 @@ mod tests {
     const READ_PATH: &str = "/streams?consistency=linearizable";
     fn node(replica_id: u8, ip: &str, http: Option<u16>) -> ClusterNodeConfig {
         ClusterNodeConfig {
+            rack: None,
             name: format!("node-{replica_id}"),
             ip: ip.to_owned(),
             advertised_address: None,
@@ -858,6 +912,31 @@ mod tests {
         let response = CustomError::from(IggyError::TransientNotAccepted).into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(response.headers().contains_key(RETRY_AFTER));
+    }
+
+    #[tokio::test]
+    async fn deferred_capacity_refusal_preserves_its_code_and_retry_hint() {
+        let response = CustomError::from(IggyError::DeferredPollCapacityExceeded).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().contains_key(RETRY_AFTER));
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            error["id"],
+            IggyError::DeferredPollCapacityExceeded.as_code()
+        );
+        assert_eq!(error["code"], "deferred_poll_capacity_exceeded");
+    }
+
+    #[tokio::test]
+    async fn tiered_read_failed_renders_424_without_retry_after() {
+        let response = CustomError::from(IggyError::TieredReadFailed).into_response();
+        assert_eq!(response.status(), StatusCode::FAILED_DEPENDENCY);
+        assert!(!response.headers().contains_key(RETRY_AFTER));
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["id"], IggyError::TieredReadFailed.as_code());
+        assert_eq!(error["code"], "tiered_read_failed");
     }
 
     #[test]

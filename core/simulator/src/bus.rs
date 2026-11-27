@@ -20,19 +20,23 @@ use crate::executor::{PendingSpawns, TimerHandle};
 use clock::Clock;
 #[cfg(test)]
 use futures::channel::oneshot;
-use iggy_binary_protocol::GenericHeader;
+use iggy_binary_protocol::{
+    Command, CommitEntry, CommitHeader, CommitReplyEntry, CommitReplyHeader, GenericHeader,
+};
 use message_bus::client_listener::RequestHandler;
 use message_bus::fd_transfer::DupedFd;
 use message_bus::installer::conn_info::ClientConnMeta;
 use message_bus::replica::listener::MessageHandler;
 use message_bus::{
     BusMessage, ClientConnectionLostFn, ConnectionInstaller, ConnectionPermit, ConnectionRegistry,
-    InstanceToken, MessageBus, ReplicaHandshakeDoneFn, SendError, SharedTlsServerConfig,
+    InstanceToken, MessageBus, ReplicaHandshakeDoneFn, ReplicaLinkId, SendError,
+    SharedTlsServerConfig,
 };
 use server_common::{
     MESSAGE_ALIGN, Message,
     iobuf::{Frozen, Owned},
 };
+use shard::commit_batch;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -47,6 +51,51 @@ use std::time::{Duration, Instant};
 fn frozen_to_message(frozen: &Frozen<MESSAGE_ALIGN>) -> Message<GenericHeader> {
     Message::try_from(Owned::<MESSAGE_ALIGN>::copy_from_slice(frozen.as_slice()))
         .expect("simulator bus must receive a valid generic message")
+}
+
+/// The frames that go on the simulated wire for `message`. A `Commit` or a
+/// `CommitReply` batch becomes one frame per entry, so the network drops,
+/// delays and reorders each entry alone. Each other frame stays as it is.
+fn split_commit_batch(message: Message<GenericHeader>) -> Vec<Message<GenericHeader>> {
+    let header = *message.header();
+    let parts = match header.command {
+        Command::Commit => message
+            .try_as_typed::<CommitHeader>()
+            .ok()
+            .and_then(|batch| {
+                let entries: Vec<CommitEntry> =
+                    commit_batch::verified_entries(batch, batch.header().checksum_body)?;
+                entries
+                    .iter()
+                    .map(|entry| {
+                        commit_batch::encode_commit_batch(header.cluster, header.replica, &[*entry])
+                            .map(Message::into_generic)
+                    })
+                    .collect()
+            }),
+        Command::CommitReply => {
+            message
+                .try_as_typed::<CommitReplyHeader>()
+                .ok()
+                .and_then(|batch| {
+                    let entries: Vec<CommitReplyEntry> =
+                        commit_batch::verified_entries(batch, batch.header().checksum_body)?;
+                    entries
+                        .iter()
+                        .map(|entry| {
+                            commit_batch::encode_commit_reply_batch(
+                                header.cluster,
+                                header.replica,
+                                &[*entry],
+                            )
+                            .map(Message::into_generic)
+                        })
+                        .collect()
+                })
+        }
+        _ => None,
+    };
+    parts.unwrap_or_else(|| vec![message])
 }
 
 /// Message envelope for tracking sender/recipient
@@ -242,12 +291,15 @@ impl MessageBus for SimOutbox {
             }
         }
 
-        self.pending_messages.borrow_mut().push_back(Envelope {
-            from_replica: Some(self.self_id),
-            to_replica: Some(replica),
-            to_client: None,
-            payload: EnvelopePayload::Replica(frozen_to_message(&data)),
-        });
+        let mut pending = self.pending_messages.borrow_mut();
+        for message in split_commit_batch(frozen_to_message(&data)) {
+            pending.push_back(Envelope {
+                from_replica: Some(self.self_id),
+                to_replica: Some(replica),
+                to_client: None,
+                payload: EnvelopePayload::Replica(message),
+            });
+        }
 
         Ok(())
     }
@@ -272,6 +324,11 @@ impl MessageBus for SimOutbox {
 
     fn monotonic_now(&self) -> Instant {
         self.timer.monotonic_now()
+    }
+
+    fn monotonic_micros(&self) -> u64 {
+        u64::try_from(Duration::from_nanos(self.timer.now().as_nanos()).as_micros())
+            .unwrap_or(u64::MAX)
     }
 }
 
@@ -335,6 +392,10 @@ impl MessageBus for SharedSimOutbox {
     fn monotonic_now(&self) -> Instant {
         self.0.monotonic_now()
     }
+
+    fn monotonic_micros(&self) -> u64 {
+        self.0.monotonic_micros()
+    }
 }
 
 /// The router's dispatch/pump impl block requires `ConnectionInstaller`
@@ -342,11 +403,13 @@ impl MessageBus for SharedSimOutbox {
 /// simulator delivers messages as in-memory frames, never as delegated
 /// fds, so the install surface is unreachable: fd installs panic loudly
 /// if a future change ever routes a connection-setup frame into the sim,
-/// while the shard-0 bookkeeping acks are harmless no-ops.
+/// while the shard-0 bookkeeping acks and link closes are harmless no-ops.
 impl ConnectionInstaller for SharedSimOutbox {
     fn install_replica_inbound_fd(
         &self,
         _fd: DupedFd,
+        _link: ReplicaLinkId,
+        _deadline: Instant,
         _on_message: MessageHandler,
         _on_done: ReplicaHandshakeDoneFn,
     ) {
@@ -356,16 +419,20 @@ impl ConnectionInstaller for SharedSimOutbox {
     fn install_replica_outbound_fd(
         &self,
         _fd: DupedFd,
-        _replica_id: u8,
+        _link: ReplicaLinkId,
         _on_message: MessageHandler,
         _on_done: ReplicaHandshakeDoneFn,
     ) {
         panic!("simulator has no fd transfer: replica outbound install is unreachable");
     }
 
-    fn release_replica_handshake_slot(&self, _slot: u64) {}
+    fn replica_inbound_handshake_done(&self, _slot: u64, _link: ReplicaLinkId) {}
 
-    fn clear_replica_dial_pending(&self, _replica_id: u8) {}
+    fn replica_outbound_handshake_done(&self, _link: ReplicaLinkId) {}
+
+    fn replica_link_closed(&self, _link: ReplicaLinkId) {}
+
+    fn close_replica_link(&self, _link: ReplicaLinkId) {}
 
     fn install_client_fd(
         &self,

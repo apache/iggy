@@ -19,6 +19,9 @@ use std::num::NonZeroUsize;
 
 /// Client-wide limits for active and retained replicated mutations.
 /// Queued writers keep their frame bytes charged after completion or abandonment.
+/// Committing fetches use a separate pool with these same limits for active
+/// reservations and local unknown-progress blocks. That pool survives sessions
+/// and charges target metadata only, never reply bodies or replay frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PendingOperationsConfig {
     /// Active or retained mutations sharing this client session.

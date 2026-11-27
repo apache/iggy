@@ -27,6 +27,8 @@ type Client interface {
 	Close() error
 
 	// ResolveOperation replays a retained mutation until its final result or ctx deadline.
+	// A retained committing poll or fetch returns FetchProgressUncertain without I/O and
+	// stays blocked until explicit AbandonOperation. Its ID is not a replay receipt.
 	// The client keeps the last outcomes that its replays proved, as many as the operation
 	// limit of tcp.WithPendingOperations, also across a session reset. So a later call for
 	// the same operation returns that outcome without a request. ierror.OperationNotRetained
@@ -46,13 +48,33 @@ type Client interface {
 	// Authentication is required.
 	GetClusterMetadata(ctx context.Context) (*ClusterMetadata, error)
 
+	// RetireGeoOrigin retires the geo peer origin, a datacenter that never
+	// returns. The cluster then follows nothing of it again: its shadow topics
+	// serve what they hold until their retention removes it, and a client may
+	// delete them. A datacenter that comes back needs another origin name. An
+	// origin that is empty or longer than 255 bytes returns
+	// ierror.ErrInvalidFormat without sending.
+	// Authentication is required, and root or the permission to manage the servers.
+	RetireGeoOrigin(ctx context.Context, origin string) error
+
 	// GetStream get the info about a specific stream by unique ID or name.
 	// Authentication is required, and the permission to read the streams.
 	GetStream(ctx context.Context, streamId Identifier) (*StreamDetails, error)
 
-	// GetStreams get the info about all the streams.
-	// Authentication is required, and the permission to read the streams.
+	// GetStreams get the info about the streams the caller may read. It reads
+	// every page of the list, so the result is not one consistent read. Every page keeps the
+	// sign-in and the deadline that the call started with. If the Next of a
+	// page is the cursor that its request sent, the call fails with
+	// ierror.ErrInvalidFormat.
+	// Authentication is required. The list holds the streams the caller may read.
 	GetStreams(ctx context.Context) ([]Stream, error)
+
+	// GetStreamsPage get one page of the streams. Send the Next of the page
+	// as the Cursor of the next query, with the same other fields, until Next
+	// is nil. A query that breaks the page rules is refused with
+	// ierror.ErrInvalidCommand before anything is sent.
+	// Authentication is required. The page holds the streams the caller may read.
+	GetStreamsPage(ctx context.Context, query NamedPageQuery) (*Page[Stream], error)
 
 	// CreateStream create a new stream. Nil options select the defaults.
 	// Authentication is required, and the permission to manage the streams.
@@ -76,9 +98,24 @@ type Client interface {
 	// Authentication is required, and the permission to read the topics.
 	GetTopic(ctx context.Context, streamId, topicId Identifier) (*TopicDetails, error)
 
-	// GetTopics get the info about all the topics.
-	// Authentication is required, and the permission to read the topics.
+	// GetTopics get the info about the topics the caller may read in a
+	// stream. It reads every page of the list, so the result is not one
+	// consistent read. Every page keeps the sign-in and the deadline that the
+	// call started with. If the stream goes missing after the first page, the
+	// call fails as GetTopicsPage does for a caller with a global read grant,
+	// and ends there for any other caller. If the Next of a page is the cursor
+	// that its request sent, the call fails with ierror.ErrInvalidFormat.
+	// Authentication is required. The list holds the topics the caller may read.
 	GetTopics(ctx context.Context, streamId Identifier) ([]Topic, error)
+
+	// GetTopicsPage get one page of the topics of a stream, as GetStreamsPage
+	// does for the streams. If the stream does not exist, or the caller may
+	// read no topic of it, a query without a Cursor gets an empty last page.
+	// For a caller with a global read grant, a query with a Cursor fails with
+	// ierror.ErrStreamIdNotFound, because the stream was deleted during the
+	// walk.
+	// Authentication is required. The page holds the topics the caller may read.
+	GetTopicsPage(ctx context.Context, streamId Identifier, query NamedPageQuery) (*Page[Topic], error)
 
 	// DescribeOptions get the option catalog for a resource scope: every key,
 	// with its kind, default and bounds, and whether an update may set or
@@ -141,45 +178,43 @@ type Client interface {
 		messages []IggyMessage,
 	) (*SendMessagesResponse, error)
 
-	// PollMessages poll given amount of messages using the specified consumer and strategy from the specified stream and topic by unique IDs or names.
-	// Authentication is required, and the permission to poll the messages.
+	// PollMessages reads one partition with the limits and the commit policy
+	// of options. The server waits up to options.MaxWait for options.MinCount
+	// messages and returns at most options.Count messages and options.MaxBytes
+	// of records. A first message larger than MaxBytes comes alone in the
+	// reply. A Last poll of more than one message whose first message is
+	// larger than MaxBytes fails with ierror.ErrInvalidSizeBytes. The call
+	// ends after options.RequestTimeout or the deadline of ctx.
 	//
-	// Clustered polls use persistent partition-primary connections while the
-	// coordinator retains group membership. Only explicit refusal before
-	// admission is retried. ErrTransientNotCommitted, or cancellation after
-	// sending an auto-commit poll, can mean the offset advanced without a reply.
-	// These polls are never replayed automatically after an unknown outcome.
-	// Servers must support primary routing and consumer-session attachment.
+	// With CommitOnRead the server stores the offset of the last message it
+	// returns as part of the read. When ctx is cancelled, the SDK cancels the
+	// poll on the server and waits for its one reply: refused with
+	// ierror.ErrTransientNotAccepted when the cancel won and nothing was
+	// stored, or with what it read and stored. A reply that the connection
+	// loses, or an error reply that does not prove that nothing was stored,
+	// ends the call with ierror.FetchProgressUncertain: the server can have
+	// stored the offset. The next poll of the partition that stores its
+	// offset and every offset store or delete of it then fail with
+	// ierror.PartitionLaneBlocked, also after a reconnect, until
+	// AbandonOperation. The next Next poll starts after what was stored.
+	// CommitAuto is refused with ierror.ErrInvalidConfiguration, because one
+	// poll has nothing to count. A partition reader counts and stores it.
 	//
-	// Without a caller-supplied partition context, a poll stamps the context
-	// of a cached route. After another client deleted and recreated the
-	// partition, one such poll can fail with ErrHistoryUnavailable, or with
-	// ErrConsumerGroupPartitionNotOwned for a consumer group that names the
-	// partition. The SDK drops the failed route and does not retry the poll.
-	// The next call routes again.
-	//
-	// A group poll that names no partition is orchestrated client-side and
-	// has three outcomes:
-	//   - err == nil with PartitionId == NoAssignedPartition and an empty
-	//     batch: nothing to read right now, poll again. This covers a member
-	//     that owns no partition and a rebalance still settling.
-	//   - ErrConsumerGroupMemberNotFound: the client is not a member, for
-	//     example after an explicit LeaveConsumerGroup. JoinConsumerGroup
-	//     restores membership.
-	//   - err == nil with a real partition id: the poll completed; the batch may be empty.
+	// A continuation of another partition, from PolledMessage.Continuation,
+	// is refused with ierror.ErrInvalidCommand. The client holds at most 64
+	// deferred polls at once, and a call waits for a free slot within its
+	// deadline.
 	//
 	// Uncompressed payloads and user headers alias the reply buffer; copy
-	// those bytes to retain only the message you need. S2 decompression
-	// allocates a separate payload buffer.
+	// those bytes to retain only the message you need.
 	PollMessages(
 		ctx context.Context,
 		streamId Identifier,
 		topicId Identifier,
+		partitionId uint32,
 		consumer Consumer,
 		strategy PollingStrategy,
-		count uint32,
-		autoCommit bool,
-		partitionId *uint32,
+		options PollOptions,
 	) (*PolledMessage, error)
 
 	// StoreConsumerOffset store the consumer offset for a specific consumer or consumer group for the given stream and topic by unique IDs or names.
@@ -202,6 +237,8 @@ type Client interface {
 	// StoreConsumerPosition stores a polled position under the partition context of its poll.
 	// A store that outlives an incarnation or owner change fails with ErrHistoryUnavailable or
 	// ErrConsumerGroupPartitionNotOwned instead of committing into the new incarnation.
+	// A zero context takes the context of the route, as in StoreConsumerOffset. Another context that
+	// names no incarnation takes the incarnation of the route and keeps its owner and op.
 	// Authentication is required, and the permission to poll the messages.
 	StoreConsumerPosition(
 		ctx context.Context,
@@ -222,8 +259,16 @@ type Client interface {
 	) (*ConsumerOffsetInfo, error)
 
 	// GetConsumerGroups get the info about all the consumer groups for the given stream and topic by unique IDs or names.
+	// It reads every page of the list, so the result is not one consistent read.
+	// Every page keeps the sign-in and the deadline that the call started with.
+	// If the Next of a page is the cursor that its request sent, the call fails with ierror.ErrInvalidFormat.
 	// Authentication is required, and the permission to read the streams or topics.
 	GetConsumerGroups(ctx context.Context, streamId Identifier, topicId Identifier) ([]ConsumerGroup, error)
+
+	// GetConsumerGroupsPage get one page of the consumer groups of a topic,
+	// as GetStreamsPage does for the streams.
+	// Authentication is required, and the permission to read the streams or topics.
+	GetConsumerGroupsPage(ctx context.Context, streamId, topicId Identifier, query NamedPageQuery) (*Page[ConsumerGroup], error)
 
 	// DeleteConsumerOffset delete the consumer offset for a specific consumer or consumer group for the given stream and topic by unique IDs or names.
 	// Authentication is required, and the permission to poll the messages.
@@ -240,6 +285,11 @@ type Client interface {
 		topicId Identifier,
 		partitionId *uint32,
 	) error
+
+	// DeleteConsumerPosition deletes the stored offset of position.PartitionId under the partition
+	// context of position. A zero context takes the context of the route. Another context that
+	// names no incarnation takes the incarnation of the route and keeps its owner and op.
+	DeleteConsumerPosition(ctx context.Context, consumer Consumer, streamId Identifier, topicId Identifier, position ConsumerPosition) error
 
 	// GetConsumerGroup get the info about a specific consumer group by unique ID or name for the given stream and topic by unique IDs or names.
 	// Authentication is required, and the permission to read the streams or topics.
@@ -299,6 +349,11 @@ type Client interface {
 		groupId Identifier,
 	) (*ConsumerGroupAssignment, error)
 
+	// GetPartitionsPage get one page of the partitions of a topic, as
+	// GetStreamsPage does for the streams.
+	// Authentication is required, and the permission to read the topics.
+	GetPartitionsPage(ctx context.Context, streamId, topicId Identifier, query PageQuery) (*Page[PartitionContract], error)
+
 	// CreatePartitions create new N partitions for a topic by unique ID or name.
 	// For example, given a topic with 3 partitions, if you create 2 partitions, the topic will have 5 partitions (from 0 to 4).
 	// Authentication is required, and the permission to manage the partitions.
@@ -333,9 +388,18 @@ type Client interface {
 	// Authentication is required, and the permission to read the users, unless the provided user ID is the same as the authenticated user.
 	GetUser(ctx context.Context, identifier Identifier) (*UserInfoDetails, error)
 
-	// GetUsers get the info about all the users.
+	// GetUsers get the info about all the users. It reads every page of the
+	// list, so the result is not one consistent read. Every page keeps the
+	// sign-in and the deadline that the call started with. If the Next of a
+	// page is the cursor that its request sent, the call fails with
+	// ierror.ErrInvalidFormat.
 	// Authentication is required, and the permission to read the users.
 	GetUsers(ctx context.Context) ([]UserInfo, error)
+
+	// GetUsersPage get one page of the users, as GetStreamsPage does for the
+	// streams.
+	// Authentication is required, and the permission to read the users.
+	GetUsersPage(ctx context.Context, query NamedPageQuery) (*Page[UserInfo], error)
 
 	// CreateUser create a new user. Nil options select the defaults.
 	// Authentication is required, and the permission to manage the users.

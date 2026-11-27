@@ -98,7 +98,9 @@ struct ReplicaRequestTests {
         defer { cluster.stop() }
         let client = try await cluster.signedInClient()
         let requests = await cluster.leader.requests.count + cluster.backup.requests.count
-        let refused: [CommandCode] = [.createStream, .pollMessages, .getConsumerOffset, .loginUser, .logoutUser]
+        let refused: [CommandCode] = [
+            .createStream, .pollMessages, .pollMessagesDeferred, .cancelDeferredRequest, .getConsumerOffset, .loginUser, .logoutUser,
+        ]
 
         for code in refused {
             await expectCode(.invalidCommand) { _ = try await client.sendRawRequest(code: code.rawValue, payload: [], replica: 1) }

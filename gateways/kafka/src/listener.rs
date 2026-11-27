@@ -22,6 +22,7 @@
 //! told the address of the listener it arrived through and no other, so a client on the TLS port
 //! is never pointed at the plaintext one by Metadata.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -220,6 +221,172 @@ pub fn apply_advertised_listeners(listeners: &mut [ListenerConfig], raw: &str) -
         seen.push(protocol);
     }
     Ok(())
+}
+
+/// One entry of `IGGY_KAFKA_BROKERS`: the node id of a gateway and the address one of its
+/// listeners advertises. The `id@host:port` form names no protocol, and fits a gateway with one
+/// listener.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerEntry {
+    pub node_id: u16,
+    pub protocol: Option<SecurityProtocol>,
+    pub host: String,
+    pub port: u16,
+}
+
+impl BrokerEntry {
+    /// Whether this entry is the address of a `protocol` listener.
+    #[must_use]
+    pub fn serves(&self, protocol: SecurityProtocol) -> bool {
+        self.protocol.is_none_or(|own| own == protocol)
+    }
+}
+
+/// Parses `IGGY_KAFKA_BROKERS`: every gateway in front of one Iggy cluster, as `id@host:port` or
+/// `id@PROTOCOL://host:port`, comma separated.
+///
+/// # Errors
+///
+/// Returns `InvalidConfig` naming the variable for an empty list, a malformed entry, a node id
+/// outside 0 to 65535, or port 0.
+pub fn parse_brokers(raw: &str) -> Result<Vec<BrokerEntry>> {
+    raw.split(',')
+        .map(str::trim)
+        .map(|entry| parse_broker(raw, entry))
+        .collect()
+}
+
+fn parse_broker(raw: &str, entry: &str) -> Result<BrokerEntry> {
+    if entry.is_empty() {
+        return Err(invalid(format!(
+            "IGGY_KAFKA_BROKERS has an empty entry in '{raw}'"
+        )));
+    }
+    let malformed = || {
+        invalid(format!(
+            "IGGY_KAFKA_BROKERS entry '{entry}' must be id@host:port or id@PROTOCOL://host:port"
+        ))
+    };
+    let (node_id, address) = entry.split_once('@').ok_or_else(malformed)?;
+    let node_id: u16 = node_id.parse().map_err(|error| {
+        invalid(format!(
+            "IGGY_KAFKA_BROKERS entry '{entry}' has an invalid node id: {error}"
+        ))
+    })?;
+    let (protocol, address) = if address.contains("://") {
+        let (protocol, address) = split_entry("IGGY_KAFKA_BROKERS", address)?;
+        (Some(protocol), address)
+    } else {
+        (None, address)
+    };
+    let (host, port) = split_host_port(address).ok_or_else(malformed)?;
+    let port: u16 = port.parse().map_err(|error| {
+        invalid(format!(
+            "IGGY_KAFKA_BROKERS entry '{entry}' has an invalid port: {error}"
+        ))
+    })?;
+    if port == 0 {
+        return Err(invalid(format!(
+            "IGGY_KAFKA_BROKERS entry '{entry}' advertises port 0"
+        )));
+    }
+    if host.len() > i16::MAX as usize {
+        return Err(invalid(format!(
+            "IGGY_KAFKA_BROKERS entry for node {node_id} has a host over Kafka's string limit \
+             (32767 bytes)"
+        )));
+    }
+    Ok(BrokerEntry {
+        node_id,
+        protocol,
+        host: host.to_string(),
+        port,
+    })
+}
+
+/// Checks `brokers` against the listeners of this gateway, whose node id is `node_id`.
+///
+/// Each gateway needs one entry per listener, so that every listener lists the same gateways.
+///
+/// # Errors
+///
+/// Returns `InvalidConfig` naming the variable when an entry names a protocol that no listener
+/// here binds, an entry without a protocol meets several listeners, a gateway has no entry or two
+/// for a listener, or `node_id` has no entry.
+pub fn check_brokers(
+    brokers: &[BrokerEntry],
+    listeners: &[ListenerConfig],
+    node_id: u16,
+) -> Result<()> {
+    for entry in brokers {
+        match entry.protocol {
+            None if listeners.len() > 1 => {
+                return Err(invalid(format!(
+                    "IGGY_KAFKA_BROKERS entry for node {} names no protocol, but this gateway has \
+                     {} listeners; write it as id@PROTOCOL://host:port",
+                    entry.node_id,
+                    listeners.len()
+                )));
+            }
+            Some(protocol)
+                if !listeners
+                    .iter()
+                    .any(|listener| listener.protocol == protocol) =>
+            {
+                return Err(invalid(format!(
+                    "IGGY_KAFKA_BROKERS names {protocol} for node {}, which no listener here binds",
+                    entry.node_id
+                )));
+            }
+            _ => {}
+        }
+    }
+    let node_ids: BTreeSet<u16> = brokers.iter().map(|entry| entry.node_id).collect();
+    if !node_ids.contains(&node_id) {
+        return Err(invalid(format!(
+            "IGGY_KAFKA_BROKERS has no entry for this gateway, node {node_id} \
+             (IGGY_KAFKA_NODE_ID)"
+        )));
+    }
+    for listener in listeners {
+        for node in &node_ids {
+            let entries = brokers
+                .iter()
+                .filter(|entry| entry.node_id == *node && entry.serves(listener.protocol))
+                .count();
+            if entries != 1 {
+                return Err(invalid(format!(
+                    "IGGY_KAFKA_BROKERS has {entries} {} entries for node {node}; each gateway \
+                     needs one per listener",
+                    listener.protocol
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The gateways other than `node_id`, as their `protocol` listeners advertise them, in node id
+/// order. Expects `brokers` to pass [`check_brokers`].
+#[must_use]
+pub fn peers_of(
+    brokers: &[BrokerEntry],
+    protocol: SecurityProtocol,
+    node_id: u16,
+) -> Vec<(i32, BrokerAdvertise)> {
+    let mut peers: Vec<(i32, BrokerAdvertise)> = brokers
+        .iter()
+        .filter(|entry| entry.node_id != node_id && entry.serves(protocol))
+        .map(|entry| {
+            let endpoint = BrokerAdvertise {
+                host: entry.host.clone(),
+                port: i32::from(entry.port),
+            };
+            (i32::from(entry.node_id), endpoint)
+        })
+        .collect();
+    peers.sort_by_key(|(node, _)| *node);
+    peers
 }
 
 impl BrokerAdvertise {
@@ -459,5 +626,99 @@ mod tests {
         assert!(SecurityProtocol::SaslSsl.uses_tls() && SecurityProtocol::SaslSsl.uses_sasl());
         assert!(SecurityProtocol::Ssl.authenticates_by_certificate());
         assert!(!SecurityProtocol::SaslSsl.authenticates_by_certificate());
+    }
+
+    #[test]
+    fn given_both_entry_forms_when_parsing_brokers_should_keep_the_node_protocol_and_address() {
+        let brokers =
+            parse_brokers("1@gw-1:9093, 2@SASL_SSL://[fd00::2]:9094").expect("valid brokers");
+        assert_eq!(
+            brokers,
+            vec![
+                BrokerEntry {
+                    node_id: 1,
+                    protocol: None,
+                    host: "gw-1".to_string(),
+                    port: 9093,
+                },
+                BrokerEntry {
+                    node_id: 2,
+                    protocol: Some(SecurityProtocol::SaslSsl),
+                    host: "fd00::2".to_string(),
+                    port: 9094,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn given_malformed_brokers_when_parsing_should_name_the_variable() {
+        for raw in [
+            "",
+            "gw-1:9093",
+            "x@gw-1:9093",
+            "70000@gw-1:9093",
+            "1@gw-1",
+            "1@gw-1:0",
+            "1@TLS://gw-1:9093",
+        ] {
+            let error = parse_brokers(raw).expect_err(raw).to_string();
+            assert!(error.contains("IGGY_KAFKA_BROKERS"), "'{raw}': {error}");
+        }
+    }
+
+    #[test]
+    fn given_one_listener_when_checking_brokers_should_need_this_gateway_once() {
+        let listeners = [ListenerConfig::new(
+            SecurityProtocol::Plaintext,
+            "0.0.0.0:9092",
+        )];
+        let brokers = parse_brokers("1@gw-1:9092,2@gw-2:9092").expect("valid brokers");
+        assert!(check_brokers(&brokers, &listeners, 2).is_ok());
+
+        let missing = check_brokers(&brokers, &listeners, 3).expect_err("node 3 is not listed");
+        assert!(missing.to_string().contains("node 3"), "{missing}");
+        let twice = parse_brokers("1@gw-1:9092,1@gw-9:9092").expect("valid brokers");
+        assert!(check_brokers(&twice, &listeners, 1).is_err());
+    }
+
+    #[test]
+    fn given_several_listeners_when_checking_brokers_should_need_one_entry_per_listener() {
+        let listeners = [
+            ListenerConfig::new(SecurityProtocol::Plaintext, "0.0.0.0:9092"),
+            ListenerConfig::new(SecurityProtocol::SaslSsl, "0.0.0.0:9094"),
+        ];
+        let complete = parse_brokers(
+            "1@PLAINTEXT://gw-1:9092,1@SASL_SSL://gw-1:9094,\
+             2@PLAINTEXT://gw-2:9092,2@SASL_SSL://gw-2:9094",
+        )
+        .expect("valid brokers");
+        assert!(check_brokers(&complete, &listeners, 1).is_ok());
+
+        for raw in [
+            "1@PLAINTEXT://gw-1:9092,1@SASL_SSL://gw-1:9094,2@PLAINTEXT://gw-2:9092",
+            "1@gw-1:9092",
+            "1@PLAINTEXT://gw-1:9092,1@SASL_SSL://gw-1:9094,1@SSL://gw-1:9093",
+        ] {
+            let brokers = parse_brokers(raw).expect("valid brokers");
+            assert!(check_brokers(&brokers, &listeners, 1).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn given_several_listeners_when_listing_peers_should_give_each_listener_its_own_endpoints() {
+        let brokers = parse_brokers(
+            "2@PLAINTEXT://gw-2:9092,2@SASL_SSL://gw-2:9094,1@PLAINTEXT://gw-1:9092,\
+             1@SASL_SSL://gw-1:9094,3@PLAINTEXT://gw-3:9092,3@SASL_SSL://gw-3:9094",
+        )
+        .expect("valid brokers");
+        let listed: Vec<(i32, String, i32)> = peers_of(&brokers, SecurityProtocol::SaslSsl, 2)
+            .into_iter()
+            .map(|(node, endpoint)| (node, endpoint.host, endpoint.port))
+            .collect();
+        assert_eq!(
+            listed,
+            [(1, "gw-1".to_string(), 9094), (3, "gw-3".to_string(), 9094)]
+        );
     }
 }

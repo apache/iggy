@@ -33,12 +33,17 @@ use message_bus::client_listener::RequestHandler;
 use message_bus::installer::{install_client_conn, install_replica_conn};
 use message_bus::replica::listener::MessageHandler;
 use message_bus::transports::{ActorContext, TransportConn};
-use message_bus::{ClientTransportKind, IggyMessageBus};
+use message_bus::{ClientTransportKind, IggyMessageBus, ReplicaLinkId};
 use std::cell::Cell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 const REPLICA_ID: u8 = 7;
+const LINK: ReplicaLinkId = ReplicaLinkId {
+    replica: REPLICA_ID,
+    link: 0,
+    epoch: 0,
+};
 const CLIENT_ID: u128 = 0x4242_4242_4242_4242_4242_4242_4242_4242;
 
 /// Transport whose `run` body panics on first poll. Models a transport
@@ -114,19 +119,19 @@ async fn replica_panic_evicts_registry_and_notifies_loss() {
     let bus = Rc::new(IggyMessageBus::new(0));
 
     let lost_count: Rc<Cell<u32>> = Rc::new(Cell::new(0));
-    let lost_peer: Rc<Cell<Option<u8>>> = Rc::new(Cell::new(None));
+    let lost_link: Rc<Cell<Option<ReplicaLinkId>>> = Rc::new(Cell::new(None));
     {
         let lost_count = Rc::clone(&lost_count);
-        let lost_peer = Rc::clone(&lost_peer);
-        bus.set_connection_lost_fn(Rc::new(move |peer_id| {
+        let lost_link = Rc::clone(&lost_link);
+        bus.set_connection_lost_fn(Rc::new(move |link| {
             lost_count.set(lost_count.get() + 1);
-            lost_peer.set(Some(peer_id));
+            lost_link.set(Some(link));
         }));
     }
 
     let on_message: MessageHandler = Rc::new(|_, _| {});
 
-    install_replica_conn(&bus, REPLICA_ID, PanickingConn, on_message.clone());
+    install_replica_conn(&bus, LINK, PanickingConn, on_message.clone());
 
     {
         let bus = Rc::clone(&bus);
@@ -151,9 +156,9 @@ async fn replica_panic_evicts_registry_and_notifies_loss() {
         1,
         "notify_connection_lost must fire exactly once on panic",
     );
-    assert_eq!(lost_peer.get(), Some(REPLICA_ID));
+    assert_eq!(lost_link.get(), Some(LINK));
 
-    install_replica_conn(&bus, REPLICA_ID, ParkingConn, on_message);
+    install_replica_conn(&bus, LINK, ParkingConn, on_message);
     {
         let bus = Rc::clone(&bus);
         wait_until(
@@ -245,13 +250,13 @@ async fn replica_panic_only_does_not_double_notify_after_dispatch_loop() {
     let lost_count: Rc<Cell<u32>> = Rc::new(Cell::new(0));
     {
         let lost_count = Rc::clone(&lost_count);
-        bus.set_connection_lost_fn(Rc::new(move |_peer_id| {
+        bus.set_connection_lost_fn(Rc::new(move |_link| {
             lost_count.set(lost_count.get() + 1);
         }));
     }
 
     let on_message: MessageHandler = Rc::new(|_, _| {});
-    install_replica_conn(&bus, REPLICA_ID, PanickingConn, on_message);
+    install_replica_conn(&bus, LINK, PanickingConn, on_message);
 
     {
         let lost_count = Rc::clone(&lost_count);
@@ -291,13 +296,13 @@ async fn replica_writer_panic_evicts_registry_via_conn_shutdown() {
     let lost_count: Rc<Cell<u32>> = Rc::new(Cell::new(0));
     {
         let lost_count = Rc::clone(&lost_count);
-        bus.set_connection_lost_fn(Rc::new(move |_peer_id| {
+        bus.set_connection_lost_fn(Rc::new(move |_link| {
             lost_count.set(lost_count.get() + 1);
         }));
     }
 
     let on_message: MessageHandler = Rc::new(|_, _| {});
-    install_replica_conn(&bus, REPLICA_ID, WriterPanicConn, on_message);
+    install_replica_conn(&bus, LINK, WriterPanicConn, on_message);
 
     {
         let bus = Rc::clone(&bus);

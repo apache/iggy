@@ -22,8 +22,8 @@
 //! persists, and serves back to polls.
 
 use crate::batch::{
-    BATCH_HEADER_SIZE, BATCH_MESSAGE_HEADER_SIZE, BatchHeader, MAX_TIMESTAMP_DELTA_MICROS,
-    calculate_batch_checksum,
+    BATCH_HEADER_SIZE, BATCH_MESSAGE_HEADER_SIZE, BatchHeader, BatchProducer,
+    MAX_TIMESTAMP_DELTA_MICROS, calculate_batch_checksum,
 };
 use crate::codec::{WireDecode, WireEncode, read_u32_le};
 use crate::error::WireError;
@@ -91,6 +91,21 @@ impl SendMessagesEncoder {
         stream_id: &WireIdentifier,
         topic_id: &WireIdentifier,
         partitioning: &WirePartitioning,
+        messages: &[RawMessage<'_>],
+    ) -> Result<(), WireError> {
+        Self::encode_with_producer(buf, stream_id, topic_id, partitioning, None, messages)
+    }
+
+    /// [`Self::encode`] for a batch of an idempotent producer.
+    ///
+    /// # Errors
+    /// See [`Self::encode`].
+    pub fn encode_with_producer(
+        buf: &mut BytesMut,
+        stream_id: &WireIdentifier,
+        topic_id: &WireIdentifier,
+        partitioning: &WirePartitioning,
+        producer: Option<BatchProducer>,
         messages: &[RawMessage<'_>],
     ) -> Result<(), WireError> {
         if messages.is_empty() {
@@ -174,6 +189,7 @@ impl SendMessagesEncoder {
         }
         let batch_length = batch_size as u64;
         let mut batch_header = BatchHeader::new(0, origin_timestamp, batch_length, message_count);
+        batch_header.producer = producer;
         batch_header.batch_checksum = calculate_batch_checksum(&batch_header, &buf[blob_start..]);
         let header_bytes: &mut [u8] = &mut buf[header_start..header_start + BATCH_HEADER_SIZE];
         batch_header.encode_into(header_bytes);

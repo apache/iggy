@@ -21,22 +21,32 @@
 //! yield. Execution returns facts about that snapshot. Only the partition
 //! owner validates its history and accepts progress.
 
-use crate::iggy_index::{IGGY_INDEX_SIZE, IggyIndexCache};
+use crate::iggy_index::{IGGY_INDEX_SIZE, IggyIndex, IggyIndexCache};
 use crate::iggy_index_reader::IggyIndexReader;
 use crate::journal::{
-    MessageLookup, push_selected_batch_fragments, select_batch_slice, unpin_sparse_source,
+    MessageLookup, SPARSE_CHUNK_PIN_DIVISOR, push_selected_batch_fragments, select_batch_slice,
+    unpin_sparse_source,
 };
-use crate::{PollFragments, PollingConsumer};
+use crate::placed_read::PlacedReadPlan;
+use crate::remote_segments::{
+    IndexFetch, IndexFetchFence, ReadPolicy, RemoteRange, RemoteSegments,
+};
+use crate::{Fragment, PollFragments, PollingConsumer};
 use compio::io::AsyncReadAtExt;
+use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BatchHeader, BatchRef};
+use iggy_binary_protocol::responses::messages::poll_messages::POLL_RESPONSE_HEADER_SIZE;
 use iggy_binary_protocol::{WireError, batch};
 use iggy_common::{ConsumerKind, IggyError};
+use iggy_object_store::{ObjectPrefix, SegmentKey, SegmentObject};
 use server_common::iobuf::{Frozen, Owned};
 use server_common::poll::PollHistoryId;
-use server_common::send_messages::{BatchIntegrity, COMMAND_HEADER_SIZE};
+use server_common::send_messages::{BatchIntegrity, COMMAND_HEADER_SIZE, frozen_batch_header};
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::{Duration, Instant};
 use tracing::{error, warn};
 
 /// Byte cap for materializing a sealed segment's sparse index into its shared
@@ -113,7 +123,28 @@ pub struct SealedSegmentReadState {
     /// others.
     /// Timestamp polls bypass it.
     pub(crate) offset_cursor: Cell<Option<SealedOffsetCursor>>,
+    /// The last failed read of the segment's objects, kept until its backoff
+    /// runs out. A client that retries meanwhile gets the same answer at once,
+    /// and the store gets no request.
+    pub(crate) remote_failure: Cell<Option<RemoteFailure>>,
 }
+
+/// See [`SealedSegmentReadState::remote_failure`].
+#[derive(Debug, Clone, Copy)]
+pub struct RemoteFailure {
+    pub(crate) fault: DiskFault,
+    /// Failures in a row, which set how long the next one is remembered.
+    pub(crate) failures: u32,
+    pub(crate) until: Instant,
+}
+
+/// How long the first failed read of a segment's objects is remembered.
+pub const REMOTE_FAILURE_BACKOFF_MIN: Duration = Duration::from_millis(100);
+
+/// The longest a failed read is remembered. The store is asked again at
+/// least this often, so a repaired outage or a fixed credential shows within
+/// it.
+pub const REMOTE_FAILURE_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 /// See [`SealedSegmentReadState::offset_cursor`].
 #[derive(Debug, Clone, Copy)]
@@ -125,6 +156,8 @@ pub struct SealedOffsetCursor {
     pub(crate) valid_until: u64,
     /// Start byte the whole interval resolves to.
     pub(crate) position: u64,
+    /// Timestamp of the resolved index entry.
+    pub(crate) timestamp: u64,
 }
 
 pub type SealedSegmentHandle = Rc<SealedSegmentReadState>;
@@ -135,10 +168,29 @@ pub type SealedSegmentHandle = Rc<SealedSegmentReadState>;
 /// resident index, because sealed segments drop that index at rotation.
 pub struct DiskReadPlan {
     pub(crate) partition_dir: PartitionDirResolution,
+    /// Where remote segments are read from, `None` on a shard without a
+    /// store.
+    pub(crate) remote: Option<Rc<RemoteSegments>>,
+    /// The prefix the partition's chain records, which names the object of a
+    /// segment that left the disk after the plan was built.
+    pub(crate) object_prefix: Option<ObjectPrefix>,
+    /// Gates the fetch of a remote segment's `.index` object on the partition
+    /// and the history the plan was built in.
+    pub(crate) index_fetches: IndexFetchFence,
     /// Segments to walk, snapshotted from the poll's starting segment onward
     /// (see `build_poll_plan`); `start_position` is the byte offset into the
     /// first one.
     pub(crate) segments: Vec<DiskSegment>,
+    /// The segment after the last of [`Self::segments`] when its bytes are in
+    /// the store, which the walk does not read and readahead may.
+    pub(crate) next_remote: Option<RemoteRange>,
+    /// The snapshot stops before the partition's last segment, because the
+    /// segments it holds already cover what the poll can return. A walk that
+    /// runs out of them anyway has more to read, never a tail to splice.
+    pub(crate) cut: bool,
+    /// When the walk stops waiting for the store. A local read is not bound
+    /// by it: the disk answers or fails by itself.
+    pub(crate) deadline: Option<Instant>,
     pub(crate) start_position: u64,
     pub(crate) start_index_offset: Option<u64>,
     pub(crate) namespace_raw: u64,
@@ -155,6 +207,8 @@ pub struct DiskReadPlan {
     /// chunk holding no complete batch, so a count-derived estimate below this
     /// buys nothing and costs the re-read it triggers.
     pub(crate) widest_batch_bytes: u64,
+    /// How the partition's reads of remote segments use the shard's cache.
+    pub(crate) read_settings: ReadPolicy,
 }
 
 pub struct DiskSegment {
@@ -167,6 +221,89 @@ pub struct DiskSegment {
     /// segment resolves its start byte from the shared sparse index; the active
     /// one grows under the reader and uses its resident index instead.
     pub(crate) sealed: bool,
+    /// Where the segment's bytes were when the plan was built.
+    pub(crate) source: SegmentSource,
+}
+
+impl DiskSegment {
+    /// Where the segment's `.index` is in `partition_dir`, or where the
+    /// fetched one goes.
+    fn index_path(&self, partition_dir: &str) -> String {
+        match &self.source {
+            SegmentSource::Remote(log) => format!("{partition_dir}/{}", log.index_file_name()),
+            SegmentSource::Local => {
+                format!("{partition_dir}/{:0>20}.index", self.start_offset)
+            }
+        }
+    }
+}
+
+/// Where a walk reads a segment's bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SegmentSource {
+    /// The `.log` in the partition directory.
+    Local,
+    /// A byte range of an object in the store.
+    Remote(RemoteRange),
+}
+
+/// A segment's bytes as the walk opened them.
+enum SegmentBytes<'a> {
+    File(compio::fs::File),
+    Remote {
+        remote: &'a RemoteSegments,
+        range: RemoteRange,
+        state: &'a SealedSegmentReadState,
+        /// The plan named the local `.log`, which was gone by the time the
+        /// walk opened it.
+        replanned: bool,
+        /// The segment after this one, when its bytes are in the same store.
+        next: Option<&'a RemoteRange>,
+    },
+}
+
+impl SealedSegmentReadState {
+    /// The failure remembered before a wait on the store that starts at
+    /// `now`, or its fault as `Err` while the backoff still runs.
+    fn remembered_failure(&self, now: Instant) -> Result<Option<RemoteFailure>, DiskFault> {
+        let remembered = self.remote_failure.get();
+        match remembered {
+            Some(failure) if now < failure.until => Err(failure.fault),
+            _ => Ok(remembered),
+        }
+    }
+
+    /// Remember how a wait on the store ended: a fault for longer than the
+    /// `previous` one in a row, and an answer clears it.
+    fn remember_outcome(&self, previous: Option<RemoteFailure>, fault: Option<DiskFault>) {
+        self.remote_failure.set(fault.map(|fault| {
+            let failures = previous.map_or(1, |failure| failure.failures.saturating_add(1));
+            RemoteFailure {
+                fault,
+                failures,
+                until: Instant::now() + remote_failure_backoff(failures),
+            }
+        }));
+    }
+}
+
+impl SegmentBytes<'_> {
+    /// The fault of bytes that are not a segment's batches.
+    const fn unreadable(&self) -> DiskFault {
+        match self {
+            Self::File(_) => DiskFault::Unreadable,
+            Self::Remote { .. } => DiskFault::Tiered,
+        }
+    }
+
+    /// Drop what the read cache holds of the `len` bytes at `position`,
+    /// which are not a segment's batches, so that the next poll asks the
+    /// store for them again.
+    fn forget(&self, position: u64, len: usize) {
+        if let Self::Remote { remote, range, .. } = self {
+            remote.forget_cached(range, position, len);
+        }
+    }
 }
 
 /// Admission inputs carried by a read without access to consumer progress maps.
@@ -183,6 +320,25 @@ pub struct PollContext {
         Option<iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner>,
     /// Keeps drain evidence incomplete until this read is accepted or dropped.
     pub(crate) _group_poll: Option<Arc<AtomicBool>>,
+    /// The first segment the read walks, on a partition that follows another
+    /// cluster's log. A trim that drops it before the read completes may have
+    /// let the origin delete its objects, so the owner refuses the read.
+    pub(crate) peer_first_segment: Option<u64>,
+    /// The remote segments the read walks, on a partition that follows
+    /// another cluster's log. The origin deletes the objects of segments it
+    /// merged into one, so the owner refuses the read once a manifest put
+    /// one segment in the place of any of these.
+    pub(crate) peer_segments: Option<PeerSegmentRun>,
+}
+
+/// Consecutive segments of a peer log, as a poll plan saw them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerSegmentRun {
+    /// The first offset of the first segment.
+    pub(crate) start_offset: u64,
+    /// The last offset of the last segment.
+    pub(crate) end_offset: u64,
+    pub(crate) segments: usize,
 }
 
 /// An owned read result awaiting validation by the partition owner.
@@ -196,9 +352,199 @@ pub struct PollReadResult {
     pub(crate) commit_offset: u64,
     /// Inclusive offset of the last selected message, or `None` for no match.
     pub(crate) last_matching_offset: Option<u64>,
+    pub(crate) message_count: u32,
+    /// A byte limit or a fault stopped the read before the requested count,
+    /// so later offsets may exist past this prefix.
+    pub(crate) truncated: bool,
+    pub(crate) read_error: Option<IggyError>,
 }
 
 impl PollReadResult {
+    /// Cap the encoded selection at `budget` before the owner accepts its
+    /// final offset. The first message passes the budget, so a poll always
+    /// makes progress. Nothing else passes `max_bytes`: a first message larger
+    /// than it comes alone when `allow_oversized_first` answers true, asked
+    /// once and only then, so a message above any limit still reaches its
+    /// consumer in one reply. A sliced batch retains its original offset base
+    /// and receives a new checksum.
+    ///
+    /// # Errors
+    /// Returns `InvalidSizeBytes` when the first message does not fit in
+    /// `max_bytes` and is not allowed past it, or `CannotReadMessage` if the
+    /// selected batch framing is invalid.
+    pub fn limit_bytes(
+        mut self,
+        max_bytes: usize,
+        budget: usize,
+        allow_oversized_first: impl FnOnce() -> bool,
+    ) -> Result<(Self, bool), IggyError> {
+        let ceiling = max_bytes
+            .checked_sub(POLL_RESPONSE_HEADER_SIZE)
+            .ok_or(IggyError::InvalidSizeBytes)?;
+        let mut allow_oversized_first = Some(allow_oversized_first);
+        let mut remaining = ceiling.min(budget.saturating_sub(POLL_RESPONSE_HEADER_SIZE));
+        // A selection that fits keeps its fragments, count and last offset, so
+        // its records need no decoding.
+        if self.encoded_bytes() < remaining {
+            return Ok((self, false));
+        }
+        let mut fragments = std::mem::take(&mut self.fragments).into_iter();
+        self.message_count = 0;
+        self.last_matching_offset = None;
+        let mut limited = false;
+        while let Some(fragment) = fragments.next() {
+            let source = fragment.into_frozen();
+            let mut header =
+                BatchHeader::decode(&source).map_err(|_| IggyError::CannotReadMessage)?;
+            let body = if source.len() == BATCH_HEADER_SIZE {
+                fragments
+                    .next()
+                    .ok_or(IggyError::CannotReadMessage)?
+                    .into_frozen()
+            } else {
+                source.slice(BATCH_HEADER_SIZE..source.len())
+            };
+            if body.len()
+                != header
+                    .blob_len()
+                    .map_err(|_| IggyError::CannotReadMessage)?
+            {
+                return Err(IggyError::CannotReadMessage);
+            }
+            let batch = BatchRef::new(header, &body);
+            let mut selected = 0;
+            let mut end = 0;
+            for record in batch.iter_with_offsets() {
+                let first = self.message_count == 0 && selected == 0;
+                let limit = if first { ceiling } else { remaining };
+                if BATCH_HEADER_SIZE.saturating_add(record.end) > limit
+                    && !(first && allow_oversized_first.take().is_some_and(|allow| allow()))
+                {
+                    limited = true;
+                    break;
+                }
+                selected += 1;
+                end = record.end;
+                self.last_matching_offset = Some(
+                    header
+                        .base_offset
+                        .checked_add(u64::from(record.message.header.offset_delta))
+                        .ok_or(IggyError::CannotReadMessage)?,
+                );
+            }
+            if selected == 0 {
+                if self.message_count == 0 {
+                    return Err(IggyError::InvalidSizeBytes);
+                }
+                break;
+            }
+            self.message_count += selected;
+            remaining = remaining.saturating_sub(BATCH_HEADER_SIZE + end);
+            limited |= remaining == 0;
+            if selected == header.message_count && source.len() != BATCH_HEADER_SIZE {
+                self.fragments.push(Fragment::whole(source));
+            } else {
+                header.message_count = selected;
+                header.batch_length = (BATCH_HEADER_SIZE + end) as u64;
+                header.batch_checksum = header.checksum_for_blob(&body[..end]);
+                self.fragments
+                    .push(Fragment::whole(frozen_batch_header(&header)));
+                self.fragments.push(Fragment::whole(body.slice(..end)));
+            }
+            if limited {
+                break;
+            }
+        }
+        Ok((self, limited))
+    }
+
+    /// Memory this result keeps alive, counting every backing allocation once
+    /// however many fragments slice it.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        self.fragments
+            .capacity()
+            .saturating_mul(size_of::<crate::Fragment>())
+            .saturating_add(charge_allocations(&mut HashSet::new(), &self.fragments))
+    }
+
+    /// Copy the selection into one exact-size allocation and drop the borrowed
+    /// buffers. A reply that slices a few bytes out of segment-sized journal
+    /// buffers pins all of them, so the copy trades one pass over the reply for
+    /// a charge that tracks the reply itself. Fragment boundaries survive, which
+    /// keeps batch framing intact.
+    #[must_use]
+    pub fn compacted(mut self) -> Self {
+        let mut buffer = Owned::with_capacity(self.encoded_bytes());
+        for fragment in &self.fragments {
+            buffer.extend_from_slice(fragment.as_slice());
+        }
+        let compacted = Frozen::from(buffer);
+        let mut start = 0;
+        self.fragments = self
+            .fragments
+            .iter()
+            .map(|fragment| {
+                let end = start + fragment.len();
+                let piece = Fragment::slice(compacted.clone(), start, end);
+                start = end;
+                piece
+            })
+            .collect();
+        self
+    }
+
+    #[must_use]
+    pub const fn message_count(&self) -> u32 {
+        self.message_count
+    }
+
+    /// The offset of the last selected message, `None` if the read selected
+    /// nothing.
+    #[must_use]
+    pub const fn last_matching_offset(&self) -> Option<u64> {
+        self.last_matching_offset
+    }
+
+    /// The selected bytes with their batch framing, which is what
+    /// [`Self::limit_bytes`] counts against its limits.
+    #[must_use]
+    pub fn encoded_bytes(&self) -> usize {
+        self.fragments.iter().map(Fragment::len).sum()
+    }
+
+    /// Whether a byte limit or a fault stopped the read early. Waiting for
+    /// more messages cannot grow such a result, because the next read stops
+    /// at the same place.
+    #[must_use]
+    pub const fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Reject a read that failed before it matched anything. A valid prefix
+    /// before a fault is served, and the next poll, which starts at the
+    /// fault, reports it.
+    ///
+    /// # Errors
+    /// Returns the underlying read failure.
+    pub fn checked(mut self) -> Result<Self, IggyError> {
+        self.read_error.take().map_or_else(|| Ok(self), Err)
+    }
+
+    /// The error of a read that the object store failed for good before it
+    /// matched anything.
+    ///
+    /// A poll without a status on its reply shows a failed read as an empty
+    /// one, which a consumer waits out. This one never reads again, so the
+    /// owner refuses the poll with it instead, once the read's history and
+    /// owner prove to be the ones it still serves.
+    #[must_use]
+    pub fn tiered_read_failure(&self) -> Option<IggyError> {
+        self.read_error
+            .clone()
+            .filter(|error| matches!(error, IggyError::TieredReadFailed))
+    }
+
     #[must_use]
     pub const fn consumer_kind(&self) -> ConsumerKind {
         match self.context.consumer {
@@ -256,24 +602,105 @@ impl PollPlan {
     /// Resident reads execute and complete synchronously on the owner.
     #[must_use]
     pub const fn needs_off_pump_io(&self) -> bool {
-        matches!(self.tier, PollTier::Disk { .. })
+        matches!(self.tier, PollTier::Disk { .. } | PollTier::Placed { .. })
+    }
+
+    /// Whether the snapshot names a segment in the object store, so the read
+    /// can wait on the store.
+    #[must_use]
+    pub fn reads_remote(&self) -> bool {
+        match &self.tier {
+            PollTier::Disk { disk, .. } => disk.reads_remote(),
+            // The messages of a placed batch are in the object store, unless
+            // this shard still holds them in memory.
+            PollTier::Placed { .. } => true,
+            PollTier::Empty | PollTier::Resident { .. } => false,
+        }
+    }
+
+    /// Read the object store with what `settings` returns, which only a plan
+    /// that reads the store asks for. They become the partition's, so the
+    /// reads still to come of its older plans use them too.
+    pub fn read_store_with(&self, settings: impl FnOnce() -> crate::PartitionReadSettings) {
+        let policy = match &self.tier {
+            PollTier::Disk { disk, .. } if disk.reads_remote() => &disk.read_settings,
+            PollTier::Placed { placed, .. } => &placed.read_settings,
+            PollTier::Disk { .. } | PollTier::Empty | PollTier::Resident { .. } => return,
+        };
+        policy.set(&settings());
+    }
+
+    /// Stop waiting for the object store at `deadline`. The read then returns
+    /// the messages it has, or asks for a retry when it has none.
+    #[must_use]
+    pub const fn with_deadline(mut self, deadline: Instant) -> Self {
+        if let PollTier::Disk { disk, .. } = &mut self.tier {
+            disk.deadline = Some(deadline);
+        }
+        if let PollTier::Placed { placed, .. } = &mut self.tier {
+            placed.deadline = Some(deadline);
+        }
+        self
     }
 
     /// Read the captured snapshot without changing consumer progress.
-    /// The result still requires owner validation, including when it is empty.
+    /// The owner decides whether legacy prefix results or strict errors apply.
+    ///
+    /// TODO(partitions): the legacy poll reply has no error channel, so a disk
+    /// fault reaches the consumer as an ordinary empty poll. Fair for a
+    /// transient IO fault, wrong for a batch that failed its own checksum: data
+    /// damaged at rest never reads again, so the consumer waits forever.
+    /// Surfacing it needs a status on the poll reply, an SDK-visible change on
+    /// every client. Deferred polls report it through [`PollReadResult::checked`].
     pub async fn execute(self) -> PollReadResult {
-        let commit_offset = self.commit_offset;
-        let (fragments, last_matching_offset) = match self.tier {
-            PollTier::Empty => (PollFragments::new(), None),
+        self.execute_with_limit(usize::MAX, usize::MAX).await
+    }
+
+    /// Read the captured snapshot like [`Self::execute`], holding at most
+    /// `max_bytes` of read buffers once the walk matched a message. Reads are
+    /// sized to what a selection of `max_selected_bytes`, counted as
+    /// [`PollReadResult::limit_bytes`] counts them, can still keep, and stop
+    /// once it is full. The batch that holds the first match is read whatever
+    /// its width, so a poll always makes progress. A walk that a limit or a
+    /// fault stops early returns its contiguous prefix, marked
+    /// [`PollReadResult::truncated`].
+    pub async fn execute_with_limit(
+        self,
+        max_bytes: usize,
+        max_selected_bytes: usize,
+    ) -> PollReadResult {
+        let mut read_error = None;
+        let mut truncated = false;
+        let (fragments, last_matching_offset, message_count) = match self.tier {
+            PollTier::Empty => (PollFragments::new(), None, 0),
             PollTier::Resident {
                 fragments,
                 last_matching_offset,
-            } => (fragments, last_matching_offset),
+                message_count,
+            } => (fragments, last_matching_offset, message_count),
+            PollTier::Placed { placed, query } => {
+                match placed.read(query, max_bytes, max_selected_bytes).await {
+                    Ok(read) => {
+                        truncated = read.truncated;
+                        crate::journal::select_resident(&read.batches, query)
+                            .unwrap_or_else(|| (PollFragments::new(), None, 0))
+                    }
+                    // Fail closed, as a disk read does: an answer without
+                    // the batch that failed would skip its messages.
+                    Err(fault) => {
+                        read_error = Some(fault.error());
+                        (PollFragments::new(), None, 0)
+                    }
+                }
+            }
             PollTier::Disk {
                 disk,
                 query,
                 resident_tail,
-            } => match disk.read_disk(query).await {
+            } => match disk
+                .read_disk_with_limit(query, max_bytes, max_selected_bytes)
+                .await
+            {
                 // Disk walked cleanly and matched nothing: the query offset is
                 // below disk retention too, so the match (if any) is journal-
                 // resident. Serve the journal forward (retention-recovery) from
@@ -281,29 +708,32 @@ impl PollPlan {
                 // timestamp); no contiguity gate, this is not a straddle.
                 DiskReadOutcome::Empty => {
                     crate::journal::select_resident(&resident_tail.entries, query)
-                        .unwrap_or_else(|| (PollFragments::new(), None))
+                        .unwrap_or_else(|| (PollFragments::new(), None, 0))
                 }
-                // Disk read stopped on a fault. Fail-closed: return an empty poll
-                // WITHOUT the journal-forward fallback. Falling forward here would
-                // splice the next resident op over the unreadable run and silently
-                // skip live data.
-                //
-                // TODO(partitions): the poll reply has no error channel, so this
-                // reaches the consumer as an ordinary empty poll. Fair for a transient
-                // IO fault, wrong for a batch that failed its own checksum: data
-                // damaged at rest never reads again, so the consumer waits forever.
-                // Surfacing it needs a status on the poll reply, an SDK-visible change
-                // on every client. Until then the ERROR in `walk_disk_chunk` is the
-                // only signal, and it is server-side only.
-                DiskReadOutcome::Faulted => (PollFragments::new(), None),
+                // Disk read stopped on a fault before any match. Fail-closed:
+                // falling forward to the journal here would splice the next
+                // resident op over the unreadable run and silently skip live data.
+                DiskReadOutcome::Faulted(fault) => {
+                    read_error = Some(fault.error());
+                    (PollFragments::new(), None, 0)
+                }
                 // Straddle: continue past the last disk match into the resident
                 // tail (gate + race argument live on `straddle_continuation`).
                 DiskReadOutcome::Matched {
                     mut fragments,
                     last_matching_offset,
                     matched,
+                    faulted,
+                    limited,
                 } => {
-                    let remaining = query.count().saturating_sub(matched);
+                    // A limited prefix stops here. Splicing the journal onto
+                    // it would both skip the offsets still on disk and spend
+                    // bytes past the limit that stopped it.
+                    let remaining = if limited {
+                        0
+                    } else {
+                        query.count().saturating_sub(matched)
+                    };
                     let continuation = last_matching_offset
                         .and_then(|last_offset| {
                             resident_tail.straddle_continuation(
@@ -315,22 +745,28 @@ impl PollPlan {
                         .and_then(|query| {
                             crate::journal::select_resident(&resident_tail.entries, query)
                         });
-                    match continuation {
-                        Some((journal_fragments, journal_last)) => {
-                            fragments.extend(journal_fragments);
-                            (fragments, journal_last.or(last_matching_offset))
-                        }
-                        None => (fragments, last_matching_offset),
+                    if let Some((journal_fragments, journal_last, journal_count)) = continuation {
+                        fragments.extend(journal_fragments);
+                        (
+                            fragments,
+                            journal_last.or(last_matching_offset),
+                            matched + journal_count,
+                        )
+                    } else {
+                        truncated = limited || faulted;
+                        (fragments, last_matching_offset, matched)
                     }
                 }
             },
         };
-
         PollReadResult {
             context: self.context,
-            commit_offset,
+            commit_offset: self.commit_offset,
             fragments,
             last_matching_offset,
+            message_count,
+            truncated,
+            read_error,
         }
     }
 
@@ -341,24 +777,25 @@ impl PollPlan {
     /// Panics if [`Self::needs_off_pump_io`] is true.
     #[must_use]
     pub fn execute_resident(self) -> PollReadResult {
-        let commit_offset = self.commit_offset;
-        let (fragments, last_matching_offset) = match self.tier {
-            PollTier::Empty => (PollFragments::new(), None),
+        let (fragments, last_matching_offset, message_count) = match self.tier {
+            PollTier::Empty => (PollFragments::new(), None, 0),
             PollTier::Resident {
                 fragments,
                 last_matching_offset,
-            } => (fragments, last_matching_offset),
-            // `needs_off_pump_io` is true for every Disk tier, so the dispatch
-            // gate never routes one here.
-            PollTier::Disk { .. } => {
-                unreachable!("execute_resident on Disk tier; needs_off_pump_io guards this")
+                message_count,
+            } => (fragments, last_matching_offset, message_count),
+            PollTier::Disk { .. } | PollTier::Placed { .. } => {
+                unreachable!("execute_resident on a tier that reads; needs_off_pump_io guards this")
             }
         };
         PollReadResult {
             context: self.context,
-            commit_offset,
+            commit_offset: self.commit_offset,
             fragments,
             last_matching_offset,
+            message_count,
+            truncated: false,
+            read_error: None,
         }
     }
 }
@@ -368,6 +805,7 @@ pub enum PollTier {
     Resident {
         fragments: PollFragments<4096>,
         last_matching_offset: Option<u64>,
+        message_count: u32,
     },
     Disk {
         disk: DiskReadPlan,
@@ -376,10 +814,16 @@ pub enum PollTier {
         /// captured at plan time so the splice runs off the partition borrow.
         resident_tail: ResidentTailSnapshot,
     },
+    /// The poll of a partition that places its batches: its segments and its
+    /// journal hold where the messages sit in the object store.
+    Placed {
+        placed: PlacedReadPlan,
+        query: MessageLookup,
+    },
 }
 
-/// Outcome of [`DiskReadPlan::read_disk`], distinguishing a benign empty walk
-/// from an IO fault so the caller can fail-closed.
+/// Outcome of [`DiskReadPlan::read_disk_with_limit`], distinguishing a benign
+/// empty walk from an IO fault so the caller can fail-closed.
 ///
 /// A faulted segment may hold data that is present-but-unreadable right now;
 /// the disk walk stops at the fault (never advancing to later segments) so a
@@ -387,30 +831,61 @@ pub enum PollTier {
 /// a `Faulted` result, or it would splice the next resident op over the
 /// unreadable run and silently skip live messages.
 pub enum DiskReadOutcome {
-    /// Walk produced matches (possibly a partial prefix if a fault stopped it).
+    /// Walk produced matches (possibly a partial prefix if a fault or a byte
+    /// limit stopped it).
     Matched {
         fragments: PollFragments<4096>,
         last_matching_offset: Option<u64>,
         matched: u32,
+        faulted: bool,
+        /// A byte limit stopped the walk. Later offsets exist but are not in
+        /// this result, so nothing may be appended to it.
+        limited: bool,
     },
     /// Walk completed with no fault and matched nothing. The query offset is
     /// below disk retention too, so the caller may serve the journal forward
     /// (retention-recovery) without skipping anything.
     Empty,
     /// Walk stopped on an IO fault before matching anything. Fail-closed: the
-    /// caller returns an empty poll so the consumer cursor does not advance
-    /// past data that may still be present-but-unreadable.
-    Faulted,
+    /// caller returns an empty poll or an error, so the consumer cursor does
+    /// not advance past data that may still be present-but-unreadable.
+    Faulted(DiskFault),
+}
+
+/// Why a disk walk stopped on a fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskFault {
+    /// Open or read retries ran out, or the directory was mid-rotation. A
+    /// later poll may read the same bytes.
+    Retryable,
+    /// A batch failed its checksum or layout, or its bytes are gone. Every
+    /// later poll of the offset fails the same way.
+    Unreadable,
+    /// The object store refused a read for a reason no retry changes, or
+    /// answered with bytes that are not the segment's.
+    Tiered,
+}
+
+impl DiskFault {
+    /// A retryable fault changed nothing, so the poll is refused like one that
+    /// no replica accepted, and clients retry it without an error.
+    const fn error(self) -> IggyError {
+        match self {
+            Self::Retryable => IggyError::TransientNotAccepted,
+            Self::Unreadable => IggyError::CannotReadMessage,
+            Self::Tiered => IggyError::TieredReadFailed,
+        }
+    }
 }
 
 /// Ceiling for ordinary disk reads. An incomplete batch may require one
 /// larger re-read, without widening subsequent chunks or segments.
-const DISK_POLL_CHUNK_MAX: u64 = 1 << 20;
+pub const DISK_POLL_CHUNK_MAX: u64 = 1 << 20;
 
 /// Smallest first read of a disk poll. Below this the syscall and the segment
 /// walk cost more than the bytes the smaller read saves, and a poll for a
 /// handful of messages would issue a read per batch.
-const DISK_POLL_CHUNK_MIN: u64 = 64 << 10;
+pub const DISK_POLL_CHUNK_MIN: u64 = 64 << 10;
 
 /// How the chunk loop over one segment ended.
 enum SegmentWalk {
@@ -419,11 +894,26 @@ enum SegmentWalk {
     Done,
     /// Fail-closed: the segment may hold present-but-unreadable or corrupt
     /// data, so no later segment may be served over it.
-    Faulted,
+    Faulted(DiskFault),
+    /// The byte budget is spent or the selection fills the reply. Whatever
+    /// matched is a contiguous prefix and is serveable, but the walk may not
+    /// continue.
+    Limited,
 }
 
 /// The state one disk walk carries across its segments.
 struct DiskWalk {
+    max_bytes: usize,
+    /// What the reply keeps. Reading past it only fetches bytes that the next
+    /// poll reads again.
+    max_selected_bytes: usize,
+    selected_bytes: usize,
+    retained_bytes: usize,
+    /// Allocations already in `retained_bytes`, so slices of one chunk or one
+    /// sparse copy are charged once.
+    charged: HashSet<usize>,
+    /// Set only after a match, so a limited walk always has a prefix to serve.
+    limited: bool,
     /// Byte offset into the segment being walked; reset at each boundary.
     position: u64,
     /// Messages between the resolved index entry and the requested offset,
@@ -435,6 +925,9 @@ struct DiskWalk {
     last_matching_offset: Option<u64>,
     /// Batch width learned from an incomplete read, capped at the chunk ceiling.
     batch_read_floor: u64,
+    /// The index entry the walk starts from, until the batch at its position
+    /// proves to be the one it names.
+    unproven_entry: Option<IggyIndex>,
     #[cfg(feature = "poll-diagnostics")]
     requested_bytes: u64,
     #[cfg(feature = "poll-diagnostics")]
@@ -448,6 +941,21 @@ impl DiskWalk {
         (count - self.matched).saturating_add(self.skipped)
     }
 
+    /// Bytes the next read can still use: the rest of the reply, plus the run
+    /// in front of the first match at `bytes_per_message` each. Without a mean
+    /// size that run has no estimate, so nothing caps the read.
+    fn usable_bytes(&self, bytes_per_message: Option<u32>) -> u64 {
+        let reply = self.max_selected_bytes.saturating_sub(self.selected_bytes) as u64;
+        if self.skipped == 0 {
+            return reply;
+        }
+        bytes_per_message.map_or(u64::MAX, |bytes_per_message| {
+            reply.saturating_add(
+                u64::from(bytes_per_message).saturating_mul(u64::from(self.skipped)),
+            )
+        })
+    }
+
     fn starting_at(position: u64, skipped: u32) -> Self {
         Self {
             position,
@@ -456,6 +964,13 @@ impl DiskWalk {
             fragments: PollFragments::new(),
             last_matching_offset: None,
             batch_read_floor: 0,
+            unproven_entry: None,
+            max_bytes: usize::MAX,
+            max_selected_bytes: usize::MAX,
+            selected_bytes: 0,
+            retained_bytes: 0,
+            charged: HashSet::new(),
+            limited: false,
             #[cfg(feature = "poll-diagnostics")]
             requested_bytes: 0,
             #[cfg(feature = "poll-diagnostics")]
@@ -465,7 +980,17 @@ impl DiskWalk {
 }
 
 impl DiskReadPlan {
-    /// Bytes to read for the next `remaining` messages.
+    /// The next read of `walk`, never under a batch width it already learned.
+    fn next_chunk_len(&self, walk: &DiskWalk, count: u32) -> u64 {
+        self.chunk_len(
+            walk.remaining_to_read(count),
+            walk.usable_bytes(self.bytes_per_message),
+        )
+        .max(walk.batch_read_floor)
+    }
+
+    /// Bytes to read for the next `remaining` messages, of which the walk can
+    /// use no more than `usable`.
     ///
     /// A poll asks for a message count and the walk reads bytes, so the two are
     /// bridged by the partition's own mean encoded size. Reading a fixed
@@ -486,13 +1011,17 @@ impl DiskReadPlan {
     /// wider than the ceiling still grows through the re-read path. The ceiling
     /// is what every poll read before it was sized at all, so no poll reads
     /// more than it used to.
-    fn chunk_len(&self, remaining: u32) -> u64 {
-        let Some(bytes_per_message) = self.bytes_per_message else {
-            return DISK_POLL_CHUNK_MAX;
-        };
-        u64::from(bytes_per_message)
-            .saturating_mul(u64::from(remaining))
-            .saturating_add(COMMAND_HEADER_SIZE as u64)
+    ///
+    /// `usable` caps the estimate under the same floors, since a smaller read
+    /// costs more than the bytes it saves.
+    fn chunk_len(&self, remaining: u32, usable: u64) -> u64 {
+        self.bytes_per_message
+            .map_or(DISK_POLL_CHUNK_MAX, |bytes_per_message| {
+                u64::from(bytes_per_message)
+                    .saturating_mul(u64::from(remaining))
+                    .saturating_add(COMMAND_HEADER_SIZE as u64)
+            })
+            .min(usable)
             .max(self.widest_batch_bytes)
             .clamp(DISK_POLL_CHUNK_MIN, DISK_POLL_CHUNK_MAX)
     }
@@ -502,7 +1031,18 @@ impl DiskReadPlan {
     /// the file IO. Walks stamped `[256B BatchHeader][blob]` batches in
     /// chunked reads, re-reading a batch split across a chunk boundary in the
     /// next chunk.
+    #[cfg(test)]
     pub(crate) async fn read_disk(self, query: MessageLookup) -> DiskReadOutcome {
+        self.read_disk_with_limit(query, usize::MAX, usize::MAX)
+            .await
+    }
+
+    async fn read_disk_with_limit(
+        self,
+        query: MessageLookup,
+        max_bytes: usize,
+        max_selected_bytes: usize,
+    ) -> DiskReadOutcome {
         let count = query.count();
         if count == 0 || self.segments.is_empty() {
             return DiskReadOutcome::Empty;
@@ -516,7 +1056,7 @@ impl DiskReadPlan {
             // read back, so the journal-forward would skip them: fail closed.
             PartitionDirResolution::NoFiles => {
                 return if self.segments.iter().any(|segment| segment.persisted > 0) {
-                    DiskReadOutcome::Faulted
+                    DiskReadOutcome::Faulted(DiskFault::Unreadable)
                 } else {
                     DiskReadOutcome::Empty
                 };
@@ -533,7 +1073,7 @@ impl DiskReadPlan {
                     segment_count = self.segments.len(),
                     "disk poll: file-backed partition has no resolvable dir; failing closed"
                 );
-                return DiskReadOutcome::Faulted;
+                return DiskReadOutcome::Faulted(DiskFault::Retryable);
             }
         };
 
@@ -548,16 +1088,24 @@ impl DiskReadPlan {
         // full-scan fallback). An active first segment keeps its
         // resident-index-resolved `start_position` untouched.
         let resolved = match self.segments.first() {
-            Some(first) => self.resolve_sealed_start(first, query, partition_dir).await,
+            Some(first) => {
+                match self
+                    .resolve_sealed_start(first, query, partition_dir, max_bytes)
+                    .await
+                {
+                    Ok(resolved) => resolved,
+                    Err(fault) => return DiskReadOutcome::Faulted(fault),
+                }
+            }
             None => None,
         };
-        let position = resolved.map_or(self.start_position, |(position, _)| position);
+        let position = resolved.map_or(self.start_position, |entry| entry.position);
         // The index is sparse, so the entry it resolved can sit a whole flush
         // group before the requested offset. The walk has to read that run to
         // reach the first match, and sizing the read from the requested count
         // alone would cross it in floor-sized reads.
         let entry_offset = resolved
-            .map(|(_, offset)| offset)
+            .map(|entry| entry.offset)
             .or(self.start_index_offset);
         let skipped = match (entry_offset, query) {
             (Some(entry_offset), MessageLookup::Offset { offset, .. }) => {
@@ -566,12 +1114,15 @@ impl DiskReadPlan {
             _ => 0,
         };
         let mut walk = DiskWalk::starting_at(position, skipped);
+        walk.unproven_entry = resolved.filter(|_| self.starts_remote());
+        walk.max_bytes = max_bytes;
+        walk.max_selected_bytes = max_selected_bytes;
         // Set when an open/read retry exhausts. The walk breaks immediately so
         // later segments are never read into the result (which would leave a
         // gap at the faulted segment). Pre-fault matches are still served.
-        let mut faulted = false;
+        let mut fault = None;
 
-        for segment in &self.segments {
+        for (at, segment) in self.segments.iter().enumerate() {
             if walk.matched >= count {
                 break;
             }
@@ -582,23 +1133,34 @@ impl DiskReadPlan {
                 walk.position = 0;
                 continue;
             }
-            let path = format!("{partition_dir}/{:0>20}.log", segment.start_offset);
-            let Some(file) = self.resolve_segment_file(segment, &path).await else {
-                // Open exhausted retries: the segment may hold present-but-
-                // unreadable data. Stop here rather than walking past it.
-                faulted = true;
-                break;
+            let next = self
+                .segments
+                .get(at + 1)
+                .map_or(self.next_remote.as_ref(), |next| match &next.source {
+                    SegmentSource::Remote(range) => Some(range),
+                    SegmentSource::Local => None,
+                });
+            let bytes = match self.open_segment(segment, next, partition_dir).await {
+                Ok(bytes) => bytes,
+                Err(kind) => {
+                    // The segment may hold present-but-unreadable data. Stop
+                    // here rather than walking past it.
+                    fault = Some(kind);
+                    break;
+                }
             };
 
-            if matches!(
-                self.walk_segment(&file, query, count, persisted, &mut walk)
-                    .await,
-                SegmentWalk::Faulted
-            ) {
-                faulted = true;
-                break;
+            match self
+                .walk_segment(&bytes, query, count, persisted, &mut walk)
+                .await
+            {
+                SegmentWalk::Done => walk.position = 0,
+                SegmentWalk::Limited => break,
+                SegmentWalk::Faulted(kind) => {
+                    fault = Some(kind);
+                    break;
+                }
             }
-            walk.position = 0;
         }
 
         // The three ratios a read-sizing change is judged on: bytes asked of
@@ -617,6 +1179,30 @@ impl DiskReadPlan {
             "disk poll read accounting"
         );
 
+        self.outcome(walk, fault, count)
+    }
+
+    /// Whether the walk starts in a remote segment.
+    ///
+    /// Such a segment is read on its index's word, and the most a fetch can
+    /// check of an index object is that it stays inside the segment. An entry
+    /// that names a later batch would start the walk past messages the poll
+    /// asked for, so the walk proves the entry it starts from.
+    fn starts_remote(&self) -> bool {
+        matches!(
+            self.segments.first(),
+            Some(DiskSegment {
+                source: SegmentSource::Remote(_),
+                ..
+            })
+        )
+    }
+
+    /// What a finished walk amounts to.
+    fn outcome(&self, walk: DiskWalk, fault: Option<DiskFault>, count: u32) -> DiskReadOutcome {
+        // Segments past the snapshot hold what the walk did not reach, so
+        // neither the journal tail nor an empty reply may follow it.
+        let unfinished = self.cut && fault.is_none() && walk.matched < count;
         if walk.matched > 0 {
             // Pre-fault matches are always a contiguous prefix (the walk stops
             // at the first fault), so a partial result carries no gap.
@@ -624,9 +1210,13 @@ impl DiskReadPlan {
                 fragments: walk.fragments,
                 last_matching_offset: walk.last_matching_offset,
                 matched: walk.matched,
+                limited: walk.limited || unfinished,
+                faulted: fault.is_some(),
             }
-        } else if faulted {
-            DiskReadOutcome::Faulted
+        } else if let Some(fault) = fault {
+            DiskReadOutcome::Faulted(fault)
+        } else if unfinished {
+            DiskReadOutcome::Faulted(DiskFault::Retryable)
         } else {
             DiskReadOutcome::Empty
         }
@@ -639,25 +1229,56 @@ impl DiskReadPlan {
     /// so narrowing it to a `usize` cannot truncate. The chunk itself is not
     /// bounded by `DISK_POLL_CHUNK_MAX`: a batch wider than the ceiling grows
     /// past it below.
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     async fn walk_segment(
         &self,
-        file: &compio::fs::File,
+        bytes: &SegmentBytes<'_>,
         query: MessageLookup,
         count: u32,
         persisted: u64,
         walk: &mut DiskWalk,
     ) -> SegmentWalk {
-        let mut chunk_len = self
-            .chunk_len(walk.remaining_to_read(count))
-            .max(walk.batch_read_floor);
+        let mut chunk_len = self.next_chunk_len(walk, count);
+        // The smallest read that holds the batch at the position, once a read
+        // came back without a whole one.
+        let mut whole_batch = 0;
         while walk.matched < count && walk.position < persisted {
-            let len = (persisted - walk.position).min(chunk_len) as usize;
-            let Some(chunk) = self.read_chunk_with_retry(file, len, walk).await else {
-                // Chunk read exhausted retries: same fail-closed reason as
-                // a failed open.
-                return SegmentWalk::Faulted;
+            let mut len = (persisted - walk.position).min(chunk_len) as usize;
+            // The batch that holds the first match is read whatever its width,
+            // as the legacy poll does: refusing it would refuse the same offset
+            // on every retry. Later reads shrink to the budget left, stop once
+            // the selection fills the reply or the budget holds no useful read,
+            // and the walk serves the prefix it holds.
+            if walk.matched > 0 {
+                let room = chunk_read_room(walk.max_bytes.saturating_sub(walk.retained_bytes));
+                let floor = DISK_POLL_CHUNK_MIN
+                    .max(walk.batch_read_floor)
+                    .max(whole_batch) as usize;
+                if walk.selected_bytes >= walk.max_selected_bytes || (room < len && room < floor) {
+                    walk.limited = true;
+                    return SegmentWalk::Limited;
+                }
+                len = len.min(room);
+            }
+            let chunk = match self.read_chunk(bytes, len, query, walk).await {
+                Ok(chunk) => chunk,
+                // Same fail-closed reason as a failed open.
+                Err(fault) => return SegmentWalk::Faulted(fault),
             };
+            if let Some(entry) = walk.unproven_entry.take()
+                && !entry_names_batch(&entry, &chunk)
+            {
+                bytes.forget(walk.position, len);
+                error!(
+                    target: "iggy.partitions.diag",
+                    plane = "partitions",
+                    namespace_raw = self.namespace_raw,
+                    offset = entry.offset,
+                    position = entry.position,
+                    "remote poll: an index entry does not name the batch at its position"
+                );
+                return SegmentWalk::Faulted(DiskFault::Unreadable);
+            }
             let fragments_before_chunk = walk.fragments.len();
             let ChunkWalk {
                 consumed,
@@ -670,7 +1291,9 @@ impl DiskReadPlan {
                 &mut walk.matched,
                 &mut walk.fragments,
                 &mut walk.last_matching_offset,
-                if self.validate_checksum {
+                // Bytes that crossed a network are checked whatever the knob
+                // says: nothing else stands between the store and a consumer.
+                if self.validate_checksum || matches!(bytes, SegmentBytes::Remote { .. }) {
                     BatchIntegrity::Verify
                 } else {
                     BatchIntegrity::LayoutOnly
@@ -684,11 +1307,24 @@ impl DiskReadPlan {
                 &chunk,
                 usize::MAX,
             );
+            let added = &walk.fragments[fragments_before_chunk..];
+            walk.retained_bytes = walk
+                .retained_bytes
+                .saturating_add(charge_allocations(&mut walk.charged, added))
+                .saturating_add(added.len().saturating_mul(size_of::<crate::Fragment>() * 2));
+            walk.selected_bytes = walk
+                .selected_bytes
+                .saturating_add(added.iter().map(Fragment::len).sum());
+            if walk.matched > 0 && walk.retained_bytes > walk.max_bytes {
+                walk.limited = true;
+                return SegmentWalk::Limited;
+            }
             if corrupt {
                 // A batch that does not match its own checksum. Fail closed like
                 // an IO fault: serving it hands a consumer data provably not what
                 // was written, and skipping ahead punches a silent gap.
-                return SegmentWalk::Faulted;
+                bytes.forget(walk.position, len);
+                return SegmentWalk::Faulted(bytes.unreadable());
             }
             if consumed == 0 {
                 if (len as u64) >= persisted - walk.position {
@@ -696,13 +1332,15 @@ impl DiskReadPlan {
                     // corrupt batch in this segment. Fail-closed like an IO
                     // fault so a later segment is never served over the corrupt
                     // run, which would punch a silent gap into the poll.
-                    return SegmentWalk::Faulted;
+                    bytes.forget(walk.position, len);
+                    return SegmentWalk::Faulted(bytes.unreadable());
                 }
                 // A single batch larger than the chunk. Its own header says
                 // how wide it is, so re-read exactly that; only a header this
                 // read could not reach leaves the old quadrupling.
                 if needed as u64 > persisted - walk.position {
-                    return SegmentWalk::Faulted;
+                    bytes.forget(walk.position, len);
+                    return SegmentWalk::Faulted(bytes.unreadable());
                 }
                 chunk_len = if needed > len {
                     walk.batch_read_floor = walk
@@ -710,36 +1348,241 @@ impl DiskReadPlan {
                         .max((needed as u64).min(DISK_POLL_CHUNK_MAX));
                     needed as u64
                 } else {
-                    chunk_len.saturating_mul(4)
+                    (len as u64).saturating_mul(4)
                 };
+                whole_batch = chunk_len;
                 continue;
             }
+            whole_batch = 0;
             if walk.matched > 0 {
                 walk.skipped = 0;
             }
-            chunk_len = self
-                .chunk_len(walk.remaining_to_read(count))
-                .max(walk.batch_read_floor);
+            chunk_len = self.next_chunk_len(walk, count);
             walk.position += consumed as u64;
         }
         SegmentWalk::Done
     }
 
+    /// Open `segment` where the plan says its bytes are.
+    ///
+    /// A sealed segment planned as local can lose its `.log` to an eviction
+    /// before the walk reaches it. Its bytes are then in the store under the
+    /// partition's prefix, so a walk that may wait on the store reads them
+    /// there instead of failing (see [`Self::evicted_source`]).
+    async fn open_segment<'a>(
+        &'a self,
+        segment: &'a DiskSegment,
+        next: Option<&'a RemoteRange>,
+        partition_dir: &str,
+    ) -> Result<SegmentBytes<'a>, DiskFault> {
+        if let SegmentSource::Remote(range) = &segment.source {
+            // A shard that has not connected its store yet cannot read the
+            // segment now, and can once it has.
+            let remote = self.remote.as_deref().ok_or(DiskFault::Retryable)?;
+            return Ok(SegmentBytes::Remote {
+                remote,
+                range: range.clone(),
+                state: &segment.read_state,
+                replanned: false,
+                next,
+            });
+        }
+        let path = format!("{partition_dir}/{:0>20}.log", segment.start_offset);
+        match self.resolve_segment_file(segment, &path).await {
+            Ok(file) => Ok(SegmentBytes::File(file)),
+            Err(std::io::ErrorKind::NotFound) => {
+                let (remote, range) = self.evicted_source(segment).ok_or(DiskFault::Retryable)?;
+                Ok(SegmentBytes::Remote {
+                    remote,
+                    range,
+                    state: &segment.read_state,
+                    replanned: true,
+                    next,
+                })
+            }
+            Err(_) => Err(DiskFault::Retryable),
+        }
+    }
+
+    /// Whether the plan named a segment in the object store when it was built.
+    fn reads_remote(&self) -> bool {
+        self.segments
+            .iter()
+            .any(|segment| segment.source != SegmentSource::Local)
+    }
+
+    /// The object a sealed segment's bytes are in once its `.log` is gone.
+    ///
+    /// `None` for a plan that named no remote segment. Its owner admitted it
+    /// as a poll of local data, outside the cap on the polls that may wait on
+    /// the store, so it asks for a retry instead. The retry's plan names the
+    /// segment as remote and is admitted under the cap.
+    fn evicted_source(&self, segment: &DiskSegment) -> Option<(&RemoteSegments, RemoteRange)> {
+        let remote = self.remote.as_deref().filter(|_| self.reads_remote())?;
+        let prefix = self.object_prefix.filter(|_| segment.sealed)?;
+        Some((
+            remote,
+            RemoteRange {
+                key: SegmentKey {
+                    prefix,
+                    start_offset: segment.start_offset,
+                    object: SegmentObject::Log,
+                },
+                keyed_end_offset: None,
+                range: 0..segment.persisted,
+            },
+        ))
+    }
+
+    async fn read_chunk(
+        &self,
+        bytes: &SegmentBytes<'_>,
+        len: usize,
+        query: MessageLookup,
+        walk: &mut DiskWalk,
+    ) -> Result<Frozen<4096>, DiskFault> {
+        match bytes {
+            SegmentBytes::File(file) => self
+                .read_chunk_with_retry(file, len, walk)
+                .await
+                .ok_or(DiskFault::Retryable),
+            SegmentBytes::Remote {
+                remote,
+                range,
+                state,
+                replanned,
+                next,
+            } => {
+                #[cfg(feature = "poll-diagnostics")]
+                {
+                    walk.requested_bytes += len as u64;
+                    walk.chunk_reads += 1;
+                }
+                // A consumer's next poll can read some of the same bytes
+                // again, and its later offset tells it apart from another
+                // poll of the same messages.
+                let poll_offset = match (walk.last_matching_offset, query) {
+                    (Some(last), _) => last.checked_add(1),
+                    (None, MessageLookup::Offset { offset, .. }) => Some(offset),
+                    (None, MessageLookup::Timestamp { .. }) => None,
+                };
+                let settings = self.read_settings.current();
+                let cached = remote.holds(range, walk.position, len, &settings);
+                let read = async {
+                    remote
+                        .read(range, walk.position, len, *next, poll_offset, &settings)
+                        .await
+                        .map_err(|fault| {
+                            // A `.log` that was gone without an eviction was
+                            // retired, and so was its object. The next poll
+                            // plans against the segments that are left.
+                            if *replanned {
+                                DiskFault::Retryable
+                            } else {
+                                fault
+                            }
+                        })
+                };
+                // A failure of the store stands in the way of requests to it,
+                // and bytes in memory need none.
+                if cached {
+                    return read.await;
+                }
+                self.wait_for_store(state, read).await
+            }
+        }
+    }
+
+    /// One wait on the object store for a segment.
+    ///
+    /// A failure is remembered on the segment, for longer after each one in a
+    /// row, and a wait that starts while it is remembered fails the same way
+    /// without a request. So the retries of clients during an outage reply at
+    /// once and cost the store nothing. The wait also ends at the poll's
+    /// deadline, which counts as a failure of the store only when the store
+    /// had the time to answer.
+    async fn wait_for_store<T>(
+        &self,
+        state: &SealedSegmentReadState,
+        wait: impl Future<Output = Result<T, DiskFault>>,
+    ) -> Result<T, DiskFault> {
+        let now = Instant::now();
+        let remembered = state.remembered_failure(now)?;
+        let result = match self.deadline {
+            None => wait.await,
+            Some(deadline) if deadline <= now => return Err(DiskFault::Retryable),
+            Some(deadline) => compio::time::timeout(deadline - now, wait)
+                .await
+                .unwrap_or(Err(DiskFault::Retryable)),
+        };
+        state.remember_outcome(remembered, result.as_ref().err().copied());
+        result
+    }
+
+    /// Wait for the segment's `.index` object to be at `path`, starting its
+    /// fetch unless one runs.
+    ///
+    /// The fetch is not this poll's: a deadline that ends the wait leaves it
+    /// running for the next poll of the segment to join, and is no failure of
+    /// the store. A fault the fetch ends with is one, remembered like that of
+    /// any other wait (see [`Self::wait_for_store`]).
+    async fn wait_for_index(
+        &self,
+        segment: &DiskSegment,
+        log: &RemoteRange,
+        partition_dir: &str,
+        path: &str,
+    ) -> Result<(), DiskFault> {
+        let remote = self.remote.as_ref().ok_or(DiskFault::Retryable)?;
+        let state = &segment.read_state;
+        let now = Instant::now();
+        let remembered = state.remembered_failure(now)?;
+        if self.deadline.is_some_and(|deadline| deadline <= now) {
+            return Err(DiskFault::Retryable);
+        }
+        let fetched = self
+            .index_fetches
+            .join(segment.start_offset, log.keyed_end_offset, |task| {
+                IndexFetch::start(
+                    task,
+                    Rc::clone(remote),
+                    log.clone(),
+                    partition_dir.to_owned(),
+                    path.to_owned(),
+                )
+            })
+            .ok_or(DiskFault::Retryable)?;
+        let ended = match self.deadline {
+            None => fetched.await,
+            Some(deadline) => compio::time::timeout(deadline - now, fetched)
+                .await
+                .map_err(|_| DiskFault::Retryable)?,
+        };
+        self.index_fetches.forget_finished(segment.start_offset);
+        // A cancelled fetch belonged to files that were replaced under it.
+        let result = ended.ok_or(DiskFault::Retryable)?;
+        state.remember_outcome(remembered, result.err());
+        result
+    }
+
     /// Resolve the read-only descriptor for `segment`'s file. A hit clones the
     /// cached fd (sharing the kernel fd, no syscall); a miss opens by path and
-    /// stores the fd back so later polls skip the `openat`. Returns `None` only
-    /// when the open exhausts its retries (the caller fails closed).
+    /// stores the fd back so later polls skip the `openat`. Fails only when
+    /// the open exhausts its retries (the caller fails closed), or at once
+    /// when the file is gone and the store can stand in for it.
     async fn resolve_segment_file(
         &self,
         segment: &DiskSegment,
         path: &str,
-    ) -> Option<compio::fs::File> {
+    ) -> Result<compio::fs::File, std::io::ErrorKind> {
         let handle = &segment.read_state;
         // Borrow only to clone the `Option<File>` out, never across the await.
         if let Some(cached) = handle.fd.borrow().clone() {
-            return Some(cached);
+            return Ok(cached);
         }
-        let file = self.open_segment_with_retry(path).await?;
+        let file = self
+            .open_segment_with_retry(path, self.evicted_source(segment).is_some())
+            .await?;
         // A sealed segment stores back only while the pump tracks its handle;
         // an untracked fill (walk-through segment, or a slot evicted mid-poll)
         // would pin an fd outside the LRU budget, so it opens transiently
@@ -751,7 +1594,7 @@ impl DiskReadPlan {
         if !segment.sealed || handle.tracked.get() {
             *handle.fd.borrow_mut() = Some(file.clone());
         }
-        Some(file)
+        Ok(file)
     }
 
     /// Resolve the start byte for the poll's target segment from its sparse
@@ -759,18 +1602,25 @@ impl DiskReadPlan {
     /// whole on the first sealed poll and is cached on the shared handle; a
     /// larger one is binary-searched on file every poll and never materialized
     /// (see the constant). Returns `None` (keep the byte-0 fallback) for the
-    /// active segment, a below-range query, or an IO failure.
+    /// active segment, a below-range query, or an IO failure on a local
+    /// segment.
+    ///
+    /// A remote segment never takes the byte-0 fallback, which would pull the
+    /// whole object through ranged GETs on every poll. Without a usable local
+    /// `.index` it fetches the `.index` object, and fails the poll when it
+    /// cannot.
     async fn resolve_sealed_start(
         &self,
         segment: &DiskSegment,
         query: MessageLookup,
         partition_dir: &str,
-    ) -> Option<(u64, u64)> {
+        max_bytes: usize,
+    ) -> Result<Option<IggyIndex>, DiskFault> {
         // The active segment grows under the reader, so neither the shared
         // sparse index nor the offset memo can describe it; its own resident
         // index already resolved `start_position`.
         if !segment.sealed {
-            return None;
+            return Ok(None);
         }
         let handle = &segment.read_state;
         // Cache hit: resolve under a short borrow, never across the await.
@@ -780,7 +1630,7 @@ impl DiskReadPlan {
             .as_ref()
             .map(|index| resolve_index_position(index, query));
         if let Some(resolved) = cached {
-            return resolved;
+            return Ok(resolved);
         }
         // No resident index, so this is the file-backed path a sequential
         // consumer would otherwise binary-search on disk every poll: answer
@@ -790,34 +1640,33 @@ impl DiskReadPlan {
             && offset >= cursor.offset
             && offset < cursor.valid_until
         {
-            return Some((cursor.position, cursor.offset));
+            return Ok(Some(IggyIndex::new(
+                cursor.offset,
+                cursor.timestamp,
+                cursor.position,
+            )));
         }
-        let path = format!("{partition_dir}/{:0>20}.index", segment.start_offset);
-        let reader = match IggyIndexReader::new(&path).await {
-            Ok(reader) => reader,
-            Err(error) => {
-                self.warn_sparse_index_fallback(&path, "open", &error);
-                return None;
-            }
+        let path = segment.index_path(partition_dir);
+        let Some((reader, entry_count)) = self.open_index(segment, partition_dir, &path).await?
+        else {
+            return Ok(None);
         };
-        let entry_count = match reader.entry_count().await {
-            Ok(entry_count) => entry_count,
-            Err(error) => {
-                self.warn_sparse_index_fallback(&path, "entry_count", &error);
-                return None;
-            }
-        };
-        if entry_count.saturating_mul(IGGY_INDEX_SIZE as u64) <= SEALED_INDEX_RESIDENT_MAX_BYTES {
+        if entry_count.saturating_mul(IGGY_INDEX_SIZE as u64) <= SEALED_INDEX_RESIDENT_MAX_BYTES
+            && entry_count
+                .saturating_mul(IGGY_INDEX_SIZE as u64)
+                .saturating_mul(2)
+                <= max_bytes as u64
+        {
             let index = match reader.load_all().await {
                 Ok(index) => index,
                 Err(error) => {
                     self.warn_sparse_index_fallback(&path, "load", &error);
-                    return None;
+                    return index_fallback(segment);
                 }
             };
             let resolved = resolve_index_position(&index, query);
             *handle.index.borrow_mut() = Some(index);
-            return resolved;
+            return Ok(resolved);
         }
         let looked_up = match query {
             MessageLookup::Offset { offset, .. } => {
@@ -830,6 +1679,7 @@ impl DiskReadPlan {
                             offset: entry.offset,
                             valid_until: successor_offset.unwrap_or(u64::MAX),
                             position: entry.position,
+                            timestamp: entry.timestamp,
                         }));
                         entry
                     })),
@@ -841,12 +1691,49 @@ impl DiskReadPlan {
             }
         };
         match looked_up {
-            Ok(entry) => entry.map(|entry| (entry.position, entry.offset)),
+            Ok(entry) => Ok(entry),
             Err(error) => {
                 self.warn_sparse_index_fallback(&path, "lower_bound", &error);
-                None
+                index_fallback(segment)
             }
         }
+    }
+
+    /// Open the segment's `.index` and count its entries.
+    ///
+    /// `None` is a local segment whose index is unusable. A remote segment in
+    /// that state gets the `.index` object written in its place first.
+    async fn open_index(
+        &self,
+        segment: &DiskSegment,
+        partition_dir: &str,
+        path: &str,
+    ) -> Result<Option<(IggyIndexReader, u64)>, DiskFault> {
+        let SegmentSource::Remote(log) = &segment.source else {
+            return Ok(self.open_local_index(path).await.ok());
+        };
+        if let Ok((reader, entry_count)) = self.open_local_index(path).await
+            && entry_count > 0
+        {
+            return Ok(Some((reader, entry_count)));
+        }
+        self.wait_for_index(segment, log, partition_dir, path)
+            .await?;
+        self.open_local_index(path)
+            .await
+            .map(Some)
+            .map_err(|()| DiskFault::Retryable)
+    }
+
+    async fn open_local_index(&self, path: &str) -> Result<(IggyIndexReader, u64), ()> {
+        let reader = IggyIndexReader::new(path)
+            .await
+            .map_err(|error| self.warn_sparse_index_fallback(path, "open", &error))?;
+        let entry_count = reader
+            .entry_count()
+            .await
+            .map_err(|error| self.warn_sparse_index_fallback(path, "entry_count", &error))?;
+        Ok((reader, entry_count))
     }
 
     /// The sparse index is unavailable or unreadable; the caller falls back to
@@ -866,11 +1753,23 @@ impl DiskReadPlan {
     /// Open a segment file for a disk poll, retrying transient IO failures (fd
     /// pressure under heavy parallel load) so one failed syscall does not
     /// silently collapse the poll into an empty result.
-    async fn open_segment_with_retry(&self, path: &str) -> Option<compio::fs::File> {
+    ///
+    /// `missing_is_final` ends the retries at a file that does not exist: the
+    /// caller has another place to read it from.
+    async fn open_segment_with_retry(
+        &self,
+        path: &str,
+        missing_is_final: bool,
+    ) -> Result<compio::fs::File, std::io::ErrorKind> {
+        let mut last = std::io::ErrorKind::Other;
         for attempt in 0..3u8 {
             match compio::fs::File::open(path).await {
-                Ok(file) => return Some(file),
+                Ok(file) => return Ok(file),
+                Err(error) if missing_is_final && error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(error.kind());
+                }
                 Err(error) => {
+                    last = error.kind();
                     warn!(
                         target: "iggy.partitions.diag",
                         plane = "partitions",
@@ -884,7 +1783,7 @@ impl DiskReadPlan {
                 }
             }
         }
-        None
+        Err(last)
     }
 
     /// Read one chunk for a disk poll, retrying transient IO failures.
@@ -934,19 +1833,65 @@ impl DiskReadPlan {
     }
 }
 
+/// How long the `failures`-th failed read in a row of a segment's objects is
+/// remembered: twice as long each time, up to the maximum.
+fn remote_failure_backoff(failures: u32) -> Duration {
+    REMOTE_FAILURE_BACKOFF_MIN
+        .saturating_mul(1 << failures.saturating_sub(1).min(16))
+        .min(REMOTE_FAILURE_BACKOFF_MAX)
+}
+
+/// What a segment whose index cannot be read resolves to: the byte-0 scan for
+/// a local one, a retryable fault for a remote one.
+const fn index_fallback(segment: &DiskSegment) -> Result<Option<IggyIndex>, DiskFault> {
+    match segment.source {
+        SegmentSource::Local => Ok(None),
+        SegmentSource::Remote(_) => Err(DiskFault::Retryable),
+    }
+}
+
 /// Byte position of the sparse-index entry at or below the query's offset /
 /// timestamp, or `None` when the query is below the first indexed entry (the
 /// caller then scans from the segment start). Mirrors `disk_poll_start`'s
 /// resident-index resolution for the sealed, off-pump path.
-/// Start byte for `query`, and the offset of the index entry it resolved to.
+/// The entry holds the start byte for `query` and the offset it resolved to.
 /// The entry sits at or before the requested offset, so the difference is the
 /// run the walk has to skip before it can match anything.
-fn resolve_index_position(index: &IggyIndexCache, query: MessageLookup) -> Option<(u64, u64)> {
+fn resolve_index_position(index: &IggyIndexCache, query: MessageLookup) -> Option<IggyIndex> {
     match query {
         MessageLookup::Offset { offset, .. } => index.offset_lower_bound(offset),
         MessageLookup::Timestamp { timestamp, .. } => index.timestamp_lower_bound(timestamp),
     }
-    .map(|entry| (entry.position, entry.offset))
+    .copied()
+}
+
+/// Whether the batch that starts `chunk`, read at the entry's position, is the
+/// one `entry` was written for.
+fn entry_names_batch(entry: &IggyIndex, chunk: &[u8]) -> bool {
+    BatchHeader::decode(chunk).is_ok_and(|header| {
+        header.base_offset == entry.offset && header.base_timestamp == entry.timestamp
+    })
+}
+
+/// Bytes of the allocations `fragments` keep alive that `charged` did not
+/// count yet, so slices of one allocation charge it once.
+/// The widest chunk that `budget` bytes hold while the walk processes it: the
+/// read buffer itself, plus a sparse copy of its selection, which is made only
+/// below `1 / SPARSE_CHUNK_PIN_DIVISOR` of the chunk. The walk charges the
+/// fragment descriptors once it holds them.
+const fn chunk_read_room(budget: usize) -> usize {
+    budget / (SPARSE_CHUNK_PIN_DIVISOR + 1) * SPARSE_CHUNK_PIN_DIVISOR
+}
+
+fn charge_allocations<'a>(
+    charged: &mut HashSet<usize>,
+    fragments: impl IntoIterator<Item = &'a Fragment>,
+) -> usize {
+    fragments
+        .into_iter()
+        .filter(|fragment| charged.insert(fragment.allocation_id()))
+        .map(Fragment::allocation_bytes)
+        .fold(0, usize::saturating_add)
 }
 
 /// Walk stamped `[256B BatchHeader][blob]` batches in one disk
@@ -1049,17 +1994,95 @@ struct ChunkWalk {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::iggy_index::IggyIndex;
-    #[cfg(feature = "poll-diagnostics")]
     use bytes::Bytes;
     use compio::io::AsyncWriteAtExt;
     use server_common::iobuf::Owned;
-    #[cfg(feature = "poll-diagnostics")]
     use server_common::send_messages::{
         IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
     };
-    #[cfg(feature = "poll-diagnostics")]
     use server_common::sharding::IggyNamespace;
+
+    #[test]
+    fn byte_limit_rewrites_whole_and_split_batches_with_valid_checksums() {
+        const PAYLOAD: &[u8] = b"payload";
+        let mut messages = IggyMessages::with_capacity(2);
+        for _ in 0..2 {
+            messages.push(IggyMessage {
+                header: IggyMessageHeader {
+                    payload_length: u32::try_from(PAYLOAD.len()).unwrap(),
+                    ..Default::default()
+                },
+                payload: Bytes::from_static(PAYLOAD),
+                user_headers: None,
+            });
+        }
+        let mut batch =
+            SendMessagesOwned::from_messages(IggyNamespace::new(1, 1, 0), &messages).unwrap();
+        batch.header.base_offset = 42;
+        batch.header.batch_checksum = batch.header.checksum_for_blob(&batch.blob);
+        let mut bytes = vec![0; batch.header.total_size()];
+        batch.header.encode_into(&mut bytes);
+        bytes[BATCH_HEADER_SIZE..].copy_from_slice(&batch.blob);
+        let one_message = POLL_RESPONSE_HEADER_SIZE
+            + BATCH_HEADER_SIZE
+            + batch::BATCH_MESSAGE_HEADER_SIZE
+            + PAYLOAD.len();
+        // The first message passes any budget, but never `max_bytes`.
+        let limits = [
+            (one_message, usize::MAX),
+            (usize::MAX, one_message),
+            (usize::MAX, 0),
+        ];
+        for split in [false, true] {
+            for (max_bytes, budget) in limits {
+                let source: Frozen<4096> = Owned::copy_from_slice(&bytes).into();
+                let mut fragments = PollFragments::new();
+                if split {
+                    fragments.push(Fragment::whole(source.slice(..BATCH_HEADER_SIZE)));
+                    fragments.push(Fragment::whole(source.slice(BATCH_HEADER_SIZE..)));
+                } else {
+                    fragments.push(Fragment::whole(source));
+                }
+                let result = PollPlan {
+                    context: PollContext {
+                        history: PollHistoryId::default(),
+                        consumer: PollingConsumer::Consumer(0, 0),
+                        auto_commit: true,
+                        owner: None,
+                        _group_poll: None,
+                        peer_first_segment: None,
+                        peer_segments: None,
+                    },
+                    commit_offset: 99,
+                    tier: PollTier::Resident {
+                        fragments,
+                        last_matching_offset: Some(43),
+                        message_count: 2,
+                    },
+                }
+                .execute_resident();
+                let (result, limited) = result.limit_bytes(max_bytes, budget, || false).unwrap();
+                assert!(limited);
+                assert_eq!(result.message_count(), 1);
+                assert_eq!(result.last_matching_offset, Some(42));
+                assert_eq!(result.commit_offset, 99);
+                let bytes: Vec<u8> = result
+                    .fragments
+                    .into_iter()
+                    .flat_map(|fragment| fragment.into_frozen().to_vec())
+                    .collect();
+                assert_eq!(bytes.len() + POLL_RESPONSE_HEADER_SIZE, one_message);
+                let header = BatchHeader::decode(&bytes).unwrap();
+                assert_eq!(header.base_offset, 42);
+                assert_eq!(header.message_count, 1);
+                assert_eq!(header.total_size(), bytes.len());
+                assert_eq!(
+                    header.batch_checksum,
+                    header.checksum_for_blob(&bytes[BATCH_HEADER_SIZE..])
+                );
+            }
+        }
+    }
 
     /// Write a sealed-segment index file too large to materialize
     /// (`entry_count * IGGY_INDEX_SIZE > SEALED_INDEX_RESIDENT_MAX_BYTES`), so
@@ -1084,11 +2107,27 @@ mod tests {
         entry_count
     }
 
+    #[test]
+    fn given_failures_in_a_row_when_remembering_should_double_the_backoff_up_to_the_maximum() {
+        assert_eq!(remote_failure_backoff(1), REMOTE_FAILURE_BACKOFF_MIN);
+        assert_eq!(remote_failure_backoff(2), REMOTE_FAILURE_BACKOFF_MIN * 2);
+        assert_eq!(remote_failure_backoff(4), REMOTE_FAILURE_BACKOFF_MIN * 8);
+        assert_eq!(remote_failure_backoff(10), REMOTE_FAILURE_BACKOFF_MAX);
+        assert_eq!(remote_failure_backoff(u32::MAX), REMOTE_FAILURE_BACKOFF_MAX);
+    }
+
     fn sizing_plan(bytes_per_message: Option<u32>, widest_batch_bytes: u64) -> DiskReadPlan {
         DiskReadPlan {
             partition_dir: PartitionDirResolution::NoFiles,
+            remote: None,
+            object_prefix: None,
+            index_fetches: IndexFetchFence::detached(),
+            next_remote: None,
+            cut: false,
+            deadline: None,
             bytes_per_message,
             widest_batch_bytes,
+            read_settings: ReadPolicy::default(),
             segments: Vec::new(),
             start_position: 0,
             start_index_offset: None,
@@ -1107,17 +2146,17 @@ mod tests {
         let mean = u32::try_from(batch / 1000).expect("mean fits");
         let plan = sizing_plan(Some(mean), batch);
 
-        assert!(plan.chunk_len(999) >= batch);
-        assert!(plan.chunk_len(500) >= batch);
-        assert!(plan.chunk_len(1) >= batch);
+        assert!(plan.chunk_len(999, u64::MAX) >= batch);
+        assert!(plan.chunk_len(500, u64::MAX) >= batch);
+        assert!(plan.chunk_len(1, u64::MAX) >= batch);
         // The floor never pushes a read above what an unsized poll would take.
         assert_eq!(
-            sizing_plan(Some(mean), 4 << 20).chunk_len(1),
+            sizing_plan(Some(mean), 4 << 20).chunk_len(1, u64::MAX),
             DISK_POLL_CHUNK_MAX
         );
         // A count wide enough to matter still wins over the floor.
         assert_eq!(
-            sizing_plan(Some(10), 2048).chunk_len(1000),
+            sizing_plan(Some(10), 2048).chunk_len(1000, u64::MAX),
             DISK_POLL_CHUNK_MIN
         );
     }
@@ -1127,19 +2166,43 @@ mod tests {
         let plan = |bytes_per_message| sizing_plan(bytes_per_message, 0);
 
         // Nothing committed yet, so nothing bridges a count to bytes.
-        assert_eq!(plan(None).chunk_len(1000), DISK_POLL_CHUNK_MAX);
+        assert_eq!(plan(None).chunk_len(1000, u64::MAX), DISK_POLL_CHUNK_MAX);
         // A thousand small messages used to read a megabyte to return 150 KB.
         assert_eq!(
-            plan(Some(150)).chunk_len(1000),
+            plan(Some(150)).chunk_len(1000, u64::MAX),
             150 * 1000 + COMMAND_HEADER_SIZE as u64
         );
         // The floor keeps a poll for a few messages off a read per batch, the
         // ceiling is what every poll read before it was sized at all.
-        assert_eq!(plan(Some(150)).chunk_len(1), DISK_POLL_CHUNK_MIN);
-        assert_eq!(plan(Some(64 << 10)).chunk_len(1000), DISK_POLL_CHUNK_MAX);
+        assert_eq!(plan(Some(150)).chunk_len(1, u64::MAX), DISK_POLL_CHUNK_MIN);
+        assert_eq!(
+            plan(Some(64 << 10)).chunk_len(1000, u64::MAX),
+            DISK_POLL_CHUNK_MAX
+        );
         // Wide messages and a wide count must clamp, never wrap.
         assert_eq!(
-            plan(Some(u32::MAX)).chunk_len(u32::MAX),
+            plan(Some(u32::MAX)).chunk_len(u32::MAX, u64::MAX),
+            DISK_POLL_CHUNK_MAX
+        );
+    }
+
+    #[test]
+    fn a_reply_byte_limit_caps_the_first_read_but_not_the_run_in_front_of_it() {
+        const REPLY_BYTES: usize = 100 << 10;
+        let plan = sizing_plan(Some(1000), 0);
+        let mut walk = DiskWalk::starting_at(0, 0);
+        walk.max_selected_bytes = REPLY_BYTES;
+        // A thousand messages of a kilobyte do not fit the reply.
+        assert_eq!(plan.next_chunk_len(&walk, 1000), REPLY_BYTES as u64);
+        // The sparse index resolved an entry 500 messages before the target.
+        walk.skipped = 500;
+        assert_eq!(
+            plan.next_chunk_len(&walk, 1000),
+            REPLY_BYTES as u64 + 500 * 1000
+        );
+        // Without a mean size the run has no width, so the reply caps nothing.
+        assert_eq!(
+            sizing_plan(None, 0).next_chunk_len(&walk, 1000),
             DISK_POLL_CHUNK_MAX
         );
     }
@@ -1153,8 +2216,15 @@ mod tests {
             .unwrap();
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::NoFiles,
+            remote: None,
+            object_prefix: None,
+            index_fetches: IndexFetchFence::detached(),
+            next_remote: None,
+            cut: false,
+            deadline: None,
             bytes_per_message: None,
             widest_batch_bytes: 0,
+            read_settings: ReadPolicy::default(),
             segments: Vec::new(),
             start_position: 0,
             start_index_offset: None,
@@ -1194,7 +2264,7 @@ mod tests {
         let mut walk = DiskWalk::starting_at(0, 0);
         assert!(matches!(
             plan.walk_segment(
-                &file,
+                &SegmentBytes::File(file.clone()),
                 MessageLookup::Offset {
                     offset: 0,
                     count: BATCH_COUNT,
@@ -1242,7 +2312,7 @@ mod tests {
                 walk.position = 0;
                 assert!(matches!(
                     plan.walk_segment(
-                        &file,
+                        &SegmentBytes::File(file.clone()),
                         MessageLookup::Offset {
                             offset: 0,
                             count: 2,
@@ -1266,17 +2336,24 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "poll-diagnostics")]
     fn disk_batch(payload_length: u32, offset: u64) -> Vec<u8> {
-        let mut messages = IggyMessages::with_capacity(1);
-        messages.push(IggyMessage {
-            header: IggyMessageHeader {
-                payload_length,
-                ..Default::default()
-            },
-            payload: Bytes::from(vec![1; usize::try_from(payload_length).unwrap()]),
-            user_headers: None,
-        });
+        disk_batch_of(1, payload_length, offset)
+    }
+
+    /// One stored batch of `count` messages of `payload_length` bytes, the
+    /// first at `offset`.
+    fn disk_batch_of(count: usize, payload_length: u32, offset: u64) -> Vec<u8> {
+        let mut messages = IggyMessages::with_capacity(count);
+        for _ in 0..count {
+            messages.push(IggyMessage {
+                header: IggyMessageHeader {
+                    payload_length,
+                    ..Default::default()
+                },
+                payload: Bytes::from(vec![1; usize::try_from(payload_length).unwrap()]),
+                user_headers: None,
+            });
+        }
         let mut batch =
             SendMessagesOwned::from_messages(IggyNamespace::new(1, 1, 0), &messages).unwrap();
         batch.header.base_offset = offset;
@@ -1314,11 +2391,19 @@ mod tests {
             persisted: u64::MAX,
             read_state: Rc::clone(&handle),
             sealed: true,
+            source: SegmentSource::Local,
         };
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(dir.display().to_string()),
+            remote: None,
+            object_prefix: None,
+            index_fetches: IndexFetchFence::detached(),
+            next_remote: None,
+            cut: false,
+            deadline: None,
             bytes_per_message: None,
             widest_batch_bytes: 0,
+            read_settings: ReadPolicy::default(),
             segments: Vec::new(),
             start_position: 0,
             start_index_offset: None,
@@ -1330,11 +2415,11 @@ mod tests {
         // First poll pays the on-file lookup and memoizes entry 2's interval
         // [20, 30): offset 25 resolves to entry 2 (offset 20 -> position 200).
         let first = plan
-            .resolve_sealed_start(&segment, offset_query(25), &partition_dir)
+            .resolve_sealed_start(&segment, offset_query(25), &partition_dir, usize::MAX)
             .await;
         // The entry offset rides along so the caller can size its first read
         // to cover the run between that entry and the requested offset.
-        assert_eq!(first, Some((200, 20)));
+        assert_eq!(first, Ok(Some(IggyIndex::new(20, 3, 200))));
         let cursor = handle.offset_cursor.get().expect("cursor memoized");
         assert_eq!(
             (cursor.offset, cursor.valid_until, cursor.position),
@@ -1345,16 +2430,16 @@ mod tests {
         // (proof the cursor answered with zero index-file reads)...
         std::fs::remove_dir_all(&dir).expect("remove dir");
         let in_interval = plan
-            .resolve_sealed_start(&segment, offset_query(29), &partition_dir)
+            .resolve_sealed_start(&segment, offset_query(29), &partition_dir, usize::MAX)
             .await;
-        assert_eq!(in_interval, Some((200, 20)));
+        assert_eq!(in_interval, Ok(Some(IggyIndex::new(20, 3, 200))));
 
         // ...while an offset past the interval misses the cursor, reaches for
         // the (now gone) file, and falls back to the byte-0 scan.
         let past_interval = plan
-            .resolve_sealed_start(&segment, offset_query(30), &partition_dir)
+            .resolve_sealed_start(&segment, offset_query(30), &partition_dir, usize::MAX)
             .await;
-        assert_eq!(past_interval, None);
+        assert_eq!(past_interval, Ok(None));
     }
 
     // Resident execution passes already selected bytes through unchanged.
@@ -1379,6 +2464,8 @@ mod tests {
             context: PollContext {
                 owner: None,
                 _group_poll: None,
+                peer_first_segment: None,
+                peer_segments: None,
                 history: snapshot_history,
                 consumer: PollingConsumer::Consumer(consumer_id, partition_id),
                 auto_commit: true,
@@ -1386,6 +2473,7 @@ mod tests {
             tier: PollTier::Resident {
                 fragments: placeholder_fragments(),
                 last_matching_offset: Some(last_selected_offset),
+                message_count: 1,
             },
         };
         assert!(!resident_plan.needs_off_pump_io());
@@ -1408,6 +2496,8 @@ mod tests {
             context: PollContext {
                 owner: None,
                 _group_poll: None,
+                peer_first_segment: None,
+                peer_segments: None,
                 history: PollHistoryId::default(),
                 consumer: PollingConsumer::Consumer(consumer_id, partition_id),
                 auto_commit: true,
@@ -1420,5 +2510,489 @@ mod tests {
         let read_result = empty_plan.execute_resident();
         assert!(read_result.fragments.is_empty());
         assert_eq!(read_result.last_matching_offset, None);
+    }
+    #[compio::test]
+    async fn deferred_disk_result_enforces_byte_limits_and_reports_faults_at_their_offset() {
+        for corrupt_tail in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut bytes = disk_batch(10, 0);
+            let first_batch_bytes = bytes.len();
+            let mut tail = disk_batch(10, 9);
+            if corrupt_tail {
+                *tail.last_mut().unwrap() ^= 1;
+            }
+            bytes.extend(tail);
+            std::fs::write(directory.path().join("00000000000000000000.log"), &bytes).unwrap();
+            let plan = |offset, count| PollPlan {
+                context: PollContext {
+                    history: PollHistoryId::default(),
+                    consumer: PollingConsumer::Consumer(0, 0),
+                    auto_commit: true,
+                    owner: None,
+                    _group_poll: None,
+                    peer_first_segment: None,
+                    peer_segments: None,
+                },
+                commit_offset: 9,
+                tier: PollTier::Disk {
+                    query: MessageLookup::Offset {
+                        offset,
+                        count,
+                        ceiling: 9,
+                    },
+                    resident_tail: ResidentTailSnapshot {
+                        entries: Vec::new(),
+                        oldest_resident: None,
+                    },
+                    disk: DiskReadPlan {
+                        partition_dir: PartitionDirResolution::Resolved(
+                            directory.path().display().to_string(),
+                        ),
+                        remote: None,
+                        object_prefix: None,
+                        index_fetches: IndexFetchFence::detached(),
+                        next_remote: None,
+                        cut: false,
+                        deadline: None,
+                        bytes_per_message: None,
+                        widest_batch_bytes: 0,
+                        read_settings: ReadPolicy::default(),
+                        segments: vec![DiskSegment {
+                            start_offset: 0,
+                            persisted: bytes.len() as u64,
+                            read_state: Rc::default(),
+                            sealed: false,
+                            source: SegmentSource::Local,
+                        }],
+                        start_position: 0,
+                        start_index_offset: None,
+                        namespace_raw: 0,
+                        validate_checksum: true,
+                    },
+                },
+            };
+            let result = plan(0, 2).execute_with_limit(1 << 20, usize::MAX).await;
+            if corrupt_tail {
+                // The valid prefix is served, and the poll that starts at the
+                // corrupt batch reports it, so the error names its offset.
+                assert_eq!(result.message_count(), 1);
+                assert!(result.truncated());
+                let result = result.checked().expect("a prefix before a fault is served");
+                assert_eq!(result.last_matching_offset, Some(0));
+                assert!(matches!(
+                    plan(9, 1)
+                        .execute_with_limit(1 << 20, usize::MAX)
+                        .await
+                        .checked(),
+                    Err(IggyError::CannotReadMessage)
+                ));
+                std::fs::remove_file(directory.path().join("00000000000000000000.log")).unwrap();
+                assert!(
+                    matches!(
+                        plan(0, 2)
+                            .execute_with_limit(1 << 20, usize::MAX)
+                            .await
+                            .checked(),
+                        Err(IggyError::TransientNotAccepted)
+                    ),
+                    "a segment that cannot be opened now is retried, not reported"
+                );
+            } else {
+                assert_eq!(
+                    result.message_count(),
+                    2,
+                    "sparse offsets count as two messages"
+                );
+                assert!(!result.truncated());
+                let (result, limited) = result
+                    .checked()
+                    .unwrap()
+                    .limit_bytes(
+                        POLL_RESPONSE_HEADER_SIZE + first_batch_bytes,
+                        usize::MAX,
+                        || false,
+                    )
+                    .unwrap();
+                assert!(limited);
+                assert_eq!(result.message_count(), 1);
+                assert_eq!(result.last_matching_offset, Some(0));
+                assert_eq!(result.commit_offset, 9);
+            }
+        }
+    }
+
+    #[compio::test]
+    async fn deferred_disk_budget_admits_the_batch_that_holds_the_first_match() {
+        // The batch is wider than the chunk and the whole budget. Refusing it
+        // failed the same offset on every retry, so the consumer stalled.
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = disk_batch(2 << 20, 0);
+        let path = directory.path().join("batch.log");
+        std::fs::write(&path, &bytes).unwrap();
+        let file = compio::fs::File::open(path).await.unwrap();
+        let plan = sizing_plan(Some(1), 0);
+        let mut walk = DiskWalk::starting_at(0, 0);
+        walk.max_bytes = 1 << 20;
+        plan.walk_segment(
+            &SegmentBytes::File(file.clone()),
+            offset_query(0),
+            1,
+            bytes.len() as u64,
+            &mut walk,
+        )
+        .await;
+        assert_eq!(walk.matched, 1);
+        assert_eq!(walk.last_matching_offset, Some(0));
+        assert_eq!(
+            walk.fragments.iter().map(Fragment::len).sum::<usize>(),
+            bytes.len()
+        );
+    }
+
+    #[compio::test]
+    async fn a_byte_limited_disk_walk_serves_the_prefix_it_already_read() {
+        // The budget runs out before the data does. Before this was fixed the
+        // walk threw away every batch it had matched, so the consumer polled
+        // the same offset again and was refused again.
+        const BATCHES: u32 = 512;
+        let directory = tempfile::tempdir().unwrap();
+        let mut bytes = Vec::new();
+        for offset in 0..u64::from(BATCHES) {
+            bytes.extend(disk_batch(16 << 10, offset));
+        }
+        std::fs::write(directory.path().join("00000000000000000000.log"), &bytes).unwrap();
+        let plan = PollPlan {
+            context: PollContext {
+                history: PollHistoryId::default(),
+                consumer: PollingConsumer::Consumer(0, 0),
+                auto_commit: true,
+                owner: None,
+                _group_poll: None,
+                peer_first_segment: None,
+                peer_segments: None,
+            },
+            commit_offset: u64::from(BATCHES) - 1,
+            tier: PollTier::Disk {
+                query: MessageLookup::Offset {
+                    offset: 0,
+                    count: BATCHES,
+                    ceiling: u64::from(BATCHES) - 1,
+                },
+                resident_tail: ResidentTailSnapshot {
+                    entries: Vec::new(),
+                    oldest_resident: None,
+                },
+                disk: DiskReadPlan {
+                    partition_dir: PartitionDirResolution::Resolved(
+                        directory.path().display().to_string(),
+                    ),
+                    remote: None,
+                    object_prefix: None,
+                    index_fetches: IndexFetchFence::detached(),
+                    next_remote: None,
+                    cut: false,
+                    deadline: None,
+                    bytes_per_message: None,
+                    widest_batch_bytes: 0,
+                    read_settings: ReadPolicy::default(),
+                    segments: vec![DiskSegment {
+                        start_offset: 0,
+                        persisted: bytes.len() as u64,
+                        read_state: Rc::default(),
+                        sealed: false,
+                        source: SegmentSource::Local,
+                    }],
+                    start_position: 0,
+                    start_index_offset: None,
+                    namespace_raw: 0,
+                    validate_checksum: true,
+                },
+            },
+        };
+        let result = plan.execute_with_limit(4608 << 10, usize::MAX).await;
+        let served = result.message_count();
+        assert!(
+            served > 0 && served < BATCHES,
+            "expected a partial prefix, got {served} of {BATCHES}"
+        );
+        assert_eq!(result.last_matching_offset, Some(u64::from(served) - 1));
+        assert!(result.truncated());
+        let result = result
+            .checked()
+            .expect("a byte-limited prefix is serveable");
+        assert_eq!(result.message_count(), served);
+    }
+
+    #[compio::test]
+    async fn a_disk_walk_with_budget_left_reads_on_in_smaller_chunks() {
+        // The walk stopped at the first chunk that did not fit whole, so a poll
+        // served about a quarter of what its budget holds and fell short of its
+        // count while more messages waited on disk.
+        const BATCHES: u32 = 512;
+        const WALK_BUDGET: usize = 4608 << 10;
+        let directory = tempfile::tempdir().unwrap();
+        let mut bytes = Vec::new();
+        for offset in 0..u64::from(BATCHES) {
+            bytes.extend(disk_batch(16 << 10, offset));
+        }
+        std::fs::write(directory.path().join("00000000000000000000.log"), &bytes).unwrap();
+
+        let result = deferred_disk_poll(directory.path(), bytes.len(), BATCHES)
+            .execute_with_limit(WALK_BUDGET, usize::MAX)
+            .await;
+
+        assert!(result.truncated());
+        assert!(
+            result.encoded_bytes() >= WALK_BUDGET * 3 / 4,
+            "served {} bytes of a {WALK_BUDGET} byte budget",
+            result.encoded_bytes()
+        );
+    }
+
+    #[compio::test]
+    async fn a_disk_walk_over_batches_wider_than_a_chunk_fills_its_count() {
+        // Batches of 100, 200 and 300 messages of 20 KB are two to six times
+        // the chunk ceiling, the shape a poll of 500 messages with a 16 MiB
+        // reply reads. The last batch matches in part and is read whole.
+        const COUNT: u32 = 500;
+        let directory = tempfile::tempdir().unwrap();
+        let mut bytes = Vec::new();
+        let mut offset = 0;
+        for batch in [100, 200, 300] {
+            bytes.extend(disk_batch_of(batch, 20_000, offset));
+            offset += batch as u64;
+        }
+        std::fs::write(directory.path().join("00000000000000000000.log"), &bytes).unwrap();
+        let max_bytes = 16 << 20;
+
+        let result = deferred_disk_poll(directory.path(), bytes.len(), COUNT)
+            .execute_with_limit(max_bytes - (2 << 20), max_bytes - POLL_RESPONSE_HEADER_SIZE)
+            .await;
+
+        assert_eq!(result.message_count(), COUNT);
+        assert!(!result.truncated());
+    }
+
+    #[compio::test]
+    async fn deferred_disk_read_reads_at_most_one_record_past_max_bytes() {
+        // The walk budget alone admitted a second chunk, so a read fetched
+        // nearly twice what its reply kept and the next poll read it again.
+        const BATCHES: u32 = 64;
+        let directory = tempfile::tempdir().unwrap();
+        let record = disk_batch(128 << 10, 0).len();
+        let mut bytes = Vec::with_capacity(record * BATCHES as usize);
+        for offset in 0..u64::from(BATCHES) {
+            bytes.extend(disk_batch(128 << 10, offset));
+        }
+        std::fs::write(directory.path().join("00000000000000000000.log"), &bytes).unwrap();
+        let max_selected_bytes = DEFAULT_MAX_BYTES - POLL_RESPONSE_HEADER_SIZE;
+        let result = deferred_disk_poll(directory.path(), bytes.len(), BATCHES)
+            .execute_with_limit(DEFAULT_WALK_BUDGET, max_selected_bytes)
+            .await;
+        assert!(result.truncated());
+        assert!(
+            result.encoded_bytes() <= max_selected_bytes + record,
+            "read {} bytes for a reply that keeps {max_selected_bytes}",
+            result.encoded_bytes()
+        );
+        let (reply, limited) = result
+            .limit_bytes(DEFAULT_MAX_BYTES, DEFAULT_MAX_READ_BYTES, || false)
+            .unwrap();
+        assert!(limited);
+        assert_eq!(reply.message_count() as usize, max_selected_bytes / record);
+    }
+
+    #[compio::test]
+    async fn deferred_disk_read_returns_a_record_above_max_bytes_alone() {
+        // The reply refuses such a record with `InvalidSizeBytes`, and the SDK
+        // then fetches it alone with no byte limit. Both reads must hold it
+        // whole, or its partition stalls.
+        const BATCHES: u32 = 16;
+        let directory = tempfile::tempdir().unwrap();
+        let mut bytes = disk_batch(2 << 20, 0);
+        let oversized = bytes.len();
+        for offset in 1..u64::from(BATCHES) {
+            bytes.extend(disk_batch(16 << 10, offset));
+        }
+        std::fs::write(directory.path().join("00000000000000000000.log"), &bytes).unwrap();
+
+        let result = deferred_disk_poll(directory.path(), bytes.len(), BATCHES)
+            .execute_with_limit(
+                DEFAULT_WALK_BUDGET,
+                DEFAULT_MAX_BYTES - POLL_RESPONSE_HEADER_SIZE,
+            )
+            .await;
+        assert_eq!(result.message_count(), 1);
+        assert_eq!(result.encoded_bytes(), oversized);
+        assert!(matches!(
+            result.limit_bytes(DEFAULT_MAX_BYTES, DEFAULT_MAX_READ_BYTES, || false),
+            Err(IggyError::InvalidSizeBytes)
+        ));
+
+        let (alone, _) = deferred_disk_poll(directory.path(), bytes.len(), 1)
+            .execute_with_limit(
+                DEFAULT_WALK_BUDGET,
+                DEFAULT_MAX_READ_BYTES - POLL_RESPONSE_HEADER_SIZE,
+            )
+            .await
+            .limit_bytes(u32::MAX as usize, DEFAULT_MAX_READ_BYTES, || false)
+            .unwrap();
+        assert_eq!(alone.message_count(), 1);
+        assert_eq!(alone.encoded_bytes(), oversized);
+    }
+
+    #[compio::test]
+    async fn given_an_oversized_first_record_when_allowed_should_return_it_alone_in_one_reply() {
+        // A record above `max_bytes` was refused, so every client needed a
+        // second read alone, and under `OnRead` a second read that commits.
+        let directory = tempfile::tempdir().unwrap();
+        let mut bytes = disk_batch(2 << 20, 0);
+        let oversized = bytes.len();
+        bytes.extend(disk_batch(16 << 10, 1));
+        std::fs::write(directory.path().join("00000000000000000000.log"), &bytes).unwrap();
+        let read = || {
+            deferred_disk_poll(directory.path(), bytes.len(), 2).execute_with_limit(
+                DEFAULT_WALK_BUDGET,
+                DEFAULT_MAX_BYTES - POLL_RESPONSE_HEADER_SIZE,
+            )
+        };
+
+        let (reply, limited) = read()
+            .await
+            .limit_bytes(DEFAULT_MAX_BYTES, DEFAULT_MAX_READ_BYTES, || true)
+            .unwrap();
+
+        assert_eq!(reply.message_count(), 1, "the oversized record comes alone");
+        assert_eq!(reply.encoded_bytes(), oversized);
+        assert!(limited);
+        let mut asked = false;
+        assert!(matches!(
+            read()
+                .await
+                .limit_bytes(DEFAULT_MAX_BYTES, DEFAULT_MAX_READ_BYTES, || {
+                    asked = true;
+                    false
+                }),
+            Err(IggyError::InvalidSizeBytes)
+        ));
+        assert!(
+            asked,
+            "the caller decides only when the first record does not fit"
+        );
+    }
+
+    /// The SDK's default `max_bytes`, the server's default read reservation,
+    /// and the third of it that the walk of a deferred disk read may hold.
+    const DEFAULT_MAX_BYTES: usize = 1 << 20;
+    const DEFAULT_MAX_READ_BYTES: usize = 16 << 20;
+    const DEFAULT_WALK_BUDGET: usize = DEFAULT_MAX_READ_BYTES / 3;
+
+    /// A poll from offset 0 over the one segment in `directory`, for a
+    /// partition without stats.
+    fn deferred_disk_poll(directory: &std::path::Path, persisted: usize, count: u32) -> PollPlan {
+        PollPlan {
+            context: PollContext {
+                history: PollHistoryId::default(),
+                consumer: PollingConsumer::Consumer(0, 0),
+                auto_commit: true,
+                owner: None,
+                _group_poll: None,
+                peer_first_segment: None,
+                peer_segments: None,
+            },
+            commit_offset: u64::MAX,
+            tier: PollTier::Disk {
+                query: MessageLookup::Offset {
+                    offset: 0,
+                    count,
+                    ceiling: u64::MAX,
+                },
+                resident_tail: ResidentTailSnapshot {
+                    entries: Vec::new(),
+                    oldest_resident: None,
+                },
+                disk: DiskReadPlan {
+                    partition_dir: PartitionDirResolution::Resolved(
+                        directory.display().to_string(),
+                    ),
+                    remote: None,
+                    object_prefix: None,
+                    index_fetches: IndexFetchFence::detached(),
+                    next_remote: None,
+                    cut: false,
+                    deadline: None,
+                    bytes_per_message: None,
+                    widest_batch_bytes: 0,
+                    read_settings: ReadPolicy::default(),
+                    segments: vec![DiskSegment {
+                        start_offset: 0,
+                        persisted: persisted as u64,
+                        read_state: Rc::default(),
+                        sealed: false,
+                        source: SegmentSource::Local,
+                    }],
+                    start_position: 0,
+                    start_index_offset: None,
+                    namespace_raw: 0,
+                    validate_checksum: true,
+                },
+            },
+        }
+    }
+
+    fn resident(fragments: PollFragments) -> PollReadResult {
+        PollPlan {
+            context: PollContext {
+                history: PollHistoryId::default(),
+                consumer: PollingConsumer::Consumer(0, 0),
+                auto_commit: true,
+                owner: None,
+                _group_poll: None,
+                peer_first_segment: None,
+                peer_segments: None,
+            },
+            commit_offset: 0,
+            tier: PollTier::Resident {
+                fragments,
+                last_matching_offset: None,
+                message_count: 0,
+            },
+        }
+        .execute_resident()
+    }
+
+    fn windows(source: &Frozen<4096>, count: usize) -> PollFragments {
+        (0..count)
+            .map(|window| Fragment::slice(source.clone(), window * 4096, window * 4096 + 512))
+            .collect()
+    }
+
+    #[test]
+    fn retained_bytes_counts_one_allocation_once_however_many_slices_borrow_it() {
+        let source: Frozen<4096> = Owned::copy_from_slice(&vec![7; 1 << 20]).into();
+        let one = resident(windows(&source, 1)).retained_bytes();
+        let four = resident(windows(&source, 4)).retained_bytes();
+        assert_eq!(one, four);
+        assert!(four < 2 * source.allocation_bytes());
+    }
+
+    #[test]
+    fn compacting_releases_the_borrowed_allocation_and_preserves_the_selection() {
+        let source: Frozen<4096> = Owned::copy_from_slice(&vec![7; 1 << 20]).into();
+        let borrowed = resident(windows(&source, 4));
+        let selection: Vec<Vec<u8>> = borrowed
+            .fragments
+            .iter()
+            .map(|fragment| fragment.as_slice().to_vec())
+            .collect();
+        let charge = borrowed.retained_bytes();
+        let compacted = borrowed.compacted();
+        assert!(compacted.retained_bytes() < charge);
+        let kept: Vec<Vec<u8>> = compacted
+            .fragments
+            .iter()
+            .map(|fragment| fragment.as_slice().to_vec())
+            .collect();
+        assert_eq!(kept, selection);
     }
 }

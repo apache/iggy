@@ -102,7 +102,7 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 - Additional features such as **server side message deduplication**
 - **Multi-tenant** support via abstraction of **streams** which group **topics**
 - **TLS** support for all transport protocols (TCP, WebSocket, QUIC, HTTPS)
-- **[Connectors](https://github.com/apache/iggy/tree/master/core/connectors)** - sinks, sources and data transformations based on the **custom Rust plugins**
+- **[Connectors](https://github.com/apache/iggy-connectors)** - sinks, sources and data transformations based on the **custom Rust plugins**
 - **[Model Context Protocol](https://github.com/apache/iggy/tree/master/core/ai/mcp)** - provide context to LLM with **MCP server**
 - Optional server-side as well as client-side **data encryption** using AES-256-GCM, server-side with a separate key per stream
 - Optional metadata support in the form of **message headers**
@@ -146,7 +146,7 @@ The server, SDKs and CLI are versioned independently. For example, server 0.9.0 
 
 We also publish edge releases (versions with an `-edge.N` suffix, and `apache/iggy:edge`) for the SDKs and the Docker images. They track the latest changes, but are not guaranteed to be stable and are not recommended for production use.
 
-This checkout moves the binary protocol to 0.12.0 and the metadata snapshot format to 14. Both are breaking: older clients and servers do not interoperate with it, and data directories written by older releases are refused. See [Upgrade recovery](core/server/README.md#upgrade-recovery).
+This checkout uses client protocol 0.12.3, replica wire revision 6 and metadata snapshot format 21. Upgrade all replicas together. Moving from replica wire revision 4 or 5 alone preserves existing data directories. Upgrades from an incompatible storage format require fresh storage. When upgrading across the credential change introduced in revision 4, sign in again over HTTP. The server refuses access tokens issued before that change. See [Upgrade recovery](core/server/README.md#upgrade-recovery).
 
 ---
 
@@ -159,7 +159,7 @@ This checkout moves the binary protocol to 0.12.0 and the metadata snapshot form
 - [Node.js (TypeScript)](https://www.npmjs.com/package/apache-iggy)
 - [Go](https://pkg.go.dev/github.com/apache/iggy/foreign/go)
 
-[C++](https://github.com/apache/iggy/tree/master/foreign/cpp) and [PHP](https://github.com/apache/iggy/tree/master/foreign/php) are work in progress.
+[C++](https://github.com/apache/iggy/tree/master/foreign/cpp), [PHP](https://github.com/apache/iggy/tree/master/foreign/php), and [Swift](https://github.com/apache/iggy/tree/master/foreign/swift) are work in progress.
 
 ---
 
@@ -181,41 +181,9 @@ There's a dedicated Web UI for the server, which allows managing the streams, to
 
 ## Connectors
 
-The highly performant and modular **[runtime](https://github.com/apache/iggy/tree/master/core/connectors)** for statically typed, yet dynamically loaded connectors. Ingest the data from the external sources and push it further to the Iggy streams, or fetch the data from the Iggy streams and push it further to the external sources. **Create your own Rust plugins** by simply implementing either the `Source` or `Sink` trait and **build custom pipelines for the data processing**.
+Connectors move data between Iggy streams and external systems. A source reads data from an external system and produces messages to an Iggy stream. A sink consumes messages from an Iggy stream and writes them to an external system. Each connector is a Rust plugin, and the connectors runtime loads the plugins and runs them.
 
-```toml
-## Configure a sink or source connector, depending on your needs in its own config file.
-type = "sink"
-key = "quickwit"
-enabled = true
-version = 0
-name = "Quickwit sink"
-path = "target/release/libiggy_connector_quickwit_sink"
-plugin_config_format = "yaml"
-
-[[streams]]
-stream = "qw"
-topics = ["records"]
-schema = "json"
-batch_length = 1000
-poll_interval = "5ms"
-consumer_group = "qw_sink_connector"
-
-[transforms.add_fields]
-enabled = true
-
-[[transforms.add_fields.fields]]
-key = "service_name"
-value.static = "qw_connector"
-
-[[transforms.add_fields.fields]]
-key = "timestamp"
-value.computed = "timestamp_millis"
-
-[transforms.delete_fields]
-enabled = true
-fields = ["email", "created_at"]
-```
+The runtime, the plugin SDK and all sinks and sources live in [apache/iggy-connectors](https://github.com/apache/iggy-connectors). Open connector issues and pull requests there.
 
 ---
 
@@ -290,11 +258,17 @@ What each policy survives in a cluster of `n` replicas. A partition gets the `pe
 
 - `persisted` keeps every acknowledged write through any pattern of crashes and restarts. It is needed to survive `q` or more replicas crashing at once, power loss of the whole cluster, or any crash in a one-replica cluster.
 - `replicated` keeps every acknowledged write as long as fewer than `q` replicas lose unflushed writes at the same time, where `q`, the replicas that acknowledge each write, is half the replicas rounded up but at most 3 (2 in a two-replica cluster). A replica that returns with that partition awaiting a state transfer counts as one of them: its log is not used, even if its WAL still holds ops.
-- Graceful restarts flush the WAL first and lose nothing, one at a time or all together. A crash (SIGKILL, OOM kill) loses the WAL writes not yet handed to the OS, and power loss also loses what the OS had not written to disk. Under `replicated`, `q` or more such crashes at once can lose the most recently acknowledged writes.
+  If the cluster has two replicas and that WAL proves a committed write, the replica refuses a state transfer from a primary that holds nothing. The partition then stays unavailable.
+- Graceful restarts flush the WAL first and lose nothing, one at a time or all together. A `replicated` partition publishes its WAL frontier at a checkpoint, a durable operation or a graceful shutdown. After a crash (SIGKILL, OOM kill) or power loss, a replica recovers the partition up to that frontier, and past it the writes that the OS still holds complete.
+  A process crash loses the writes that the server had not yet handed to the OS. A power loss or an OS crash also loses the ones that the OS had not yet written to the disk. Under `replicated`, `q` or more such crashes at once can lose the most recently acknowledged writes. In a one-replica cluster, any crash can.
+  After such a crash, a stored consumer offset can point past the log that a replica recovered. That replica lowers the offset to the last offset at its WAL checkpoint, or removes it if that checkpoint holds no message. The consumer can then receive again at most the messages since that checkpoint. After a removal, the consumer starts from its default position. A one-replica partition keeps the offset: it assigns new offsets only above those it assigned before the crash.
+  With more replicas, new messages take the offsets of the lost writes. A reader that stayed connected keeps its position in memory, and the offset of an external group is never lowered, so either can skip those new messages.
 - A restarted `replicated` replica accepts no writes and acknowledges no prepares until it joins a settled view: one a running primary sends it, or one that an election starts. Until then writes and polls sent to it, binary or HTTP, fail with `TransientNotAccepted` (HTTP 503), which clients retry.
   When no primary answers, the restarted replicas hold an election and mark their logs as possibly incomplete. A new view starts only from `n - q + 1` replicas whose logs are not marked (2 in a two-replica cluster, a majority up to six replicas), or once every replica has reported, and the partition stays unavailable until then.
   After a full-cluster restart that means every replica must be back. A replica whose partition awaits a state transfer still reports without a log while it is recovering; once it has joined a view it stays out of later elections until its transfer completes. A replica that never returns halts the partition indefinitely (no operator override yet).
-  Mixed versions can drop acknowledged writes, see [Upgrading](core/server/README.md#upgrading).
+  A view that starts only because every replica reported leaves out the first write that no replica can still serve, and every write after it. It does not start while a replica reports that write as committed or cannot tell whether it holds it. The partition then stays unavailable even with every replica back. With `n - q + 1` or more unmarked logs nothing is left out: a write that no replica can serve or prove uncommitted keeps the partition unavailable.
+  A replica reports commits only up to the last write it holds. A replica that learned of a commit before the write reached it therefore does not stop such a view, and the view leaves that write out.
+  Running two releases together when neither lists the other as compatible can drop acknowledged writes. See [Upgrading](core/server/README.md#upgrading).
 - When a replica adopts a view whose headers contradict partition history it already applied, it sets that partition's local files aside in `.fenced.N` and fetches it again from a peer instead of stopping the node. A contradiction outside the headers the view carries, and a WAL append whose parent check fails, still stop the node.
 
 The data directory is configured with `path` or `IGGY_PATH`. The layout beneath it is `streams/<stream>/topics/<topic>/partitions/<partition>`, with fixed directory names.
@@ -472,20 +446,24 @@ producer.init().await?;
 let messages = vec![IggyMessage::from_str("Hello Apache Iggy")?];
 producer.send(messages).await?;
 
-// Create a consumer for the given stream and one of its topics
+// Create a consumer group member for the given stream and one of its topics.
+// It stores the last processed message every second and after each batch.
 let mut consumer = client
     .consumer_group("my_app", "dev01", "events")?
-    .auto_commit(AutoCommit::IntervalOrWhen(
-        NonZeroIggyDuration::from_str("1s")?,
-        AutoCommitWhen::ConsumingAllMessages,
-    ))
     .create_consumer_group_if_not_exists()
-    .auto_join_consumer_group()
     .polling_strategy(PollingStrategy::next())
-    .poll_interval(IggyDuration::from_str("1ms")?)
-    .batch_length(1000)
+    .poll_options(PollOptions {
+        count: 1000,
+        commit: CommitPolicy::Auto(AutoCommit {
+            interval: Some(NonZeroIggyDuration::from_str("1s")?),
+            every: Some(CommitEvery::Batch),
+            after: CommitAfter::Processing,
+        }),
+        ..PollOptions::wait(IggyDuration::from_str("1s")?)
+    })
     .build();
 
+// Joins the group and starts reading
 consumer.init().await?;
 
 // Start consuming the messages
@@ -493,6 +471,8 @@ while let Some(message) = consumer.next().await {
     // Handle the message
 }
 ```
+
+For batches of many partitions, use `PartitionReader` from `client.reader(...)`. The [Rust SDK README](core/sdk/README.md#reading-messages) describes the three ways to read, the commit options and what to do after a lost reply.
 
 ---
 

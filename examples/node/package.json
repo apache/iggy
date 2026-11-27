@@ -39,11 +39,11 @@
   },
   "devDependencies": {
     "@types/debug": "^4.1.12",
-    "@types/node": "^22.9.3",
-    "eslint": "^10.12.0",
+    "@types/node": "^26.6.6",
+    "eslint": "^10.14.0",
     "jiti": "^2.7.0",
     "tsx": "^4.23.15",
-    "typescript-eslint": "^8.47.0"
+    "typescript-eslint": "^8.72.2"
   },
   "overrides": {
     "flatted": "^3.4.2"

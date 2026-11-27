@@ -188,11 +188,13 @@ async fn given_empty_partition_and_registration_churn_when_cluster_restarts_shou
             .poll_messages(
                 &stream,
                 &topic,
-                Some(0),
+                0,
                 &Consumer::default(),
                 &PollingStrategy::offset(0),
-                10,
-                false,
+                PollOptions {
+                    count: 10,
+                    ..PollOptions::default()
+                },
             )
             .await
             .unwrap();
@@ -1110,30 +1112,42 @@ async fn poll_all(client: &IggyClient) -> u32 {
     poll_up_to(client, 100).await
 }
 
+/// Counts the messages from offset 0, up to `max`. One reply holds at most
+/// `max_bytes`, so the count reads on until an empty batch.
 async fn poll_up_to(client: &IggyClient, max: u32) -> u32 {
     let stream_id = Identifier::named(STREAM_NAME).expect("stream identifier");
     let topic_id = Identifier::named(TOPIC_NAME).expect("topic identifier");
+    let consumer = Consumer::new(Identifier::numeric(1).expect("consumer identifier"));
     let deadline = Instant::now() + COMMIT_BUDGET;
-    loop {
+    let mut strategy = PollingStrategy::offset(0);
+    let mut total = 0;
+    while total < max {
         match client
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                Some(PARTITION_ID),
-                &Consumer::new(Identifier::numeric(1).expect("consumer identifier")),
-                &PollingStrategy::offset(0),
-                max,
-                false,
+                PARTITION_ID,
+                &consumer,
+                &strategy,
+                PollOptions {
+                    count: max - total,
+                    ..PollOptions::default()
+                },
             )
             .await
         {
-            Ok(polled) => return polled.messages.len() as u32,
+            Ok(polled) if polled.messages.is_empty() => break,
+            Ok(polled) => {
+                total += polled.messages.len() as u32;
+                strategy = polled.continuation();
+            }
             Err(IggyError::TransientNotAccepted) if Instant::now() < deadline => {
                 sleep(RETRY_PAUSE).await;
             }
             Err(error) => panic!("poll messages after recovery: {error:?}"),
         }
     }
+    total
 }
 
 /// Full `SendMessages` body: metadata prefix, batch header, one message.

@@ -18,7 +18,7 @@
 //! On-disk format backwards compatibility.
 //!
 //! A server built from the master tip the change merges onto (the BASELINE)
-//! writes a rich data directory. The same directory is then restarted under
+//! writes a rich data directory. The same directory is then booted under
 //! the build under test, and everything must read back unchanged:
 //!
 //! - A checkpointed metadata snapshot holding topics with every option key,
@@ -32,16 +32,24 @@
 //!   inside every batch, and a partial segment deletion.
 //! - Individual and group consumer offsets.
 //!
-//! The swap works because `ServerHandle::start` re-reads
-//! `config.executable_path` on every call while the data directory, the
-//! ports and the harness paths all survive a `stop`.
+//! # Two halves, two source trees
+//!
+//! The seed half runs from the baseline's own source, so it talks to the
+//! baseline through the baseline's SDK and a client protocol change in the
+//! build under test cannot fail it. It copies the data directory to
+//! `COMPAT_BASELINE_DATA` and writes everything it read from the baseline
+//! into a JSON record beside it. The verify half runs from the build under
+//! test, boots on a copy of that directory and compares against the record.
+//! The harness owns the server's data path, so the directory travels by copy
+//! in both directions.
 //!
 //! # Why every assertion here is about DATA
 //!
 //! Three failure modes reach exit code 0 with a server that boots and serves:
 //!
-//! - A partition whose durable state cannot be read is TOMBSTONED and boot
-//!   continues. Only the log says so.
+//! - A partition whose durable state cannot be read is REFUSED and boot
+//!   continues. Only the log says so, in a line that starts with
+//!   [`PARTITION_REFUSED_MARKER`].
 //! - A topic loses a single storage option, per key, with no log line at
 //!   all: `TopicCreateOptions::parse_committed` deliberately discards
 //!   per-entry parse errors so one unreadable key cannot drop the rest.
@@ -49,7 +57,7 @@
 //!   happens to poll still read back fine, because segment batch headers
 //!   carry no magic and no version.
 //!
-//! So the test asserts the tombstone marker is absent, re-reads every seeded
+//! So the test asserts that marker is absent, re-reads every seeded
 //! option value AND its provenance flag, compares every stored message field
 //! against a read taken from the baseline, and byte-compares the segment
 //! files across the swap. It stops producing MID-segment on purpose: boot
@@ -60,9 +68,9 @@
 //!
 //! The baseline uses its extracted config and a test-only launcher that maps
 //! current harness environment names to the baseline's system-prefixed names.
-//! On replacement, the fixture copies supported values into the current schema
-//! and switches IGGY_CONFIG_PATH before restarting. Removed settings stay out
-//! of the replacement config. This isolates storage compatibility from the
+//! The verify half copies supported values into the current schema and points
+//! IGGY_CONFIG_PATH at the result. Removed settings stay out of the
+//! replacement config. This isolates storage compatibility from the
 //! deliberately breaking public configuration rename.
 //!
 //! Topic creation likewise uses the baseline options block. The new durability
@@ -71,10 +79,14 @@
 //! their independent replicated defaults. Production SDKs gain no fallback.
 //!
 //! `IGGY_TEST_VERBOSE` makes the harness inherit the server's stdout instead
-//! of capturing it, which would make the tombstone check vacuous. The
+//! of capturing it, which would make the marker check vacuous. The
 //! graceful-shutdown assertion below is taken on the same log and fails
 //! loudly in that case rather than passing on an empty file.
 
+use crate::server::tiered_storage_fs::{
+    STREAM as TIERED_STREAM, TOPIC as TIERED_TOPIC, create_tiered_topic, fs_store_envs,
+    send_every_message, wait_for_eviction,
+};
 use bytes::Bytes;
 use iggy::prelude::*;
 use iggy_binary_protocol::codec::WireEncode;
@@ -88,11 +100,14 @@ use integration::harness::{
     TestHarness, TestServerConfig, USER_PASSWORD, disk, resolve_config_paths,
     wait_for_consumer_group_assignment,
 };
+use serde::{Deserialize, Serialize};
 use serial_test::parallel;
+use server_common::diagnostics::PARTITION_REFUSED_MARKER;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -109,21 +124,42 @@ const BASELINE_SERVER_ENV: &str = "COMPAT_BASELINE_SERVER";
 /// Same naming rule as [`BASELINE_SERVER_ENV`].
 const BASELINE_CONFIG_ENV: &str = "COMPAT_BASELINE_CONFIG";
 
+/// Absolute path of the data directory the seed half writes and the verify
+/// half boots from. The seed's record sits beside it, see [`record_path`].
+/// Same naming rule as [`BASELINE_SERVER_ENV`].
+const BASELINE_DATA_ENV: &str = "COMPAT_BASELINE_DATA";
+
 /// Selects the server's config file, ahead of the relative default path the
 /// module documentation warns about.
 const CONFIG_PATH_ENV: &str = "IGGY_CONFIG_PATH";
 
+/// The file under the data directory that names the storage format of the
+/// build that created it.
+const STORAGE_FORMAT_FILE: &str = "storage-format";
+
+/// What every build since the storage format gate says when it refuses a data
+/// directory.
+const UNSUPPORTED_STORAGE: &str = "startup refused without modifying data";
+
+/// How long the baseline may take to refuse a data directory. It refuses
+/// before it binds a port or opens a partition.
+const REFUSAL_DEADLINE: Duration = Duration::from_secs(60);
+
+const JOURNAL_SLOTS_KEY: &str = "metadata.journal_slots";
+
 /// `metadata.journal_slots` floor for `prepare_queue_depth = 32`
-/// (`4 * max(64, 32)`). With the 64-op checkpoint margin a checkpoint fires
-/// once the journal holds 192 committed ops.
+/// (`4 * max(64, 32)`). A checkpoint starts once half of it, 128 ops,
+/// committed past the last one.
 const JOURNAL_SLOTS: &str = "256";
 
-/// Committed metadata ops between forced checkpoints at [`JOURNAL_SLOTS`].
-const CHECKPOINT_EVERY: u32 = 192;
+/// Committed metadata ops between checkpoints at [`JOURNAL_SLOTS`].
+const CHECKPOINT_EVERY: u32 = 128;
 
 /// Stream creates that drive the metadata plane past its first checkpoint.
-/// Everything seeded before them lands in the snapshot.
-const SEED_STREAMS: u32 = 250;
+/// Everything seeded before them lands in the snapshot. The seed and the WAL
+/// tail end far from the second checkpoint, so no tail record lands in a
+/// snapshot.
+const SEED_STREAMS: u32 = 180;
 
 /// Stream creates issued after the checkpoint, so recovery must fold a
 /// snapshot AND replay a WAL suffix on top of it.
@@ -221,42 +257,15 @@ const READBACK_COUNT: u32 = 16;
 
 /// Bound on every [`wait_until`] probe loop and on the group assignment wait.
 ///
-/// Kept small because the whole test has to finish inside nextest's 300s hard
+/// Kept small because the seed half has to finish inside nextest's 300s hard
 /// kill (`slow-timeout` x `terminate-after` in `.config/nextest.toml`, and the
-/// driving script deliberately runs without `--profile ci`). Two boots at 60s
-/// plus two stops at 5s plus six of these waits is 190s. A SIGKILL past
+/// driving script deliberately runs without `--profile ci`). One boot at 60s
+/// plus one stop at 5s plus six of these waits is 125s. A SIGKILL past
 /// that budget would take the named `wait_until` message with it, losing the
 /// diagnostic in exactly the run that needed it. At a 200ms
 /// [`POLL_INTERVAL`] this is still ~50 probes per wait.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
-
-/// Substring shared by all three tombstone log lines in
-/// `core/server/src/bootstrap.rs`. Matching the full sentence of any one of
-/// them would miss the others, and a segment layout change lands on the
-/// first arm, not the consensus-state one.
-///
-/// Being shorter than a whole word is what makes it match every arm, and also
-/// what makes it collide with [`TOMBSTONE_FIELD`]. Strip that before matching
-/// rather than lengthening this.
-const TOMBSTONE_MARKER: &str = "tombston";
-
-/// The one tracing FIELD in the server named for the tombstone state
-/// (`partition_reconciler.rs`, the parked-frame discard). Fields render as
-/// `key=value`, so a shard that is merely not the namespace's owner logs
-/// `tombstoned=false`, which contains [`TOMBSTONE_MARKER`] on a HEALTHY run.
-///
-/// Removed from the log before the absence check. Only this exact field form
-/// goes: every real arm reads `tombstoning it`, `tombstoned rather than` or
-/// `tombstoning the`, and none of them emits a `tombstoned` field, so their
-/// detection is untouched.
-///
-/// The collision is dormant at the default `info` level, but the line is
-/// `debug!`, and two independent variables reach the child: the harness
-/// forwards every `IGGY_*` name, and `RUST_LOG` is inherited by any process
-/// and OUTRANKS the configured level. Filtering the text keeps the check
-/// working under both instead of refusing to run.
-const TOMBSTONE_FIELD: &str = "tombstoned=";
 
 /// Logged by `iggy-server`'s `main` once shutdown ran to completion. A stop
 /// that escalated to `SIGKILL` leaves crash-recovery state behind, which
@@ -264,37 +273,93 @@ const TOMBSTONE_FIELD: &str = "tombstoned=";
 /// same time.
 const GRACEFUL_SHUTDOWN_MARKER: &str = "server shutdown complete";
 
+/// Everything the seed half read from the baseline that the verify half
+/// compares against. Names, topic options and message generators are not
+/// here: both halves share them through this file.
+#[derive(Serialize, Deserialize)]
+struct BaselineRecord {
+    data_stream_id: u32,
+    data_topic_id: u32,
+    compression_stream_id: u32,
+    streams: BTreeMap<u32, String>,
+    retained_segments: Vec<String>,
+    /// Blake3 of every comparable file, so the verify half can tell that its
+    /// directory is the one this record describes.
+    segment_digests: BTreeMap<String, String>,
+    first_retained_offset: u64,
+    retained_window: Vec<RecordedMessage>,
+    last_message: Vec<RecordedMessage>,
+    user_permissions: Permissions,
+    wal_tail_user_permissions: Permissions,
+    token: SeededToken,
+    wal_tail_token: SeededToken,
+}
+
+/// A polled message with its stored bytes kept exact. `IggyMessage`'s own
+/// serde form rebuilds user headers from a decoded map.
+#[derive(Serialize, Deserialize)]
+struct RecordedMessage {
+    header: IggyMessageHeader,
+    payload: String,
+    user_headers: Option<String>,
+}
+
+impl From<IggyMessage> for RecordedMessage {
+    fn from(message: IggyMessage) -> Self {
+        Self {
+            header: message.header,
+            payload: hex::encode(message.payload),
+            user_headers: message.user_headers.map(hex::encode),
+        }
+    }
+}
+
+impl TryFrom<RecordedMessage> for IggyMessage {
+    type Error = hex::FromHexError;
+
+    fn try_from(recorded: RecordedMessage) -> Result<Self, Self::Error> {
+        Ok(Self {
+            header: recorded.header,
+            payload: Bytes::from(hex::decode(recorded.payload)?),
+            user_headers: recorded
+                .user_headers
+                .map(hex::decode)
+                .transpose()?
+                .map(Bytes::from),
+        })
+    }
+}
+
+/// A personal access token as the baseline handed it out: the raw token a
+/// later login presents, and the stored expiry a listing must reproduce.
+#[derive(Serialize, Deserialize)]
+struct SeededToken {
+    raw: String,
+    expiry_at: IggyTimestamp,
+}
+
 #[tokio::test]
 #[parallel]
-#[ignore = "needs a baseline iggy-server built from master; run via scripts/ci/storage-compat.sh"]
-async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
+#[ignore = "needs a baseline iggy-server built from master, run via scripts/ci/storage-compat.sh"]
+async fn given_baseline_server_when_seeding_data_directory_should_record_what_it_serves() {
     let baseline = baseline_server_binary();
     let baseline_config = baseline_server_config();
+    let seed_directory = baseline_data_directory();
+    assert!(
+        !seed_directory.exists(),
+        "{BASELINE_DATA_ENV}={} already exists. The seed refuses to write into it, so a stale \
+         directory can never be verified against a fresh record.",
+        seed_directory.display()
+    );
     let fixture = tempfile::tempdir().unwrap();
     let baseline_document: toml::Value =
         toml::from_str(&fs::read_to_string(&baseline_config).unwrap()).unwrap();
     let launcher = baseline_launcher(fixture.path(), &baseline, &baseline_document);
-    let replacement_config = fixture.path().join("replacement.toml");
-    let current_document: toml::Value =
-        toml::from_str(include_str!("../../../server/config.toml")).unwrap();
-    fs::write(
-        &replacement_config,
-        toml::to_string(&replacement_configuration(
-            &baseline_document,
-            current_document,
-        ))
-        .unwrap(),
-    )
-    .unwrap();
 
-    let overrides = HashMap::from([(
-        "metadata.journal_slots".to_string(),
-        JOURNAL_SLOTS.to_string(),
-    )]);
+    let overrides = HashMap::from([(JOURNAL_SLOTS_KEY.to_string(), JOURNAL_SLOTS.to_string())]);
     assert_overrides_known_to_the_baseline(&overrides, &baseline_config);
     let mut envs = resolve_config_paths(&overrides)
         .expect("metadata.journal_slots resolves against the live config catalog");
-    // The baseline reads its own schema until the explicit replacement below.
     envs.insert(CONFIG_PATH_ENV.to_string(), baseline_config.clone());
 
     let mut harness = TestHarness::builder()
@@ -668,30 +733,140 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
          still hold. Segments: {retained:?}"
     );
 
-    // The swap: `None` selects the cargo-built binary of the crate under test.
-    harness.server_mut().set_executable_path(None);
-    harness.server_mut().add_env(
-        CONFIG_PATH_ENV,
+    copy_directory(&data_path, &seed_directory);
+    let record = BaselineRecord {
+        data_stream_id: data_stream_details.id,
+        data_topic_id: data_topic_details.id,
+        compression_stream_id: compression_stream_details.id,
+        streams: expected_streams,
+        retained_segments: retained,
+        segment_digests: segment_digests(&baseline_files),
+        first_retained_offset,
+        retained_window: retained_before
+            .into_iter()
+            .map(RecordedMessage::from)
+            .collect(),
+        last_message: tail_before.into_iter().map(RecordedMessage::from).collect(),
+        user_permissions: permissions,
+        wal_tail_user_permissions: tail_permissions,
+        token: pat,
+        wal_tail_token: tail_pat,
+    };
+    fs::write(
+        record_path(&seed_directory),
+        serde_json::to_vec_pretty(&record).unwrap(),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+#[parallel]
+#[ignore = "needs a data directory seeded by the baseline, run via scripts/ci/storage-compat.sh"]
+async fn given_baseline_data_directory_when_booted_by_build_under_test_should_read_back_the_record()
+{
+    let baseline_config = baseline_server_config();
+    let seed_directory = baseline_data_directory();
+    let record_file = record_path(&seed_directory);
+    let record: BaselineRecord =
+        serde_json::from_slice(&fs::read(&record_file).unwrap_or_else(|error| {
+            panic!(
+                "reading the seed record {}: {error}. The baseline's seed test writes it.",
+                record_file.display()
+            )
+        }))
+        .unwrap_or_else(|error| {
+            panic!(
+                "the seed record {} does not parse: {error}. The baseline's seed test and this \
+                 verify test disagree on the record shape.",
+                record_file.display()
+            )
+        });
+
+    let baseline_files = disk::collect_comparable_files(&seed_directory, false);
+    assert_eq!(
+        segment_digests(&baseline_files),
+        record.segment_digests,
+        "the segment files under {} are not the ones the seed recorded (directory left, record \
+         right), so the directory and its record come from different seed runs or the \
+         directory changed after the seed",
+        seed_directory.display()
+    );
+
+    let fixture = tempfile::tempdir().unwrap();
+    let baseline_document: toml::Value =
+        toml::from_str(&fs::read_to_string(&baseline_config).unwrap()).unwrap();
+    let replacement_config = fixture.path().join("replacement.toml");
+    let current_document: toml::Value =
+        toml::from_str(include_str!("../../../server/config.toml")).unwrap();
+    fs::write(
+        &replacement_config,
+        toml::to_string(&replacement_configuration(
+            &baseline_document,
+            current_document,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let overrides = HashMap::from([(JOURNAL_SLOTS_KEY.to_string(), JOURNAL_SLOTS.to_string())]);
+    let mut envs = resolve_config_paths(&overrides)
+        .expect("metadata.journal_slots resolves against the live config catalog");
+    envs.insert(
+        CONFIG_PATH_ENV.to_string(),
         replacement_config.to_string_lossy().into_owned(),
     );
-    harness.restart_server().await.unwrap_or_else(|error| {
+
+    // No executable path: the harness boots the cargo-built binary of the
+    // crate under test.
+    let mut harness = TestHarness::builder()
+        .cluster_nodes(1)
+        .server(TestServerConfig::builder().extra_envs(envs).build())
+        .build()
+        .unwrap();
+    let data_path = harness.server().data_path();
+    copy_directory(&seed_directory, &data_path);
+    harness.start().await.unwrap_or_else(|error| {
         panic!(
-            "the server under test did not restart on the data directory the baseline wrote. \
+            "the server under test did not start on the data directory the baseline wrote. \
              A Config(...) error below is a configuration break rather than a storage one: \
              this branch dropped or renamed a key the merge base's config file still sets, or \
              added a field without a `#[serde(default)]`: {error}"
         )
     });
 
-    // `tcp_root_client` hands out a client the harness does not own, so the
-    // reconnect loop inside `restart_server` never touched it. Take a fresh one.
     let client = harness.tcp_root_client().await.unwrap();
+    let data_stream = Identifier::numeric(record.data_stream_id).unwrap();
+    let data_topic = Identifier::numeric(record.data_topic_id).unwrap();
+    let compression_stream = Identifier::numeric(record.compression_stream_id).unwrap();
+    let partition = partition_dir(
+        &data_path,
+        record.data_stream_id,
+        record.data_topic_id,
+        SEEDED_PARTITION,
+    );
+    let readback = Consumer::new(Identifier::named(READBACK_CONSUMER).unwrap());
+    let offset_consumer = Consumer::new(Identifier::named(OFFSET_CONSUMER).unwrap());
+    let offset_group = Consumer::group(Identifier::named(OFFSET_GROUP).unwrap());
+    let first_retained_offset = record.first_retained_offset;
+    let last_offset = PRODUCED_MESSAGES - 1;
+    let retained_before = record
+        .retained_window
+        .into_iter()
+        .map(IggyMessage::try_from)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("the recorded retained window is hex");
+    let tail_before = record
+        .last_message
+        .into_iter()
+        .map(IggyMessage::try_from)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("the recorded last message is hex");
 
     // Ids AND names: later reads resolve by numeric id, so a corrupted name
     // would pass a bare count.
     assert_eq!(
         stream_catalog(&client).await,
-        expected_streams,
+        record.streams,
         "streams written by the baseline must all recover with their ids and names, both the \
          checkpointed prefix and the WAL tail"
     );
@@ -714,7 +889,7 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
 
     assert_eq!(
         segment_logs(&partition),
-        retained,
+        record.retained_segments,
         "the segment chain must recover exactly as the baseline left it"
     );
 
@@ -779,10 +954,16 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
         "the on-disk offset record must decode to the offset the baseline stored"
     );
 
-    assert_user_recovered(&harness, &client, COMPAT_USER, &permissions).await;
-    assert_user_recovered(&harness, &client, WAL_TAIL_USER, &tail_permissions).await;
-    assert_token_recovered(&harness, &client, COMPAT_PAT, &pat).await;
-    assert_token_recovered(&harness, &client, WAL_TAIL_PAT, &tail_pat).await;
+    assert_user_recovered(&harness, &client, COMPAT_USER, &record.user_permissions).await;
+    assert_user_recovered(
+        &harness,
+        &client,
+        WAL_TAIL_USER,
+        &record.wal_tail_user_permissions,
+    )
+    .await;
+    assert_token_recovered(&harness, &client, COMPAT_PAT, &record.token).await;
+    assert_token_recovered(&harness, &client, WAL_TAIL_PAT, &record.wal_tail_token).await;
 
     let groups = client
         .get_consumer_groups(&data_stream, &data_topic)
@@ -801,14 +982,10 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
     // whole run to drain, and after a positive marker so an uncaptured log
     // fails loudly instead of passing the absence check vacuously.
     assert_graceful_shutdown(&harness, "the server under test");
-    // `stdout_plain` returns the same ANSI-stripped text `stdout_contains`
-    // matches against, so filtering it costs no matching power.
     let stdout = harness.server().stdout_plain();
     assert!(
-        !stdout
-            .replace(TOMBSTONE_FIELD, "")
-            .contains(TOMBSTONE_MARKER),
-        "the server under test tombstoned a partition rather than reading the baseline's \
+        !stdout.contains(PARTITION_REFUSED_MARKER),
+        "the server under test refused a partition rather than reading the baseline's \
          durable state; boot still exits 0, so only the log says so. Server stdout:\n{stdout}"
     );
 
@@ -818,12 +995,154 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
     );
 }
 
+/// A partition of a tiered topic keeps a chain file, and its older segments
+/// live only in the object store. A build from before tiered storage would
+/// read it as a partition that lost data, so a baseline with another storage
+/// format must refuse the whole directory and leave it as it was.
+///
+/// Run it with a baseline from before the storage format of the build under
+/// test: `COMPAT_BASELINE_SERVER` and `COMPAT_BASELINE_CONFIG` as for the
+/// seed half. A baseline with the same format fails it.
+#[tokio::test]
+#[parallel]
+#[ignore = "needs a baseline iggy-server and its config, see the test's documentation"]
+async fn given_a_tiered_data_directory_when_a_baseline_with_another_storage_format_boots_on_it_should_refuse_it_unchanged()
+ {
+    let baseline = baseline_server_binary();
+    let baseline_config = baseline_server_config();
+    let fixture = tempfile::tempdir().unwrap();
+    let baseline_document: toml::Value =
+        toml::from_str(&fs::read_to_string(&baseline_config).unwrap()).unwrap();
+    let launcher = baseline_launcher(fixture.path(), &baseline, &baseline_document);
+
+    let baseline_format = {
+        let envs = HashMap::from([(CONFIG_PATH_ENV.to_string(), baseline_config.clone())]);
+        let mut harness = TestHarness::builder()
+            .cluster_nodes(1)
+            .server(
+                TestServerConfig::builder()
+                    .executable_path(launcher.to_string_lossy().into_owned())
+                    .extra_envs(envs)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        harness
+            .start()
+            .await
+            .expect("the baseline boots on an empty data directory");
+        let format = fs::read(harness.server().data_path().join(STORAGE_FORMAT_FILE)).unwrap();
+        harness.stop().await.unwrap();
+        format
+    };
+
+    let store = tempfile::tempdir().unwrap();
+    let mut harness = TestHarness::builder()
+        .cluster_nodes(1)
+        .server(
+            TestServerConfig::builder()
+                .extra_envs(fs_store_envs(store.path()))
+                .build(),
+        )
+        .build()
+        .unwrap();
+    harness.start().await.unwrap();
+    let data_path = harness.server().data_path();
+    let client = harness.tcp_root_client().await.unwrap();
+    let stream = Identifier::named(TIERED_STREAM).unwrap();
+    let topic = Identifier::named(TIERED_TOPIC).unwrap();
+    client
+        .create_stream(TIERED_STREAM, &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    create_tiered_topic(&client, &stream).await;
+    send_every_message(&client, &stream, &topic).await;
+    wait_for_eviction(store.path(), &data_path).await;
+    drop(client);
+    harness.stop().await.unwrap();
+
+    let format = fs::read(data_path.join(STORAGE_FORMAT_FILE)).unwrap();
+    assert_ne!(
+        String::from_utf8_lossy(&format),
+        String::from_utf8_lossy(&baseline_format),
+        "the baseline writes the storage format of the build under test, so it would read the \
+         tiered partitions as its own. Either the build under test kept a format it changed, or \
+         the baseline is not from before it"
+    );
+    let directory = fixture.path().join("data");
+    copy_directory(&data_path, &directory);
+    let before = every_file(&directory);
+    assert!(
+        before.keys().any(|path| path.ends_with("remote.chain")),
+        "the data directory holds no chain file: {:?}",
+        before.keys().collect::<Vec<_>>()
+    );
+
+    let mut baseline = Command::new(&launcher)
+        .env("IGGY_PATH", &directory)
+        .env(CONFIG_PATH_ENV, &baseline_config)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + REFUSAL_DEADLINE;
+    let status = loop {
+        if let Some(status) = baseline.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = baseline.kill();
+            let _ = baseline.wait();
+            panic!(
+                "the baseline still runs {REFUSAL_DEADLINE:?} after it booted on a directory of \
+                 storage format {:?}",
+                String::from_utf8_lossy(&format)
+            );
+        }
+        sleep(Duration::from_millis(100)).await;
+    };
+    let output = baseline.wait_with_output().unwrap();
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(!status.success(), "the baseline exited with {status}");
+    assert!(
+        said.contains(UNSUPPORTED_STORAGE),
+        "the baseline exited with {status} for another reason than the storage format: {said}"
+    );
+    assert!(
+        every_file(&directory) == before,
+        "the baseline changed the data directory it refused"
+    );
+}
+
+/// Every file under `root`, by its path below `root`, with its bytes.
+fn every_file(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    let mut pending = vec![root.to_owned()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                let relative = path.strip_prefix(root).unwrap().display().to_string();
+                files.insert(relative, fs::read(&path).unwrap());
+            }
+        }
+    }
+    files
+}
+
 /// Resolve one of the baseline artefacts to an absolute, existing path.
 ///
 /// The absolute requirement is not cosmetic for the binary. `ServerHandle::start`
 /// only spawns the configured path directly when it has more than one component
 /// or already exists; a bare name that does not exist falls through to
-/// `Command::cargo_bin`, which resolves the binary of the crate under test. So
+/// `cargo_bin_path`, which resolves the binary of the crate under test. So
 /// a single-component value would boot the HEAD build while the test reported
 /// it as the baseline, comparing master against master and passing forever.
 /// The same silent-green family as running a stale binary.
@@ -833,7 +1152,7 @@ fn baseline_path_from_env(variable: &str, artefact: &str) -> String {
             "{variable} is unset. It must be an ABSOLUTE path to the baseline {artefact}. \
              Without it this test would run entirely on the build under test and prove nothing, \
              so it refuses to run. Use scripts/ci/storage-compat.sh, which builds the baseline \
-             and exports both variables."
+             and exports every variable this test reads."
         )
     });
 
@@ -864,6 +1183,61 @@ fn baseline_server_binary() -> String {
 
 fn baseline_server_config() -> String {
     baseline_path_from_env(BASELINE_CONFIG_ENV, "core/server/config.toml")
+}
+
+/// Absolute because the two halves run from different source trees, each with
+/// its own crate directory as the working directory, so a relative value
+/// would name two different places.
+fn baseline_data_directory() -> PathBuf {
+    let raw = std::env::var(BASELINE_DATA_ENV).unwrap_or_else(|_| {
+        panic!(
+            "{BASELINE_DATA_ENV} is unset. It must be an ABSOLUTE path to the data directory the \
+             seed half writes and the verify half boots from. Use scripts/ci/storage-compat.sh, \
+             which runs both halves on one directory."
+        )
+    });
+    let path = PathBuf::from(&raw);
+    assert!(
+        path.is_absolute(),
+        "{BASELINE_DATA_ENV}={raw:?} is relative. The seed and verify halves run from different \
+         crate directories, so it must be ABSOLUTE."
+    );
+    path
+}
+
+fn record_path(data_directory: &Path) -> PathBuf {
+    let mut path = data_directory.as_os_str().to_owned();
+    path.push(".json");
+    PathBuf::from(path)
+}
+
+fn segment_digests(files: &BTreeMap<String, Vec<u8>>) -> BTreeMap<String, String> {
+    files
+        .iter()
+        .map(|(relative, bytes)| (relative.clone(), blake3::hash(bytes).to_hex().to_string()))
+        .collect()
+}
+
+fn copy_directory(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination)
+        .unwrap_or_else(|error| panic!("creating {}: {error}", destination.display()));
+    let entries = fs::read_dir(source)
+        .unwrap_or_else(|error| panic!("listing {}: {error}", source.display()));
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|error| panic!("listing {}: {error}", source.display()));
+        let target = destination.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_directory(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).unwrap_or_else(|error| {
+                panic!(
+                    "copying {} to {}: {error}",
+                    entry.path().display(),
+                    target.display()
+                )
+            });
+        }
+    }
 }
 
 /// Refuse an override the baseline binary cannot read.
@@ -1127,13 +1501,6 @@ fn seeded_permissions(stream_id: u32, topic_id: u32) -> Permissions {
     }
 }
 
-/// A personal access token as the baseline handed it out: the raw token a
-/// later login presents, and the stored expiry a listing must reproduce.
-struct SeededToken {
-    raw: String,
-    expiry_at: IggyTimestamp,
-}
-
 async fn create_token(client: &IggyClient, name: &str, expiry_secs: u64) -> SeededToken {
     let raw = client
         .create_personal_access_token(
@@ -1180,11 +1547,13 @@ async fn poll_window(
         .poll_messages(
             stream,
             topic,
-            Some(SEEDED_PARTITION),
+            SEEDED_PARTITION,
             consumer,
             &PollingStrategy::offset(offset),
-            count,
-            false,
+            PollOptions {
+                count,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap_or_else(|error| panic!("poll {count} message(s) from offset {offset}: {error}"));
@@ -1303,6 +1672,18 @@ async fn assert_topic_recovered(
         preallocate_segments: seed
             .preallocate_segments
             .and(recovered.preallocate_segments),
+        replication_factor: seed.replication_factor.and(recovered.replication_factor),
+        segment_max_age: seed.segment_max_age.and(recovered.segment_max_age),
+        tiered_storage: seed.tiered_storage.and(recovered.tiered_storage),
+        local_retention_age: seed.local_retention_age.and(recovered.local_retention_age),
+        local_retention_size: seed
+            .local_retention_size
+            .and(recovered.local_retention_size),
+        topic_type: seed.topic_type.and(recovered.topic_type),
+        geo_mode: seed.geo_mode.and(recovered.geo_mode),
+        // No default is derived for them, so they read back as sent.
+        geo_durations: recovered.geo_durations,
+        read_cache: recovered.read_cache,
         raw: BTreeMap::new(),
     };
     assert_eq!(
@@ -1455,7 +1836,7 @@ fn assert_graceful_shutdown(harness: &TestHarness, who: &str) {
         "{who} did not log {GRACEFUL_SHUTDOWN_MARKER:?}. Either the stop escalated to SIGKILL, \
          leaving crash-recovery state that confounds the compatibility verdict, or stdout was \
          not captured at all (IGGY_TEST_VERBOSE makes the harness inherit it, which would also \
-         make the tombstone check vacuous). Server stdout:\n{}",
+         make the marker check vacuous). Server stdout:\n{}",
         harness.server().stdout_plain()
     );
 }

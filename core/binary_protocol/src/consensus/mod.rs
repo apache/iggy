@@ -37,6 +37,7 @@
 //! - [`StartViewHeader`] - new primary -> all replicas (header-only)
 
 mod command;
+mod commit_batch;
 mod consumer_session;
 mod error;
 mod header;
@@ -47,20 +48,25 @@ mod request;
 mod segment_delete;
 
 pub use command::Command;
+pub use commit_batch::{
+    COMMIT_BATCH_ENTRIES_MAX, COMMIT_BATCH_FRAME_MAX, COMMIT_REPLY_BATCH_ENTRIES_MAX, CommitEntry,
+    CommitReplyEntry, HeartbeatState, batch_entries, batch_frame_size,
+};
 pub use consumer_session::{
     ConsumerSession, ConsumerSessionHeartbeatHeader, MAX_CONSUMER_SESSIONS_PER_HEARTBEAT,
 };
 pub use error::ConsensusError;
 pub use header::{
-    CHECKSUM_UNSEALED, CommitHeader, ConsensusHeader, DVC_HEADERS_MAX, DoViewChangeHeader,
-    EvictionHeader, EvictionReason, ForwardCompletionHeader, ForwardLogoutHeader,
-    ForwardLogoutOutcome, ForwardLogoutResultHeader, ForwardRegisterHeader, ForwardRegisterOutcome,
-    ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, LIFECYCLE_BATCH_HEADER_SIZE,
-    LIFECYCLE_COMPLETION_SIZE, LIFECYCLE_COMPLETIONS_MAX, PrepareHeader, PrepareOkHeader,
-    RESERVED_COMMAND_LEN, RepairPrepareHeader, RepairRangeReplyHeader, ReplyHeader, RequestHeader,
-    RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
-    RequestStateTransferHeader, RoutedRequestHeader, SIZE_FIELD_OFFSET, StartViewChangeHeader,
-    StartViewHeader, StateChunkHeader, StateTransferTargetHeader, frame_body, frame_checksum_bytes,
+    CHECKSUM_UNSEALED, CommitHeader, CommitReplyHeader, ConsensusHeader, DVC_HEADERS_MAX,
+    DoViewChangeHeader, EvictionHeader, EvictionReason, ForwardCompletionHeader,
+    ForwardLogoutHeader, ForwardLogoutOutcome, ForwardLogoutResultHeader, ForwardRegisterHeader,
+    ForwardRegisterOutcome, ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE,
+    LIFECYCLE_BATCH_HEADER_SIZE, LIFECYCLE_COMPLETION_SIZE, LIFECYCLE_COMPLETIONS_MAX,
+    PrepareHeader, PrepareOkHeader, PrepareProgressHeader, RESERVED_COMMAND_LEN,
+    RepairPrepareHeader, RepairRangeReplyHeader, ReplyHeader, RequestHeader, RequestPreparesHeader,
+    RequestStartViewHeader, RequestStateChunkHeader, RequestStateTransferHeader,
+    RoutedRequestHeader, SIZE_FIELD_OFFSET, StartViewChangeHeader, StartViewHeader,
+    StateChunkHeader, StateTransferTargetHeader, frame_body, frame_checksum_bytes,
     prepare_identity_checksum_bytes, read_size_field,
 };
 pub use operation::Operation;

@@ -21,7 +21,7 @@ inputs:
   node-version:
     description: "Node.js version to use"
     required: false
-    default: "23"
+    default: "24"
   workspace:
     description: "Workspace directory"
     required: false

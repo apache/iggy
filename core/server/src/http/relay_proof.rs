@@ -37,10 +37,11 @@ use axum::http::{HeaderValue, Method};
 use iggy_common::{IggyDuration, IggyTimestamp};
 use ring::hmac;
 
-/// How long a relay proof stays valid, which is also the deadline of the
-/// partition request it relays. Each attempt signs anew, the hop target checks
-/// the proof when the request head arrives, and no attempt outlives the
-/// request deadline, so an older proof could only serve a replay.
+/// How long a relay proof stays valid, which is also the deadline of an
+/// immediate partition request. Each attempt signs anew, and the hop target
+/// checks the proof when the request head arrives, so an older proof could only
+/// serve a replay. A deferred poll can wait longer than this lifetime, because
+/// its proof is checked before the wait.
 ///
 /// Expiry compares the wall clocks of two nodes, which are assumed to agree
 /// within a few seconds (NTP). A hop target refuses a proof made more than

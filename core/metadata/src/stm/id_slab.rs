@@ -30,8 +30,10 @@
 //! occupied set, which is exactly what a snapshot carries. Restored and live
 //! arenas agree by construction.
 
+use crate::stm::walk::Directed;
 use std::collections::BTreeSet;
 use std::ops::{Index, IndexMut};
+use std::sync::Arc;
 
 /// Arena addressed by stable `usize` keys, allocating the lowest free key.
 #[derive(Debug, Clone)]
@@ -85,6 +87,25 @@ impl<T> IdSlab<T> {
         self.entries.len() - 1
     }
 
+    /// Inserts at `key` instead of [`Self::vacant_key`], and returns `false`
+    /// without inserting when `key` is occupied. The keys it passes over
+    /// above the high-water mark become free, as a rebuild from the same
+    /// pairs makes them, so the arena stays a function of its occupied set.
+    pub fn insert_at(&mut self, key: usize, value: T) -> bool {
+        if self.contains(key) {
+            return false;
+        }
+        if key >= self.entries.len() {
+            self.free.extend(self.entries.len()..key);
+            self.entries.resize_with(key + 1, || None);
+        } else {
+            self.free.remove(&key);
+        }
+        self.entries[key] = Some(value);
+        self.len += 1;
+        true
+    }
+
     #[must_use]
     pub fn contains(&self, key: usize) -> bool {
         self.get(key).is_some()
@@ -136,11 +157,52 @@ impl<T> IdSlab<T> {
         Iter { inner }
     }
 
+    /// Every slot from `key` on, ascending by key, `None` for an unoccupied
+    /// one. A walk that must bound the slots it reads uses this:
+    /// [`Self::iter_from`] passes any run of unoccupied slots in one step.
+    pub fn slots_from(&self, key: usize) -> impl Iterator<Item = (usize, Option<&T>)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .skip(key)
+            .map(|(key, slot)| (key, slot.as_ref()))
+    }
+
+    /// Occupied keys below `key`, ascending; `.rev()` walks them descending.
+    #[must_use]
+    pub fn iter_before(&self, key: usize) -> Iter<'_, T> {
+        Iter {
+            inner: self.entries[..key.min(self.entries.len())]
+                .iter()
+                .enumerate(),
+        }
+    }
+
+    /// Occupied entries after `after` in one direction. An id page walks this.
+    #[must_use]
+    pub fn walk(&self, after: Option<usize>, descending: bool) -> Directed<Iter<'_, T>> {
+        let iter = match after {
+            None => self.iter(),
+            Some(key) if descending => self.iter_before(key),
+            Some(key) => self.iter_from(key.saturating_add(1)),
+        };
+        Directed::new(iter, descending)
+    }
+
     /// Ascending by key.
     pub fn iter_mut(&mut self) -> IterMut<'_, T> {
         IterMut {
             inner: self.entries.iter_mut().enumerate(),
         }
+    }
+}
+
+impl<T: Clone> IdSlab<Arc<T>> {
+    /// The value at `key` for writing, copied first when another holder, such
+    /// as a checkpoint capture, shares it. Call it only once the write is
+    /// certain: a write that changes nothing still pays the copy.
+    pub fn make_mut(&mut self, key: usize) -> Option<&mut T> {
+        self.get_mut(key).map(Arc::make_mut)
     }
 }
 
@@ -156,6 +218,17 @@ impl<'a, T> Iterator for Iter<'a, T> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             let (key, slot) = self.inner.next()?;
+            if let Some(value) = slot {
+                return Some((key, value));
+            }
+        }
+    }
+}
+
+impl<T> DoubleEndedIterator for Iter<'_, T> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        loop {
+            let (key, slot) = self.inner.next_back()?;
             if let Some(value) = slot {
                 return Some((key, value));
             }
@@ -292,6 +365,62 @@ mod tests {
         assert_eq!(keys(usize::MAX), [] as [usize; 0]);
     }
 
+    #[test]
+    fn given_gaps_when_reading_slots_from_a_key_should_yield_unoccupied_slots_too() {
+        let mut slab: IdSlab<char> = IdSlab::new();
+        for value in ['a', 'b', 'c', 'd'] {
+            slab.insert(value);
+        }
+        slab.remove(1);
+        slab.remove(3);
+
+        let slots = |from| {
+            slab.slots_from(from)
+                .map(|(key, slot)| (key, slot.copied()))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            slots(0),
+            [(0, Some('a')), (1, None), (2, Some('c')), (3, None)]
+        );
+        assert_eq!(slots(3), [(3, None)]);
+        assert_eq!(slots(4), []);
+        assert_eq!(slots(usize::MAX), []);
+    }
+
+    #[test]
+    fn given_gaps_when_walking_after_a_key_should_yield_occupied_keys_past_it_in_both_directions() {
+        let mut slab: IdSlab<char> = IdSlab::new();
+        for value in ['a', 'b', 'c', 'd', 'e', 'f'] {
+            slab.insert(value);
+        }
+        slab.remove(0);
+        slab.remove(3);
+
+        let walk = |after, descending| {
+            slab.walk(after, descending)
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(walk(None, false), [1, 2, 4, 5]);
+        assert_eq!(walk(None, true), [5, 4, 2, 1]);
+        assert_eq!(walk(Some(3), false), [4, 5], "a vacant key still splits");
+        assert_eq!(walk(Some(3), true), [2, 1]);
+        assert_eq!(walk(Some(1), true), [] as [usize; 0]);
+        assert_eq!(walk(Some(5), false), [] as [usize; 0]);
+        assert_eq!(walk(Some(usize::MAX), false), [] as [usize; 0]);
+        assert_eq!(walk(Some(usize::MAX), true), [5, 4, 2, 1]);
+        for after in 0..8 {
+            let mut ascending = walk(Some(after), false);
+            ascending.extend(walk(Some(after), true));
+            ascending.extend(slab.get(after).map(|_| after));
+            ascending.sort_unstable();
+            assert_eq!(ascending, walk(None, false), "after {after}");
+        }
+    }
+
     /// The property the type exists for. `Slab` fails it: LIFO reuse makes the
     /// head depend on delete order while a rebuild scans ascending, so
     /// descending deletes diverge.
@@ -350,6 +479,24 @@ mod tests {
 
         assert_eq!(slab.vacant_key(), 1);
         assert_eq!(slab.insert('c'), 1);
+    }
+
+    #[test]
+    fn given_a_chosen_key_when_inserting_at_it_should_match_a_rebuild_of_the_same_pairs() {
+        let mut slab: IdSlab<char> = IdSlab::new();
+        slab.insert('a');
+
+        assert!(slab.insert_at(4, 'e'));
+        assert!(slab.insert_at(2, 'c'));
+        assert!(!slab.insert_at(4, 'x'), "an occupied key is refused");
+
+        let rebuilt: IdSlab<char> = [(0, 'a'), (2, 'c'), (4, 'e')].into_iter().collect();
+        assert_eq!(slab.len(), rebuilt.len());
+        assert_eq!(slab.get(4), Some(&'e'));
+        assert_eq!(slab.vacant_key(), rebuilt.vacant_key());
+        assert_eq!(slab.insert('b'), 1);
+        assert_eq!(slab.insert('d'), 3);
+        assert_eq!(slab.insert('f'), 5);
     }
 
     #[test]

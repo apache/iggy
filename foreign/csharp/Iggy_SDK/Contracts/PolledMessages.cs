@@ -15,6 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Text.Json.Serialization;
+using Apache.Iggy.Enums;
+using Apache.Iggy.Kinds;
+
 namespace Apache.Iggy.Contracts;
 
 /// <summary>
@@ -46,6 +50,62 @@ public sealed class PolledMessages
     ///     List of messages.
     /// </summary>
     public required IReadOnlyList<MessageResponse> Messages { get; set; }
+
+    /// <summary>The start of the read that returned this batch, which the continuation of an empty batch keeps.</summary>
+    internal PollingStrategy? RequestStart { get; set; }
+
+    /// <summary>The position after the last message, to commit the whole batch. Null for an empty batch.</summary>
+    [JsonIgnore]
+    public Checkpoint? Checkpoint => CheckpointAt(Messages.Count - 1);
+
+    /// <summary>
+    ///     The position after the next read of the partition. After the last message it is
+    ///     <see cref="PollingStrategy.Offset" /> of the next offset. An empty batch keeps the start of its read:
+    ///     <see cref="PollingStrategy.First" /> becomes offset 0, and <see cref="PollingStrategy.Next" /> stays Next, so
+    ///     the next read resolves it again from the stored offset. The continuation belongs to the partition of the
+    ///     batch, and a read of another partition refuses it. It carries the context of the batch, so a read after a
+    ///     change of the partition history fails with status 87 (HistoryUnavailable).
+    /// </summary>
+    /// <remarks>
+    ///     An empty batch with a zero context names no partition history, so its continuation is the start of the
+    ///     read as it was.
+    /// </remarks>
+    [JsonIgnore]
+    public PollingStrategy Continuation
+    {
+        get
+        {
+            if (Messages.Count > 0)
+            {
+                return PollingStrategy.Continuation(PartitionId, MessagePolling.Offset,
+                    Messages[^1].Header.Offset + 1, Context);
+            }
+
+            var start = RequestStart ?? PollingStrategy.Next();
+            if (Context == default)
+            {
+                return start;
+            }
+
+            return start.Kind == MessagePolling.First
+                ? PollingStrategy.Continuation(PartitionId, MessagePolling.Offset, 0, Context)
+                : PollingStrategy.Continuation(PartitionId, start.Kind, start.Value, Context);
+        }
+    }
+
+    /// <summary>
+    ///     The position after <see cref="Messages" /> at <paramref name="index" />, to commit a processed part of the
+    ///     batch. Null for an index out of range.
+    /// </summary>
+    public Checkpoint? CheckpointAt(int index)
+    {
+        return index >= 0 && index < Messages.Count
+            ? new Checkpoint(PartitionId, Messages[index].Header.Offset, Context, Stamp)
+            : null;
+    }
+
+    /// <summary>The reader and partition generation that delivered the batch, null for a one-shot poll.</summary>
+    internal ReaderStamp? Stamp { get; set; }
 
     /// <summary>
     ///     Empty polled messages.

@@ -68,11 +68,13 @@ async fn background_send_receive_ok(harness: &TestHarness) {
         .poll_messages(
             &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &consumer,
             &PollingStrategy::offset(0),
-            messages_count,
-            false,
+            PollOptions {
+                count: messages_count,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -237,11 +239,13 @@ async fn background_graceful_shutdown(harness: &TestHarness) {
         .poll_messages(
             &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &consumer,
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -252,11 +256,13 @@ async fn background_graceful_shutdown(harness: &TestHarness) {
         .poll_messages(
             &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &consumer,
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -311,11 +317,13 @@ async fn background_many_parallel_producers(harness: &TestHarness) {
         .poll_messages(
             &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &consumer,
             &PollingStrategy::offset(0),
-            10,
-            false,
+            PollOptions {
+                count: 10,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -367,11 +375,13 @@ async fn background_linger_time_respected_after_idle(harness: &TestHarness) {
         .poll_messages(
             &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &consumer,
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -385,11 +395,13 @@ async fn background_linger_time_respected_after_idle(harness: &TestHarness) {
         .poll_messages(
             &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &consumer,
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -435,11 +447,13 @@ async fn background_preserves_message_ordering(harness: &TestHarness) {
         .poll_messages(
             &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &consumer,
             &PollingStrategy::offset(0),
-            messages_count,
-            false,
+            PollOptions {
+                count: messages_count,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -495,11 +509,13 @@ async fn background_preserves_ordering_with_multiple_shards(harness: &TestHarnes
         .poll_messages(
             &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &consumer,
             &PollingStrategy::offset(0),
-            messages_count,
-            false,
+            PollOptions {
+                count: messages_count,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();

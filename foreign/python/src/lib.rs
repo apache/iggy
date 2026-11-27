@@ -20,29 +20,34 @@ mod config;
 mod consumer;
 mod durability;
 mod duration;
+mod event_loop;
 mod identifier;
 mod metadata_changes;
 mod options;
+mod page;
 mod partitioning;
 mod permissions;
+mod poll_options;
 mod producer;
+mod reader;
 mod receive_message;
 mod resource_options;
 mod send_message;
+mod snapshot;
 mod stats;
 mod stream;
 mod topic;
 mod user;
 mod user_headers;
 
-use client::{IggyClient, OptionError, PendingOperationError, PyIggyError};
+use client::{IggyClient, OptionError, PendingOperationError, PyIggyError, ReadError};
 use config::{
     AutoLogin, HttpConfig, PendingOperationsConfig, QuicConfig, QuicReconnectionConfig, TcpConfig,
     TcpReconnectionConfig, WebSocketConfig, WebSocketFramingConfig, WebSocketReconnectionConfig,
 };
 use consumer::{
-    AutoCommit, AutoCommitAfter, AutoCommitWhen, Consumer, ConsumerGroup, ConsumerGroupDetails,
-    ConsumerGroupMember, IggyConsumer, ReceiveMessageIterator,
+    Consumer, ConsumerGroup, ConsumerGroupDetails, ConsumerGroupMember, ConsumerOffsetInfo,
+    IggyConsumer, ReceiveMessageIterator,
 };
 use metadata_changes::{
     MetadataChangeCursor, MetadataChangeGroup, MetadataChangeKind, MetadataChangePhase,
@@ -57,19 +62,25 @@ use metadata_changes::{
     MetadataUnknownItem, MetadataUserChange, MetadataUserIdentity, MetadataUserPermissionsUpdated,
 };
 use options::OptionSpec;
+use page::{ConsumerGroupsPage, PageOrder, PartitionsPage, StreamsPage, TopicsPage, UsersPage};
 use partitioning::Partitioning;
 use permissions::{GlobalPermissions, Permissions, StreamPermissions, TopicPermissions};
+use poll_options::{AutoCommit, CommitAfter, CommitEvery, CommitPolicy, PollOptions};
 use producer::{
     BackgroundProducerConfig, BackpressureMode, DirectProducerConfig, IggyProducer,
     ProducerSendError, ProducerSharding,
 };
 use pyo3::prelude::*;
-use receive_message::{ConsumerPosition, PartitionContext, PollingStrategy, ReceiveMessage};
+use reader::PartitionReader;
+use receive_message::{
+    Checkpoint, PartitionContext, PolledMessages, PollingStrategy, ReceiveMessage,
+};
 use resource_options::{
-    OptionKey, PartitionResizePolicy, StreamOptions, TopicOptions, UserOptions,
+    GeoMode, OptionKey, PartitionResizePolicy, StreamOptions, TopicOptions, TopicType, UserOptions,
     encryption_key_fingerprint,
 };
 use send_message::{SendMessage, SendMessagesConfirmation, SendMessagesResponse};
+use snapshot::{SnapshotCompression, SystemSnapshotType};
 use stats::{CacheMetrics, CacheMetricsKey, Stats};
 use stream::{Stream, StreamDetails};
 use topic::{IggyExpiry, MaxTopicSize, Partition, Topic, TopicDetails};
@@ -79,17 +90,25 @@ use user_headers::{HeaderKey, HeaderValue, UserHeaders};
 /// Python client for Apache Iggy, the persistent message streaming platform.
 #[pymodule]
 fn apache_iggy(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    event_loop::register_exit_gate(m)?;
     durability::Durability::register(py, m)?;
     m.add_class::<SendMessage>()?;
     m.add_class::<SendMessagesResponse>()?;
     m.add_class::<SendMessagesConfirmation>()?;
     m.add_class::<ReceiveMessage>()?;
     m.add_class::<PartitionContext>()?;
-    m.add_class::<ConsumerPosition>()?;
+    m.add_class::<Checkpoint>()?;
+    m.add_class::<PolledMessages>()?;
+    m.add_class::<PollOptions>()?;
+    m.add_class::<CommitPolicy>()?;
+    m.add_class::<AutoCommit>()?;
+    m.add_class::<CommitEvery>()?;
+    m.add_class::<CommitAfter>()?;
     m.add_class::<IggyClient>()?;
     m.add_class::<PyIggyError>()?;
     m.add_class::<PendingOperationError>()?;
     m.add_class::<OptionError>()?;
+    m.add_class::<ReadError>()?;
     m.add_class::<IggyProducer>()?;
     m.add_class::<ProducerSendError>()?;
     m.add_class::<DirectProducerConfig>()?;
@@ -121,18 +140,19 @@ fn apache_iggy(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TopicOptions>()?;
     m.add_class::<UserOptions>()?;
     m.add_class::<PartitionResizePolicy>()?;
+    m.add_class::<TopicType>()?;
+    m.add_class::<GeoMode>()?;
     m.add_function(wrap_pyfunction!(encryption_key_fingerprint, m)?)?;
     m.add_class::<Partitioning>()?;
     m.add_class::<Partition>()?;
     m.add_class::<Consumer>()?;
+    m.add_class::<ConsumerOffsetInfo>()?;
     m.add_class::<ConsumerGroup>()?;
     m.add_class::<ConsumerGroupDetails>()?;
     m.add_class::<ConsumerGroupMember>()?;
     m.add_class::<PollingStrategy>()?;
+    m.add_class::<PartitionReader>()?;
     m.add_class::<IggyConsumer>()?;
-    m.add_class::<AutoCommit>()?;
-    m.add_class::<AutoCommitAfter>()?;
-    m.add_class::<AutoCommitWhen>()?;
     m.add_class::<ReceiveMessageIterator>()?;
     m.add_class::<IdentityInfo>()?;
     m.add_class::<TokenInfo>()?;
@@ -146,6 +166,14 @@ fn apache_iggy(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<GlobalPermissions>()?;
     m.add_class::<StreamPermissions>()?;
     m.add_class::<TopicPermissions>()?;
+    m.add_class::<SnapshotCompression>()?;
+    m.add_class::<SystemSnapshotType>()?;
+    m.add_class::<PageOrder>()?;
+    m.add_class::<StreamsPage>()?;
+    m.add_class::<TopicsPage>()?;
+    m.add_class::<PartitionsPage>()?;
+    m.add_class::<ConsumerGroupsPage>()?;
+    m.add_class::<UsersPage>()?;
     m.add_class::<MetadataChanges>()?;
     m.add_class::<MetadataChangeRecord>()?;
     m.add_class::<MetadataCurrentItem>()?;

@@ -22,15 +22,23 @@
 //! peer's real replica port, and the relay forwards to that port. A link is
 //! cut while either of its ends is isolated: it drops its live connections
 //! and closes new ones, so both sides see the connection end at once (a
-//! reset partition, not a silent drop).
+//! reset partition, not a silent drop). A link can also drop one live
+//! connection and stay up, the way one of several replica links to a peer
+//! fails.
+//!
+//! Each relay also counts the frames that cross it, so a test can measure the
+//! peer traffic of a cluster.
 
+use std::io;
 use std::net::{IpAddr, SocketAddr, TcpListener as StdTcpListener};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::ops::{Add, Sub};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use tokio::io::copy_bidirectional;
+use iggy_binary_protocol::{Command, GenericHeader, HEADER_SIZE};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Builder;
 use tokio::sync::{Notify, oneshot};
@@ -39,6 +47,53 @@ use tracing::{debug, info, warn};
 use crate::harness::error::TestBinaryError;
 
 const ACCEPT_RETRY_PAUSE: Duration = Duration::from_millis(50);
+/// The dialer writes `message_bus::replica::preamble::PREAMBLE_LEN` bytes
+/// before its first frame.
+const PREAMBLE_LEN: usize = 8;
+const COPY_BUFFER_LEN: usize = 64 * 1024;
+
+/// The frames that crossed the links from one node to another.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PeerTraffic {
+    pub frames: u64,
+    pub bytes: u64,
+    pub commit_frames: u64,
+    pub commit_bytes: u64,
+    pub reply_frames: u64,
+    pub reply_bytes: u64,
+}
+
+/// The sum of two counts.
+impl Add for PeerTraffic {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            frames: self.frames + other.frames,
+            bytes: self.bytes + other.bytes,
+            commit_frames: self.commit_frames + other.commit_frames,
+            commit_bytes: self.commit_bytes + other.commit_bytes,
+            reply_frames: self.reply_frames + other.reply_frames,
+            reply_bytes: self.reply_bytes + other.reply_bytes,
+        }
+    }
+}
+
+/// The traffic since the `earlier` count.
+impl Sub for PeerTraffic {
+    type Output = Self;
+
+    fn sub(self, earlier: Self) -> Self {
+        Self {
+            frames: self.frames - earlier.frames,
+            bytes: self.bytes - earlier.bytes,
+            commit_frames: self.commit_frames - earlier.commit_frames,
+            commit_bytes: self.commit_bytes - earlier.commit_bytes,
+            reply_frames: self.reply_frames - earlier.reply_frames,
+            reply_bytes: self.reply_bytes - earlier.reply_bytes,
+        }
+    }
+}
 
 /// One relay per ordered pair of nodes, serving on its own thread.
 pub(crate) struct PeerRelays {
@@ -64,6 +119,97 @@ struct Link {
 struct LinkState {
     cut: AtomicBool,
     notify: Notify,
+    /// Wakes one live connection, which closes.
+    drop_one: Notify,
+    /// Frames from the dialer to the peer.
+    sent: TrafficCounter,
+    /// Frames from the peer back to the dialer.
+    received: TrafficCounter,
+}
+
+/// The frames of one direction of a link.
+#[derive(Default)]
+struct TrafficCounter {
+    frames: AtomicU64,
+    bytes: AtomicU64,
+    commit_frames: AtomicU64,
+    commit_bytes: AtomicU64,
+    reply_frames: AtomicU64,
+    reply_bytes: AtomicU64,
+}
+
+impl TrafficCounter {
+    fn record(&self, command: u8, size: u64) {
+        self.frames.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(size, Ordering::Relaxed);
+        if command == Command::Commit as u8 {
+            self.commit_frames.fetch_add(1, Ordering::Relaxed);
+            self.commit_bytes.fetch_add(size, Ordering::Relaxed);
+        } else if command == Command::CommitReply as u8 {
+            self.reply_frames.fetch_add(1, Ordering::Relaxed);
+            self.reply_bytes.fetch_add(size, Ordering::Relaxed);
+        }
+    }
+
+    fn snapshot(&self) -> PeerTraffic {
+        PeerTraffic {
+            frames: self.frames.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
+            commit_frames: self.commit_frames.load(Ordering::Relaxed),
+            commit_bytes: self.commit_bytes.load(Ordering::Relaxed),
+            reply_frames: self.reply_frames.load(Ordering::Relaxed),
+            reply_bytes: self.reply_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Splits a byte stream into frames by the `size` in each header.
+struct FrameCounter {
+    skip: usize,
+    header: Vec<u8>,
+    remaining: usize,
+}
+
+impl FrameCounter {
+    fn new(skip: usize) -> Self {
+        Self {
+            skip,
+            header: Vec::with_capacity(HEADER_SIZE),
+            remaining: 0,
+        }
+    }
+
+    fn feed(&mut self, mut bytes: &[u8], counter: &TrafficCounter) {
+        while !bytes.is_empty() {
+            let taken = if self.skip > 0 {
+                let taken = self.skip.min(bytes.len());
+                self.skip -= taken;
+                taken
+            } else if self.remaining > 0 {
+                let taken = self.remaining.min(bytes.len());
+                self.remaining -= taken;
+                taken
+            } else {
+                let taken = (HEADER_SIZE - self.header.len()).min(bytes.len());
+                self.header.extend_from_slice(&bytes[..taken]);
+                if self.header.len() == HEADER_SIZE {
+                    let at = std::mem::offset_of!(GenericHeader, size);
+                    let size = u32::from_le_bytes([
+                        self.header[at],
+                        self.header[at + 1],
+                        self.header[at + 2],
+                        self.header[at + 3],
+                    ]) as usize;
+                    let command = self.header[std::mem::offset_of!(GenericHeader, command)];
+                    counter.record(command, size as u64);
+                    self.remaining = size.saturating_sub(HEADER_SIZE);
+                    self.header.clear();
+                }
+                taken
+            };
+            bytes = &bytes[taken..];
+        }
+    }
 }
 
 impl PeerRelays {
@@ -140,6 +286,22 @@ impl PeerRelays {
             .map(|link| link.address)
     }
 
+    /// The frames that crossed every link from node `from` to node `to`.
+    pub(crate) fn traffic(&self, from: usize, to: usize) -> PeerTraffic {
+        self.links
+            .iter()
+            .filter_map(|link| {
+                if link.from == from && link.to == to {
+                    Some(link.state.sent.snapshot())
+                } else if link.from == to && link.to == from {
+                    Some(link.state.received.snapshot())
+                } else {
+                    None
+                }
+            })
+            .fold(PeerTraffic::default(), Add::add)
+    }
+
     /// Cuts every link to and from `node`.
     pub(crate) fn cut_node(&self, node: usize) -> Result<(), TestBinaryError> {
         self.set_node_links(node, true)
@@ -148,6 +310,19 @@ impl PeerRelays {
     /// Restores every link to and from `node`.
     pub(crate) fn heal_node(&self, node: usize) -> Result<(), TestBinaryError> {
         self.set_node_links(node, false)
+    }
+
+    /// Closes one live connection that node `from` dialed to peer `to`. The
+    /// link stays up, so the redial goes through.
+    pub(crate) fn drop_connection(&self, from: usize, to: usize) -> Result<(), TestBinaryError> {
+        let link = self
+            .links
+            .iter()
+            .find(|link| link.from == from && link.to == to)
+            .ok_or(TestBinaryError::MissingServer)?;
+        link.state.drop_one.notify_one();
+        info!(from, to, "dropped one peer connection");
+        Ok(())
     }
 
     fn set_node_links(&self, node: usize, cut: bool) -> Result<(), TestBinaryError> {
@@ -218,8 +393,8 @@ async fn relay(listener: TcpListener, target: SocketAddr, state: Arc<LinkState>)
     }
 }
 
-/// Copies both ways until one side closes or the link is cut; the drop on
-/// return closes both sockets.
+/// Copies both ways and counts the frames until both sides close, the link is
+/// cut or this connection is dropped. The drop on return closes both sockets.
 async fn forward(mut inbound: TcpStream, mut outbound: TcpStream, state: Arc<LinkState>) {
     let cut = state.notify.notified();
     tokio::pin!(cut);
@@ -229,9 +404,42 @@ async fn forward(mut inbound: TcpStream, mut outbound: TcpStream, state: Arc<Lin
     if state.cut.load(Ordering::SeqCst) {
         return;
     }
+    let (mut dialer_read, mut dialer_write) = inbound.split();
+    let (mut peer_read, mut peer_write) = outbound.split();
+    let copy = async {
+        tokio::join!(
+            copy_counted(&mut dialer_read, &mut peer_write, &state.sent, PREAMBLE_LEN),
+            copy_counted(&mut peer_read, &mut dialer_write, &state.received, 0),
+        )
+    };
     tokio::select! {
-        _ = copy_bidirectional(&mut inbound, &mut outbound) => {}
+        _ = copy => {}
         _ = &mut cut => {}
+        _ = state.drop_one.notified() => {}
+    }
+}
+
+/// Copies `reader` to `writer` until the end of `reader`, and counts each
+/// frame after the first `skip` bytes.
+async fn copy_counted<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    counter: &TrafficCounter,
+    skip: usize,
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut frames = FrameCounter::new(skip);
+    let mut buffer = vec![0; COPY_BUFFER_LEN];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            return writer.shutdown().await;
+        }
+        frames.feed(&buffer[..read], counter);
+        writer.write_all(&buffer[..read]).await?;
     }
 }
 
@@ -244,7 +452,8 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio::time::timeout;
 
-    use super::PeerRelays;
+    use super::{FrameCounter, PREAMBLE_LEN, PeerRelays, TrafficCounter};
+    use iggy_binary_protocol::{Command, GenericHeader, HEADER_SIZE};
 
     const PROMPTLY: Duration = Duration::from_secs(5);
     const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -296,6 +505,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn given_frames_split_across_reads_when_counted_should_count_each_frame() {
+        let frame = |command: Command, size: usize| {
+            let mut frame = vec![0u8; size];
+            let at = std::mem::offset_of!(GenericHeader, size);
+            frame[at..at + 4].copy_from_slice(&u32::try_from(size).unwrap().to_le_bytes());
+            frame[std::mem::offset_of!(GenericHeader, command)] = command as u8;
+            frame
+        };
+        let mut stream = vec![0xAB; PREAMBLE_LEN];
+        stream.extend(frame(Command::Commit, HEADER_SIZE + 80));
+        stream.extend(frame(Command::CommitReply, HEADER_SIZE + 32));
+        stream.extend(frame(Command::Prepare, HEADER_SIZE));
+        let counter = TrafficCounter::default();
+        let mut frames = FrameCounter::new(PREAMBLE_LEN);
+
+        for chunk in stream.chunks(7) {
+            frames.feed(chunk, &counter);
+        }
+
+        let traffic = counter.snapshot();
+        assert_eq!(traffic.frames, 3);
+        assert_eq!(traffic.bytes, (stream.len() - PREAMBLE_LEN) as u64);
+        assert_eq!((traffic.commit_frames, traffic.commit_bytes), (1, 336));
+        assert_eq!((traffic.reply_frames, traffic.reply_bytes), (1, 288));
+    }
+
     #[tokio::test]
     async fn given_relay_when_client_writes_should_forward_both_ways() {
         let echo = echo_server().await;
@@ -329,6 +565,32 @@ mod tests {
         echo_round_trip(&mut healed, b"after").await;
 
         assert!(relays.cut_node(3).is_err());
+    }
+
+    #[tokio::test]
+    async fn given_two_connections_when_one_is_dropped_should_keep_the_other_and_the_link() {
+        let echo = echo_server().await;
+        let relays = PeerRelays::bind(LOOPBACK, &[echo, echo]).expect("bind the relays");
+        let mut first = connect(&relays, 0, 1).await;
+        echo_round_trip(&mut first, b"first").await;
+        let mut second = connect(&relays, 0, 1).await;
+        echo_round_trip(&mut second, b"second").await;
+
+        relays.drop_connection(0, 1).expect("drop one connection");
+        let first_ended = timeout(PROMPTLY, async {
+            tokio::select! {
+                () = ends_promptly(&mut first) => true,
+                () = ends_promptly(&mut second) => false,
+            }
+        })
+        .await
+        .expect("one connection ends");
+        let survivor = if first_ended { &mut second } else { &mut first };
+        echo_round_trip(survivor, b"still up").await;
+        let mut redialed = connect(&relays, 0, 1).await;
+        echo_round_trip(&mut redialed, b"link up").await;
+
+        assert!(relays.drop_connection(0, 2).is_err());
     }
 
     #[tokio::test]

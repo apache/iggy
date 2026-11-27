@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::POLL_REPLY_MAX_BYTES;
 use futures::StreamExt;
 use iggy::prelude::*;
 use iggy_common::TransportProtocol;
@@ -105,11 +106,13 @@ pub async fn run_producer(harness: &mut TestHarness) {
         .poll_messages(
             &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            10,
-            false,
+            PollOptions {
+                count: 10,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("Failed to poll messages after restart");
@@ -160,11 +163,14 @@ pub async fn run_consumer(harness: &mut TestHarness) {
     Client::connect(&client).await.expect("Failed to connect");
 
     let mut consumer = client
-        .consumer("test-consumer", STREAM_NAME, TOPIC_NAME, 0)
+        .consumer("test-consumer", STREAM_NAME, TOPIC_NAME)
         .expect("Failed to create consumer builder")
+        .partitions([0])
         .polling_strategy(PollingStrategy::next())
-        .batch_length(10)
-        .poll_interval(IggyDuration::from_str("100ms").unwrap())
+        .poll_options(PollOptions {
+            count: 10,
+            ..PollOptions::wait(IggyDuration::ONE_SECOND)
+        })
         .polling_retry_interval(NonZeroIggyDuration::from_str("500ms").unwrap())
         .build();
 
@@ -264,7 +270,7 @@ async fn consume_messages_validated(
     let mut payloads = Vec::with_capacity(expected as usize);
     let deadline = tokio::time::Instant::now() + max_wait;
     while (payloads.len() as u32) < expected && tokio::time::Instant::now() < deadline {
-        let poll_result: Option<Result<ReceivedMessage, IggyError>> =
+        let poll_result: Option<Result<ReceivedMessage, ReadError>> =
             tokio::time::timeout(Duration::from_millis(500), consumer.next())
                 .await
                 .ok()
@@ -324,11 +330,14 @@ pub async fn run_single_message_offset_zero_restart(harness: &mut TestHarness) {
         .poll_messages(
             &Identifier::named(STREAM).unwrap(),
             &Identifier::named(TOPIC).unwrap(),
-            Some(0),
+            0,
             &consumer,
             &PollingStrategy::next(),
-            10,
-            true,
+            PollOptions {
+                count: 10,
+                commit: CommitPolicy::OnRead,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -370,11 +379,14 @@ pub async fn run_single_message_offset_zero_restart(harness: &mut TestHarness) {
         .poll_messages(
             &Identifier::named(STREAM).unwrap(),
             &Identifier::named(TOPIC).unwrap(),
-            Some(0),
+            0,
             &consumer,
             &PollingStrategy::next(),
-            10,
-            true,
+            PollOptions {
+                count: 10,
+                commit: CommitPolicy::OnRead,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -447,11 +459,14 @@ pub async fn run_consumer_offset_ahead_after_crash(harness: &mut TestHarness) {
         .poll_messages(
             &Identifier::named(STREAM).unwrap(),
             &Identifier::named(TOPIC).unwrap(),
-            Some(0),
+            0,
             &consumer,
             &PollingStrategy::next(),
-            100,
-            true,
+            PollOptions {
+                count: 100,
+                commit: CommitPolicy::OnRead,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -514,11 +529,14 @@ pub async fn run_consumer_offset_ahead_after_crash(harness: &mut TestHarness) {
         .poll_messages(
             &Identifier::named(STREAM).unwrap(),
             &Identifier::named(TOPIC).unwrap(),
-            Some(0),
+            0,
             &consumer,
             &PollingStrategy::next(),
-            100,
-            true,
+            PollOptions {
+                count: 100,
+                commit: CommitPolicy::OnRead,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -610,11 +628,16 @@ async fn poll_from_zero_until(
             .poll_messages(
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
-                Some(0),
+                0,
                 &Consumer::default(),
                 &PollingStrategy::offset(0),
-                expected * 2,
-                false,
+                PollOptions {
+                    count: expected * 2,
+                    // Each message is its own batch, so the default byte limit
+                    // holds only a few thousand of them.
+                    max_bytes: POLL_REPLY_MAX_BYTES,
+                    ..PollOptions::default()
+                },
             )
             .await;
         if let Ok(polled) = &polled

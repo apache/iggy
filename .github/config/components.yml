@@ -95,14 +95,14 @@ components:
     paths:
       - "core/binary_protocol/**"
 
-  # Miri (UB detector) on unsafe-heavy crates that don't pull tokio/compio.
-  # Scoped to `iggy_binary_protocol` (heavy unsafe in `consensus/iobuf.rs`:
-  # ref-counted CoW buffer, manual atomics, pointer arithmetic) plus the
-  # `consensus` crate (zero unsafe but exercises binary_protocol's unsafe
-  # via integration). Other crates (journal, metadata, partitions, common)
-  # instantiate compio, which uses io_uring syscalls Miri cannot emulate.
-  # See the `# Alignment` doc on the `ConsensusHeader` trait for the
-  # alignment contract that motivates this check.
+  # Miri (UB detector) runs the tests of `iggy_binary_protocol` and
+  # `consensus`, and the tests of the unsafe `server_common` files:
+  # `iobuf.rs` (ref-counted CoW buffer, manual atomics, pointer
+  # arithmetic), `consensus_message.rs` and `buffer.rs`. Other crates
+  # (journal, metadata, partitions, common) instantiate compio, which uses
+  # io_uring syscalls Miri cannot emulate. See the `# Alignment` doc on the
+  # `ConsensusHeader` trait for the alignment contract that motivates this
+  # check.
   rust-miri:
     depends_on:
       - "rust-workspace"
@@ -110,6 +110,9 @@ components:
     paths:
       - "core/binary_protocol/**"
       - "core/consensus/**"
+      - "core/server_common/src/iobuf.rs"
+      - "core/server_common/src/consensus_message.rs"
+      - "core/server_common/src/buffer.rs"
       - ".config/nextest.toml"
     tasks:
       - "miri"
@@ -145,7 +148,7 @@ components:
   # existing deployments, which no other check covers. Matching is literal
   # glob with no crate-graph expansion, so every crate has to be spelled out:
   # `core/server/**` does not cover `core/server_common/**`.
-  # `breaking:storage` on the PR skips it (see .github/workflows/_rust.yml).
+  # `breaking:storage` or `breaking:protocol` on the PR skips it (see .github/workflows/_rust.yml).
   rust-storage-compat:
     depends_on:
       - "rust-workspace"
@@ -184,6 +187,24 @@ components:
     paths:
       - "core/simulator/**"
 
+  # Runtime-free Kafka wire layer the gateway consumes. Listed on its own so a
+  # change confined to the crate still starts the Rust jobs and reruns the
+  # gateway, which no gateways/** glob would otherwise catch.
+  rust-kafka-wire:
+    depends_on:
+      - "rust-workspace"
+      - "rust-common" # the record codec maps onto iggy_common message types
+    paths:
+      - "core/kafka_wire/**"
+
+  # Object store interfaces behind tiered storage. Listed on its own so a change
+  # confined to the crate still starts the Rust jobs.
+  rust-object-store:
+    depends_on:
+      - "rust-workspace"
+    paths:
+      - "core/object_store/**"
+
   # Main Rust workspace testing
   rust:
     depends_on:
@@ -195,13 +216,15 @@ components:
       - "rust-server"
       - "rust-cluster"
       - "rust-simulator"
+      - "rust-kafka-wire"
+      - "rust-object-store"
       - "rust-tools"
       - "rust-cli"
       - "rust-bench"
-      - "rust-connectors"
       - "rust-mcp"
       - "rust-integration"
       - "rust-gateway"
+      - "rust-web-ui"
       - "ci-infrastructure"
     paths:
       - "Dockerfile*"
@@ -236,14 +259,6 @@ components:
       - "rust-sdk"
     paths:
       - "core/bench/**"
-
-  # Connectors runtime
-  rust-connectors:
-    depends_on:
-      - "rust-sdk"
-      - "rust-configs"
-    paths:
-      - "core/connectors/**"
 
   # MCP AI component
   rust-mcp:
@@ -346,6 +361,8 @@ components:
       - "foreign/swift/**"
       - "bdd/swift/**"
       - "examples/swift/**"
+      - "Package.swift"
+      - ".spi.yml"
     tasks: ["lint", "test", "build", "build-macos", "golden", "e2e"]
 
   # Shared BDD infrastructure that affects all BDD tests
@@ -392,6 +409,7 @@ components:
     paths:
       - "bdd/php/**"
       - "bdd/scenarios/basic_messaging.feature"
+      - "bdd/scenarios/deferred_polling.feature"
     tasks: ["bdd-php"]
 
   bdd-go:
@@ -456,6 +474,18 @@ components:
       - "bdd/cpp/**"
       - "bdd/scenarios/**"
     tasks: ["bdd-cpp"]
+
+  bdd-swift:
+    depends_on:
+      - "rust-server"
+      - "rust-sdk"
+      - "sdk-swift"
+      - "bdd-infrastructure"
+      - "ci-infrastructure"
+    paths:
+      - "bdd/swift/**"
+      - "bdd/scenarios/**"
+    tasks: ["bdd-swift"]
 
   examples-rust:
     depends_on:
@@ -540,6 +570,25 @@ components:
       - "scripts/utils.sh"
     tasks: ["examples-java"]
 
+  examples-swift:
+    depends_on:
+      - "rust-server"
+      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "sdk-swift"
+      - "ci-infrastructure"
+    paths:
+      - "examples/swift/**"
+      - "scripts/run-examples-from-readme.sh"
+      - "scripts/utils.sh"
+    tasks: ["examples-swift"]
+
+  # The docs pages, which apache/iggy-website builds into iggy.apache.org/docs
+  docs:
+    paths:
+      - "docs/**"
+      - ".github/workflows/_test_docs.yml"
+    tasks: ["build"]
+
   web-ui:
     paths:
       - "web/**"
@@ -548,6 +597,9 @@ components:
   helm:
     paths:
       - "helm/**"
+      # The smoke builds the gateway image.
+      - "gateways/kafka/Dockerfile"
+      - "gateways/kafka/Dockerfile.dockerignore"
       - "scripts/ci/setup-helm-smoke-cluster.sh"
       - "scripts/ci/test-helm.sh"
     tasks: ["validate", "smoke"]
@@ -557,6 +609,23 @@ components:
       - "core/bench/dashboard/**"
       - "scripts/dashboard/**"
     tasks: ["build"]
+
+  # Dioxus web UI. The rust component runs the native workspace checks on it.
+  rust-web-ui:
+    paths:
+      - "core/web_ui/**"
+
+  # wasm32 lints and the dx bundle the server will embed. A leaf, so an edit to
+  # the bundle scripts alone does not start the full Rust matrix.
+  rust-web-ui-bundle:
+    depends_on:
+      - "rust-web-ui"
+      - "rust-workspace" # a Cargo.lock bump of dioxus must re-check the dx pin
+      - "ci-infrastructure"
+    paths:
+      - "scripts/build-web-ui.sh"
+      - "scripts/ci/install-dx.sh"
+    tasks: ["build-web-ui"]
 
   # Core tools component
   rust-tools:
@@ -571,6 +640,8 @@ components:
       - ".github/config/components.yml"
       - "scripts/ci/restore-runtime.sh"
       - "scripts/ci/test-runtime-artifacts.py"
+      - "scripts/run-examples-from-readme.sh"
+      - "scripts/utils.sh"
       - ".github/workflows/**/*.yml"
       - ".github/actions/**/*.yml"
       - ".github/ci/**/*.yml"
@@ -580,6 +651,7 @@ components:
   rust-gateway:
     depends_on:
       - "rust-sdk"
+      - "rust-kafka-wire"
       - "rust-workspace"
       - "ci-infrastructure"
     paths:

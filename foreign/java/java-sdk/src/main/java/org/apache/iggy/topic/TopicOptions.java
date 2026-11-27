@@ -31,9 +31,13 @@ import java.util.Set;
 /**
  * The options a topic is created with, one typed setter per catalog key.
  *
- * <p>Every key here is fixed at create except {@code message_expiry} and {@code max_topic_size}, which a
- * {@link TopicUpdate} may change later. A key left unset is resolved by the server and reported in the
- * topic's derived options. {@code describeOptions} enumerates what a given server accepts.
+ * <p>Every key here is fixed at create except {@code message_expiry}, {@code max_topic_size},
+ * {@code local_retention_age} and {@code local_retention_size}, which a {@link TopicUpdate} may change
+ * later, {@code tiered_storage}, which it may turn on, and the six durations of a geo topic,
+ * {@code read_cache_size} and {@code read_ahead}, which it may set again. A key left unset is resolved by
+ * the server and reported in the topic's derived options, except those durations and sizes, which stay
+ * unset for each node to apply its own server setting. {@code describeOptions} enumerates what a given
+ * server accepts.
  *
  * <pre>{@code
  * var options = TopicOptions.builder()
@@ -163,6 +167,162 @@ public final class TopicOptions {
          */
         public Builder preallocateSegments(boolean enabled) {
             return set(TopicOptionKey.PREALLOCATE_SEGMENTS, HeaderValue.fromBool(enabled));
+        }
+
+        /**
+         * Number of nodes that store each partition, 1 to 32 and at most the cluster's node count. Left unset,
+         * the server's {@code [cluster] default_replication_factor} applies: every node unless an operator set a
+         * number.
+         *
+         * <p>Two replicas keep two copies but stop accepting writes while either node is down, like Kafka with
+         * {@code min.insync.replicas=2}. The server refuses an out-of-range value with
+         * {@code INVALID_REPLICATION_FACTOR}.
+         */
+        public Builder replicationFactor(long replicas) {
+            return set(TopicOptionKey.REPLICATION_FACTOR, HeaderValue.fromUint32(replicas));
+        }
+
+        /**
+         * Segment age roll in microseconds, {@code 2^64 - 1} meaning never: a batch stamped this long after the
+         * active segment's first batch starts the next segment. Zero leaves the key to the server default.
+         *
+         * <p>The server refuses less than ten minutes, and any age together with {@code preallocate_segments}.
+         */
+        public Builder segmentMaxAge(BigInteger micros) {
+            return setUnlessZero(TopicOptionKey.SEGMENT_MAX_AGE, micros);
+        }
+
+        /**
+         * Move sealed segments to the object store and keep only the local retention on disk. An update can
+         * turn it on later and never off, because the removed local segments cannot come back.
+         *
+         * <p>Needs an object store on every node of the cluster: while one is not ready, the server refuses
+         * {@code true} with {@code FEATURE_UNAVAILABLE}.
+         */
+        public Builder tieredStorage(boolean enabled) {
+            return set(TopicOptionKey.TIERED_STORAGE, HeaderValue.fromBool(enabled));
+        }
+
+        /**
+         * How long a tiered topic keeps an uploaded segment on local disk in microseconds, {@code 2^64 - 1}
+         * meaning never removed. Zero leaves the key to the server default.
+         *
+         * <p>The server refuses a value above a finite {@code message_expiry}. No effect without
+         * {@code tiered_storage}.
+         */
+        public Builder localRetentionAge(BigInteger micros) {
+            return setUnlessZero(TopicOptionKey.LOCAL_RETENTION_AGE, micros);
+        }
+
+        /**
+         * Topic-wide cap in bytes on the uploaded segments a tiered topic keeps on local disk, {@code 2^64 - 1}
+         * meaning unlimited. Zero leaves the key to the server default.
+         *
+         * <p>The server refuses a value above a finite {@code max_topic_size}. No effect without
+         * {@code tiered_storage}.
+         */
+        public Builder localRetentionSize(BigInteger bytes) {
+            return setUnlessZero(TopicOptionKey.LOCAL_RETENTION_SIZE, bytes);
+        }
+
+        /**
+         * Normal or geo, fixed at create. Left unset, the topic is normal.
+         *
+         * <p>A geo topic needs an object store on every node of the cluster: while one is not ready, the
+         * server refuses {@link TopicType#GEO} with {@code FEATURE_UNAVAILABLE}. A geo topic refuses tiered
+         * storage and an encrypted stream, and keeps its name, options and partition count.
+         */
+        public Builder topicType(TopicType type) {
+            return set(TopicOptionKey.TOPIC_TYPE, HeaderValue.fromString(type.value()));
+        }
+
+        /**
+         * How a geo topic writes its messages, fixed at create. Left unset, a geo topic uses {@link GeoMode#GEO}.
+         *
+         * <p>The server refuses {@link GeoMode#GEO_TIERED} with {@code FEATURE_UNAVAILABLE} for now. A normal
+         * topic has no mode, so the server refuses one there with {@code INVALID_OPTION_VALUE}.
+         */
+        public Builder geoMode(GeoMode mode) {
+            return set(TopicOptionKey.GEO_MODE, HeaderValue.fromString(mode.value()));
+        }
+
+        /**
+         * The longest time a send waits for the upload of its fresh object to start, in microseconds, at most ten
+         * seconds. Zero uploads as soon as an upload slot is free. Overrides the server's
+         * {@code [tiered_storage] fresh_upload_interval}.
+         *
+         * <p>This and the five durations below are only on a geo topic: the server refuses them on a normal
+         * topic with {@code INVALID_OPTION_VALUE}. Zero is a value for them and is sent, unlike a zero
+         * {@code message_expiry}. Left unset, each node applies its own server setting of the same name.
+         */
+        public Builder freshUploadInterval(BigInteger micros) {
+            return set(TopicOptionKey.FRESH_UPLOAD_INTERVAL, HeaderValue.fromUint64(micros));
+        }
+
+        /**
+         * The shortest time between two uploads of the positions that the offsets its consumer groups store
+         * themselves wait for, in microseconds, at most one second. Zero answers such a store at its local commit.
+         * Overrides the server's {@code [geo] consumer_offset_upload_interval}.
+         */
+        public Builder consumerOffsetUploadInterval(BigInteger micros) {
+            return set(TopicOptionKey.CONSUMER_OFFSET_UPLOAD_INTERVAL, HeaderValue.fromUint64(micros));
+        }
+
+        /**
+         * How often a node uploads the changed positions of the topic's consumer groups, in microseconds, more
+         * than zero. Overrides the server's {@code [geo] positions_publish_interval}.
+         */
+        public Builder positionsPublishInterval(BigInteger micros) {
+            return set(TopicOptionKey.POSITIONS_PUBLISH_INTERVAL, HeaderValue.fromUint64(micros));
+        }
+
+        /**
+         * How long the tombstone and the objects of the deleted topic stay in the object store, in microseconds,
+         * more than zero. Overrides the server's {@code [geo] tombstone_grace}.
+         */
+        public Builder tombstoneGrace(BigInteger micros) {
+            return set(TopicOptionKey.TOMBSTONE_GRACE, HeaderValue.fromUint64(micros));
+        }
+
+        /**
+         * How long, after a node starts, the group polls of the topic's partitions wait for the positions of the
+         * geo peers, in microseconds. Zero does not wait. Overrides the server's
+         * {@code [geo] positions_resume_timeout}.
+         */
+        public Builder positionsResumeTimeout(BigInteger micros) {
+            return set(TopicOptionKey.POSITIONS_RESUME_TIMEOUT, HeaderValue.fromUint64(micros));
+        }
+
+        /**
+         * The longest wait between two rewrites of a partition's committed messages into long-term segments, in
+         * microseconds, at least one second. Overrides the server's {@code [geo] long_term_rewrite_max_interval}.
+         */
+        public Builder longTermRewriteMaxInterval(BigInteger micros) {
+            return set(TopicOptionKey.LONG_TERM_REWRITE_MAX_INTERVAL, HeaderValue.fromUint64(micros));
+        }
+
+        /**
+         * The memory in bytes that each node keeps for what the topic's reads fetch from the object store,
+         * divided between its partitions. A partition's share is a limit within the read cache of its shard,
+         * not a reservation. Zero keeps nothing that they fetch, any other value is at least 512 KiB. Overrides
+         * the server's {@code [tiered_storage] read_cache_size}.
+         *
+         * <p>This and {@link #readAhead} are on a normal or a geo topic. Zero is a value for them and is sent,
+         * unlike a zero {@code max_topic_size}. Left unset, each node applies its own server setting of the
+         * same name.
+         */
+        public Builder readCacheSize(BigInteger bytes) {
+            return set(TopicOptionKey.READ_CACHE_SIZE, HeaderValue.fromUint64(bytes));
+        }
+
+        /**
+         * The most bytes that readahead fetches from the object store in front of a sequential reader of the
+         * topic. Zero turns readahead off, any other value is at least 128 KiB. With a nonzero
+         * {@link #readCacheSize}, the server refuses more than one eighth of it. Overrides the server's
+         * {@code [tiered_storage] read_ahead}.
+         */
+        public Builder readAhead(BigInteger bytes) {
+            return set(TopicOptionKey.READ_AHEAD, HeaderValue.fromUint64(bytes));
         }
 
         /** An option this build has no setter for. A typed setter wins on collision. */

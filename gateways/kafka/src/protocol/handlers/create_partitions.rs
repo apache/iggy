@@ -40,8 +40,29 @@
 //!   if it committed. One still uncommitted after that can commit later, and a retry that read
 //!   the old count would then add again.
 //!
+//! Iggy splits a topic's `max_topic_size` evenly across its partitions, while Kafka's
+//! `retention.bytes` caps each partition. So a grow of a topic that has a size cap first raises
+//! the cap in proportion, under the same lock, and adds the partitions only once the raise
+//! landed. Iggy's cleaner runs on its own clock, so partitions added first would take part of the
+//! share of each old partition, and could cost it sealed segments before a later raise.
+//!
+//! - A raise that Iggy refuses adds nothing. A raise whose outcome is unknown adds nothing
+//!   either, and the old cap is written back, so that a retry starts from it.
+//! - When the partitions are proven not added, the old cap is written back. When their outcome
+//!   is unknown, the raised cap stays: it keeps more of each partition, never less.
+//! - A topic that ends with more partitions than requested, because something else grew it too,
+//!   gets its cap raised again for every partition it has, from the cap read after the write.
+//! - A write of the cap starts only when a whole bridge write fits before `SETTLE_LIMIT`, and is
+//!   never cut short, so the lock is not released while it can still land.
+//!
+//! An alter that writes a size cap takes the same lock, so on one gateway it never runs between
+//! the raise and the read that follows the add. Another gateway, or an Iggy client, that changes
+//! the cap or the count at the same time can still leave a partition with a smaller share.
+//! Closing that needs Iggy to scale the cap in the commit that adds partitions, or to keep a cap
+//! for each partition.
+//!
 //! The lock is held at most `MAX_REQUEST_TIMEOUT` (30 s) plus `SETTLE_LIMIT` (20 s) after the
-//! request that took it arrived: the write never starts past that request's deadline, and
+//! request that took it arrived: the first write never starts past that request's deadline, and
 //! everything after it ends by `SETTLE_LIMIT`. A call that waited on the lock gets a retriable
 //! `REQUEST_TIMED_OUT`, which the Java admin client does not retry by itself: the caller sees a
 //! `TimeoutException` and must retry. 50 s stays under the Java client's 60 s
@@ -63,7 +84,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use iggy::prelude::{
-    IggyError, IggyTimestamp, PartitionResizePolicy, TopicCreateOptions, TopicDetails,
+    IggyError, IggyTimestamp, MaxTopicSize, PartitionResizePolicy, TopicCreateOptions, TopicDetails,
 };
 use kafka_protocol::messages::create_partitions_request::{
     CreatePartitionsAssignment, CreatePartitionsTopic,
@@ -75,22 +96,23 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::time::{Instant, timeout_at};
 
 use crate::auth::AuthenticatedPrincipal;
-use crate::bridge::iggy_bridge::in_slot;
-use crate::bridge::{BridgeError, IggyBridge, MAX_TOPIC_PARTITIONS};
+use crate::bridge::iggy_bridge::{REQUEST_TIMEOUT, in_slot};
+use crate::bridge::{
+    BridgeError, IggyBridge, MAX_TOPIC_PARTITIONS, RetentionBytes, SettingChange, TopicConfigUpdate,
+};
 use crate::error::Result;
 use crate::protocol::api::{
-    API_KEY_CREATE_PARTITIONS, ApiVersionRange, ERROR_INVALID_PARTITIONS,
+    API_KEY_CREATE_PARTITIONS, ApiVersionRange, ConnectionState, ERROR_INVALID_PARTITIONS,
     ERROR_INVALID_REPLICA_ASSIGNMENT, ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_NOT_CONTROLLER,
     ERROR_POLICY_VIOLATION, ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_AUTHORIZATION_FAILED,
     ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, HandleOutcome,
 };
 use crate::protocol::bounds_guard::validate_create_partitions_shape;
-use crate::protocol::handlers::create_topics::SINGLE_BROKER_ID;
 use crate::protocol::handlers::topic_config::{
     exceeds_topic_cap, find_duplicate_names, topic_cap_message,
 };
 use crate::protocol::handlers::{
-    MAX_REQUEST_TIMEOUT, clamp_request_timeout, decode_guarded, encode_message,
+    MAX_REQUEST_TIMEOUT, another_controller, clamp_request_timeout, decode_guarded, encode_message,
     handle_versioned_request, is_supported_version, respond_or_close, unsupported_version_response,
 };
 
@@ -114,6 +136,14 @@ const _: () = assert!(
     "the longest lock hold must leave a caller that retries at once inside its call budget"
 );
 
+/// The longest one bridge write takes: `with_request_timeout` ends each one.
+const WRITE_LIMIT: Duration = REQUEST_TIMEOUT;
+
+const _: () = assert!(
+    WRITE_LIMIT.as_secs() < SETTLE_LIMIT.as_secs(),
+    "the raise of the size cap, the first write, must end before SETTLE_LIMIT"
+);
+
 /// Pause between two re-reads of a write whose outcome is unknown.
 const SETTLE_POLL: Duration = Duration::from_millis(250);
 
@@ -128,11 +158,15 @@ const NOTHING_ADDED: &str = "timed out waiting for Iggy; no partitions were adde
 
 const FIXED_PARTITION_COUNT: &str = "this topic was created with a fixed partition count";
 
+const CAP_IN_DOUBT: &str = "timed out waiting for Iggy to raise the size cap of the topic for \
+                            the new partitions; no partitions were added";
+
 /// A rejection or verdict for one topic: the Kafka code and its text.
 type Verdict = (i16, Option<StrBytes>);
 
 pub async fn handle(
     state: &GatewayState,
+    connection: &ConnectionState,
     principal: Option<&AuthenticatedPrincipal>,
     api_version: i16,
     body: Bytes,
@@ -172,6 +206,12 @@ pub async fn handle(
             );
         }
     };
+    if another_controller(state, &connection.brokers) {
+        return respond_or_close(
+            encode_inner(api_version, &req.topics, ERROR_NOT_CONTROLLER),
+            "CreatePartitions",
+        );
+    }
 
     // Kafka's `ControllerApis.createPartitions` order: duplicates are answered first, once per
     // name, before authorization looks at the rest.
@@ -213,6 +253,7 @@ pub async fn handle(
             &topics,
             req.validate_only,
             deadline,
+            state.node_id,
         )
         .await,
     );
@@ -311,6 +352,13 @@ pub(crate) trait GrowthBridge: Send + Sync + 'static {
         kafka_topic: &str,
         added: u32,
     ) -> impl Future<Output = core::result::Result<(), BridgeError>> + Send;
+
+    /// Sets the topic's `max_topic_size`. Ends within [`WRITE_LIMIT`].
+    fn resize_topic(
+        &self,
+        kafka_topic: &str,
+        max_topic_size: MaxTopicSize,
+    ) -> impl Future<Output = core::result::Result<(), BridgeError>> + Send;
 }
 
 impl GrowthBridge for IggyBridge {
@@ -329,6 +377,18 @@ impl GrowthBridge for IggyBridge {
     ) -> core::result::Result<(), BridgeError> {
         self.create_kafka_partitions(kafka_topic, added).await
     }
+
+    async fn resize_topic(
+        &self,
+        kafka_topic: &str,
+        max_topic_size: MaxTopicSize,
+    ) -> core::result::Result<(), BridgeError> {
+        let update = TopicConfigUpdate {
+            max_topic_size: Some(SettingChange::Set(max_topic_size)),
+            ..TopicConfigUpdate::default()
+        };
+        self.update_kafka_topic_config(kafka_topic, &update).await
+    }
 }
 
 /// Grows every requested topic, independently of the others.
@@ -344,6 +404,7 @@ async fn grow_all_topics<B: GrowthBridge>(
     topics: &[&CreatePartitionsTopic],
     validate_only: bool,
     deadline: Instant,
+    node_id: i32,
 ) -> Vec<CreatePartitionsTopicResult> {
     let mut results = Vec::with_capacity(topics.len());
     let mut deadline_exceeded = false;
@@ -360,9 +421,9 @@ async fn grow_all_topics<B: GrowthBridge>(
             continue;
         }
         let result = if validate_only {
-            validate_one_topic(bridge.as_ref(), topic, deadline).await
+            validate_one_topic(bridge.as_ref(), topic, deadline, node_id).await
         } else {
-            grow_one_topic(bridge, partition_growth, topic, deadline).await
+            grow_one_topic(bridge, partition_growth, topic, deadline, node_id).await
         };
         results.push(result);
     }
@@ -377,8 +438,9 @@ async fn validate_one_topic<B: GrowthBridge>(
     bridge: &B,
     topic: &CreatePartitionsTopic,
     deadline: Instant,
+    node_id: i32,
 ) -> CreatePartitionsTopicResult {
-    match timeout_at(deadline, plan_growth(bridge, topic)).await {
+    match timeout_at(deadline, plan_growth(bridge, topic, node_id)).await {
         Ok(Ok(_plan)) => topic_result(topic, ERROR_NONE, None),
         Ok(Err((error_code, error_message))) => {
             topic_result(topic, error_code, Some(error_message))
@@ -403,9 +465,10 @@ async fn grow_one_topic<B: GrowthBridge>(
     partition_growth: &Arc<Mutex<()>>,
     topic: &CreatePartitionsTopic,
     deadline: Instant,
+    node_id: i32,
 ) -> CreatePartitionsTopicResult {
     let kafka_topic = topic.name.as_str();
-    let grow = grow_locked(Arc::clone(bridge), topic.clone(), deadline);
+    let grow = grow_locked(Arc::clone(bridge), topic.clone(), deadline, node_id);
     let Some(guard) = lock_by(partition_growth, deadline).await else {
         tracing::warn!(
             kafka_topic,
@@ -442,18 +505,21 @@ async fn lock_by(lock: &Arc<Mutex<()>>, deadline: Instant) -> Option<OwnedMutexG
     }
 }
 
-/// The read, the checks, the write and the check after it, all under the lock.
+/// The read, the checks, the raise of the size cap, the write and the check after it, all under
+/// the lock.
 ///
 /// Nothing is written once `deadline` has passed, since the caller has answered by then. Every
-/// Iggy call after the write ends by `SETTLE_LIMIT` after the write started, which with the
+/// Iggy call after the first write ends by `SETTLE_LIMIT` after it started, which with the
 /// deadline bounds how long the lock is held.
 async fn grow_locked<B: GrowthBridge>(
     bridge: Arc<B>,
     topic: CreatePartitionsTopic,
     deadline: Instant,
+    node_id: i32,
 ) -> Verdict {
     let kafka_topic = topic.name.as_str();
-    let plan = match timeout_at(deadline, plan_growth(bridge.as_ref(), &topic)).await {
+    let bridge = bridge.as_ref();
+    let plan = match timeout_at(deadline, plan_growth(bridge, &topic, node_id)).await {
         Ok(Ok(plan)) => plan,
         Ok(Err((error_code, error_message))) => return (error_code, Some(error_message)),
         Err(_elapsed) => return nothing_added(kafka_topic),
@@ -464,14 +530,25 @@ async fn grow_locked<B: GrowthBridge>(
     }
 
     let settle_by = Instant::now() + SETTLE_LIMIT;
+    if let Some(raised) = plan.raised_size_cap() {
+        if let Err(verdict) = raise_size_cap(bridge, kafka_topic, &plan, raised, settle_by).await {
+            return verdict;
+        }
+        // The raise can end past the deadline, and the caller has answered by then.
+        if Instant::now() >= deadline {
+            restore_size_cap(bridge, kafka_topic, &plan, settle_by).await;
+            return nothing_added(kafka_topic);
+        }
+    }
     let written = timeout_at(settle_by, bridge.add_partitions(kafka_topic, plan.added))
         .await
         .unwrap_or(Err(BridgeError::Timeout));
     match written {
-        Ok(()) => match read_by(bridge.as_ref(), kafka_topic, settle_by).await {
-            Ok(after) => plan.verdict(kafka_topic, plan.observe(after)),
+        Ok(()) => match read_by(bridge, kafka_topic, settle_by).await {
+            Ok(after) => settle(bridge, kafka_topic, &plan, plan.observe(after), settle_by).await,
             Err(error) => {
-                // Iggy acknowledged the write. Only the identity check could not run.
+                // Iggy acknowledged the write, and the cap was raised before it. Only the identity
+                // check could not run.
                 tracing::warn!(
                     kafka_topic,
                     %error,
@@ -481,16 +558,126 @@ async fn grow_locked<B: GrowthBridge>(
             }
         },
         Err(BridgeError::Iggy(IggyError::RequestTooOld)) => {
-            reread_aged_out(bridge.as_ref(), kafka_topic, &plan, settle_by).await
+            reread_aged_out(bridge, kafka_topic, &plan, settle_by).await
         }
         Err(error) if refused_before_apply(&error) => {
+            restore_size_cap(bridge, kafka_topic, &plan, settle_by).await;
             let (error_code, error_message) = bridge_failure(kafka_topic, &error);
             (error_code, Some(error_message))
         }
+        Err(error) => settle_unknown_outcome(bridge, kafka_topic, &plan, &error, settle_by).await,
+    }
+}
+
+/// Raises the size cap of the topic to `raised` before the write adds partitions, or answers why
+/// nothing is added.
+///
+/// A refusal that proves the cap unchanged answers with that refusal. Any other failure leaves
+/// the outcome of the raise unknown. The old cap is then written back, so that a retry sizes the
+/// cap from it and not from a raise that landed late.
+async fn raise_size_cap<B: GrowthBridge>(
+    bridge: &B,
+    kafka_topic: &str,
+    plan: &Plan,
+    raised: MaxTopicSize,
+    settle_by: Instant,
+) -> core::result::Result<(), Verdict> {
+    match write_size_cap(bridge, kafka_topic, raised, settle_by).await {
+        Ok(()) => Ok(()),
+        Err(error) if refused_before_apply(&error) => {
+            tracing::warn!(
+                kafka_topic,
+                %error,
+                "CreatePartitions could not raise the size cap of the topic; nothing was added"
+            );
+            let (error_code, error_message) = bridge_failure(kafka_topic, &error);
+            Err((error_code, Some(error_message)))
+        }
         Err(error) => {
-            settle_unknown_outcome(bridge.as_ref(), kafka_topic, &plan, &error, settle_by).await
+            tracing::warn!(
+                kafka_topic,
+                %error,
+                "CreatePartitions does not know whether the size cap of the topic was raised; \
+                 nothing was added"
+            );
+            restore_size_cap(bridge, kafka_topic, plan, settle_by).await;
+            Err((
+                ERROR_REQUEST_TIMED_OUT,
+                Some(StrBytes::from_static_str(CAP_IN_DOUBT)),
+            ))
         }
     }
+}
+
+/// Writes back the size cap the topic had before the raise, once no partitions were added. When
+/// that fails, or a whole write no longer fits before `settle_by`, the raised cap stays: it keeps
+/// more of each partition, never less.
+async fn restore_size_cap<B: GrowthBridge>(
+    bridge: &B,
+    kafka_topic: &str,
+    plan: &Plan,
+    settle_by: Instant,
+) {
+    if plan.raised_size_cap().is_none() {
+        return;
+    }
+    let before = MaxTopicSize::from(plan.before.max_topic_size);
+    if let Err(error) = write_size_cap(bridge, kafka_topic, before, settle_by).await {
+        tracing::warn!(
+            kafka_topic,
+            %error,
+            "CreatePartitions added no partitions and could not lower the size cap of the topic \
+             back, so each partition keeps more than retention.bytes until it is set again"
+        );
+    }
+}
+
+/// One write of the size cap of the topic. It starts only when a whole bridge write fits before
+/// `settle_by`, and it is not cut short by `timeout_at`: a write cut short could still land after
+/// the lock is released, over a later change on this gateway.
+async fn write_size_cap<B: GrowthBridge>(
+    bridge: &B,
+    kafka_topic: &str,
+    max_topic_size: MaxTopicSize,
+    settle_by: Instant,
+) -> core::result::Result<(), BridgeError> {
+    if Instant::now() + WRITE_LIMIT > settle_by {
+        return Err(BridgeError::Timeout);
+    }
+    match bridge.resize_topic(kafka_topic, max_topic_size).await {
+        Ok(()) | Err(BridgeError::Iggy(IggyError::RequestAlreadyApplied)) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// [`Plan::verdict`] for what the topic shows after the write. The size cap was raised for the
+/// requested count before the write. A topic that has more partitions than that, because
+/// something else grew it too, gets the cap raised again, from the cap it shows now, so that each
+/// partition keeps its share.
+async fn settle<B: GrowthBridge>(
+    bridge: &B,
+    kafka_topic: &str,
+    plan: &Plan,
+    observed: Observed,
+    settle_by: Instant,
+) -> Verdict {
+    if let Observed::Count {
+        count,
+        max_topic_size,
+    } = observed
+        && let Some(raised) = plan.raised_for(count, max_topic_size)
+        && let Err(error) = write_size_cap(bridge, kafka_topic, raised, settle_by).await
+    {
+        tracing::warn!(
+            kafka_topic,
+            count,
+            %error,
+            "CreatePartitions found more partitions than it added and could not raise the size \
+             cap of the topic for them, so each partition keeps less than retention.bytes until \
+             it is set again"
+        );
+    }
+    plan.verdict(kafka_topic, observed)
 }
 
 /// [`GrowthBridge::read_topic`], given up as [`BridgeError::Timeout`] at `by`.
@@ -553,18 +740,19 @@ async fn reread_aged_out<B: GrowthBridge>(
 ) -> Verdict {
     match read_by(bridge, kafka_topic, settle_by).await {
         Ok(after) => match plan.observe(after) {
-            Observed::Count(count) if count == plan.before.partitions_count => {
+            Observed::Count { count, .. } if count == plan.before.partitions_count => {
                 tracing::warn!(
                     kafka_topic,
                     count,
                     "CreatePartitions write already ran in Iggy and left the count unchanged"
                 );
+                restore_size_cap(bridge, kafka_topic, plan, settle_by).await;
                 (
                     ERROR_REQUEST_TIMED_OUT,
                     Some(StrBytes::from_static_str(NOTHING_ADDED)),
                 )
             }
-            observed => plan.verdict(kafka_topic, observed),
+            observed => settle(bridge, kafka_topic, plan, observed, settle_by).await,
         },
         Err(error) => {
             tracing::warn!(
@@ -582,6 +770,7 @@ async fn reread_aged_out<B: GrowthBridge>(
 
 /// Re-reads the topic after a write whose outcome is unknown until the count moves or
 /// `settle_by` passes, so the lock is not released while the write can still be seen to land.
+/// The raised size cap stays when the count never moves, since the write can still land.
 ///
 /// A count that moved to anything but the requested one ends the wait too. Another gateway or a
 /// direct Iggy client moved it, and this write may still land on top afterwards: the lock is
@@ -601,8 +790,8 @@ async fn settle_unknown_outcome<B: GrowthBridge>(
     loop {
         if let Ok(after) = read_by(bridge, kafka_topic, settle_by).await {
             match plan.observe(after) {
-                Observed::Count(count) if count == plan.before.partitions_count => {}
-                observed => return plan.verdict(kafka_topic, observed),
+                Observed::Count { count, .. } if count == plan.before.partitions_count => {}
+                observed => return settle(bridge, kafka_topic, plan, observed, settle_by).await,
             }
         }
         if Instant::now() + SETTLE_POLL >= settle_by {
@@ -629,6 +818,8 @@ pub(crate) struct TopicState {
     created_at: IggyTimestamp,
     partitions_count: u32,
     fixed_partition_count: bool,
+    /// The topic's `max_topic_size`, in its `u64` form.
+    max_topic_size: u64,
 }
 
 impl From<&TopicDetails> for TopicState {
@@ -640,6 +831,7 @@ impl From<&TopicDetails> for TopicState {
             fixed_partition_count: TopicCreateOptions::from_resource_options(&details.options)
                 .partition_resize_policy
                 == Some(PartitionResizePolicy::Fixed),
+            max_topic_size: u64::from(details.resolved_options().max_topic_size),
         }
     }
 }
@@ -658,13 +850,29 @@ enum Observed {
     Grown,
     /// Gone, or another topic under the same name.
     Replaced,
-    /// The same topic at another count.
-    Count(u32),
+    /// The same topic at another count, with the size cap read with it, in its `u64` form.
+    Count { count: u32, max_topic_size: u64 },
 }
 
 impl Plan {
     const fn target(&self) -> u32 {
         self.before.partitions_count + self.added
+    }
+
+    /// The size cap that gives each partition of the grown topic the share each one has now, or
+    /// `None` when the topic has no cap.
+    fn raised_size_cap(&self) -> Option<MaxTopicSize> {
+        scaled_size_cap(
+            self.before.max_topic_size,
+            self.before.partitions_count,
+            self.target(),
+        )
+    }
+
+    /// The size cap that gives each of `count` partitions the share that `max_topic_size`, raised
+    /// for the requested count, gives each of those, or `None` when that is no raise.
+    fn raised_for(&self, count: u32, max_topic_size: u64) -> Option<MaxTopicSize> {
+        scaled_size_cap(max_topic_size, self.target(), count)
     }
 
     fn observe(&self, after: Option<TopicState>) -> Observed {
@@ -675,7 +883,10 @@ impl Plan {
                 if after.partitions_count == self.target() {
                     Observed::Grown
                 } else {
-                    Observed::Count(after.partitions_count)
+                    Observed::Count {
+                        count: after.partitions_count,
+                        max_topic_size: after.max_topic_size,
+                    }
                 }
             }
             _ => Observed::Replaced,
@@ -706,7 +917,7 @@ impl Plan {
             // Something outside this gateway changed the count alongside this write. The count
             // the client asked for no longer holds, which is what INVALID_PARTITIONS reports, and
             // a retry gets the same answer Kafka would give for that count.
-            Observed::Count(count) => {
+            Observed::Count { count, .. } => {
                 tracing::warn!(
                     kafka_topic,
                     count,
@@ -727,6 +938,19 @@ impl Plan {
     }
 }
 
+/// The size cap that gives each of `count` partitions the share that `max_topic_size` gives each
+/// of `sized_for` partitions, or `None` when the topic has no cap or that is no raise. Never below
+/// `max_topic_size`, which Iggy already admitted.
+fn scaled_size_cap(max_topic_size: u64, sized_for: u32, count: u32) -> Option<MaxTopicSize> {
+    let RetentionBytes::PerPartition(share) =
+        RetentionBytes::share_of(MaxTopicSize::from(max_topic_size), sized_for)
+    else {
+        return None;
+    };
+    let scaled = RetentionBytes::PerPartition(share).topic_size(count, max_topic_size);
+    (u64::from(scaled) > max_topic_size).then_some(scaled)
+}
+
 /// Reads one topic and checks the request against it, returning what the write would add.
 ///
 /// The checks run in the order real Kafka's `ReplicationControlManager.createPartitions` runs
@@ -736,6 +960,7 @@ impl Plan {
 async fn plan_growth<B: GrowthBridge>(
     bridge: &B,
     topic: &CreatePartitionsTopic,
+    node_id: i32,
 ) -> core::result::Result<Plan, (i16, StrBytes)> {
     let kafka_topic = topic.name.as_str();
     let before = match bridge.read_topic(kafka_topic).await {
@@ -751,7 +976,9 @@ async fn plan_growth<B: GrowthBridge>(
     };
 
     let added = partitions_to_add(kafka_topic, before.partitions_count, topic.count)
-        .and_then(|added| validate_assignments(topic.assignments.as_deref(), added).map(|()| added))
+        .and_then(|added| {
+            validate_assignments(topic.assignments.as_deref(), added, node_id).map(|()| added)
+        })
         .and_then(|added| within_per_request_cap(added).map(|()| added))
         .and_then(|added| resizable(&before).map(|()| added))
         .inspect_err(|(error_code, _)| {
@@ -831,8 +1058,8 @@ fn partitions_to_add(
 ///
 /// A null list means "let the broker place them", which is what every client sends unless the
 /// caller named replicas. A present list must hold exactly one entry per new partition, as real
-/// Kafka requires, and each entry must name this gateway's single broker (node id 1) exactly
-/// once: that is the only replica list Metadata ever advertises, the same ceiling
+/// Kafka requires, and each entry must name this gateway (`node_id`) exactly once: that is the
+/// only replica list Metadata advertises, the same ceiling
 /// `create_topics::assignment_replicas_are_valid` holds `CreateTopics` to. Both failures are
 /// `INVALID_REPLICA_ASSIGNMENT` (39), real Kafka's code for each.
 ///
@@ -843,6 +1070,7 @@ fn partitions_to_add(
 fn validate_assignments(
     assignments: Option<&[CreatePartitionsAssignment]>,
     added: u32,
+    node_id: i32,
 ) -> core::result::Result<(), (i16, StrBytes)> {
     let Some(assignments) = assignments else {
         return Ok(());
@@ -859,13 +1087,13 @@ fn validate_assignments(
     }
     if assignments
         .iter()
-        .any(|assignment| assignment.broker_ids != [BrokerId(SINGLE_BROKER_ID)])
+        .any(|assignment| assignment.broker_ids != [BrokerId(node_id)])
     {
         return Err((
             ERROR_INVALID_REPLICA_ASSIGNMENT,
             StrBytes::from(format!(
-                "each new partition must be assigned to broker {SINGLE_BROKER_ID} exactly once, \
-                 the only broker this gateway advertises"
+                "each new partition must be assigned to broker {node_id} exactly once, the one \
+                 replica this gateway advertises"
             )),
         ));
     }
@@ -1005,12 +1233,13 @@ fn encode_inner(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use iggy::prelude::Identifier;
+    use iggy::prelude::{Identifier, IggyByteSize};
     use kafka_protocol::messages::TopicName;
 
     use super::*;
+
+    /// The node id of the gateway under test.
+    const NODE_ID: i32 = 1;
     use crate::protocol::acl::PrincipalPermissions;
     use crate::protocol::api::{ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_UNKNOWN_SERVER_ERROR};
 
@@ -1029,10 +1258,12 @@ mod tests {
     fn principal(manage_topics: bool, permissions_known: bool) -> AuthenticatedPrincipal {
         AuthenticatedPrincipal {
             username: "alice".to_string(),
+            user: None,
             permissions: PrincipalPermissions {
                 manage_topics,
                 ..PrincipalPermissions::default()
             },
+            topic_reads: Arc::default(),
             permissions_known,
         }
     }
@@ -1043,6 +1274,7 @@ mod tests {
             created_at: IggyTimestamp::from(created_at),
             partitions_count,
             fixed_partition_count: false,
+            max_topic_size: u64::from(MaxTopicSize::Unlimited),
         }
     }
 
@@ -1098,22 +1330,19 @@ mod tests {
 
     #[test]
     fn a_null_assignment_list_passes() {
-        assert_eq!(validate_assignments(None, 2), Ok(()));
+        assert_eq!(validate_assignments(None, 2, NODE_ID), Ok(()));
     }
 
     #[test]
     fn an_assignment_per_new_partition_naming_the_single_broker_passes() {
-        let assignments = [
-            assignment(&[SINGLE_BROKER_ID]),
-            assignment(&[SINGLE_BROKER_ID]),
-        ];
-        assert_eq!(validate_assignments(Some(&assignments), 2), Ok(()));
+        let assignments = [assignment(&[NODE_ID]), assignment(&[NODE_ID])];
+        assert_eq!(validate_assignments(Some(&assignments), 2, NODE_ID), Ok(()));
     }
 
     #[test]
     fn an_assignment_list_of_the_wrong_length_is_rejected() {
-        let assignments = [assignment(&[SINGLE_BROKER_ID])];
-        let (code, message) = validate_assignments(Some(&assignments), 2).unwrap_err();
+        let assignments = [assignment(&[NODE_ID])];
+        let (code, message) = validate_assignments(Some(&assignments), 2, NODE_ID).unwrap_err();
         assert_eq!(code, ERROR_INVALID_REPLICA_ASSIGNMENT);
         assert_eq!(
             message.as_str(),
@@ -1125,15 +1354,15 @@ mod tests {
     fn an_empty_but_present_assignment_list_is_rejected() {
         // Kafka checks a present list's length even when it is empty: `increaseTo(n)` sends a
         // null list, so an empty one is a client that meant to name replicas and named none.
-        let (code, _) = validate_assignments(Some(&[]), 1).unwrap_err();
+        let (code, _) = validate_assignments(Some(&[]), 1, NODE_ID).unwrap_err();
         assert_eq!(code, ERROR_INVALID_REPLICA_ASSIGNMENT);
     }
 
     #[test]
     fn an_assignment_naming_another_broker_or_an_empty_list_is_rejected() {
-        for broker_ids in [&[][..], &[7][..], &[SINGLE_BROKER_ID, SINGLE_BROKER_ID][..]] {
+        for broker_ids in [&[][..], &[7][..], &[NODE_ID, NODE_ID][..]] {
             let assignments = [assignment(broker_ids)];
-            let (code, _) = validate_assignments(Some(&assignments), 1).unwrap_err();
+            let (code, _) = validate_assignments(Some(&assignments), 1, NODE_ID).unwrap_err();
             assert_eq!(code, ERROR_INVALID_REPLICA_ASSIGNMENT, "{broker_ids:?}");
         }
     }
@@ -1217,18 +1446,26 @@ mod tests {
         assert!(message.is_some());
     }
 
+    /// What [`Plan::observe`] makes of an uncapped topic at `count`.
+    fn uncapped_count(count: u32) -> Observed {
+        Observed::Count {
+            count,
+            max_topic_size: u64::from(MaxTopicSize::Unlimited),
+        }
+    }
+
     #[test]
     fn the_same_topic_at_another_count_is_not_answered_none() {
         let plan = plan();
         assert_eq!(
             plan.observe(Some(topic_state(7, 1_000, 7))),
-            Observed::Count(7)
+            uncapped_count(7)
         );
         assert_eq!(
             plan.observe(Some(topic_state(7, 1_000, 3))),
-            Observed::Count(3)
+            uncapped_count(3)
         );
-        let (code, message) = plan.verdict("orders", Observed::Count(7));
+        let (code, message) = plan.verdict("orders", uncapped_count(7));
         assert_eq!(code, ERROR_INVALID_PARTITIONS);
         assert_eq!(
             message.as_deref(),
@@ -1339,13 +1576,21 @@ mod tests {
     /// Builds a fresh reply each call, since a [`BridgeError`] cannot be cloned.
     type Reread = fn() -> Reply<Option<TopicState>>;
 
+    /// One call a [`ScriptedIggy`] took, in the order it took them.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Call {
+        Read,
+        Add,
+        Resize(MaxTopicSize),
+    }
+
     /// A [`GrowthBridge`] whose every reply comes from a script indexed by call number. Read 0 is
     /// the read before the write.
     struct ScriptedIggy {
         reads: Script<Option<TopicState>>,
         writes: Script<()>,
-        read_calls: AtomicUsize,
-        write_calls: AtomicUsize,
+        resizes: Script<()>,
+        calls: std::sync::Mutex<Vec<Call>>,
     }
 
     impl ScriptedIggy {
@@ -1353,20 +1598,60 @@ mod tests {
             reads: impl Fn(usize) -> Reply<Option<TopicState>> + Send + Sync + 'static,
             writes: impl Fn(usize) -> Reply<()> + Send + Sync + 'static,
         ) -> Arc<Self> {
+            Self::resizing(reads, writes, |_| Reply::Now(Ok(())))
+        }
+
+        fn resizing(
+            reads: impl Fn(usize) -> Reply<Option<TopicState>> + Send + Sync + 'static,
+            writes: impl Fn(usize) -> Reply<()> + Send + Sync + 'static,
+            resizes: impl Fn(usize) -> Reply<()> + Send + Sync + 'static,
+        ) -> Arc<Self> {
             Arc::new(Self {
                 reads: Box::new(reads),
                 writes: Box::new(writes),
-                read_calls: AtomicUsize::new(0),
-                write_calls: AtomicUsize::new(0),
+                resizes: Box::new(resizes),
+                calls: std::sync::Mutex::new(Vec::new()),
             })
         }
 
+        /// Records `call`, and returns how many calls of its kind came before it.
+        fn take(&self, call: Call) -> usize {
+            let mut calls = self.calls.lock().expect("not poisoned");
+            let kind = std::mem::discriminant(&call);
+            let index = calls
+                .iter()
+                .filter(|seen| std::mem::discriminant(*seen) == kind)
+                .count();
+            calls.push(call);
+            index
+        }
+
+        fn calls(&self) -> Vec<Call> {
+            self.calls.lock().expect("not poisoned").clone()
+        }
+
+        fn resized_to(&self) -> Vec<MaxTopicSize> {
+            self.calls()
+                .into_iter()
+                .filter_map(|call| match call {
+                    Call::Resize(size) => Some(size),
+                    Call::Read | Call::Add => None,
+                })
+                .collect()
+        }
+
         fn reads(&self) -> usize {
-            self.read_calls.load(Ordering::SeqCst)
+            self.calls()
+                .iter()
+                .filter(|call| **call == Call::Read)
+                .count()
         }
 
         fn writes(&self) -> usize {
-            self.write_calls.load(Ordering::SeqCst)
+            self.calls()
+                .iter()
+                .filter(|call| **call == Call::Add)
+                .count()
         }
     }
 
@@ -1375,7 +1660,7 @@ mod tests {
             &self,
             _kafka_topic: &str,
         ) -> core::result::Result<Option<TopicState>, BridgeError> {
-            let call = self.read_calls.fetch_add(1, Ordering::SeqCst);
+            let call = self.take(Call::Read);
             (self.reads)(call).resolve().await
         }
 
@@ -1384,9 +1669,44 @@ mod tests {
             _kafka_topic: &str,
             _added: u32,
         ) -> core::result::Result<(), BridgeError> {
-            let call = self.write_calls.fetch_add(1, Ordering::SeqCst);
+            let call = self.take(Call::Add);
             (self.writes)(call).resolve().await
         }
+
+        async fn resize_topic(
+            &self,
+            _kafka_topic: &str,
+            max_topic_size: MaxTopicSize,
+        ) -> core::result::Result<(), BridgeError> {
+            let call = self.take(Call::Resize(max_topic_size));
+            (self.resizes)(call).resolve().await
+        }
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn gib(count: u64) -> MaxTopicSize {
+        MaxTopicSize::Custom(IggyByteSize::from(count * GIB))
+    }
+
+    /// Topic 7 of [`plan`] at `count` partitions, with a cap of `cap_gib` GiB in all.
+    fn capped(count: u32, cap_gib: u64) -> Reply<Option<TopicState>> {
+        Reply::Now(Ok(Some(TopicState {
+            max_topic_size: cap_gib * GIB,
+            ..topic_state(7, 1_000, count)
+        })))
+    }
+
+    /// Topic 7 of [`plan`] at `count` partitions, with a cap of 1 GiB for each.
+    fn capped_at(count: u32) -> Reply<Option<TopicState>> {
+        capped(count, u64::from(count))
+    }
+
+    /// Read 0 finds topic 7 at 3 partitions with 1 GiB for each, and every later read `after`.
+    fn capped_then(
+        after: fn() -> Reply<Option<TopicState>>,
+    ) -> impl Fn(usize) -> Reply<Option<TopicState>> + Send + Sync + 'static {
+        move |call| if call == 0 { capped_at(3) } else { after() }
     }
 
     /// Topic 7 of [`plan`] at `count` partitions.
@@ -1413,7 +1733,7 @@ mod tests {
 
     /// Grows "orders" from 3 to 5 through `bridge`.
     async fn grow_orders(bridge: &Arc<ScriptedIggy>, deadline: Instant) -> Verdict {
-        grow_locked(Arc::clone(bridge), topic("orders", 5), deadline).await
+        grow_locked(Arc::clone(bridge), topic("orders", 5), deadline, NODE_ID).await
     }
 
     fn may_have_been_added() -> Verdict {
@@ -1653,7 +1973,8 @@ mod tests {
         assert!(lock_by(&lock, Instant::now()).await.is_none());
 
         let bridge = ScriptedIggy::new(|_| at(3), |_| Reply::Now(Ok(())));
-        let result = grow_one_topic(&bridge, &lock, &topic("orders", 5), Instant::now()).await;
+        let result =
+            grow_one_topic(&bridge, &lock, &topic("orders", 5), Instant::now(), NODE_ID).await;
         assert_eq!(result.error_code, ERROR_REQUEST_TIMED_OUT);
         assert_eq!(result.error_message.as_deref(), Some(NOTHING_ADDED));
         assert_eq!((bridge.reads(), bridge.writes()), (0, 0));
@@ -1670,6 +1991,7 @@ mod tests {
             &lock,
             &topic("orders", 5),
             Instant::now() + Duration::from_secs(1),
+            NODE_ID,
         )
         .await;
         assert_eq!(result.error_code, ERROR_REQUEST_TIMED_OUT);
@@ -1679,6 +2001,190 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(5)).await;
         tokio::task::yield_now().await;
         assert!(lock.try_lock().is_ok(), "the write settled");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_topic_with_a_size_cap_when_it_grows_should_raise_the_cap_before_adding() {
+        let bridge = ScriptedIggy::new(capped_then(|| capped(5, 5)), |_| Reply::Now(Ok(())));
+        assert_eq!(
+            grow_orders(&bridge, far_deadline()).await,
+            (ERROR_NONE, None)
+        );
+        assert_eq!(
+            bridge.calls(),
+            [Call::Read, Call::Resize(gib(5)), Call::Add, Call::Read],
+            "the old partitions keep their share while the new ones appear"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_topic_without_a_size_cap_when_it_grows_should_not_resize_it() {
+        let bridge = ScriptedIggy::new(lands_after(0), |_| Reply::Now(Ok(())));
+        assert_eq!(
+            grow_orders(&bridge, far_deadline()).await,
+            (ERROR_NONE, None)
+        );
+        assert_eq!(bridge.resized_to(), [] as [MaxTopicSize; 0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_raise_iggy_refuses_should_add_nothing() {
+        let bridge = ScriptedIggy::resizing(
+            capped_then(|| capped_at(3)),
+            |_| Reply::Now(Ok(())),
+            |_| Reply::Now(Err(BridgeError::Iggy(IggyError::Unauthorized))),
+        );
+        let (code, _) = grow_orders(&bridge, far_deadline()).await;
+        assert_eq!(code, ERROR_TOPIC_AUTHORIZATION_FAILED);
+        assert_eq!(bridge.calls(), [Call::Read, Call::Resize(gib(5))]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_raise_of_unknown_outcome_should_add_nothing_and_write_the_old_cap_back() {
+        let bridge = ScriptedIggy::resizing(
+            capped_then(|| capped_at(3)),
+            |_| Reply::Now(Ok(())),
+            |call| {
+                if call == 0 {
+                    Reply::Now(Err(BridgeError::Timeout))
+                } else {
+                    Reply::Now(Ok(()))
+                }
+            },
+        );
+        assert_eq!(
+            grow_orders(&bridge, far_deadline()).await,
+            (
+                ERROR_REQUEST_TIMED_OUT,
+                Some(StrBytes::from_static_str(CAP_IN_DOUBT))
+            )
+        );
+        assert_eq!(
+            bridge.calls(),
+            [Call::Read, Call::Resize(gib(5)), Call::Resize(gib(3))],
+            "a retry then sizes the cap from the old one"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_add_iggy_refuses_should_write_the_old_cap_back() {
+        let bridge = ScriptedIggy::new(capped_then(|| capped_at(3)), |_| {
+            Reply::Now(Err(BridgeError::Iggy(IggyError::PartitionsLimitReached)))
+        });
+        let (code, _) = grow_orders(&bridge, far_deadline()).await;
+        assert_eq!(code, ERROR_POLICY_VIOLATION);
+        assert_eq!(
+            bridge.calls(),
+            [
+                Call::Read,
+                Call::Resize(gib(5)),
+                Call::Add,
+                Call::Resize(gib(3))
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_add_whose_reply_aged_out_and_added_nothing_should_write_the_old_cap_back() {
+        let bridge = ScriptedIggy::new(capped_then(|| capped(3, 5)), |_| {
+            Reply::Now(Err(BridgeError::Iggy(IggyError::RequestTooOld)))
+        });
+        assert_eq!(
+            grow_orders(&bridge, far_deadline()).await,
+            nothing_was_added()
+        );
+        assert_eq!(bridge.resized_to(), [gib(5), gib(3)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_add_of_unknown_outcome_should_keep_the_raised_cap() {
+        let bridge = ScriptedIggy::new(capped_then(|| capped(3, 5)), |_| {
+            Reply::Now(Err(BridgeError::Timeout))
+        });
+        assert_eq!(
+            grow_orders(&bridge, far_deadline()).await,
+            may_have_been_added()
+        );
+        assert_eq!(
+            bridge.resized_to(),
+            [gib(5)],
+            "the add can still land, and a raised cap keeps more, never less"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_count_grown_past_the_target_should_raise_the_cap_for_every_partition() {
+        let bridge = ScriptedIggy::new(capped_then(|| capped(7, 5)), |_| Reply::Now(Ok(())));
+        let (code, _) = grow_orders(&bridge, far_deadline()).await;
+        assert_eq!(code, ERROR_INVALID_PARTITIONS);
+        assert_eq!(
+            bridge.resized_to(),
+            [gib(5), gib(7)],
+            "raised again from the cap read after the write"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_raise_that_ends_past_the_deadline_should_add_nothing_and_write_the_old_cap_back()
+     {
+        let bridge = ScriptedIggy::resizing(
+            capped_then(|| capped(3, 5)),
+            |_| Reply::Now(Ok(())),
+            |call| {
+                if call == 0 {
+                    Reply::After(Duration::from_secs(2), Ok(()))
+                } else {
+                    Reply::Now(Ok(()))
+                }
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert_eq!(grow_orders(&bridge, deadline).await, nothing_was_added());
+        assert_eq!(
+            bridge.calls(),
+            [Call::Read, Call::Resize(gib(5)), Call::Resize(gib(3))]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_no_room_for_a_whole_write_before_the_settle_limit_should_not_start_one() {
+        let bridge = ScriptedIggy::new(capped_then(|| capped_at(3)), |_| {
+            Reply::After(
+                SETTLE_LIMIT.saturating_sub(WRITE_LIMIT) + Duration::from_secs(1),
+                Err(BridgeError::Iggy(IggyError::PartitionsLimitReached)),
+            )
+        });
+        let started = Instant::now();
+        let (code, _) = grow_orders(&bridge, far_deadline()).await;
+        assert_eq!(code, ERROR_POLICY_VIOLATION);
+        assert_eq!(
+            bridge.resized_to(),
+            [gib(5)],
+            "the old cap is not written back when the write could outlast the lock"
+        );
+        assert!(started.elapsed() <= SETTLE_LIMIT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_slow_raise_should_still_release_the_lock_by_the_settle_limit() {
+        let bridge = ScriptedIggy::resizing(
+            capped_then(|| capped(3, 5)),
+            |_| Reply::Never,
+            |_| Reply::After(WRITE_LIMIT, Ok(())),
+        );
+        let started = Instant::now();
+        let verdict = tokio::time::timeout(
+            Duration::from_secs(600),
+            grow_orders(&bridge, far_deadline()),
+        )
+        .await
+        .expect("the lock is released");
+        assert_eq!(verdict, may_have_been_added());
+        assert!(
+            started.elapsed() <= SETTLE_LIMIT,
+            "held for {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1694,7 +2200,7 @@ mod tests {
             StrBytes::from_static_str(FIXED_PARTITION_COUNT),
         );
         assert_eq!(
-            plan_growth(bridge.as_ref(), &topic("orders", 5)).await,
+            plan_growth(bridge.as_ref(), &topic("orders", 5), NODE_ID).await,
             Err(expected)
         );
         assert_eq!(bridge.writes(), 0);

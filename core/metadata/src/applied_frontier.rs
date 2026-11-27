@@ -21,7 +21,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Mutex;
 use std::sync::PoisonError;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
@@ -55,7 +55,11 @@ pub struct AppliedFrontier {
     recovered_revision: AtomicU64,
     waiters: Mutex<Waiters>,
     read_budget: Duration,
+    partition_request_budget: Duration,
     partition_freshness: Option<PartitionFreshness>,
+    tiered_storage_ready: AtomicBool,
+    store_identity_verified: AtomicBool,
+    store_claimed_by_another: AtomicBool,
 }
 
 /// Volatile quorum evidence. Recovery restores metadata, never freshness.
@@ -96,9 +100,14 @@ impl AppliedFrontier {
     /// commit broadcasts at the built-in `COMMIT_MESSAGE_TICKS` interval.
     ///
     /// The server always overrides this from `[cluster]
-    /// commit_broadcast_interval`, and a test asserts the two agree at the
+    /// commit_busy_heartbeat_interval`, and a test asserts the two agree at the
     /// config default; this is what the simulator and unit fixtures get.
     pub const DEFAULT_READ_BUDGET: Duration = Duration::from_millis(3_000);
+
+    /// The budget of a partition request ahead of this frontier when nothing
+    /// sizes it from config: two commit broadcasts at the built-in
+    /// `COMMIT_MESSAGE_TICKS` interval.
+    pub const DEFAULT_PARTITION_REQUEST_BUDGET: Duration = Duration::from_millis(1_000);
 
     /// A frontier at zero whose held reads get `read_budget` before they fail
     /// retryable.
@@ -112,8 +121,61 @@ impl AppliedFrontier {
                 entries: Vec::new(),
             }),
             read_budget,
+            partition_request_budget: Self::DEFAULT_PARTITION_REQUEST_BUDGET,
             partition_freshness: None,
+            tiered_storage_ready: AtomicBool::new(false),
+            store_identity_verified: AtomicBool::new(false),
+            store_claimed_by_another: AtomicBool::new(false),
         }
+    }
+
+    /// Record whether the partitions of this node can read their remote
+    /// segments back. False until set, which the server does once it gave
+    /// them a store to read from.
+    pub fn set_tiered_storage_ready(&self, ready: bool) {
+        self.tiered_storage_ready.store(ready, Ordering::Release);
+    }
+
+    /// Whether this node can tier topics: [`Self::set_tiered_storage_ready`]
+    /// last recorded true and the node passes the store identity check.
+    /// Shard 0 reports it to the metadata primary, which admits a tiered
+    /// topic only once every member reports true, and each shard stages
+    /// evictions only while it holds.
+    #[must_use]
+    pub fn tiered_storage_ready(&self) -> bool {
+        self.tiered_storage_ready.load(Ordering::Acquire) && self.store_identity_verified()
+    }
+
+    /// Record whether this node passes the store identity check: it read back
+    /// its cluster's store identity object since it booted, and no check
+    /// since found that object missing or changed. False until the server's
+    /// identity check sets it. Each shard runs its uploads and object deletes
+    /// only while it holds.
+    pub fn set_store_identity_verified(&self, verified: bool) {
+        self.store_identity_verified
+            .store(verified, Ordering::Release);
+    }
+
+    /// Whether this node passes the store identity check, as
+    /// [`Self::set_store_identity_verified`] last recorded it.
+    #[must_use]
+    pub fn store_identity_verified(&self) -> bool {
+        self.store_identity_verified.load(Ordering::Acquire)
+    }
+
+    /// Record whether the last check that read this node's store identity
+    /// object found it naming another cluster, or holding bytes no cluster
+    /// wrote. False until the server's identity check sets it.
+    pub fn set_store_claimed_by_another(&self, claimed: bool) {
+        self.store_claimed_by_another
+            .store(claimed, Ordering::Release);
+    }
+
+    /// Whether this node's store names another cluster, as
+    /// [`Self::set_store_claimed_by_another`] last recorded it.
+    #[must_use]
+    pub fn store_claimed_by_another(&self) -> bool {
+        self.store_claimed_by_another.load(Ordering::Acquire)
     }
 
     /// Arm admission for a multi-node process. `epoch` must use the bus clock;
@@ -129,6 +191,14 @@ impl AppliedFrontier {
             window: heartbeat_timeout.saturating_add(Self::PARTITION_FRESHNESS_MARGIN),
             until_ns: AtomicU64::new(0),
         });
+        self
+    }
+
+    /// Size the wait of a partition request ahead of this frontier from
+    /// config, as the server sizes `read_budget`.
+    #[must_use]
+    pub const fn with_partition_request_budget(mut self, budget: Duration) -> Self {
+        self.partition_request_budget = budget;
         self
     }
 
@@ -168,6 +238,14 @@ impl AppliedFrontier {
     #[must_use]
     pub const fn read_budget(&self) -> Duration {
         self.read_budget
+    }
+
+    /// How long a partition request ahead of this frontier may wait for it.
+    /// Shorter than [`Self::read_budget`], because the wait holds back the
+    /// requests that its connection sent after it.
+    #[must_use]
+    pub const fn partition_request_budget(&self) -> Duration {
+        self.partition_request_budget
     }
 
     /// Highest metadata op this NODE has applied and published.
@@ -345,6 +423,21 @@ mod tests {
     use std::sync::Arc;
     use std::task::{Context, Poll};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn given_each_tiering_flag_when_reading_readiness_should_need_both() {
+        let frontier = AppliedFrontier::default();
+        for (ready, verified) in [(false, false), (true, false), (false, true), (true, true)] {
+            frontier.set_tiered_storage_ready(ready);
+            frontier.set_store_identity_verified(verified);
+
+            assert_eq!(
+                frontier.tiered_storage_ready(),
+                ready && verified,
+                "ready {ready}, verified {verified}"
+            );
+        }
+    }
 
     #[test]
     fn given_quorum_credit_when_the_deadline_arrives_should_expire_without_an_owner_tick() {

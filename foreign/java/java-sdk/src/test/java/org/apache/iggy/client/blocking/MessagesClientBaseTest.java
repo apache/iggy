@@ -20,16 +20,20 @@
 package org.apache.iggy.client.blocking;
 
 import org.apache.iggy.consumergroup.Consumer;
+import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
+import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingKind;
 import org.apache.iggy.message.PollingStrategy;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
+import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 
 import static java.util.Optional.empty;
 import static org.apache.iggy.TestConstants.STREAM_NAME;
@@ -37,6 +41,11 @@ import static org.apache.iggy.TestConstants.TOPIC_NAME;
 import static org.assertj.core.api.Assertions.assertThat;
 
 public abstract class MessagesClientBaseTest extends IntegrationTest {
+
+    private static final Duration READINESS_WAIT = Duration.ofSeconds(4);
+    private static final Duration SHORT_READINESS_WAIT = Duration.ofMillis(400);
+    private static final Duration SEND_DELAY = Duration.ofMillis(200);
+    private static final int BYTE_BOUND_PAYLOAD_SIZE = 400;
 
     protected MessagesClient messagesClient;
 
@@ -212,5 +221,126 @@ public abstract class MessagesClientBaseTest extends IntegrationTest {
         // then
         assertThat(polledMessages.messages()).hasSize(1);
         assertThat(new String(polledMessages.messages().get(0).payload())).isEqualTo(content);
+    }
+
+    @Test
+    void shouldWakeADeferredPollWhenAMessageArrives() {
+        // given
+        setUpStreamAndTopic();
+        var options = DeferredPollOptions.defaults().withMaxWait(READINESS_WAIT);
+        CompletableFuture<Void> sender = CompletableFuture.runAsync(() -> {
+            sleep(SEND_DELAY);
+            messagesClient.sendMessages(
+                    STREAM_NAME, TOPIC_NAME, Partitioning.partitionId(0L), List.of(Message.of("late arrival")));
+        });
+
+        // when
+        long startedNanos = System.nanoTime();
+        PolledMessages polled = messagesClient.pollMessagesDeferred(
+                STREAM_NAME,
+                TOPIC_NAME,
+                Optional.of(0L),
+                Consumer.of(0L),
+                PollingStrategy.first(),
+                10L,
+                false,
+                options);
+        Duration elapsed = Duration.ofNanos(System.nanoTime() - startedNanos);
+        sender.join();
+
+        // then
+        assertThat(polled.messages()).hasSize(1);
+        assertThat(new String(polled.messages().get(0).payload())).isEqualTo("late arrival");
+        assertThat(elapsed)
+                .as("the poll woke on the message, not on the readiness deadline")
+                .isLessThan(READINESS_WAIT);
+    }
+
+    @Test
+    void shouldReturnEmptyWhenTheReadinessWaitExpires() {
+        // given
+        setUpStreamAndTopic();
+        var options = DeferredPollOptions.defaults().withMaxWait(SHORT_READINESS_WAIT);
+
+        // when
+        long startedNanos = System.nanoTime();
+        PolledMessages polled = messagesClient.pollMessagesDeferred(
+                STREAM_NAME,
+                TOPIC_NAME,
+                Optional.of(0L),
+                Consumer.of(0L),
+                PollingStrategy.first(),
+                10L,
+                false,
+                options);
+        Duration elapsed = Duration.ofNanos(System.nanoTime() - startedNanos);
+
+        // then
+        assertThat(polled.messages()).isEmpty();
+        assertThat(elapsed).isGreaterThanOrEqualTo(SHORT_READINESS_WAIT.dividedBy(2));
+    }
+
+    @Test
+    void shouldReturnAPartialBatchWhenTheReadinessTargetIsNotMet() {
+        // given
+        setUpStreamAndTopic();
+        messagesClient.sendMessages(
+                STREAM_NAME, TOPIC_NAME, Partitioning.partitionId(0L), List.of(Message.of("only one")));
+        var options =
+                DeferredPollOptions.defaults().withMaxWait(SHORT_READINESS_WAIT).withMinCount(3);
+
+        // when
+        PolledMessages polled = messagesClient.pollMessagesDeferred(
+                STREAM_NAME,
+                TOPIC_NAME,
+                Optional.of(0L),
+                Consumer.of(0L),
+                PollingStrategy.first(),
+                10L,
+                false,
+                options);
+
+        // then
+        assertThat(polled.messages()).hasSize(1);
+    }
+
+    @Test
+    void shouldReturnADeferredBatchBoundedByBytes() {
+        // given
+        setUpStreamAndTopic();
+        String payload = "x".repeat(BYTE_BOUND_PAYLOAD_SIZE);
+        messagesClient.sendMessages(
+                STREAM_NAME,
+                TOPIC_NAME,
+                Partitioning.partitionId(0L),
+                List.of(Message.of(payload), Message.of(payload), Message.of(payload)));
+        // Room for a message and its framing, far short of all three.
+        var options = DeferredPollOptions.defaults()
+                .withMaxWait(SHORT_READINESS_WAIT)
+                .withMaxBytes(2L * BYTE_BOUND_PAYLOAD_SIZE);
+
+        // when
+        PolledMessages polled = messagesClient.pollMessagesDeferred(
+                STREAM_NAME,
+                TOPIC_NAME,
+                Optional.of(0L),
+                Consumer.of(0L),
+                PollingStrategy.first(),
+                10L,
+                false,
+                options);
+
+        // then
+        assertThat(polled.messages()).hasSizeBetween(1, 2);
+        assertThat(new String(polled.messages().get(0).payload())).isEqualTo(payload);
+    }
+
+    private static void sleep(Duration duration) {
+        try {
+            Thread.sleep(duration.toMillis());
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(interrupted);
+        }
     }
 }

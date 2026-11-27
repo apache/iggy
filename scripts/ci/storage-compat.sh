@@ -23,31 +23,44 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/init.sh"
 
 # storage-compat.sh -- Prove HEAD still reads a data directory written by master.
 #
-# Supplies two iggy-server binaries to one integration test:
-#   baseline  built from --baseline-ref, copied aside. Default: on a
-#             pull_request run, the master tip under the checked-out merge ref;
-#             anywhere else, origin/master.
-#   HEAD      restored from the CI runtime archive, or built locally from HEAD
-# The test boots the baseline, seeds a data directory, swaps the binary to HEAD
-# and restarts against that same directory.
+# Runs the two halves of core/integration/tests/data_integrity/storage_compat.rs,
+# each from its own source tree, on one data directory:
+#   seed    the baseline's own seed test, run from a worktree of --baseline-ref
+#           against an iggy-server built from that worktree and copied aside.
+#           It writes the data directory and a JSON record of what the
+#           baseline served. Default baseline: on a pull_request run, the
+#           master tip under the checked-out merge ref, anywhere else,
+#           origin/master.
+#   verify  HEAD's verify test, run from this tree against an iggy-server
+#           restored from the CI runtime archive or built locally from HEAD.
+#           It boots on a copy of that directory and checks the record.
+# The seed talks to the baseline through the baseline's own SDK, so a client
+# protocol change in HEAD cannot fail it. A baseline that predates this split
+# has no seed test, and the run stops before any build with a pointer to the
+# breaking:protocol label.
 #
-# The baseline's own core/server/config.toml is extracted next to its binary and
-# both boots read it, so the swap changes the binary and nothing else.
+# The baseline's own core/server/config.toml is extracted next to its binary.
+# The seed boots the baseline on it and the verify translates it into HEAD's
+# schema, so the swap changes the binary and nothing else.
 #
-# The harness only locates binaries; it never builds them. CI supplies HEAD
+# The harness only locates binaries and never builds them. CI supplies HEAD
 # through a revision-checked runtime archive. Local runs build HEAD here.
 # The baseline is always resolved independently from its own source tree.
 #
-# Exit codes: 0 = compatible, non-zero = build failure or format regression.
+# Exit codes: 0 = compatible, non-zero = build failure, format regression or
+# a baseline without the seed test.
 
 # Empty selects the default described above once HEAD is known.
 BASELINE_REF=""
 REBUILD_BASELINE=0
 RUNTIME_ARTIFACTS=""
 
-# The single #[ignore]d test this script exists to drive. The integration crate
+# The two #[ignore]d halves this script exists to drive. The integration crate
 # is one binary built from tests/mod.rs, so tests are selected by module path.
-TEST_FILTER="data_integrity::storage_compat"
+# Neither name contains the other, so each filter selects exactly one test.
+SEED_TEST="given_baseline_server_when_seeding_data_directory_should_record_what_it_serves"
+VERIFY_TEST="given_baseline_data_directory_when_booted_by_build_under_test_should_read_back_the_record"
+TEST_MODULE="data_integrity::storage_compat"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -209,66 +222,117 @@ if ! git show "${BASELINE_SHA}:core/server/config.toml" >"${BASELINE_CONFIG}"; t
   exit 1
 fi
 
+# The data directory the seed writes and the verify boots a copy of, with the
+# seed's record beside it. Wiped before every seed and kept after the run, so a
+# failed verify can be inspected and rerun by hand against the same pair.
+SEED_DATA="${TARGET_DIR}/storage-compat/${BASELINE_SHA}/data"
+SEED_RECORD="${SEED_DATA}.json"
+
+# --run-ignored only: both halves are #[ignore]d, so the normal lanes skip them.
+# --no-tests=fail: a filter matching nothing has to be an error here, unlike the
+# main lane's --no-tests=warn, which would report a typo'd filter as green.
+# --retries 0: a read-back that only fails sometimes is exactly the signal this
+# check exists for, so no retry may hide it. Explicit rather than "not
+# --profile ci": a profile default or NEXTEST_RETRIES in the environment would
+# otherwise apply.
+# --ignore-default-filter: nextest intersects -E with the profile's
+# default-filter, so one that excluded this module would turn the run into a
+# --no-tests=fail abort instead of running the test.
+# The version floor for these flags lives in .config/nextest.toml.
+NEXTEST_ARGS=(
+  --locked -p integration
+  --run-ignored only
+  --no-tests=fail
+  --retries 0
+  --ignore-default-filter
+)
+
 if [ "${REBUILD_BASELINE}" -eq 1 ]; then
   rm -f "${BASELINE_SERVER}"
 fi
 
-if [ -x "${BASELINE_SERVER}" ]; then
-  echo "Reusing baseline server at ${BASELINE_SERVER}"
-else
-  # Outside the repo on purpose: an in-tree worktree gets swept up by the
-  # repo-wide find(1) in the lint scripts and by cargo's workspace globs.
-  # A fresh mktemp path per run cannot collide with an aborted run; the only
-  # residue such a run leaves is an admin entry under .git/worktrees, which
-  # prune clears.
-  git worktree prune
-  WORKTREE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/iggy-storage-compat.XXXXXX")"
-  git worktree add --detach "${WORKTREE_DIR}" "${BASELINE_SHA}"
+# Outside the repo on purpose: an in-tree worktree gets swept up by the
+# repo-wide find(1) in the lint scripts and by cargo's workspace globs.
+# A fresh mktemp path per run cannot collide with an aborted run. The only
+# residue such a run leaves is an admin entry under .git/worktrees, which
+# prune clears. Created on every run, cached binary or not, because the seed
+# test runs from the baseline's own source.
+git worktree prune
+WORKTREE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/iggy-storage-compat.XXXXXX")"
+git worktree add --detach "${WORKTREE_DIR}" "${BASELINE_SHA}"
 
-  echo "Building baseline iggy-server from ${BASELINE_SHA}..."
-  # Built from the worktree as CWD so the baseline's own rust-toolchain.toml
-  # applies, and into a target directory of the worktree's own.
-  #
-  # The two trees MUST NOT share one. Cargo keys a workspace member's unit hash
-  # on its manifest path RELATIVE to the workspace root, and records that
-  # member's sources in the dep-info relative too, so `core/configs` in the
-  # worktree and `core/configs` here hash identically and both resolve against
-  # whichever root cargo is invoked from. Sharing a target directory therefore
-  # makes the second build read the first build's rlibs as fresh: HEAD's
-  # `server` would compile against MASTER's `configs`, `consensus`,
-  # `partitions` and `shard`. Any PR touching a crate below `server` fails to
-  # build here with errors that do not reproduce anywhere else. The duplicated
-  # dependency compile is the price of the two halves being what they claim.
-  #
-  # Inside the worktree so the cleanup trap reclaims it with the worktree; only
-  # the copied binary below outlives the run.
-  #
-  # Debug profile on both sides, and no --all-features: release would compile
-  # debug_assert! out of the baseline while HEAD still panics on it, and
-  # --all-features turns on the server's `disable-mimalloc`, so the two halves
-  # would differ in ways the storage format never changed.
-  BASELINE_TARGET_DIR="${WORKTREE_DIR}/target"
-  (
-    cd "${WORKTREE_DIR}"
-    # The reference revision must not contribute counters to HEAD's coverage report.
-    if [[ "${__CARGO_LLVM_COV_RUSTC_WRAPPER:-}" == 1 ]]; then
-      export RUSTC_WRAPPER="${__CARGO_LLVM_COV_RUSTC_WRAPPER_PRE_EXISTING:-}"
+# Checked before any build. A baseline from before the split carries a single
+# test that seeds through HEAD's SDK, which a baseline server refuses at login
+# once HEAD moves the client protocol, so it cannot stand in for the seed.
+if ! grep -rqs "fn ${SEED_TEST}(" "${WORKTREE_DIR}/core/integration/tests"; then
+  echo "Baseline ${BASELINE_SHA} has no ${SEED_TEST}."
+  echo "It predates the seed and verify split of the storage compatibility test, so the data"
+  echo "directory cannot be seeded from the baseline's own source. Its single test seeds"
+  echo "through HEAD's SDK and fails whenever HEAD changes the client protocol."
+  echo "Add the breaking:protocol label to the pull request to skip this check once."
+  exit 1
+fi
+
+# Inside the worktree so the cleanup trap reclaims it with the worktree. The
+# copied binary and the seeded directory are all that outlive the run.
+BASELINE_TARGET_DIR="${WORKTREE_DIR}/target"
+
+rm -rf "${SEED_DATA}" "${SEED_RECORD}"
+
+# Every baseline cargo call runs from the worktree as CWD so the baseline's own
+# rust-toolchain.toml applies, and into a target directory of the worktree's own.
+#
+# The two trees MUST NOT share one. Cargo keys a workspace member's unit hash
+# on its manifest path RELATIVE to the workspace root, and records that
+# member's sources in the dep-info relative too, so `core/configs` in the
+# worktree and `core/configs` here hash identically and both resolve against
+# whichever root cargo is invoked from. Sharing a target directory therefore
+# makes the second build read the first build's rlibs as fresh: HEAD's
+# `server` would compile against MASTER's `configs`, `consensus`,
+# `partitions` and `shard`. Any PR touching a crate below `server` fails to
+# build here with errors that do not reproduce anywhere else. The duplicated
+# dependency compile is the price of the two halves being what they claim.
+#
+# Debug profile on both sides, and no --all-features: release would compile
+# debug_assert! out of the baseline while HEAD still panics on it, and
+# --all-features turns on the server's `disable-mimalloc`, so the two halves
+# would differ in ways the storage format never changed.
+(
+  cd "${WORKTREE_DIR}"
+  # The reference revision must not contribute counters to HEAD's coverage report.
+  if [[ "${__CARGO_LLVM_COV_RUSTC_WRAPPER:-}" == 1 ]]; then
+    export RUSTC_WRAPPER="${__CARGO_LLVM_COV_RUSTC_WRAPPER_PRE_EXISTING:-}"
+  fi
+  export CARGO_TARGET_DIR="${BASELINE_TARGET_DIR}"
+
+  if [ -x "${BASELINE_SERVER}" ]; then
+    echo "Reusing baseline server at ${BASELINE_SERVER}"
+  else
+    echo "Building baseline iggy-server from ${BASELINE_SHA}..."
+    cargo build --locked -p server --bin iggy-server
+
+    BASELINE_BUILT="${BASELINE_TARGET_DIR}/debug/iggy-server"
+    if [ ! -x "${BASELINE_BUILT}" ]; then
+      echo "Baseline build did not produce ${BASELINE_BUILT}"
+      exit 1
     fi
-    CARGO_TARGET_DIR="${BASELINE_TARGET_DIR}" cargo build --locked -p server --bin iggy-server
-  )
 
-  BASELINE_BUILT="${BASELINE_TARGET_DIR}/debug/iggy-server"
-  if [ ! -x "${BASELINE_BUILT}" ]; then
-    echo "Baseline build did not produce ${BASELINE_BUILT}"
-    exit 1
+    mkdir -p "$(dirname "${BASELINE_SERVER}")"
+    cp "${BASELINE_BUILT}" "${BASELINE_SERVER}"
   fi
 
-  mkdir -p "$(dirname "${BASELINE_SERVER}")"
-  cp "${BASELINE_BUILT}" "${BASELINE_SERVER}"
-  # Now, not at cleanup: a second full debug dependency graph is several GB, and
-  # the HEAD build plus the integration test still have to fit on the runner.
-  rm -rf "${BASELINE_TARGET_DIR}"
-fi
+  echo "Running the seed test of ${BASELINE_SHA}..."
+  # Absolute path: ServerHandle only treats this value as a literal path when it
+  # has more than one component, otherwise it falls back to a cargo_bin lookup.
+  COMPAT_BASELINE_SERVER="${BASELINE_SERVER}" \
+    COMPAT_BASELINE_CONFIG="${BASELINE_CONFIG}" \
+    COMPAT_BASELINE_DATA="${SEED_DATA}" \
+    cargo nextest run "${NEXTEST_ARGS[@]}" -E "test(${TEST_MODULE}::${SEED_TEST})"
+)
+
+# Now, not at cleanup: a second full debug dependency graph is several GB, and
+# the HEAD build plus the verify test still have to fit on the runner.
+rm -rf "${BASELINE_TARGET_DIR}"
 
 if [[ -n "$RUNTIME_ARTIFACTS" ]]; then
   ./scripts/ci/restore-runtime.sh "$RUNTIME_ARTIFACTS"
@@ -283,28 +347,9 @@ if [ ! -x "${HEAD_SERVER}" ]; then
   exit 1
 fi
 
-# Absolute path: ServerHandle only treats this value as a literal path when it
-# has more than one component, otherwise it falls back to a cargo_bin lookup.
-export COMPAT_BASELINE_SERVER="${BASELINE_SERVER}"
-export COMPAT_BASELINE_CONFIG="${BASELINE_CONFIG}"
-
-echo "Running storage compatibility test..."
-# --run-ignored only: the test is #[ignore]d, so the normal lanes skip it.
-# --no-tests=fail: a filter matching nothing has to be an error here, unlike the
-# main lane's --no-tests=warn, which would report a typo'd filter as green.
-# --retries 0: a read-back that only fails sometimes is exactly the signal this
-# check exists for, so no retry may hide it. Explicit rather than "not
-# --profile ci": a profile default or NEXTEST_RETRIES in the environment would
-# otherwise apply.
-# --ignore-default-filter: nextest intersects -E with the profile's
-# default-filter, so one that excluded this module would turn the run into a
-# --no-tests=fail abort instead of running the test.
-# The version floor for these flags lives in .config/nextest.toml.
-cargo nextest run --locked -p integration \
-  --run-ignored only \
-  --no-tests=fail \
-  --retries 0 \
-  --ignore-default-filter \
-  -E "test(${TEST_FILTER})"
+echo "Running the verify test of ${HEAD_SHA}..."
+COMPAT_BASELINE_CONFIG="${BASELINE_CONFIG}" \
+  COMPAT_BASELINE_DATA="${SEED_DATA}" \
+  cargo nextest run "${NEXTEST_ARGS[@]}" -E "test(${TEST_MODULE}::${VERIFY_TEST})"
 
 echo "Storage format compatible: ${BASELINE_SHA} -> ${HEAD_SHA}"

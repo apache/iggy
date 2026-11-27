@@ -30,14 +30,16 @@ import static org.apache.iggy.system.OptionSpec.FLAG_UPDATABLE;
  * The option keys of a stream, in catalog order.
  *
  * <p>{@code name} is set at create and changed through an update. {@code encryption_key} is accepted only
- * at create and never returned. The three projections are computed by the server and only read.
+ * at create and never returned. The three encryption projections and {@code shadow_origin} are computed by
+ * the server and only read.
  */
 public enum StreamOptionKey implements OptionKey {
     NAME("name", FLAG_UPDATABLE),
     ENCRYPTION_KEY("encryption_key", FLAG_SECRET | FLAG_CRITICAL),
     ENCRYPTION_KEY_SOURCE("encryption_key_source", FLAG_READ_ONLY),
     ENCRYPTION_KEY_FINGERPRINT("encryption_key_fingerprint", FLAG_READ_ONLY),
-    ENCRYPTION_KEK_FINGERPRINT("encryption_kek_fingerprint", FLAG_READ_ONLY);
+    ENCRYPTION_KEK_FINGERPRINT("encryption_kek_fingerprint", FLAG_READ_ONLY),
+    SHADOW_ORIGIN("shadow_origin", FLAG_READ_ONLY);
 
     private final String value;
     private final int flags;

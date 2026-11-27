@@ -35,7 +35,8 @@ use crate::error::to_php_exception;
 /// Stream option keys, as the cases an update's reset list takes.
 ///
 /// No stream option is resettable in this release, so `Client::updateStream()` refuses every
-/// case with the error the server would return.
+/// case with the error the server would return. The source, fingerprint and shadow origin keys
+/// are read-only.
 #[php_enum]
 #[php(name = "Iggy\\StreamOptionKey")]
 #[derive(Clone, Copy)]
@@ -50,6 +51,8 @@ pub enum StreamOptionKey {
     EncryptionKeyFingerprint,
     #[php(value = "encryption_kek_fingerprint")]
     EncryptionKekFingerprint,
+    #[php(value = "shadow_origin")]
+    ShadowOrigin,
 }
 
 impl From<StreamOptionKey> for OptionKey {
@@ -60,6 +63,7 @@ impl From<StreamOptionKey> for OptionKey {
             StreamOptionKey::EncryptionKeySource => Self::EncryptionKeySource,
             StreamOptionKey::EncryptionKeyFingerprint => Self::EncryptionKeyFingerprint,
             StreamOptionKey::EncryptionKekFingerprint => Self::EncryptionKekFingerprint,
+            StreamOptionKey::ShadowOrigin => Self::ShadowOrigin,
         }
     }
 }
@@ -73,6 +77,7 @@ impl StubLiteral for StreamOptionKey {
             Self::EncryptionKeySource => "EncryptionKeySource",
             Self::EncryptionKeyFingerprint => "EncryptionKeyFingerprint",
             Self::EncryptionKekFingerprint => "EncryptionKekFingerprint",
+            Self::ShadowOrigin => "ShadowOrigin",
         };
         format!("\\Iggy\\StreamOptionKey::{case}")
     }
@@ -80,8 +85,10 @@ impl StubLiteral for StreamOptionKey {
 
 /// Topic option keys, as the cases an update's reset list takes.
 ///
-/// Only `MessageExpiry` and `MaxTopicSize` are resettable in this release. The server refuses
-/// every other case with its own category.
+/// Only `MessageExpiry`, `MaxTopicSize`, `LocalRetentionAge` and `LocalRetentionSize` are
+/// resettable in this release. The server refuses every other case with its own category. The
+/// durations of a geo topic, from `FreshUploadInterval` on, and the read cache settings,
+/// `ReadCacheSize` and `ReadAhead`, have no default to return to.
 #[php_enum]
 #[php(name = "Iggy\\TopicOptionKey")]
 #[derive(Clone, Copy)]
@@ -108,6 +115,36 @@ pub enum TopicOptionKey {
     SizeOfMessagesRequiredToSave,
     #[php(value = "preallocate_segments")]
     PreallocateSegments,
+    #[php(value = "replication_factor")]
+    ReplicationFactor,
+    #[php(value = "segment_max_age")]
+    SegmentMaxAge,
+    #[php(value = "tiered_storage")]
+    TieredStorage,
+    #[php(value = "local_retention_age")]
+    LocalRetentionAge,
+    #[php(value = "local_retention_size")]
+    LocalRetentionSize,
+    #[php(value = "topic_type")]
+    TopicType,
+    #[php(value = "geo_mode")]
+    GeoMode,
+    #[php(value = "fresh_upload_interval")]
+    FreshUploadInterval,
+    #[php(value = "consumer_offset_upload_interval")]
+    ConsumerOffsetUploadInterval,
+    #[php(value = "positions_publish_interval")]
+    PositionsPublishInterval,
+    #[php(value = "tombstone_grace")]
+    TombstoneGrace,
+    #[php(value = "positions_resume_timeout")]
+    PositionsResumeTimeout,
+    #[php(value = "long_term_rewrite_max_interval")]
+    LongTermRewriteMaxInterval,
+    #[php(value = "read_cache_size")]
+    ReadCacheSize,
+    #[php(value = "read_ahead")]
+    ReadAhead,
 }
 
 impl From<TopicOptionKey> for OptionKey {
@@ -124,6 +161,21 @@ impl From<TopicOptionKey> for OptionKey {
             TopicOptionKey::MessagesRequiredToSave => Self::MessagesRequiredToSave,
             TopicOptionKey::SizeOfMessagesRequiredToSave => Self::SizeOfMessagesRequiredToSave,
             TopicOptionKey::PreallocateSegments => Self::PreallocateSegments,
+            TopicOptionKey::ReplicationFactor => Self::ReplicationFactor,
+            TopicOptionKey::SegmentMaxAge => Self::SegmentMaxAge,
+            TopicOptionKey::TieredStorage => Self::TieredStorage,
+            TopicOptionKey::LocalRetentionAge => Self::LocalRetentionAge,
+            TopicOptionKey::LocalRetentionSize => Self::LocalRetentionSize,
+            TopicOptionKey::TopicType => Self::TopicType,
+            TopicOptionKey::GeoMode => Self::GeoMode,
+            TopicOptionKey::FreshUploadInterval => Self::FreshUploadInterval,
+            TopicOptionKey::ConsumerOffsetUploadInterval => Self::ConsumerOffsetUploadInterval,
+            TopicOptionKey::PositionsPublishInterval => Self::PositionsPublishInterval,
+            TopicOptionKey::TombstoneGrace => Self::TombstoneGrace,
+            TopicOptionKey::PositionsResumeTimeout => Self::PositionsResumeTimeout,
+            TopicOptionKey::LongTermRewriteMaxInterval => Self::LongTermRewriteMaxInterval,
+            TopicOptionKey::ReadCacheSize => Self::ReadCacheSize,
+            TopicOptionKey::ReadAhead => Self::ReadAhead,
         }
     }
 }
@@ -143,6 +195,21 @@ impl StubLiteral for TopicOptionKey {
             Self::MessagesRequiredToSave => "MessagesRequiredToSave",
             Self::SizeOfMessagesRequiredToSave => "SizeOfMessagesRequiredToSave",
             Self::PreallocateSegments => "PreallocateSegments",
+            Self::ReplicationFactor => "ReplicationFactor",
+            Self::SegmentMaxAge => "SegmentMaxAge",
+            Self::TieredStorage => "TieredStorage",
+            Self::LocalRetentionAge => "LocalRetentionAge",
+            Self::LocalRetentionSize => "LocalRetentionSize",
+            Self::TopicType => "TopicType",
+            Self::GeoMode => "GeoMode",
+            Self::FreshUploadInterval => "FreshUploadInterval",
+            Self::ConsumerOffsetUploadInterval => "ConsumerOffsetUploadInterval",
+            Self::PositionsPublishInterval => "PositionsPublishInterval",
+            Self::TombstoneGrace => "TombstoneGrace",
+            Self::PositionsResumeTimeout => "PositionsResumeTimeout",
+            Self::LongTermRewriteMaxInterval => "LongTermRewriteMaxInterval",
+            Self::ReadCacheSize => "ReadCacheSize",
+            Self::ReadAhead => "ReadAhead",
         };
         format!("\\Iggy\\TopicOptionKey::{case}")
     }
@@ -287,6 +354,15 @@ pub(crate) fn options_array(
     Ok(array)
 }
 
+/// An unsigned 64-bit value as an int, or as a decimal string above `PHP_INT_MAX`.
+pub(crate) fn unsigned_scalar(number: u64) -> PhpResult<Zval> {
+    match i64::try_from(number) {
+        Ok(number) => number.into_zval(false),
+        Err(_) => number.to_string().into_zval(false),
+    }
+    .map_err(to_php_exception)
+}
+
 fn option_scalar(value: &HeaderValue) -> PhpResult<Zval> {
     let zval = match value.kind() {
         HeaderKind::Raw => Binary::new(value.as_bytes().to_vec()).into_zval(false),
@@ -315,11 +391,7 @@ fn option_scalar(value: &HeaderValue) -> PhpResult<Zval> {
             i64::from(value.as_uint32().map_err(to_php_exception)?).into_zval(false)
         }
         HeaderKind::Uint64 => {
-            let number = value.as_uint64().map_err(to_php_exception)?;
-            match i64::try_from(number) {
-                Ok(number) => number.into_zval(false),
-                Err(_) => number.to_string().into_zval(false),
-            }
+            return unsigned_scalar(value.as_uint64().map_err(to_php_exception)?);
         }
         HeaderKind::Uint128 => value
             .as_uint128()

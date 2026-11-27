@@ -115,6 +115,17 @@ public class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
                 }));
     }
 
+    CompletableFuture<Void> deleteConsumerOffset(
+            StreamId streamId, TopicId topicId, Long partitionId, Consumer consumer, PartitionContext context) {
+        var payload = offsetTarget(consumer, streamId, topicId, Optional.of(partitionId));
+        payload.writeByte(ACK_QUORUM);
+        return pollRouter.onClientLoop(AsyncTcpConnection.mapResponse(
+                write(CommandCode.ConsumerOffset.DELETE.getValue(), payload, Optional.of(context)), response -> {
+                    response.release();
+                    return null;
+                }));
+    }
+
     private CompletableFuture<Void> store(
             StreamId streamId,
             TopicId topicId,

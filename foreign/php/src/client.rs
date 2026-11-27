@@ -27,18 +27,25 @@ use bytes::Bytes;
 use ext_php_rs::{binary::Binary, exception::PhpResult, php_class, php_impl, types::Zval};
 use iggy::prelude::{
     CompressionAlgorithm, Consumer as RustConsumer, IggyClient as RustIggyClient,
-    IggyClientBuilder, IggyDuration, IggyExpiry, IggyMessage as RustMessage, MaxTopicSize,
-    Partitioning, PollingStrategy as RustPollingStrategy, *,
+    IggyClientBuilder, IggyExpiry, IggyMessage as RustMessage, MaxTopicSize, Partitioning,
+    PollOptions as RustPollOptions, PollingStrategy as RustPollingStrategy, *,
 };
 use tokio::sync::Mutex;
 
-use crate::consumer::{AutoCommit, IggyConsumer};
+use crate::consumer::{ConsumerOffsetInfo, IggyConsumer};
 use crate::durability::Durability as PhpDurability;
 use crate::error::to_php_exception;
 use crate::identifier::PhpIdentifier;
 use crate::metadata_changes::{MetadataChangeGroup, MetadataChangeStart, MetadataChanges};
 use crate::options::{OptionSpec, OptionsScope, StreamOptionKey, TopicOptionKey, reset_names};
-use crate::receive_message::{PollingStrategy, ReceiveMessage};
+use crate::page::{
+    ConsumerGroupsPage, PageOrder, PartitionsPage, StreamsPage, TopicsPage, UsersPage,
+    named_page_query, page_query,
+};
+use crate::pending_poll::PendingPoll;
+use crate::poll_options::PollOptions;
+use crate::reader::PartitionReader;
+use crate::receive_message::{Checkpoint, PolledMessages, PollingStrategy};
 use crate::runtime::runtime;
 use crate::send_message::{SendMessage, SendMessagesResponse};
 use crate::stream::StreamDetails;
@@ -160,8 +167,20 @@ impl IggyClient {
         runtime().block_on(async move { inner.connect().await.map_err(to_php_exception) })
     }
 
+    /// Closes the current connection. Repeated calls are safe. Call connect() to use the client
+    /// again, and loginUser() after it, because the sign-in is dropped. Until then requests
+    /// fail, and nothing connects the client in the background. A poll with
+    /// CommitPolicy::onRead() that waits throws FetchProgressUncertain (14010), and its partition
+    /// stays blocked across the reconnect until abandonOperation().
+    pub fn disconnect(&self) -> PhpResult {
+        let inner = self.inner.clone();
+        runtime().block_on(async move { inner.disconnect().await.map_err(to_php_exception) })
+    }
+
     /// Replays an exact retained operation. A committed rejection raises its original error
     /// and releases its lane; uncertainty keeps it retained. HTTP is unsupported.
+    /// A fetch progress block raises code 14010 without replay. Only explicit
+    /// abandonOperation releases it, accepting the unknown server outcome.
     /// Operation IDs use decimal strings to preserve the full unsigned 64-bit range.
     pub fn resolve_operation(
         &self,
@@ -269,6 +288,10 @@ impl IggyClient {
     }
 
     /// Gets a stream by id or name.
+    ///
+    /// Over TCP, QUIC and WebSocket, a stream with too many topics for one reply throws
+    /// ReplyTooLarge (97), and the connection stays usable. getTopicsPage() reads its topics
+    /// page by page.
     pub fn get_stream(&self, stream_id: PhpIdentifier) -> PhpResult<Option<StreamDetails>> {
         let stream_id: Identifier = stream_id.try_into()?;
         let inner = self.inner.clone();
@@ -289,6 +312,54 @@ impl IggyClient {
     /// (18446744073709551615) can be sent. `raw` sends string-valued keys this build does not
     /// know, and the server decides whether to accept them. It is marked
     /// `#[\SensitiveParameter]`, because an unknown key may hold a secret.
+    ///
+    /// `replication_factor` is how many nodes store each partition, 1 to 32 and at most the
+    /// cluster's node count. Null lets the server's `[cluster] default_replication_factor` apply:
+    /// every node unless an operator set a number. A write commits on a quorum of these nodes, so
+    /// 2 keeps two copies but stops accepting writes while either node is down. The server
+    /// rejects an out-of-range value with `InvalidReplicationFactor`.
+    ///
+    /// `segment_max_age_micros` starts a new segment once a batch arrives this long after the
+    /// active segment's first batch, at least 10 minutes. 18446744073709551615 and null roll
+    /// segments by size alone. The server refuses a duration together with
+    /// `preallocate_segments`. It follows `raw`, so positional calls written before it existed
+    /// keep their meaning, and so do the options below.
+    ///
+    /// `tiered_storage` moves sealed segments to the object store. Null leaves it off, and the
+    /// server refuses true with `Feature is unavailable` until it tiers topics.
+    /// `local_retention_age_micros` is how long a tiered topic keeps an uploaded segment on local
+    /// disk, one day when null, and `local_retention_size` caps the uploaded segments it keeps
+    /// there, unlimited when null. The server refuses an age above a finite message expiry and a
+    /// size above a finite `max_topic_size`.
+    ///
+    /// `topic_type` is `normal` or `geo`, and null creates a normal topic. A geo topic's messages
+    /// also become readable in the other datacenters through the object store. A geo topic needs
+    /// an object store on every node of the cluster: while one is not ready, the server refuses
+    /// `geo` with `Feature is unavailable`. A geo topic refuses tiered storage and an encrypted
+    /// stream, and keeps its name, its partition count and every option but the durations and the
+    /// read cache settings below. `geo_mode` says how a geo topic writes its messages, `geo` or
+    /// `geo_tiered`, and null resolves to `geo` there. The server refuses `geo_tiered` with
+    /// `Feature is unavailable` for now, and any mode on a normal topic.
+    ///
+    /// The six durations after `geo_mode` override, for a geo topic, the server settings of the
+    /// same name on each node: `[tiered_storage] fresh_upload_interval` (at most 10 s) and the
+    /// `[geo]` settings `consumer_offset_upload_interval` (at most 1 s, 0 answers an offset store
+    /// at its local commit), `positions_publish_interval` and `tombstone_grace` (above 0),
+    /// `positions_resume_timeout` (0 waits for no peer) and `long_term_rewrite_max_interval` (at
+    /// least 1 s). Each takes an int or a decimal string of microseconds. 0 is sent as a value,
+    /// and null leaves the server setting in force. The server refuses any of them on a normal
+    /// topic with `Invalid option value`.
+    ///
+    /// `read_cache_size` and `read_ahead`, after the durations, go on any topic and override the
+    /// `[tiered_storage]` settings of the same name on each node. `read_cache_size` is the memory
+    /// each node keeps for what the topic's reads fetch from the object store, divided between
+    /// its partitions: a limit within the read cache of each partition's shard, not a
+    /// reservation. 0 keeps nothing they fetch, otherwise it is at least 512 KiB. `read_ahead` is
+    /// the most bytes readahead fetches in front of a sequential reader of the topic. 0 turns
+    /// readahead off, otherwise it is at least 128 KiB and at most an eighth of a
+    /// `read_cache_size` above 0. Each takes an int or a decimal string of bytes. 0 is sent as a
+    /// value, and null leaves the server setting in force. The server refuses a value out of
+    /// range with `Invalid option value`.
     #[allow(clippy::too_many_arguments)]
     pub fn create_topic(
         &self,
@@ -305,51 +376,54 @@ impl IggyClient {
         size_of_messages_required_to_save: Option<&Zval>,
         preallocate_segments: Option<bool>,
         partition_resize_policy: Option<String>,
+        replication_factor: Option<&Zval>,
         raw: Option<BTreeMap<String, String>>,
+        segment_max_age_micros: Option<&Zval>,
+        tiered_storage: Option<bool>,
+        local_retention_age_micros: Option<&Zval>,
+        local_retention_size: Option<&Zval>,
+        topic_type: Option<String>,
+        geo_mode: Option<String>,
+        fresh_upload_interval_micros: Option<&Zval>,
+        consumer_offset_upload_interval_micros: Option<&Zval>,
+        positions_publish_interval_micros: Option<&Zval>,
+        tombstone_grace_micros: Option<&Zval>,
+        positions_resume_timeout_micros: Option<&Zval>,
+        long_term_rewrite_max_interval_micros: Option<&Zval>,
+        read_cache_size: Option<&Zval>,
+        read_ahead: Option<&Zval>,
     ) -> PhpResult {
-        let message_expiry_micros = optional_u64(message_expiry_micros, "message_expiry_micros")?;
-        let max_topic_size = optional_u64(max_topic_size, "max_topic_size")?;
-        let segment_size = optional_u64(segment_size, "segment_size")?;
-        let messages_required_to_save =
-            optional_unsigned::<u32>(messages_required_to_save, "messages_required_to_save")?;
-        let size_of_messages_required_to_save = optional_u64(
+        let options = topic_create_options(
+            partitions_count,
+            compression_algorithm,
+            message_expiry_micros,
+            max_topic_size,
+            segment_size,
+            durability,
+            consumer_offset_durability,
+            messages_required_to_save,
             size_of_messages_required_to_save,
-            "size_of_messages_required_to_save",
+            preallocate_segments,
+            partition_resize_policy,
+            replication_factor,
+            raw,
+            segment_max_age_micros,
+            tiered_storage,
+            local_retention_age_micros,
+            local_retention_size,
+            topic_type,
+            geo_mode,
+            fresh_upload_interval_micros,
+            consumer_offset_upload_interval_micros,
+            positions_publish_interval_micros,
+            tombstone_grace_micros,
+            positions_resume_timeout_micros,
+            long_term_rewrite_max_interval_micros,
+            read_cache_size,
+            read_ahead,
         )?;
-        let compression_algorithm = match compression_algorithm {
-            Some(value) => CompressionAlgorithm::from_str(&value).map_err(to_php_exception)?,
-            None => CompressionAlgorithm::default(),
-        };
-        let partition_resize_policy = partition_resize_policy
-            .as_deref()
-            .map(PartitionResizePolicy::from_str)
-            .transpose()
-            .map_err(|_| {
-                to_php_exception("'partition_resize_policy' must be 'mutable' or 'fixed'")
-            })?;
-        let expiry = message_expiry_micros.map_or(IggyExpiry::ServerDefault, IggyExpiry::from);
-        let max_size = max_topic_size.map_or(MaxTopicSize::ServerDefault, MaxTopicSize::from);
         let stream: Identifier = stream.try_into()?;
         let inner = self.inner.clone();
-
-        // `None` is what tells admission to resolve the server default, so the
-        // sentinels above must collapse back to it.
-        let options = TopicCreateOptions {
-            partitions_count: Some(partitions_count),
-            compression_algorithm: (compression_algorithm != CompressionAlgorithm::default())
-                .then_some(compression_algorithm),
-            message_expiry: (expiry != IggyExpiry::ServerDefault).then_some(expiry),
-            max_topic_size: (max_size != MaxTopicSize::ServerDefault).then_some(max_size),
-            segment_size: segment_size.map(IggyByteSize::from),
-            durability: durability.unwrap_or_default().into(),
-            consumer_offset_durability: consumer_offset_durability.unwrap_or_default().into(),
-            partition_resize_policy,
-            messages_required_to_save,
-            size_of_messages_required_to_save: size_of_messages_required_to_save
-                .map(IggyByteSize::from),
-            preallocate_segments,
-            raw: raw.unwrap_or_default(),
-        };
 
         runtime().block_on(async move {
             inner
@@ -368,6 +442,20 @@ impl IggyClient {
     /// default. `raw` and `raw_reset` reach keys this build does not know, and the server
     /// decides whether each one may be set or reset. `raw` is marked
     /// `#[\SensitiveParameter]`, because an unknown key may hold a secret.
+    ///
+    /// `tiered_storage` set to true turns tiered storage on. The server refuses false, an update
+    /// never turns it off, and refuses true with `Feature is unavailable` until it tiers topics.
+    /// `local_retention_age_micros` and `local_retention_size` change how long and how much a
+    /// tiered topic keeps on local disk after upload, with the same int or decimal string values
+    /// and the same refusal of 0 as the expiry and the size cap.
+    ///
+    /// The six durations of a geo topic take the values `createTopic()` takes, 0 included. With
+    /// the read cache settings, they are the only options an update can change on a geo topic. A
+    /// normal topic refuses them with `Invalid option value`, and they cannot be reset: a `reset`
+    /// case or a `raw_reset` name of one is refused with `Option cannot be reset`.
+    ///
+    /// `read_cache_size` and `read_ahead` take the values `createTopic()` takes, 0 included, and
+    /// an update can change them on any topic. They cannot be reset either.
     #[allow(clippy::too_many_arguments)]
     #[php(defaults(reset = Vec::<TopicOptionKey>::new()))]
     pub fn update_topic(
@@ -380,24 +468,39 @@ impl IggyClient {
         reset: Vec<TopicOptionKey>,
         raw: Option<BTreeMap<String, String>>,
         raw_reset: Option<Vec<String>>,
+        tiered_storage: Option<bool>,
+        local_retention_age_micros: Option<&Zval>,
+        local_retention_size: Option<&Zval>,
+        fresh_upload_interval_micros: Option<&Zval>,
+        consumer_offset_upload_interval_micros: Option<&Zval>,
+        positions_publish_interval_micros: Option<&Zval>,
+        tombstone_grace_micros: Option<&Zval>,
+        positions_resume_timeout_micros: Option<&Zval>,
+        long_term_rewrite_max_interval_micros: Option<&Zval>,
+        read_cache_size: Option<&Zval>,
+        read_ahead: Option<&Zval>,
     ) -> PhpResult {
-        let message_expiry = optional_u64(message_expiry_micros, "message_expiry_micros")?
-            .map(|micros| positive_update(micros, "message_expiry_micros").map(IggyExpiry::from))
-            .transpose()?;
-        let max_topic_size = optional_u64(max_topic_size, "max_topic_size")?
-            .map(|bytes| positive_update(bytes, "max_topic_size").map(MaxTopicSize::from))
-            .transpose()?;
-        let stream: Identifier = stream.try_into()?;
-        let topic: Identifier = topic.try_into()?;
-        let (reset, raw_reset) = reset_names(reset, raw_reset)?;
-        let options = TopicUpdateOptions {
+        let options = topic_update_options(
             name,
-            message_expiry,
+            message_expiry_micros,
             max_topic_size,
             reset,
+            raw,
             raw_reset,
-            raw: raw.unwrap_or_default(),
-        };
+            tiered_storage,
+            local_retention_age_micros,
+            local_retention_size,
+            fresh_upload_interval_micros,
+            consumer_offset_upload_interval_micros,
+            positions_publish_interval_micros,
+            tombstone_grace_micros,
+            positions_resume_timeout_micros,
+            long_term_rewrite_max_interval_micros,
+            read_cache_size,
+            read_ahead,
+        )?;
+        let stream: Identifier = stream.try_into()?;
+        let topic: Identifier = topic.try_into()?;
         let inner = self.inner.clone();
 
         runtime().block_on(async move {
@@ -463,7 +566,28 @@ impl IggyClient {
         })
     }
 
+    /// Retires the geo origin of a datacenter that never returns.
+    ///
+    /// The cluster then follows nothing more of the origin: its shadow topics serve what they
+    /// hold until their retention removes it, and a client may delete them. Retiring an origin
+    /// that is retired already changes nothing. A datacenter that comes back needs another
+    /// origin name. Needs root or the global `manage_servers` permission.
+    pub fn retire_geo_origin(&self, origin: String) -> PhpResult {
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .retire_geo_origin(&origin)
+                .await
+                .map_err(to_php_exception)
+        })
+    }
+
     /// Gets a topic by stream and topic id/name.
+    ///
+    /// Over TCP, QUIC and WebSocket, a topic with too many partitions for one reply throws
+    /// ReplyTooLarge (97), and the connection stays usable. getPartitionsPage() reads its
+    /// partitions page by page.
     pub fn get_topic(
         &self,
         stream_id: PhpIdentifier,
@@ -478,6 +602,143 @@ impl IggyClient {
                 .get_topic(&stream_id, &topic_id)
                 .await
                 .map(|topic| topic.map(TopicDetails::from))
+                .map_err(to_php_exception)
+        })
+    }
+
+    /// Reads one page of the streams the caller may read.
+    ///
+    /// `order` is `Iggy\PageOrder::Id` when null, and `descending` reverses it. `limit` is 1 to
+    /// 1000, 100 when null. `cursor` is the `next` of the previous page, null for the first
+    /// page. `name` keeps the streams whose name holds the text, case-sensitive, and is 1 to
+    /// 255 bytes. A query outside these ranges, or a cursor text that the client cannot read,
+    /// throws `Invalid command` (code 3) before anything is sent. The server refuses a cursor
+    /// that does not fit the query with the same error, which HTTP reports as code 300. A
+    /// `limit` that is not an integer, or that does not fit an unsigned 32-bit integer, throws
+    /// `IggyException` with code 0 from the argument check.
+    #[php(defaults(descending = false))]
+    pub fn get_streams_page(
+        &self,
+        order: Option<PageOrder>,
+        descending: bool,
+        limit: Option<&Zval>,
+        cursor: Option<String>,
+        name: Option<String>,
+    ) -> PhpResult<StreamsPage> {
+        let query = named_page_query(order, descending, limit, cursor, name)?;
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .get_streams_page(&query)
+                .await
+                .map(StreamsPage::from)
+                .map_err(to_php_exception)
+        })
+    }
+
+    /// Reads one page of the topics the caller may read in a stream. A missing stream, or one the
+    /// caller may read no topic of, gives an empty page without `next`. For a caller with a global
+    /// read grant, a page read with a cursor throws code 1009 instead, which HTTP reports as code
+    /// 20 (ResourceNotFound), because the stream was deleted during the walk. The other arguments are those of
+    /// getStreamsPage().
+    #[php(defaults(descending = false))]
+    pub fn get_topics_page(
+        &self,
+        stream_id: PhpIdentifier,
+        order: Option<PageOrder>,
+        descending: bool,
+        limit: Option<&Zval>,
+        cursor: Option<String>,
+        name: Option<String>,
+    ) -> PhpResult<TopicsPage> {
+        let stream_id: Identifier = stream_id.try_into()?;
+        let query = named_page_query(order, descending, limit, cursor, name)?;
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .get_topics_page(&stream_id, &query)
+                .await
+                .map(TopicsPage::from)
+                .map_err(to_php_exception)
+        })
+    }
+
+    /// Reads one page of the partitions of a topic. Partition ids follow creation, so both
+    /// orders walk by id. The other arguments are those of getStreamsPage() except `name`,
+    /// because a partition has no name.
+    #[php(defaults(descending = false))]
+    pub fn get_partitions_page(
+        &self,
+        stream_id: PhpIdentifier,
+        topic_id: PhpIdentifier,
+        order: Option<PageOrder>,
+        descending: bool,
+        limit: Option<&Zval>,
+        cursor: Option<String>,
+    ) -> PhpResult<PartitionsPage> {
+        let stream_id: Identifier = stream_id.try_into()?;
+        let topic_id: Identifier = topic_id.try_into()?;
+        let query = page_query(order, descending, limit, cursor)?;
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .get_partitions_page(&stream_id, &topic_id, &query)
+                .await
+                .map(PartitionsPage::from)
+                .map_err(to_php_exception)
+        })
+    }
+
+    /// Reads one page of the consumer groups of a topic. Group ids follow creation, so both
+    /// orders walk by id. The other arguments are those of getStreamsPage().
+    #[allow(clippy::too_many_arguments)]
+    #[php(defaults(descending = false))]
+    pub fn get_consumer_groups_page(
+        &self,
+        stream_id: PhpIdentifier,
+        topic_id: PhpIdentifier,
+        order: Option<PageOrder>,
+        descending: bool,
+        limit: Option<&Zval>,
+        cursor: Option<String>,
+        name: Option<String>,
+    ) -> PhpResult<ConsumerGroupsPage> {
+        let stream_id: Identifier = stream_id.try_into()?;
+        let topic_id: Identifier = topic_id.try_into()?;
+        let query = named_page_query(order, descending, limit, cursor, name)?;
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .get_consumer_groups_page(&stream_id, &topic_id, &query)
+                .await
+                .map(ConsumerGroupsPage::from)
+                .map_err(to_php_exception)
+        })
+    }
+
+    /// Reads one page of the users, and `name` matches the username. The other arguments are
+    /// those of getStreamsPage().
+    #[php(defaults(descending = false))]
+    pub fn get_users_page(
+        &self,
+        order: Option<PageOrder>,
+        descending: bool,
+        limit: Option<&Zval>,
+        cursor: Option<String>,
+        name: Option<String>,
+    ) -> PhpResult<UsersPage> {
+        let query = named_page_query(order, descending, limit, cursor, name)?;
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .get_users_page(&query)
+                .await
+                .map(UsersPage::from)
                 .map_err(to_php_exception)
         })
     }
@@ -509,54 +770,276 @@ impl IggyClient {
         })
     }
 
-    /// Polls messages from the specified topic and partition.
+    /// Polls messages from one partition of a topic, as the standalone consumer `consumer`.
     ///
-    /// Each message keeps the partition context of this poll. To continue at an offset under
-    /// that context, pass PollingStrategy::offset($offset)->withContext($message->context()).
-    /// A stale context fails with HistoryUnavailable (87).
+    /// PollingStrategy::next() starts at the stored offset of `consumer`. `options` defaults to
+    /// `new PollOptions()`: up to 1000 messages and no wait. With CommitPolicy::onRead(),
+    /// the server stores the offset of the batch for `consumer`.
     ///
-    /// Without a context, the poll uses the context of its route. It can fail once with
+    /// To read on, pass `$polled->continuation()` as the next strategy. It keeps the partition
+    /// history of the batch, so a read after the partition was recreated fails with
+    /// HistoryUnavailable (87), and a read of another partition refuses it with InvalidCommand
+    /// (3).
+    ///
+    /// A fresh strategy uses the context of its route. It can fail once with
     /// HistoryUnavailable (87) after another client deleted and recreated the partition. The
     /// failed route is dropped, and the next call routes again.
+    ///
+    /// `consumer` polls as a standalone consumer, or as a member of the consumer group of that
+    /// id when `group` is true, which reads only the partitions assigned to it.
+    ///
+    /// Under CommitPolicy::onRead(), a lost reply throws FetchProgressUncertain (14010),
+    /// because the server can still store the offset. The partition stays blocked, and the
+    /// next poll of it throws PartitionLaneBlocked (14009), until abandonOperation().
+    #[allow(clippy::too_many_arguments)]
     pub fn poll_messages(
         &self,
         stream: PhpIdentifier,
         topic: PhpIdentifier,
         partition_id: u32,
+        consumer: PhpIdentifier,
         polling_strategy: &PollingStrategy,
-        count: u32,
-        auto_commit: bool,
-    ) -> PhpResult<Vec<ReceiveMessage>> {
-        let consumer = RustConsumer::default();
+        options: Option<&PollOptions>,
+        group: Option<bool>,
+    ) -> PhpResult<PolledMessages> {
+        let consumer = consumer_identity(consumer, group)?;
         let stream: Identifier = stream.try_into()?;
         let topic: Identifier = topic.try_into()?;
         let strategy: RustPollingStrategy = polling_strategy.into();
+        let options = options.map_or_else(RustPollOptions::default, |options| options.inner);
         let inner = self.inner.clone();
 
         runtime().block_on(async move {
-            let polled_messages = inner
-                .poll_messages(
-                    &stream,
-                    &topic,
-                    Some(partition_id),
-                    &consumer,
-                    &strategy,
-                    count,
-                    auto_commit,
-                )
+            inner
+                .poll_messages(&stream, &topic, partition_id, &consumer, &strategy, options)
+                .await
+                .map(PolledMessages::from)
+                .map_err(to_php_exception)
+        })
+    }
+
+    /// Starts the poll of pollMessages() in the background and returns at once, so the caller
+    /// can wait for its batch in steps with PendingPoll::wait() or cancel it with
+    /// PendingPoll::cancel(). Invalid arguments throw here, a failed poll throws from wait().
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_poll_messages(
+        &self,
+        stream: PhpIdentifier,
+        topic: PhpIdentifier,
+        partition_id: u32,
+        consumer: PhpIdentifier,
+        polling_strategy: &PollingStrategy,
+        options: Option<&PollOptions>,
+        group: Option<bool>,
+    ) -> PhpResult<PendingPoll> {
+        let consumer = consumer_identity(consumer, group)?;
+        let stream: Identifier = stream.try_into()?;
+        let topic: Identifier = topic.try_into()?;
+        let strategy: RustPollingStrategy = polling_strategy.into();
+        let options = options.map_or_else(RustPollOptions::default, |options| options.inner);
+        let inner = self.inner.clone();
+
+        let task = runtime().spawn(async move {
+            inner
+                .poll_messages(&stream, &topic, partition_id, &consumer, &strategy, options)
+                .await
+        });
+        Ok(PendingPoll::from(task))
+    }
+
+    /// Deletes the stored offset of the partition of a checkpoint for a standalone consumer, or
+    /// for a consumer group when `group` is true, under the partition history that delivered
+    /// the checkpoint. The offset of the checkpoint is not used.
+    ///
+    /// Throws HistoryUnavailable (87) after the partition was deleted and created again,
+    /// ConsumerGroupPartitionNotOwned (5009) after its consumer group owner changed, and
+    /// ConsumerOffsetNotFound (3021) when no offset is stored. HTTP sends no partition history,
+    /// so there the server deletes the offset of the history it holds.
+    pub fn delete_consumer_position(
+        &self,
+        stream: PhpIdentifier,
+        topic: PhpIdentifier,
+        consumer: PhpIdentifier,
+        checkpoint: &Checkpoint,
+        group: Option<bool>,
+    ) -> PhpResult {
+        let consumer = consumer_identity(consumer, group)?;
+        let stream: Identifier = stream.try_into()?;
+        let topic: Identifier = topic.try_into()?;
+        let checkpoint = checkpoint.inner;
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .delete_consumer_position(&consumer, &stream, &topic, &checkpoint)
+                .await
+                .map_err(to_php_exception)
+        })
+    }
+
+    /// Stores the offset of a checkpoint for a standalone consumer, or for a consumer group
+    /// when `group` is true, under the partition history that delivered the checkpoint, which
+    /// covers every earlier message of its partition.
+    ///
+    /// Throws HistoryUnavailable (87) after the partition was deleted and created again, and
+    /// ConsumerGroupPartitionNotOwned (5009) after its consumer group owner changed, instead of
+    /// storing the offset on the new partition.
+    pub fn store_consumer_position(
+        &self,
+        stream: PhpIdentifier,
+        topic: PhpIdentifier,
+        consumer: PhpIdentifier,
+        checkpoint: &Checkpoint,
+        group: Option<bool>,
+    ) -> PhpResult {
+        let consumer = consumer_identity(consumer, group)?;
+        let stream: Identifier = stream.try_into()?;
+        let topic: Identifier = topic.try_into()?;
+        let checkpoint = checkpoint.inner;
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .store_consumer_position(&consumer, &stream, &topic, &checkpoint)
+                .await
+                .map_err(to_php_exception)
+        })
+    }
+
+    /// Stores `offset` on `partition_id` for a standalone consumer, or for a consumer group
+    /// when `group` is true, under the partition history of its route. After another client
+    /// deleted and created the partition again, it can throw HistoryUnavailable (87) once, and
+    /// the next call routes again. Prefer storeConsumerPosition() with a checkpoint.
+    pub fn store_consumer_offset(
+        &self,
+        stream: PhpIdentifier,
+        topic: PhpIdentifier,
+        consumer: PhpIdentifier,
+        partition_id: u32,
+        offset: u64,
+        group: Option<bool>,
+    ) -> PhpResult {
+        let consumer = consumer_identity(consumer, group)?;
+        let stream: Identifier = stream.try_into()?;
+        let topic: Identifier = topic.try_into()?;
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .store_consumer_offset(&consumer, &stream, &topic, Some(partition_id), offset)
+                .await
+                .map_err(to_php_exception)
+        })
+    }
+
+    /// Returns the offset stored on `partition_id` for a standalone consumer, or for a consumer
+    /// group when `group` is true, or null when nothing is stored. In a cluster the node of the
+    /// connection answers from its own replica, which can lag a store that just returned.
+    pub fn get_consumer_offset(
+        &self,
+        stream: PhpIdentifier,
+        topic: PhpIdentifier,
+        consumer: PhpIdentifier,
+        partition_id: u32,
+        group: Option<bool>,
+    ) -> PhpResult<Option<ConsumerOffsetInfo>> {
+        let consumer = consumer_identity(consumer, group)?;
+        let stream: Identifier = stream.try_into()?;
+        let topic: Identifier = topic.try_into()?;
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            let offset = inner
+                .get_consumer_offset(&consumer, &stream, &topic, Some(partition_id))
                 .await
                 .map_err(to_php_exception)?;
-
-            Ok(polled_messages
-                .messages
-                .into_iter()
-                .map(|message| ReceiveMessage {
-                    inner: message,
-                    partition_id,
-                    context: polled_messages.context,
-                })
-                .collect())
+            Ok(offset.map(|offset| ConsumerOffsetInfo {
+                partition_id: offset.partition_id,
+                current_offset: offset.current_offset,
+                stored_offset: offset.stored_offset,
+            }))
         })
+    }
+
+    /// Deletes the offset stored on `partition_id` for a standalone consumer, or for a consumer
+    /// group when `group` is true. Throws ConsumerOffsetNotFound (3021) when nothing is stored.
+    /// Prefer deleteConsumerPosition() with a checkpoint.
+    pub fn delete_consumer_offset(
+        &self,
+        stream: PhpIdentifier,
+        topic: PhpIdentifier,
+        consumer: PhpIdentifier,
+        partition_id: u32,
+        group: Option<bool>,
+    ) -> PhpResult {
+        let consumer = consumer_identity(consumer, group)?;
+        let stream: Identifier = stream.try_into()?;
+        let topic: Identifier = topic.try_into()?;
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .delete_consumer_offset(&consumer, &stream, &topic, Some(partition_id))
+                .await
+                .map_err(to_php_exception)
+        })
+    }
+
+    /// Builds a reader of chosen partitions as a standalone consumer.
+    ///
+    /// `partitions` must not be empty. `start` is the start of a partition without a stored
+    /// offset, PollingStrategy::next() when null, and a continuation is refused. `options`
+    /// defaults to a wait of 5 seconds for up to 1000 messages per request: a reader that waits
+    /// 0 polls an idle topic in a busy loop. `prefetch_bytes`, 16 MiB when null, and
+    /// `prefetch_messages`, 16000 when null, set the requested budgets for requests in flight and
+    /// queued batches. Each effective budget holds at least 32 full batches so primary groups can
+    /// wait independently: 32 MiB and 32000 messages with the default options. Larger budgets
+    /// allow more queued batches.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reader(
+        &self,
+        stream: PhpIdentifier,
+        topic: PhpIdentifier,
+        consumer: PhpIdentifier,
+        partitions: Vec<u32>,
+        start: Option<&PollingStrategy>,
+        options: Option<&PollOptions>,
+        prefetch_bytes: Option<&Zval>,
+        prefetch_messages: Option<&Zval>,
+    ) -> PhpResult<PartitionReader> {
+        let stream: Identifier = stream.try_into()?;
+        let topic: Identifier = topic.try_into()?;
+        let consumer = RustConsumer::new(consumer.try_into()?);
+        let builder = self
+            .inner
+            .reader(&stream, &topic, &consumer)
+            .partitions(partitions);
+
+        build_reader(builder, start, options, prefetch_bytes, prefetch_messages)
+    }
+
+    /// Builds a reader of the partitions that a consumer group assigns to this member.
+    ///
+    /// The group must exist: the reader joins it, joins again after a session loss, and leaves
+    /// it in close(). HTTP cannot join a group, so it throws FeatureUnavailable. The other
+    /// arguments are those of reader().
+    #[allow(clippy::too_many_arguments)]
+    pub fn group_reader(
+        &self,
+        stream: PhpIdentifier,
+        topic: PhpIdentifier,
+        group: PhpIdentifier,
+        start: Option<&PollingStrategy>,
+        options: Option<&PollOptions>,
+        prefetch_bytes: Option<&Zval>,
+        prefetch_messages: Option<&Zval>,
+    ) -> PhpResult<PartitionReader> {
+        let stream: Identifier = stream.try_into()?;
+        let topic: Identifier = topic.try_into()?;
+        let group = RustConsumer::group(group.try_into()?);
+        let builder = self.inner.reader(&stream, &topic, &group);
+
+        build_reader(builder, start, options, prefetch_bytes, prefetch_messages)
     }
 
     /// Deletes a stream by id or name.
@@ -588,115 +1071,92 @@ impl IggyClient {
 
     /// Creates and initializes a consumer group consumer.
     ///
-    /// `$partition_id` is ignored for a consumer group: the member reads the partitions
-    /// the server assigns to it.
+    /// The member reads the partitions that the server assigns to it. `polling_strategy` is
+    /// the start of a partition without a stored offset, PollingStrategy::next() when null, and
+    /// a continuation is refused. `poll_options` defaults to a wait of 5 seconds for up to 1000
+    /// messages per request: a consumer that waits 0 polls an idle topic in a busy loop.
+    /// The `commit` of `poll_options` says when offsets are stored. CommitPolicy::manual(), the
+    /// default, stores nothing: commit checkpoints after processing, or each restart reads the
+    /// same messages again. With CommitPolicy::onRead() the server stores the offset of each
+    /// batch that it reads, and CommitPolicy::auto() stores counted positions.
+    /// `prefetch_bytes` and `prefetch_messages` are those of reader().
     #[allow(clippy::too_many_arguments)]
-    #[php(defaults(
-        create_consumer_group_if_not_exists = true,
-        auto_join_consumer_group = true,
-        allow_replay = false
-    ))]
+    #[php(defaults(create_consumer_group_if_not_exists = true, allow_replay = false))]
     pub fn consumer_group(
         &self,
         name: String,
         stream: String,
         topic: String,
-        partition_id: Option<&Zval>,
         polling_strategy: Option<&PollingStrategy>,
-        batch_length: Option<&Zval>,
-        auto_commit: Option<&AutoCommit>,
+        poll_options: Option<&PollOptions>,
+        prefetch_bytes: Option<&Zval>,
+        prefetch_messages: Option<&Zval>,
         create_consumer_group_if_not_exists: bool,
-        auto_join_consumer_group: bool,
-        poll_interval_micros: Option<&Zval>,
         polling_retry_interval_micros: Option<&Zval>,
         init_retries: Option<&Zval>,
         init_retry_interval_micros: Option<&Zval>,
         allow_replay: bool,
     ) -> PhpResult<IggyConsumer> {
-        let partition_id = optional_unsigned::<u32>(partition_id, "partition_id")?;
-        let batch_length = optional_unsigned::<u32>(batch_length, "batch_length")?;
-        let poll_interval_micros =
-            optional_unsigned::<u64>(poll_interval_micros, "poll_interval_micros")?;
-        let polling_retry_interval_micros = optional_unsigned::<u64>(
+        let settings = ConsumerSettings::new(
+            polling_strategy,
+            poll_options,
+            prefetch_bytes,
+            prefetch_messages,
             polling_retry_interval_micros,
-            "polling_retry_interval_micros",
+            init_retries,
+            init_retry_interval_micros,
+            allow_replay,
         )?;
-        let init_retries = optional_unsigned::<u32>(init_retries, "init_retries")?;
-        let init_retry_interval_micros =
-            optional_unsigned::<u64>(init_retry_interval_micros, "init_retry_interval_micros")?;
-        let mut builder = self
+        let builder = self
             .inner
             .consumer_group(&name, &stream, &topic)
             .map_err(to_php_exception)?
-            .without_encryptor()
-            .partition(partition_id);
-
-        builder = if create_consumer_group_if_not_exists {
+            .without_encryptor();
+        let builder = if create_consumer_group_if_not_exists {
             builder.create_consumer_group_if_not_exists()
         } else {
             builder.do_not_create_consumer_group_if_not_exists()
         };
-        builder = if auto_join_consumer_group {
-            builder.auto_join_consumer_group()
-        } else {
-            builder.do_not_auto_join_consumer_group()
-        };
-        if let Some(polling_strategy) = polling_strategy {
-            builder = builder.polling_strategy(polling_strategy.into());
-        }
-        if let Some(batch_length) = batch_length {
-            builder = builder.batch_length(batch_length);
-        }
-        if let Some(auto_commit) = auto_commit {
-            builder = builder.auto_commit(auto_commit.into());
-        }
-        builder = match poll_interval_micros {
-            Some(micros) => builder.poll_interval(IggyDuration::from(micros)),
-            None => builder.without_poll_interval(),
-        };
-        if let Some(micros) = polling_retry_interval_micros {
-            builder = builder.polling_retry_interval(non_zero_duration_micros(
-                "polling_retry_interval_micros",
-                micros,
-            )?);
-        }
+        initialized_consumer(settings.apply(builder))
+    }
 
-        match (init_retries, init_retry_interval_micros) {
-            (Some(retries), Some(micros)) => {
-                builder = builder.init_retries(
-                    retries,
-                    non_zero_duration_micros("init_retry_interval_micros", micros)?,
-                );
-            }
-            (Some(_), None) => {
-                return Err(to_php_exception(
-                    "'init_retry_interval_micros' is required if 'init_retries' is set",
-                ));
-            }
-            (None, Some(_)) => {
-                return Err(to_php_exception(
-                    "'init_retries' is required if 'init_retry_interval_micros' is set",
-                ));
-            }
-            (None, None) => {}
-        }
-        if allow_replay {
-            builder = builder.allow_replay();
-        }
-
-        let mut consumer = builder.build();
-        runtime().block_on(async move {
-            consumer.init().await.map_err(to_php_exception)?;
-            let name = consumer.name().to_string();
-            let stream = consumer.stream().to_string();
-            let topic = consumer.topic().to_string();
-            Ok(IggyConsumer {
-                inner: Arc::new(Mutex::new(consumer)),
-                name,
-                stream,
-                topic,
-            })
-        })
+    /// Creates and initializes a standalone consumer of `partitions`, identified by `name`: it
+    /// stores its offsets under that consumer name and joins no group. `partitions` must not be
+    /// empty. The other arguments are those of consumerGroup().
+    #[allow(clippy::too_many_arguments)]
+    #[php(defaults(allow_replay = false))]
+    pub fn consumer(
+        &self,
+        name: String,
+        stream: String,
+        topic: String,
+        partitions: Vec<u32>,
+        polling_strategy: Option<&PollingStrategy>,
+        poll_options: Option<&PollOptions>,
+        prefetch_bytes: Option<&Zval>,
+        prefetch_messages: Option<&Zval>,
+        polling_retry_interval_micros: Option<&Zval>,
+        init_retries: Option<&Zval>,
+        init_retry_interval_micros: Option<&Zval>,
+        allow_replay: bool,
+    ) -> PhpResult<IggyConsumer> {
+        let settings = ConsumerSettings::new(
+            polling_strategy,
+            poll_options,
+            prefetch_bytes,
+            prefetch_messages,
+            polling_retry_interval_micros,
+            init_retries,
+            init_retry_interval_micros,
+            allow_replay,
+        )?;
+        let builder = self
+            .inner
+            .consumer(&name, &stream, &topic)
+            .map_err(to_php_exception)?
+            .without_encryptor()
+            .partitions(partitions);
+        initialized_consumer(settings.apply(builder))
     }
 
     /// Sends a command code with a payload and returns the raw response bytes.
@@ -738,6 +1198,376 @@ impl IggyClient {
                 .map_err(to_php_exception)
         })
     }
+}
+
+/// The options `createTopic()` sends for its arguments after the name.
+#[allow(clippy::too_many_arguments)]
+fn topic_create_options(
+    partitions_count: u32,
+    compression_algorithm: Option<String>,
+    message_expiry_micros: Option<&Zval>,
+    max_topic_size: Option<&Zval>,
+    segment_size: Option<&Zval>,
+    durability: Option<PhpDurability>,
+    consumer_offset_durability: Option<PhpDurability>,
+    messages_required_to_save: Option<&Zval>,
+    size_of_messages_required_to_save: Option<&Zval>,
+    preallocate_segments: Option<bool>,
+    partition_resize_policy: Option<String>,
+    replication_factor: Option<&Zval>,
+    raw: Option<BTreeMap<String, String>>,
+    segment_max_age_micros: Option<&Zval>,
+    tiered_storage: Option<bool>,
+    local_retention_age_micros: Option<&Zval>,
+    local_retention_size: Option<&Zval>,
+    topic_type: Option<String>,
+    geo_mode: Option<String>,
+    fresh_upload_interval_micros: Option<&Zval>,
+    consumer_offset_upload_interval_micros: Option<&Zval>,
+    positions_publish_interval_micros: Option<&Zval>,
+    tombstone_grace_micros: Option<&Zval>,
+    positions_resume_timeout_micros: Option<&Zval>,
+    long_term_rewrite_max_interval_micros: Option<&Zval>,
+    read_cache_size: Option<&Zval>,
+    read_ahead: Option<&Zval>,
+) -> PhpResult<TopicCreateOptions> {
+    let message_expiry_micros = optional_u64(message_expiry_micros, "message_expiry_micros")?;
+    let max_topic_size = optional_u64(max_topic_size, "max_topic_size")?;
+    let segment_size = optional_u64(segment_size, "segment_size")?;
+    let messages_required_to_save =
+        optional_unsigned::<u32>(messages_required_to_save, "messages_required_to_save")?;
+    let size_of_messages_required_to_save = optional_u64(
+        size_of_messages_required_to_save,
+        "size_of_messages_required_to_save",
+    )?;
+    let replication_factor = optional_unsigned::<u32>(replication_factor, "replication_factor")?;
+    let segment_max_age_micros = optional_u64(segment_max_age_micros, "segment_max_age_micros")?;
+    let local_retention_age_micros =
+        optional_u64(local_retention_age_micros, "local_retention_age_micros")?;
+    let local_retention_size = optional_u64(local_retention_size, "local_retention_size")?;
+    let compression_algorithm = match compression_algorithm {
+        Some(value) => CompressionAlgorithm::from_str(&value).map_err(to_php_exception)?,
+        None => CompressionAlgorithm::default(),
+    };
+    let partition_resize_policy = partition_resize_policy
+        .as_deref()
+        .map(PartitionResizePolicy::from_str)
+        .transpose()
+        .map_err(|_| to_php_exception("'partition_resize_policy' must be 'mutable' or 'fixed'"))?;
+    let topic_type = topic_type
+        .as_deref()
+        .map(TopicType::from_str)
+        .transpose()
+        .map_err(|_| to_php_exception("'topic_type' must be 'normal' or 'geo'"))?;
+    let geo_mode = geo_mode
+        .as_deref()
+        .map(GeoMode::from_str)
+        .transpose()
+        .map_err(|_| to_php_exception("'geo_mode' must be 'geo' or 'geo_tiered'"))?;
+    let geo_durations = geo_durations(
+        fresh_upload_interval_micros,
+        consumer_offset_upload_interval_micros,
+        positions_publish_interval_micros,
+        tombstone_grace_micros,
+        positions_resume_timeout_micros,
+        long_term_rewrite_max_interval_micros,
+    )?;
+    let read_cache = read_cache(read_cache_size, read_ahead)?;
+    let expiry = message_expiry_micros.map_or(IggyExpiry::ServerDefault, IggyExpiry::from);
+    let max_size = max_topic_size.map_or(MaxTopicSize::ServerDefault, MaxTopicSize::from);
+    let segment_max_age =
+        segment_max_age_micros.map_or(IggyExpiry::ServerDefault, IggyExpiry::from);
+    let local_retention_age =
+        local_retention_age_micros.map_or(IggyExpiry::ServerDefault, IggyExpiry::from);
+    let local_retention_size =
+        local_retention_size.map_or(MaxTopicSize::ServerDefault, MaxTopicSize::from);
+
+    // `None` is what tells admission to resolve the server default, so the
+    // sentinels above must collapse back to it.
+    Ok(TopicCreateOptions {
+        partitions_count: Some(partitions_count),
+        compression_algorithm: (compression_algorithm != CompressionAlgorithm::default())
+            .then_some(compression_algorithm),
+        message_expiry: (expiry != IggyExpiry::ServerDefault).then_some(expiry),
+        max_topic_size: (max_size != MaxTopicSize::ServerDefault).then_some(max_size),
+        segment_size: segment_size.map(IggyByteSize::from),
+        durability: durability.unwrap_or_default().into(),
+        consumer_offset_durability: consumer_offset_durability.unwrap_or_default().into(),
+        partition_resize_policy,
+        messages_required_to_save,
+        size_of_messages_required_to_save: size_of_messages_required_to_save
+            .map(IggyByteSize::from),
+        preallocate_segments,
+        replication_factor,
+        segment_max_age: (segment_max_age != IggyExpiry::ServerDefault).then_some(segment_max_age),
+        tiered_storage,
+        local_retention_age: (local_retention_age != IggyExpiry::ServerDefault)
+            .then_some(local_retention_age),
+        local_retention_size: (local_retention_size != MaxTopicSize::ServerDefault)
+            .then_some(local_retention_size),
+        topic_type,
+        geo_mode,
+        geo_durations,
+        read_cache,
+        raw: raw.unwrap_or_default(),
+    })
+}
+
+/// The options `updateTopic()` sends for its arguments after the topic.
+#[allow(clippy::too_many_arguments)]
+fn topic_update_options(
+    name: Option<String>,
+    message_expiry_micros: Option<&Zval>,
+    max_topic_size: Option<&Zval>,
+    reset: Vec<TopicOptionKey>,
+    raw: Option<BTreeMap<String, String>>,
+    raw_reset: Option<Vec<String>>,
+    tiered_storage: Option<bool>,
+    local_retention_age_micros: Option<&Zval>,
+    local_retention_size: Option<&Zval>,
+    fresh_upload_interval_micros: Option<&Zval>,
+    consumer_offset_upload_interval_micros: Option<&Zval>,
+    positions_publish_interval_micros: Option<&Zval>,
+    tombstone_grace_micros: Option<&Zval>,
+    positions_resume_timeout_micros: Option<&Zval>,
+    long_term_rewrite_max_interval_micros: Option<&Zval>,
+    read_cache_size: Option<&Zval>,
+    read_ahead: Option<&Zval>,
+) -> PhpResult<TopicUpdateOptions> {
+    let message_expiry = optional_u64(message_expiry_micros, "message_expiry_micros")?
+        .map(|micros| positive_update(micros, "message_expiry_micros").map(IggyExpiry::from))
+        .transpose()?;
+    let max_topic_size = optional_u64(max_topic_size, "max_topic_size")?
+        .map(|bytes| positive_update(bytes, "max_topic_size").map(MaxTopicSize::from))
+        .transpose()?;
+    let local_retention_age =
+        optional_u64(local_retention_age_micros, "local_retention_age_micros")?
+            .map(|micros| {
+                positive_update(micros, "local_retention_age_micros").map(IggyExpiry::from)
+            })
+            .transpose()?;
+    let local_retention_size = optional_u64(local_retention_size, "local_retention_size")?
+        .map(|bytes| positive_update(bytes, "local_retention_size").map(MaxTopicSize::from))
+        .transpose()?;
+    let geo_durations = geo_durations(
+        fresh_upload_interval_micros,
+        consumer_offset_upload_interval_micros,
+        positions_publish_interval_micros,
+        tombstone_grace_micros,
+        positions_resume_timeout_micros,
+        long_term_rewrite_max_interval_micros,
+    )?;
+    let read_cache = read_cache(read_cache_size, read_ahead)?;
+    let (reset, raw_reset) = reset_names(reset, raw_reset)?;
+    Ok(TopicUpdateOptions {
+        name,
+        message_expiry,
+        max_topic_size,
+        tiered_storage,
+        local_retention_age,
+        local_retention_size,
+        geo_durations,
+        read_cache,
+        reset,
+        raw_reset,
+        raw: raw.unwrap_or_default(),
+    })
+}
+
+/// The durations of a geo topic, each an int or a decimal string of microseconds.
+///
+/// Zero is a duration of its own, such as no wait, so unlike the expiry and size sentinels it
+/// is sent, and only null leaves a duration to the server setting.
+fn geo_durations(
+    fresh_upload_interval_micros: Option<&Zval>,
+    consumer_offset_upload_interval_micros: Option<&Zval>,
+    positions_publish_interval_micros: Option<&Zval>,
+    tombstone_grace_micros: Option<&Zval>,
+    positions_resume_timeout_micros: Option<&Zval>,
+    long_term_rewrite_max_interval_micros: Option<&Zval>,
+) -> PhpResult<GeoTopicDurations> {
+    let duration = |value: Option<&Zval>, field: &str| {
+        optional_u64(value, field).map(|micros| micros.map(IggyDuration::from))
+    };
+    Ok(GeoTopicDurations {
+        fresh_upload_interval: duration(
+            fresh_upload_interval_micros,
+            "fresh_upload_interval_micros",
+        )?,
+        consumer_offset_upload_interval: duration(
+            consumer_offset_upload_interval_micros,
+            "consumer_offset_upload_interval_micros",
+        )?,
+        positions_publish_interval: duration(
+            positions_publish_interval_micros,
+            "positions_publish_interval_micros",
+        )?,
+        tombstone_grace: duration(tombstone_grace_micros, "tombstone_grace_micros")?,
+        positions_resume_timeout: duration(
+            positions_resume_timeout_micros,
+            "positions_resume_timeout_micros",
+        )?,
+        long_term_rewrite_max_interval: duration(
+            long_term_rewrite_max_interval_micros,
+            "long_term_rewrite_max_interval_micros",
+        )?,
+    })
+}
+
+/// The read cache settings of a topic, each an int or a decimal string of bytes.
+///
+/// Zero turns a setting off, so like a zero duration it is sent, and only null leaves a setting
+/// to the server.
+fn read_cache(
+    read_cache_size: Option<&Zval>,
+    read_ahead: Option<&Zval>,
+) -> PhpResult<TopicReadCache> {
+    Ok(TopicReadCache {
+        size: optional_u64(read_cache_size, "read_cache_size")?.map(IggyByteSize::from),
+        read_ahead: optional_u64(read_ahead, "read_ahead")?.map(IggyByteSize::from),
+    })
+}
+
+fn build_reader(
+    mut builder: ReaderBuilder,
+    start: Option<&PollingStrategy>,
+    options: Option<&PollOptions>,
+    prefetch_bytes: Option<&Zval>,
+    prefetch_messages: Option<&Zval>,
+) -> PhpResult<PartitionReader> {
+    if let Some(start) = start {
+        builder = builder.start(start.into());
+    }
+    if let Some(options) = options {
+        builder = builder.options(options.inner);
+    }
+    if let Some(bytes) = optional_unsigned(prefetch_bytes, "prefetch_bytes")? {
+        builder = builder.prefetch_bytes(bytes);
+    }
+    if let Some(messages) = optional_unsigned(prefetch_messages, "prefetch_messages")? {
+        builder = builder.prefetch_messages(messages);
+    }
+
+    runtime()
+        .block_on(builder.build())
+        .map(PartitionReader::from)
+        .map_err(to_php_exception)
+}
+
+/// The consumer identity of a client call: a consumer group when `group` is true.
+fn consumer_identity(consumer: PhpIdentifier, group: Option<bool>) -> PhpResult<RustConsumer> {
+    let id = consumer.try_into()?;
+    Ok(if group.unwrap_or(false) {
+        RustConsumer::group(id)
+    } else {
+        RustConsumer::new(id)
+    })
+}
+
+/// The settings that a standalone consumer and a consumer group member share, checked before
+/// the consumer is built.
+struct ConsumerSettings {
+    polling_strategy: Option<RustPollingStrategy>,
+    poll_options: Option<RustPollOptions>,
+    prefetch_bytes: Option<u32>,
+    prefetch_messages: Option<u32>,
+    polling_retry_interval: Option<NonZeroIggyDuration>,
+    init_retries: Option<(u32, NonZeroIggyDuration)>,
+    allow_replay: bool,
+}
+
+impl ConsumerSettings {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        polling_strategy: Option<&PollingStrategy>,
+        poll_options: Option<&PollOptions>,
+        prefetch_bytes: Option<&Zval>,
+        prefetch_messages: Option<&Zval>,
+        polling_retry_interval_micros: Option<&Zval>,
+        init_retries: Option<&Zval>,
+        init_retry_interval_micros: Option<&Zval>,
+        allow_replay: bool,
+    ) -> PhpResult<Self> {
+        let polling_retry_interval = optional_unsigned::<u64>(
+            polling_retry_interval_micros,
+            "polling_retry_interval_micros",
+        )?
+        .map(|micros| non_zero_duration_micros("polling_retry_interval_micros", micros))
+        .transpose()?;
+        let init_retries = match (
+            optional_unsigned::<u32>(init_retries, "init_retries")?,
+            optional_unsigned::<u64>(init_retry_interval_micros, "init_retry_interval_micros")?,
+        ) {
+            (Some(retries), Some(micros)) => Some((
+                retries,
+                non_zero_duration_micros("init_retry_interval_micros", micros)?,
+            )),
+            (Some(_), None) => {
+                return Err(to_php_exception(
+                    "'init_retry_interval_micros' is required if 'init_retries' is set",
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(to_php_exception(
+                    "'init_retries' is required if 'init_retry_interval_micros' is set",
+                ));
+            }
+            (None, None) => None,
+        };
+        Ok(Self {
+            polling_strategy: polling_strategy.map(Into::into),
+            poll_options: poll_options.map(|options| options.inner),
+            prefetch_bytes: optional_unsigned(prefetch_bytes, "prefetch_bytes")?,
+            prefetch_messages: optional_unsigned(prefetch_messages, "prefetch_messages")?,
+            polling_retry_interval,
+            init_retries,
+            allow_replay,
+        })
+    }
+
+    fn apply(self, mut builder: IggyConsumerBuilder) -> IggyConsumerBuilder {
+        if let Some(polling_strategy) = self.polling_strategy {
+            builder = builder.polling_strategy(polling_strategy);
+        }
+        if let Some(poll_options) = self.poll_options {
+            builder = builder.poll_options(poll_options);
+        }
+        if let Some(bytes) = self.prefetch_bytes {
+            builder = builder.prefetch_bytes(bytes);
+        }
+        if let Some(messages) = self.prefetch_messages {
+            builder = builder.prefetch_messages(messages);
+        }
+        if let Some(interval) = self.polling_retry_interval {
+            builder = builder.polling_retry_interval(interval);
+        }
+        if let Some((retries, interval)) = self.init_retries {
+            builder = builder.init_retries(retries, interval);
+        }
+        if self.allow_replay {
+            builder = builder.allow_replay();
+        }
+        builder
+    }
+}
+
+/// Builds the consumer and initializes it, which joins a group member to its group.
+fn initialized_consumer(builder: IggyConsumerBuilder) -> PhpResult<IggyConsumer> {
+    let mut consumer = builder.build();
+    runtime().block_on(async move {
+        consumer.init().await.map_err(to_php_exception)?;
+        let name = consumer.name().to_string();
+        let stream = consumer.stream().to_string();
+        let topic = consumer.topic().to_string();
+        let state = consumer.state();
+        Ok(IggyConsumer {
+            inner: Arc::new(Mutex::new(consumer)),
+            state,
+            name,
+            stream,
+            topic,
+        })
+    })
 }
 
 pub(crate) fn non_zero_duration_micros(field: &str, micros: u64) -> PhpResult<NonZeroIggyDuration> {
@@ -805,7 +1635,10 @@ fn stream_key(key: Binary<u8>) -> PhpResult<StreamEncryptionKey> {
         .map_err(to_php_exception)
 }
 
-fn optional_unsigned<T: TryFrom<i64>>(value: Option<&Zval>, field: &str) -> PhpResult<Option<T>> {
+pub(crate) fn optional_unsigned<T: TryFrom<i64>>(
+    value: Option<&Zval>,
+    field: &str,
+) -> PhpResult<Option<T>> {
     optional_integer(value, field)?
         .map(|value| {
             T::try_from(value).map_err(|_| {
@@ -839,4 +1672,368 @@ fn operation_id_from_decimal(value: &str) -> PhpResult<u64> {
     value
         .parse::<u64>()
         .map_err(|_| to_php_exception("'operation_id' exceeds the unsigned 64-bit range"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy_binary_protocol::requests::system::{ResourceTarget, UpdateResourceRequest};
+    use iggy_binary_protocol::requests::topics::CreateTopicRequest;
+    use iggy_binary_protocol::{WireEncode, WireIdentifier, WireName};
+    use iggy_common::create_topic::CreateTopic;
+    use iggy_common::resource_options_json;
+    use iggy_common::wire_conversions::{identifier_to_wire, resource_options_from_wire};
+    use iggy_common::{DEFAULT_PARTITIONS_COUNT, OptionInputMap};
+    use serde_json::Value;
+
+    const FIXTURE: &str = include_str!("../tests/fixtures/resource_options.json");
+
+    #[test]
+    fn given_create_topic_vectors_when_building_typed_arguments_should_match_wire_and_http_bodies()
+    {
+        for vector in vectors("create_topic") {
+            let case = text(&vector["case"]);
+            let input = &vector["input"];
+            let message_expiry = long_argument(&input["message_expiry"]);
+            let max_topic_size = long_argument(&input["max_topic_size"]);
+            let segment_size = long_argument(&input["segment_size"]);
+            let [fresh, consumer_offset, publish, tombstone, resume, rewrite] = durations(input);
+            let [read_cache_size, read_ahead] = read_cache_settings(input);
+            let options = topic_create_options(
+                number(&input["partitions_count"]),
+                input["compression_algorithm"].as_str().map(str::to_owned),
+                message_expiry.as_ref(),
+                max_topic_size.as_ref(),
+                segment_size.as_ref(),
+                input["durability"].as_str().map(durability),
+                input["consumer_offset_durability"].as_str().map(durability),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                input["topic_type"].as_str().map(str::to_owned),
+                None,
+                fresh.as_ref(),
+                consumer_offset.as_ref(),
+                publish.as_ref(),
+                tombstone.as_ref(),
+                resume.as_ref(),
+                rewrite.as_ref(),
+                read_cache_size.as_ref(),
+                read_ahead.as_ref(),
+            )
+            .expect("typed arguments convert");
+            let stream_id = identifier(&input["stream_id"]);
+            let name = text(&input["name"]);
+            let partitions_count = options.partitions_count.unwrap_or(DEFAULT_PARTITIONS_COUNT);
+            let request = CreateTopicRequest {
+                stream_id: identifier_to_wire(&stream_id).expect("stream id encodes"),
+                partitions_count,
+                name: WireName::new(name).expect("name encodes"),
+                options: options.to_wire().expect("options encode"),
+            };
+
+            assert_eq!(
+                hex(&request.to_bytes()),
+                text(&vector["body_hex"]),
+                "{case}"
+            );
+            assert_eq!(
+                resource_options_from_wire(&request.options, true).expect("options decode"),
+                option_map(&vector["wire_options"]),
+                "{case}"
+            );
+            let http_body = serde_json::to_string(&CreateTopic {
+                stream_id,
+                partitions_count,
+                name: name.to_owned(),
+                options: OptionInputMap(options.to_input_map().expect("options map")),
+            })
+            .expect("HTTP body encodes");
+            assert_eq!(http_body, text(&vector["http_body"]), "{case}");
+        }
+    }
+
+    #[test]
+    fn given_topic_update_vectors_when_building_typed_arguments_should_match_wire_bodies() {
+        for vector in vectors("update_resource") {
+            if vector["scope"] != "topic" {
+                continue;
+            }
+            let case = text(&vector["case"]);
+            let input = &vector["input"];
+            let message_expiry = long_argument(&input["message_expiry"]);
+            let max_topic_size = long_argument(&input["max_topic_size"]);
+            let reset = input["reset"]
+                .as_array()
+                .map_or_else(Vec::new, |names| names.iter().map(reset_case).collect());
+            let [fresh, consumer_offset, publish, tombstone, resume, rewrite] = durations(input);
+            let [read_cache_size, read_ahead] = read_cache_settings(input);
+            let options = topic_update_options(
+                input["name"].as_str().map(str::to_owned),
+                message_expiry.as_ref(),
+                max_topic_size.as_ref(),
+                reset,
+                None,
+                None,
+                None,
+                None,
+                None,
+                fresh.as_ref(),
+                consumer_offset.as_ref(),
+                publish.as_ref(),
+                tombstone.as_ref(),
+                resume.as_ref(),
+                rewrite.as_ref(),
+                read_cache_size.as_ref(),
+                read_ahead.as_ref(),
+            )
+            .expect("typed arguments convert");
+            let patch = options.to_patch().expect("patch encodes");
+            let target = &vector["target"];
+            let request = UpdateResourceRequest {
+                target: ResourceTarget::Topic {
+                    stream_id: wire_identifier(&target["stream_id"]),
+                    topic_id: wire_identifier(&target["topic_id"]),
+                },
+                reset: patch.reset,
+                options: patch.set,
+            };
+
+            assert_eq!(
+                hex(&request.to_bytes()),
+                text(&vector["body_hex"]),
+                "{case}"
+            );
+            assert_eq!(
+                resource_options_from_wire(&request.options, true).expect("set block decodes"),
+                option_map(&vector["wire_set"]),
+                "{case}"
+            );
+            let reset: Vec<&str> = request.reset.iter().map(WireName::as_str).collect();
+            let wire_reset: Vec<&str> = vector["wire_reset"]
+                .as_array()
+                .expect("reset list")
+                .iter()
+                .map(text)
+                .collect();
+            assert_eq!(reset, wire_reset, "{case}");
+        }
+    }
+
+    #[test]
+    fn given_zero_and_null_durations_when_building_options_should_send_zero_and_omit_null() {
+        let zero = long(0);
+        let created = topic_create_options(
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("geo".to_owned()),
+            None,
+            Some(&zero),
+            None,
+            None,
+            None,
+            Some(&zero),
+            None,
+            None,
+            None,
+        )
+        .expect("zero converts")
+        .to_wire()
+        .expect("options encode");
+        let updated = topic_update_options(
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&zero),
+            None,
+            None,
+            None,
+            Some(&zero),
+            None,
+            None,
+            None,
+        )
+        .expect("zero converts")
+        .to_patch()
+        .expect("a zero duration alone is a change")
+        .set;
+
+        let expected = [Some(0), None, None, None, Some(0), None];
+        for sent in [created, updated] {
+            let sent = resource_options_from_wire(&sent, true).expect("options decode");
+            for (key, micros) in GeoTopicDurations::KEYS.into_iter().zip(expected) {
+                let value = sent
+                    .get(&HeaderKey::from(key))
+                    .map(|option| option.value.as_uint64().expect("uint64 micros"));
+                assert_eq!(value, micros, "{key}");
+            }
+        }
+    }
+
+    #[test]
+    fn given_negative_duration_when_building_options_should_refuse_before_sending() {
+        let negative = long(-1);
+
+        let created = topic_create_options(
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("geo".to_owned()),
+            None,
+            None,
+            None,
+            None,
+            Some(&negative),
+            None,
+            None,
+            None,
+            None,
+        );
+        let updated = topic_update_options(
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&negative),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert!(created.is_err());
+        assert!(updated.is_err());
+    }
+
+    fn vectors(section: &str) -> Vec<Value> {
+        let fixture: Value = serde_json::from_str(FIXTURE).expect("fixture parses");
+        fixture[section].as_array().expect("vector list").clone()
+    }
+
+    /// The durations of a fixture input as the ints a PHP caller passes, in catalog order.
+    fn durations(input: &Value) -> [Option<Zval>; 6] {
+        GeoTopicDurations::KEYS.map(|key| {
+            let name: &'static str = key.into();
+            long_argument(&input[name])
+        })
+    }
+
+    /// The read cache settings of a fixture input as the ints a PHP caller passes, in catalog
+    /// order.
+    fn read_cache_settings(input: &Value) -> [Option<Zval>; 2] {
+        TopicReadCache::KEYS.map(|key| {
+            let name: &'static str = key.into();
+            long_argument(&input[name])
+        })
+    }
+
+    /// A decimal fixture value as the int a PHP caller passes, none when the input omits it.
+    fn long_argument(value: &Value) -> Option<Zval> {
+        value
+            .as_str()
+            .map(|number| long(number.parse().expect("value fits a PHP int")))
+    }
+
+    fn long(value: i64) -> Zval {
+        let mut zval = Zval::new();
+        zval.set_long(value);
+        zval
+    }
+
+    fn durability(name: &str) -> PhpDurability {
+        match name {
+            "replicated" => PhpDurability::Replicated,
+            "persisted" => PhpDurability::Persisted,
+            other => panic!("no durability {other}"),
+        }
+    }
+
+    fn reset_case(name: &Value) -> TopicOptionKey {
+        match text(name) {
+            "message_expiry" => TopicOptionKey::MessageExpiry,
+            "max_topic_size" => TopicOptionKey::MaxTopicSize,
+            other => panic!("no reset case for {other}"),
+        }
+    }
+
+    fn identifier(value: &Value) -> Identifier {
+        match value.as_u64() {
+            Some(id) => Identifier::numeric(u32::try_from(id).expect("id fits u32")),
+            None => Identifier::named(text(value)),
+        }
+        .expect("identifier")
+    }
+
+    fn wire_identifier(value: &Value) -> WireIdentifier {
+        identifier_to_wire(&identifier(value)).expect("identifier encodes")
+    }
+
+    fn number(value: &Value) -> u32 {
+        value
+            .as_u64()
+            .and_then(|number| u32::try_from(number).ok())
+            .expect("u32 number")
+    }
+
+    fn option_map(value: &Value) -> ResourceOptions {
+        resource_options_json::deserialize(value.clone()).expect("option map")
+    }
+
+    fn text(value: &Value) -> &str {
+        value.as_str().expect("text")
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
 }

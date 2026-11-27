@@ -16,7 +16,10 @@
 // under the License.
 
 using System.Buffers.Binary;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Tcp;
+using Apache.Iggy.Encryption;
+using Apache.Iggy.Exceptions;
 using Apache.Iggy.Extensions;
 using Apache.Iggy.Vsr;
 using Apache.Iggy.Kinds;
@@ -165,6 +168,32 @@ public sealed class MessageBatchGoldenVectorTests
         Assert.Equal(
             BinaryPrimitives.ReadUInt64LittleEndian(pollBody.AsSpan(40 + 256 + 48 + "first-payload"u8.Length, 8)),
             second.Header.Checksum);
+    }
+
+    [Fact]
+    public void MapRentedMessages_MalformedRecords_KeepTheRemainingBytes()
+    {
+        var pollBody = Convert.FromHexString(POLL_BODY)[..^1];
+
+        var error = Assert.Throws<MalformedResponseException>(() =>
+            Mappers.BinaryMapper.MapRentedMessages(pollBody, EmptyMemoryOwner.Instance));
+
+        Assert.Equal(pollBody[DeferredPollOptions.POLL_REPLY_HEADER_SIZE..], error.Record);
+    }
+
+    [Fact]
+    public void MapRentedMessages_WrongKey_KeepsTheFrameAsServed()
+    {
+        var pollBody = Convert.FromHexString(POLL_BODY);
+        using var encryptor = new AesMessageEncryptor(AesMessageEncryptor.GenerateKey());
+        var frameStart = DeferredPollOptions.POLL_REPLY_HEADER_SIZE + BatchWireFormat.BATCH_HEADER_SIZE;
+        var frameEnd = frameStart + BatchWireFormat.FRAME_HEADER_SIZE + "first-payload"u8.Length;
+
+        var error = Assert.Throws<MessageDecryptionException>(() =>
+            Mappers.BinaryMapper.MapRentedMessages(pollBody, EmptyMemoryOwner.Instance, encryptor));
+
+        Assert.Equal(100ul, error.Offset);
+        Assert.Equal(pollBody[frameStart..frameEnd], error.Record);
     }
 
     private static Message[] GoldenMessages()

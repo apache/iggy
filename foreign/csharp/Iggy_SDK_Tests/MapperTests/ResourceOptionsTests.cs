@@ -69,12 +69,28 @@ public sealed class ResourceOptionsTests
     {
         ["encryption_key_source"] = stream => stream.EncryptionKeySource,
         ["encryption_key_fingerprint"] = stream => stream.EncryptionKeyFingerprint,
-        ["encryption_kek_fingerprint"] = stream => stream.EncryptionKekFingerprints.SingleOrDefault()
+        ["encryption_kek_fingerprint"] = stream => stream.EncryptionKekFingerprints.SingleOrDefault(),
+        ["shadow_origin"] = stream => stream.ShadowOrigin
     };
 
     private static readonly byte[] RawKey = Enumerable.Range(1, EncryptionKeys.KEY_LENGTH).Select(value => (byte)value).ToArray();
 
     private static readonly string[] HttpUpdateCases = ["topic_reset_array", "stream_rename", "user_username_and_status"];
+
+    private static readonly HashSet<string> CreateTopicInputs =
+    [
+        "stream_id", "name", "partitions_count", "compression_algorithm", "message_expiry", "max_topic_size",
+        "segment_size", "durability", "consumer_offset_durability", "topic_type", "fresh_upload_interval",
+        "consumer_offset_upload_interval", "positions_publish_interval", "tombstone_grace", "positions_resume_timeout",
+        "long_term_rewrite_max_interval", "read_cache_size", "read_ahead"
+    ];
+
+    private static readonly TopicOptionKey[] GeoDurationKeys =
+    [
+        TopicOptionKey.FreshUploadInterval, TopicOptionKey.ConsumerOffsetUploadInterval,
+        TopicOptionKey.PositionsPublishInterval, TopicOptionKey.TombstoneGrace, TopicOptionKey.PositionsResumeTimeout,
+        TopicOptionKey.LongTermRewriteMaxInterval
+    ];
 
     public static TheoryData<string, string> SharedVectors
     {
@@ -264,6 +280,62 @@ public sealed class ResourceOptionsTests
     }
 
     [Fact]
+    public void given_geo_durations_when_patching_should_send_zero_and_refuse_a_reset()
+    {
+        var patch = new TopicUpdate
+        {
+            ConsumerOffsetUploadInterval = TimeSpan.Zero,
+            PositionsResumeTimeout = TimeSpan.FromSeconds(30),
+            MessageExpiry = TimeSpan.Zero
+        }.ToPatch();
+
+        // A zero expiry is the sentinel for no change, while a zero duration of a geo topic is a value.
+        Assert.Equal(["consumer_offset_upload_interval", "positions_resume_timeout"],
+            patch.Set.Keys.Order(StringComparer.Ordinal));
+        Assert.Equal(HeaderKind.Uint64, patch.Set["consumer_offset_upload_interval"].Kind);
+        Assert.Equal(0UL, patch.Set["consumer_offset_upload_interval"].ToUInt64());
+        Assert.Equal(30_000_000UL, patch.Set["positions_resume_timeout"].ToUInt64());
+        Assert.Equal(["fresh_upload_interval"], new TopicUpdate { FreshUploadInterval = TimeSpan.Zero }.ToPatch().Set.Keys);
+        var empty = Assert.Throws<IggyInvalidStatusCodeException>(() =>
+            new TopicUpdate { MessageExpiry = TimeSpan.Zero }.ToPatch());
+        Assert.Equal(VsrError.INVALID_COMMAND, empty.StatusCode);
+
+        foreach (var key in GeoDurationKeys)
+        {
+            var reset = Assert.Throws<IggyInvalidStatusCodeException>(() =>
+                new TopicUpdate { Reset = new HashSet<TopicOptionKey> { key } }.ToPatch());
+            Assert.Equal(VsrError.OPTION_NOT_RESETTABLE, reset.StatusCode);
+        }
+
+        // A reset by name travels raw, and the server refuses it for a key without a default.
+        Assert.Equal(["tombstone_grace"],
+            new TopicUpdate { RawReset = new HashSet<string> { "tombstone_grace" } }.ToPatch().Reset);
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new TopicUpdate { TombstoneGrace = TimeSpan.FromSeconds(-1) }.ToPatch());
+    }
+
+    [Fact]
+    public void given_read_cache_when_patching_should_send_zero_and_refuse_a_reset()
+    {
+        var patch = new TopicUpdate { ReadCacheSize = 0, ReadAhead = 0, MaxTopicSize = 0 }.ToPatch();
+
+        // A zero size cap is the sentinel for no change, while a zero read cache or readahead is a value.
+        Assert.Equal(["read_ahead", "read_cache_size"], patch.Set.Keys.Order(StringComparer.Ordinal));
+        Assert.All(patch.Set.Values, value =>
+        {
+            Assert.Equal(HeaderKind.Uint64, value.Kind);
+            Assert.Equal(0UL, value.ToUInt64());
+        });
+
+        foreach (var key in new[] { TopicOptionKey.ReadCacheSize, TopicOptionKey.ReadAhead })
+        {
+            var reset = Assert.Throws<IggyInvalidStatusCodeException>(() =>
+                new TopicUpdate { Reset = new HashSet<TopicOptionKey> { key } }.ToPatch());
+            Assert.Equal(VsrError.OPTION_NOT_RESETTABLE, reset.StatusCode);
+        }
+    }
+
+    [Fact]
     public void given_raw_reset_no_wire_name_holds_when_patching_should_refuse_unsupported_key()
     {
         var empty = Assert.Throws<IggyInvalidStatusCodeException>(() =>
@@ -447,11 +519,11 @@ public sealed class ResourceOptionsTests
             .ToList();
         var createKeys = rows
             .Where(row => row.GetProperty("storage").GetString() == "map"
-                          && row.GetProperty("mutability").GetString() is "create_only" or "updatable")
+                          && row.GetProperty("mutability").GetString() is "create_only" or "updatable" or "enable_only")
             .Select(row => row.GetProperty("key").GetString()!)
             .ToHashSet();
         var updateKeys = rows
-            .Where(row => row.GetProperty("mutability").GetString() == "updatable")
+            .Where(row => row.GetProperty("mutability").GetString() is "updatable" or "enable_only")
             .Select(row => row.GetProperty("key").GetString()!)
             .ToHashSet();
 
@@ -509,14 +581,41 @@ public sealed class ResourceOptionsTests
                     PartitionResizePolicy = PartitionResizePolicy.Fixed,
                     MessagesRequiredToSave = 64,
                     SizeOfMessagesRequiredToSave = 4096,
-                    PreallocateSegments = true
+                    PreallocateSegments = true,
+                    ReplicationFactor = 3,
+                    SegmentMaxAge = TimeSpan.FromHours(1),
+                    TieredStorage = false,
+                    LocalRetentionAge = TimeSpan.FromHours(6),
+                    LocalRetentionSize = 536_870_912,
+                    TopicType = TopicType.Geo,
+                    GeoMode = GeoMode.GeoTiered,
+                    FreshUploadInterval = TimeSpan.FromMilliseconds(50),
+                    ConsumerOffsetUploadInterval = TimeSpan.Zero,
+                    PositionsPublishInterval = TimeSpan.FromSeconds(2),
+                    TombstoneGrace = TimeSpan.FromHours(1),
+                    PositionsResumeTimeout = TimeSpan.Zero,
+                    LongTermRewriteMaxInterval = TimeSpan.FromSeconds(20),
+                    ReadCacheSize = 16_777_216,
+                    ReadAhead = 0
                 }.ToDictionary().Keys.ToHashSet());
                 Assert.Equal(updateKeys, new TopicUpdate
                 {
                     Name = "renamed",
                     MessageExpiry = TimeSpan.FromDays(1),
-                    MaxTopicSize = 1_073_741_824
+                    MaxTopicSize = 1_073_741_824,
+                    TieredStorage = true,
+                    LocalRetentionAge = TimeSpan.FromHours(6),
+                    LocalRetentionSize = 536_870_912,
+                    FreshUploadInterval = TimeSpan.Zero,
+                    ConsumerOffsetUploadInterval = TimeSpan.FromMilliseconds(20),
+                    PositionsPublishInterval = TimeSpan.FromSeconds(2),
+                    TombstoneGrace = TimeSpan.FromHours(1),
+                    PositionsResumeTimeout = TimeSpan.Zero,
+                    LongTermRewriteMaxInterval = TimeSpan.FromSeconds(20),
+                    ReadCacheSize = 0,
+                    ReadAhead = 1_048_576
                 }.ToPatch().Set.Keys.ToHashSet());
+                AssertEnableOnlyKeys(rows);
                 break;
             case "user":
                 AssertKeyMembers<UserOptionKey>(describedKeys, resettableKeys, OptionKeys.Describe,
@@ -528,6 +627,29 @@ public sealed class ResourceOptionsTests
                         .ToHashSet());
                 break;
         }
+    }
+
+    private static void AssertEnableOnlyKeys(List<JsonElement> rows)
+    {
+        var enableOnlyKeys = rows
+            .Where(row => row.GetProperty("mutability").GetString() == "enable_only")
+            .Select(row => row.GetProperty("key").GetString()!)
+            .ToHashSet();
+        Assert.Equal(enableOnlyKeys, OptionKeys.For(OptionsScope.Topic).Where(descriptor => descriptor.EnableOnly)
+            .Select(descriptor => descriptor.Name).ToHashSet());
+
+        foreach (var key in Enum.GetValues<TopicOptionKey>()
+                     .Where(key => enableOnlyKeys.Contains(OptionKeys.Describe(key).Name)))
+        {
+            var reset = Assert.Throws<IggyInvalidStatusCodeException>(() =>
+                new TopicUpdate { Reset = new HashSet<TopicOptionKey> { key } }.ToPatch());
+            Assert.Equal(VsrError.OPTION_NOT_UPDATABLE, reset.StatusCode);
+        }
+
+        Assert.True(new TopicUpdate { TieredStorage = true }.ToPatch().Set["tiered_storage"].ToBool());
+        var turnedOff = Assert.Throws<IggyInvalidStatusCodeException>(() =>
+            new TopicUpdate { TieredStorage = false }.ToPatch());
+        Assert.Equal(VsrError.OPTION_NOT_UPDATABLE, turnedOff.StatusCode);
     }
 
     /// <summary>
@@ -698,16 +820,7 @@ public sealed class ResourceOptionsTests
         var streamId = TargetIdentifier(input.GetProperty("stream_id"));
         var name = input.GetProperty("name").GetString()!;
         var partitionsCount = input.GetProperty("partitions_count").GetUInt32();
-        var options = new TopicOptions
-        {
-            CompressionAlgorithm = Enum.Parse<CompressionAlgorithm>(input.GetProperty("compression_algorithm").GetString()!, true),
-            MessageExpiry = DurationHelpers.FromDuration(ParseU64(input, "message_expiry")),
-            MaxTopicSize = ParseU64(input, "max_topic_size"),
-            SegmentSize = ParseU64(input, "segment_size"),
-            Durability = Enum.Parse<Durability>(input.GetProperty("durability").GetString()!, true),
-            ConsumerOffsetDurability =
-                Enum.Parse<Durability>(input.GetProperty("consumer_offset_durability").GetString()!, true)
-        };
+        var options = TopicOptionsFrom(input);
 
         Assert.Equal(Hex(vector, "body_hex"),
             TcpContracts.CreateTopic(streamId, name, partitionsCount, options.ToDictionary()));
@@ -782,6 +895,17 @@ public sealed class ResourceOptionsTests
                 stream.EncryptionKeyFingerprint);
             Assert.Equal(expected.GetProperty("encryption_kek_fingerprints").EnumerateArray()
                 .Select(entry => entry.GetString()!).ToList(), stream.EncryptionKekFingerprints);
+            var origin = expected.TryGetProperty("shadow_origin", out var shadowOrigin) ? shadowOrigin.GetString() : null;
+            Assert.Equal(origin, stream.ShadowOrigin);
+            Assert.Equal(origin, new MetadataStreamChange
+            {
+                StreamId = stream.Id,
+                StreamCreatedOp = 1,
+                CreatedAt = 0,
+                Name = stream.Name,
+                Options = stream.Options,
+                DerivedOptions = stream.DerivedOptions
+            }.ShadowOrigin);
             AssertNeverReturned(stream.Options, stream.DerivedOptions);
         }
 
@@ -806,10 +930,41 @@ public sealed class ResourceOptionsTests
                 topic.CompressionAlgorithm);
             Assert.Equal(ParseU64(expected, "message_expiry"), DurationHelpers.ToDuration(topic.MessageExpiry));
             Assert.Equal(ParseU64(expected, "max_topic_size"), topic.MaxTopicSize);
+            Assert.Equal(ParseU64(expected.GetProperty("options").GetProperty("segment_max_age"), "value"),
+                DurationHelpers.ToDuration(topic.SegmentMaxAge));
+            Assert.Equal(expected.GetProperty("options").GetProperty("tiered_storage").GetProperty("value").GetString(),
+                topic.TieredStorage ? "true" : "false");
+            Assert.Equal(ParseU64(expected.GetProperty("options").GetProperty("local_retention_age"), "value"),
+                DurationHelpers.ToDuration(topic.LocalRetentionAge));
+            Assert.Equal(ParseU64(expected.GetProperty("options").GetProperty("local_retention_size"), "value"),
+                topic.LocalRetentionSize);
+            Assert.Equal(OptionText(expected, "topic_type") ?? "normal", SnakeCase(topic.TopicType));
+            Assert.Equal(OptionText(expected, "geo_mode"), topic.GeoMode is { } mode ? SnakeCase(mode) : null);
+            foreach (var (key, duration) in GeoDurations(topic))
+            {
+                ulong? micros = expected.TryGetProperty(key, out _) ? ParseU64(expected, key) : null;
+                Assert.Equal(micros, duration is { } value ? DurationHelpers.ToDuration(value) : (ulong?)null);
+            }
+
+            Assert.Equal(Bytes(expected, "read_cache_size"), topic.ReadCacheSize);
+            Assert.Equal(Bytes(expected, "read_ahead"), topic.ReadAhead);
+
             AssertNeverReturned(topic.Options, topic.DerivedOptions);
         }
 
         Assert.Equal(MicrosSinceEpoch(binary.CreatedAt), expected.GetProperty("created_at").GetUInt64());
+    }
+
+    private static string? OptionText(JsonElement expected, string key)
+    {
+        return expected.GetProperty("options").TryGetProperty(key, out var option)
+            ? option.GetProperty("value").GetString()
+            : null;
+    }
+
+    private static string SnakeCase<TEnum>(TEnum value) where TEnum : struct, Enum
+    {
+        return JsonNamingPolicy.SnakeCaseLower.ConvertName(value.ToString());
     }
 
     private static void AssertUserResponse(JsonElement vector)
@@ -887,12 +1042,76 @@ public sealed class ResourceOptionsTests
         return new TopicUpdate
         {
             Name = input.TryGetProperty("name", out var name) ? name.GetString() : null,
-            MessageExpiry = input.TryGetProperty("message_expiry", out _)
-                ? DurationHelpers.FromDuration(ParseU64(input, "message_expiry"))
-                : null,
+            MessageExpiry = Micros(input, "message_expiry"),
             MaxTopicSize = input.TryGetProperty("max_topic_size", out _) ? ParseU64(input, "max_topic_size") : null,
+            FreshUploadInterval = Micros(input, "fresh_upload_interval"),
+            ConsumerOffsetUploadInterval = Micros(input, "consumer_offset_upload_interval"),
+            PositionsPublishInterval = Micros(input, "positions_publish_interval"),
+            TombstoneGrace = Micros(input, "tombstone_grace"),
+            PositionsResumeTimeout = Micros(input, "positions_resume_timeout"),
+            LongTermRewriteMaxInterval = Micros(input, "long_term_rewrite_max_interval"),
+            ReadCacheSize = Bytes(input, "read_cache_size"),
+            ReadAhead = Bytes(input, "read_ahead"),
             Reset = ResetKeys<TopicOptionKey>(input),
             RawReset = RawResetNames<TopicOptionKey>(input)
+        };
+    }
+
+    /// <summary>
+    ///     The typed options a <c>create_topic</c> vector's input describes. An input field this runner does not know
+    ///     fails the vector, so a new fixture field cannot be skipped unnoticed.
+    /// </summary>
+    private static TopicOptions TopicOptionsFrom(JsonElement input)
+    {
+        Assert.All(input.EnumerateObject(), member => Assert.Contains(member.Name, CreateTopicInputs));
+        return new TopicOptions
+        {
+            CompressionAlgorithm = input.TryGetProperty("compression_algorithm", out var compression)
+                ? Enum.Parse<CompressionAlgorithm>(compression.GetString()!, true)
+                : null,
+            MessageExpiry = Micros(input, "message_expiry"),
+            MaxTopicSize = input.TryGetProperty("max_topic_size", out _) ? ParseU64(input, "max_topic_size") : null,
+            SegmentSize = input.TryGetProperty("segment_size", out _) ? ParseU64(input, "segment_size") : null,
+            Durability = input.TryGetProperty("durability", out var durability)
+                ? Enum.Parse<Durability>(durability.GetString()!, true)
+                : Durability.Replicated,
+            ConsumerOffsetDurability = input.TryGetProperty("consumer_offset_durability", out var offsetDurability)
+                ? Enum.Parse<Durability>(offsetDurability.GetString()!, true)
+                : Durability.Replicated,
+            TopicType = input.TryGetProperty("topic_type", out var topicType)
+                ? Enum.Parse<TopicType>(topicType.GetString()!, true)
+                : null,
+            FreshUploadInterval = Micros(input, "fresh_upload_interval"),
+            ConsumerOffsetUploadInterval = Micros(input, "consumer_offset_upload_interval"),
+            PositionsPublishInterval = Micros(input, "positions_publish_interval"),
+            TombstoneGrace = Micros(input, "tombstone_grace"),
+            PositionsResumeTimeout = Micros(input, "positions_resume_timeout"),
+            LongTermRewriteMaxInterval = Micros(input, "long_term_rewrite_max_interval"),
+            ReadCacheSize = Bytes(input, "read_cache_size"),
+            ReadAhead = Bytes(input, "read_ahead")
+        };
+    }
+
+    private static TimeSpan? Micros(JsonElement input, string property)
+    {
+        return input.TryGetProperty(property, out _) ? DurationHelpers.FromDuration(ParseU64(input, property)) : null;
+    }
+
+    private static ulong? Bytes(JsonElement input, string property)
+    {
+        return input.TryGetProperty(property, out _) ? ParseU64(input, property) : null;
+    }
+
+    private static Dictionary<string, TimeSpan?> GeoDurations(TopicResponse topic)
+    {
+        return new Dictionary<string, TimeSpan?>
+        {
+            ["fresh_upload_interval"] = topic.FreshUploadInterval,
+            ["consumer_offset_upload_interval"] = topic.ConsumerOffsetUploadInterval,
+            ["positions_publish_interval"] = topic.PositionsPublishInterval,
+            ["tombstone_grace"] = topic.TombstoneGrace,
+            ["positions_resume_timeout"] = topic.PositionsResumeTimeout,
+            ["long_term_rewrite_max_interval"] = topic.LongTermRewriteMaxInterval
         };
     }
 

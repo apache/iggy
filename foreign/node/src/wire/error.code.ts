@@ -90,6 +90,9 @@ export const translateErrorCode = (code: number): string => {
     case '87': return "The partition history is no longer available; this request cannot execute again";
     case '88': return "A committed lifecycle operation prevents this mutation. Retry as a new request.";
     case '89': return "The replica is not the partition primary.";
+    case '90': return "Deferred poll capacity exceeded; retry after backoff on the same replica";
+    case '96': return "Tiered data cannot be read from the object store; a retry does not help";
+    case '97': return "The reply is larger than the reply size limit";
 
     case '100': return "Client with ID: {0} was not found.";
     case '101': return "Invalid client ID";
@@ -128,6 +131,7 @@ export const translateErrorCode = (code: number): string => {
     case '1015': return "Cannot read streams";
     case '1019': return "Max topic size cannot be lower than segment size. Max topic size: {0} < segment size: {1}.";
     case '1020': return "Too many streams";
+    case '1021': return "The stream is a shadow of another cluster's stream and takes no writes";
 
 
     case '2000': return "Cannot create topics directory for stream with ID: {0}, Path: {1}";
@@ -285,6 +289,9 @@ export const translateErrorCode = (code: number): string => {
     case '14003': return "Incompatible binary protocol version: client {}, server accepts [{}, {}]";
     case '14004': return "VSR session mismatch: requested {0}, server bound {1}";
     case '14005': return "VSR request id exhausted";
+    case '14007': return "Lane blocked by operation {0} with an unknown outcome";
+    case '14009': return "Lane of partition {0} blocked by operation {1} with an unknown outcome";
+    case '14010': return "Read {0} has unknown progress and requires explicit abandonment";
 
     default: return 'error';
   }

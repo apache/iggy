@@ -28,19 +28,23 @@ import typing
 __all__ = [
     "Durability",
     "AutoCommit",
-    "AutoCommitAfter",
-    "AutoCommitWhen",
     "AutoLogin",
     "BackgroundProducerConfig",
     "BackpressureMode",
     "CacheMetrics",
     "CacheMetricsKey",
+    "Checkpoint",
+    "CommitAfter",
+    "CommitEvery",
+    "CommitPolicy",
     "Consumer",
     "ConsumerGroup",
     "ConsumerGroupDetails",
     "ConsumerGroupMember",
-    "ConsumerPosition",
+    "ConsumerGroupsPage",
+    "ConsumerOffsetInfo",
     "DirectProducerConfig",
+    "GeoMode",
     "GlobalPermissions",
     "HeaderKey",
     "HeaderValue",
@@ -92,27 +96,36 @@ __all__ = [
     "OptionError",
     "OptionKey",
     "OptionSpec",
+    "PageOrder",
     "Partition",
     "PartitionContext",
+    "PartitionReader",
     "PartitionResizePolicy",
     "Partitioning",
+    "PartitionsPage",
     "PendingOperationError",
     "PendingOperationsConfig",
     "Permissions",
+    "PollOptions",
+    "PolledMessages",
     "PollingStrategy",
     "ProducerSendError",
     "ProducerSharding",
     "QuicConfig",
     "QuicReconnectionConfig",
+    "ReadError",
     "ReceiveMessage",
     "SendMessage",
     "SendMessagesConfirmation",
     "SendMessagesResponse",
+    "SnapshotCompression",
     "Stats",
     "Stream",
     "StreamDetails",
     "StreamOptions",
     "StreamPermissions",
+    "StreamsPage",
+    "SystemSnapshotType",
     "TcpConfig",
     "TcpReconnectionConfig",
     "TokenInfo",
@@ -120,209 +133,68 @@ __all__ = [
     "TopicDetails",
     "TopicOptions",
     "TopicPermissions",
+    "TopicType",
+    "TopicsPage",
     "UserHeaders",
     "UserInfo",
     "UserInfoDetails",
     "UserOptions",
     "UserStatus",
+    "UsersPage",
     "WebSocketConfig",
     "WebSocketFramingConfig",
     "WebSocketReconnectionConfig",
     "encryption_key_fingerprint",
 ]
 
+@typing.final
 class AutoCommit:
     r"""
-    The auto-commit configuration for storing the offset on the server.
+    When `CommitPolicy.Auto` stores. It also stores on close, on shutdown and before a rebalance
+    takes a partition away. A store only moves forward.
     """
-    @typing.final
-    class Disabled(AutoCommit):
+    @property
+    def interval(self) -> datetime.timedelta | None:
         r"""
-        The auto-commit is disabled and the offset must be stored manually by the consumer.
+        The interval of the stores, or `None`.
         """
-
-        __match_args__ = ()
-        def __new__(cls) -> AutoCommit.Disabled: ...
-        def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
-
-    @typing.final
-    class Interval(AutoCommit):
+    @property
+    def every(self) -> CommitEvery | None:
         r"""
-        The auto-commit is enabled and the offset is stored on the server after a certain interval.
+        The event of the stores, or `None`.
         """
-
-        __match_args__ = ("_0",)
-        @property
-        def _0(self) -> datetime.timedelta: ...
-        def __new__(cls, _0: datetime.timedelta) -> AutoCommit.Interval: ...
-        def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
-
-    @typing.final
-    class IntervalOrWhen(AutoCommit):
+    @property
+    def after(self) -> CommitAfter:
         r"""
-        The auto-commit is enabled and the offset is stored on the server after a certain interval or depending on the mode when consuming the messages.
+        When a message counts.
         """
-
-        __match_args__ = (
-            "_0",
-            "_1",
-        )
-        @property
-        def _0(self) -> datetime.timedelta: ...
-        @property
-        def _1(self) -> AutoCommitWhen: ...
-        def __new__(
-            cls, _0: datetime.timedelta, _1: AutoCommitWhen
-        ) -> AutoCommit.IntervalOrWhen: ...
-        def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
-
-    @typing.final
-    class IntervalOrAfter(AutoCommit):
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __new__(
+        cls,
+        *,
+        interval: datetime.timedelta | None = None,
+        every: CommitEvery | None = None,
+        after: CommitAfter | None = None,
+    ) -> AutoCommit:
         r"""
-        The auto-commit is enabled and the offset is stored on the server after a certain interval or depending on the mode after consuming the messages.
+        Constructs when `CommitPolicy.Auto` stores. `AutoCommit.default()` stores every 10,000
+        messages or every 5 seconds, whichever comes first, after processing.
+
+        Args:
+            interval: Store the latest counted position at this interval, when it moved.
+            every: Also store it on this event.
+            after: When a message counts. `None` counts after processing, as
+                `CommitAfter.Processing`.
+
+        Raises `ValueError` for a negative or zero `interval`, for `CommitEvery.Messages(0)`, and
+        without `interval` and `every`, which would store only on close.
         """
-
-        __match_args__ = (
-            "_0",
-            "_1",
-        )
-        @property
-        def _0(self) -> datetime.timedelta: ...
-        @property
-        def _1(self) -> AutoCommitAfter: ...
-        def __new__(
-            cls, _0: datetime.timedelta, _1: AutoCommitAfter
-        ) -> AutoCommit.IntervalOrAfter: ...
-        def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
-
-    @typing.final
-    class When(AutoCommit):
+    @staticmethod
+    def default() -> AutoCommit:
         r"""
-        The auto-commit is enabled and the offset is stored on the server depending on the mode when consuming the messages.
+        Every 10,000 messages or every 5 seconds, whichever comes first, after processing.
         """
-
-        __match_args__ = ("_0",)
-        @property
-        def _0(self) -> AutoCommitWhen: ...
-        def __new__(cls, _0: AutoCommitWhen) -> AutoCommit.When: ...
-        def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
-
-    @typing.final
-    class After(AutoCommit):
-        r"""
-        The auto-commit is enabled and the offset is stored on the server depending on the mode after consuming the messages.
-        """
-
-        __match_args__ = ("_0",)
-        @property
-        def _0(self) -> AutoCommitAfter: ...
-        def __new__(cls, _0: AutoCommitAfter) -> AutoCommit.After: ...
-        def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
-
-    ...
-
-class AutoCommitAfter:
-    r"""
-    The auto-commit mode for storing the offset on the server **after** receiving the messages.
-    """
-    @typing.final
-    class ConsumingAllMessages(AutoCommitAfter):
-        r"""
-        The offset is stored on the server after all the messages are consumed.
-        """
-
-        __match_args__ = ()
-        def __new__(cls) -> AutoCommitAfter.ConsumingAllMessages: ...
-        def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
-
-    @typing.final
-    class ConsumingEachMessage(AutoCommitAfter):
-        r"""
-        The offset is stored on the server after consuming each message.
-        """
-
-        __match_args__ = ()
-        def __new__(cls) -> AutoCommitAfter.ConsumingEachMessage: ...
-        def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
-
-    @typing.final
-    class ConsumingEveryNthMessage(AutoCommitAfter):
-        r"""
-        The offset is stored on the server after consuming every Nth message.
-        """
-
-        __match_args__ = ("_0",)
-        @property
-        def _0(self) -> builtins.int: ...
-        def __new__(
-            cls, _0: builtins.int
-        ) -> AutoCommitAfter.ConsumingEveryNthMessage: ...
-        def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
-
-    ...
-
-class AutoCommitWhen:
-    r"""
-    The auto-commit mode for storing the offset on the server.
-    """
-    @typing.final
-    class PollingMessages(AutoCommitWhen):
-        r"""
-        The offset is stored on the server when the messages are received.
-        """
-
-        __match_args__ = ()
-        def __new__(cls) -> AutoCommitWhen.PollingMessages: ...
-        def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
-
-    @typing.final
-    class ConsumingAllMessages(AutoCommitWhen):
-        r"""
-        The offset is stored on the server when all the messages are consumed.
-        """
-
-        __match_args__ = ()
-        def __new__(cls) -> AutoCommitWhen.ConsumingAllMessages: ...
-        def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
-
-    @typing.final
-    class ConsumingEachMessage(AutoCommitWhen):
-        r"""
-        The offset is stored on the server when consuming each message.
-        """
-
-        __match_args__ = ()
-        def __new__(cls) -> AutoCommitWhen.ConsumingEachMessage: ...
-        def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
-
-    @typing.final
-    class ConsumingEveryNthMessage(AutoCommitWhen):
-        r"""
-        The offset is stored on the server when consuming every Nth message.
-        """
-
-        __match_args__ = ("_0",)
-        @property
-        def _0(self) -> builtins.int: ...
-        def __new__(
-            cls, _0: builtins.int
-        ) -> AutoCommitWhen.ConsumingEveryNthMessage: ...
-        def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
-
-    ...
+    def __repr__(self) -> builtins.str: ...
 
 @typing.final
 class AutoLogin:
@@ -511,6 +383,135 @@ class CacheMetricsKey:
     ) -> CacheMetricsKey: ...
     def __repr__(self) -> builtins.str: ...
 
+@typing.final
+class Checkpoint:
+    r"""
+    The position after one received message: its partition, its offset and the partition
+    history that delivered it. A commit stores its offset, which marks every earlier message
+    of the partition as consumed.
+
+    Get it from `ReceiveMessage.checkpoint()` or `PolledMessages.checkpoint()`, and commit it
+    with `PartitionReader.commit()` or `IggyConsumer.commit()`. A commit after the partition was
+    deleted and created again, or after its consumer group owner changed, is refused instead of
+    landing on the new partition.
+    """
+    @property
+    def partition_id(self) -> builtins.int:
+        r"""
+        The partition the message was read from.
+        """
+    @property
+    def offset(self) -> builtins.int:
+        r"""
+        The offset of the message. Committing it marks the message as consumed.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __repr__(self) -> builtins.str: ...
+    def __hash__(self) -> builtins.int: ...
+
+@typing.final
+class CommitAfter:
+    r"""
+    When a message counts for `CommitPolicy.Auto`.
+    """
+
+    Processing: typing.ClassVar[CommitAfter]
+    r"""
+    When the application asks for the next message or batch, returns from its callback, or
+    closes the reader. A callback that raises leaves its message uncounted.
+    """
+    Delivery: typing.ClassVar[CommitAfter]
+    r"""
+    When the message or the batch is handed over.
+    """
+    Marked: typing.ClassVar[CommitAfter]
+    r"""
+    Only when the application calls `mark()` with its checkpoint.
+    """
+
+class CommitEvery:
+    r"""
+    The event on which `AutoCommit` also stores.
+    """
+    def __repr__(self) -> builtins.str: ...
+    @typing.final
+    class Message(CommitEvery):
+        r"""
+        Each counted message, or each counted batch of a `PartitionReader`.
+        """
+
+        __match_args__ = ()
+        def __new__(cls) -> CommitEvery.Message: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
+
+    @typing.final
+    class Messages(CommitEvery):
+        r"""
+        This many counted messages of a partition since its last store. Not zero.
+        """
+
+        __match_args__ = ("_0",)
+        @property
+        def _0(self) -> builtins.int: ...
+        def __new__(cls, _0: builtins.int) -> CommitEvery.Messages: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
+
+    @typing.final
+    class Batch(CommitEvery):
+        r"""
+        The last message of each batch.
+        """
+
+        __match_args__ = ()
+        def __new__(cls) -> CommitEvery.Batch: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
+
+class CommitPolicy:
+    r"""
+    When the offsets of the messages that a read returns are stored.
+    """
+    def __repr__(self) -> builtins.str: ...
+    @typing.final
+    class Manual(CommitPolicy):
+        r"""
+        Nothing is stored. The application commits checkpoints. The default.
+        """
+
+        __match_args__ = ()
+        def __new__(cls) -> CommitPolicy.Manual: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
+
+    @typing.final
+    class OnRead(CommitPolicy):
+        r"""
+        The server stores the offset of the last message of each read as part of the read, in one
+        round trip. While the primary stays up a message is delivered at most once. A failover
+        before the store replicates can deliver the last batch again.
+        """
+
+        __match_args__ = ()
+        def __new__(cls) -> CommitPolicy.OnRead: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
+
+    @typing.final
+    class Auto(CommitPolicy):
+        r"""
+        A `PartitionReader` or an `IggyConsumer` stores the latest counted position, at least
+        once with `CommitAfter.Processing`. `IggyClient.poll_messages()` refuses it.
+        """
+
+        __match_args__ = ("_0",)
+        @property
+        def _0(self) -> AutoCommit: ...
+        def __new__(cls, _0: AutoCommit) -> CommitPolicy.Auto: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
+
 class Consumer:
     r"""
     The consumer polling the messages. It selects both the consumer kind and the
@@ -610,31 +611,42 @@ class ConsumerGroupMember:
         """
 
 @typing.final
-class ConsumerPosition:
+class ConsumerGroupsPage:
     r"""
-    The position of a received message: its partition, its offset and the context of
-    the poll that delivered it. Commit it with `IggyConsumer.store_position()`.
+    One page of a list, as `IggyClient.get_consumer_groups_page` returns it.
+    """
+    @property
+    def items(self) -> builtins.list[ConsumerGroup]:
+        r"""
+        The items of the page, in the order of the query.
+        """
+    @property
+    def next(self) -> builtins.str | None:
+        r"""
+        Pass it as `cursor`, with the same other arguments, to read the
+        next page. `None` on the last page.
+        """
+
+@typing.final
+class ConsumerOffsetInfo:
+    r"""
+    The offset that a consumer stored on a partition.
     """
     @property
     def partition_id(self) -> builtins.int:
         r"""
-        The partition the message was read from.
+        The partition of the offset.
         """
     @property
-    def offset(self) -> builtins.int:
+    def current_offset(self) -> builtins.int:
         r"""
-        The offset of the message. Committing it marks the message as consumed.
+        The offset of the last message of the partition when the offset was read.
         """
     @property
-    def context(self) -> PartitionContext:
+    def stored_offset(self) -> builtins.int:
         r"""
-        The partition incarnation and owner the poll was served under.
+        The stored offset.
         """
-    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
-    def __hash__(self) -> builtins.int: ...
-    def __new__(
-        cls, partition_id: builtins.int, offset: builtins.int, context: PartitionContext
-    ) -> ConsumerPosition: ...
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
@@ -660,6 +672,21 @@ class DirectProducerConfig:
         Constructs direct-producer batching and pacing configuration.
         """
     def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class GeoMode:
+    r"""
+    How a geo topic writes its messages, fixed at creation.
+    """
+
+    Geo: typing.ClassVar[GeoMode]
+    r"""
+    A batch goes to the object store before it commits.
+    """
+    GeoTiered: typing.ClassVar[GeoMode]
+    r"""
+    A batch is replicated first, and sealed segments are uploaded later.
+    """
 
 @typing.final
 class GlobalPermissions:
@@ -1120,12 +1147,8 @@ class HttpConfig:
     There is no `AutoLogin` and no reconnection policy, and `connect()` does not
     dial: it only starts the heartbeat, so `login_user(...)` has to follow it.
 
-    HTTP is single-consumer only. `consumer_group(...)` fails with
-    `Feature is unavailable`, and so does a `Consumer.Group(...)` poll unless it
-    names an explicit `partition_id`. With one, the consumer kind is not carried
-    on the HTTP wire, so the poll is served as an ordinary consumer named after
-    the group, with no membership, no partition assignment, and no rebalancing
-    behind it. Pass `Consumer.Single(...)` explicitly.
+    HTTP is single-consumer only. `consumer_group(...)`, and a `Consumer.Group(...)`
+    poll or reader, fail with `Feature is unavailable`. Pass `Consumer.Single(...)`.
     """
     @property
     def api_url(self) -> builtins.str: ...
@@ -1260,6 +1283,60 @@ class IggyClient:
                 authenticated, the user lacks the permission, or the request
                 fails.
         """
+    def snapshot(
+        self,
+        snapshot_compression: SnapshotCompression,
+        snapshot_types: typing.Sequence[SystemSnapshotType],
+    ) -> collections.abc.Awaitable[bytes]:
+        r"""
+        Capture a diagnostic snapshot of the server as a compressed ZIP archive.
+
+        Requires an authenticated session whose user holds the `manage_servers`
+        global permission.
+
+        Args:
+            snapshot_compression: Archive compression method as a
+                `SnapshotCompression` enum.
+            snapshot_types: Data to include in the snapshot as a list of
+                `SystemSnapshotType` enums. `SystemSnapshotType.All` cannot be
+                combined with any other snapshot type.
+
+        Returns:
+            An awaitable that resolves to the ZIP archive `bytes`.
+
+        Raises:
+            TypeError: If `snapshot_compression` is not a `SnapshotCompression`
+                or `snapshot_types` contains elements other than `SystemSnapshotType`.
+            ValueError: If `snapshot_types` is empty.
+            RuntimeError: If the client is not connected, the session is not
+                authenticated, the user lacks the permission, `SystemSnapshotType.All` is
+                combined with another snapshot type, the 30-second binary
+                operation deadline expires, or the request fails.
+        """
+    def retire_geo_origin(
+        self, origin: builtins.str
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Retire the geo origin of a datacenter that never returns.
+
+        The cluster then follows nothing more of the origin: its shadow topics
+        serve what they hold until their retention removes it, and a client
+        may delete them. Retiring an origin that is retired already changes
+        nothing. A datacenter that comes back needs another origin name.
+
+        Requires root or the global `manage_servers` permission.
+
+        Args:
+            origin: The origin name of the lost datacenter, such as `"dc-a"`.
+
+        Returns:
+            An awaitable that resolves to `None` once the cluster committed
+            the retirement.
+
+        Raises:
+            IggyError: If the user lacks the permission, the server refuses
+                the origin, or the request fails.
+        """
     def describe_options(
         self, scope: builtins.str
     ) -> collections.abc.Awaitable[list[OptionSpec]]:
@@ -1363,13 +1440,40 @@ class IggyClient:
         """
     def get_users(self) -> collections.abc.Awaitable[list[UserInfo]]:
         r"""
-        Get the info about all the users.
+        Get the info about all the users, in id order.
+
+        The list is read in pages of 1,000, so it is not one consistent read.
+        A user that someone creates or deletes during the read can appear or
+        not appear. `get_users_page` reads one page.
 
         Returns:
             An awaitable that resolves to `list[UserInfo]`.
 
         Raises:
             RuntimeError: If the request fails.
+        """
+    def get_users_page(
+        self,
+        *,
+        order: PageOrder | None = None,
+        descending: builtins.bool = False,
+        limit: builtins.int | None = None,
+        cursor: builtins.str | None = None,
+        name: builtins.str | None = None,
+    ) -> collections.abc.Awaitable[UsersPage]:
+        r"""
+        Reads one page of the users. `name` matches the username.
+
+        Takes the keyword arguments of `get_streams_page`, with the same
+        cursor rules.
+
+        Returns:
+            An awaitable that resolves to `UsersPage`.
+
+        Raises:
+            OverflowError: If `limit` is outside the unsigned 32-bit range.
+            IggyError: As for `get_streams_page`. A user without the permission
+                to read the users gets the unauthorized code.
         """
     def create_user(
         self,
@@ -1532,6 +1636,8 @@ class IggyClient:
         Replays the exact retained operation until its final result or the deadline.
         A committed rejection raises its original error and frees the lane.
         Uncertainty keeps the operation retained. HTTP does not support this operation.
+        A fetch progress block raises code 14010 without replaying. Only explicit
+        abandon_operation releases it, accepting the unknown server outcome.
         `timeout` must be a positive timedelta; omission or None uses 30 seconds.
         """
     def abandon_operation(
@@ -1539,6 +1645,7 @@ class IggyClient:
     ) -> collections.abc.Awaitable[None]:
         r"""
         Releases a retained operation without claiming whether it committed.
+        For a fetch, this releases every affected partition without stopping the old request.
         """
     def shutdown(self) -> collections.abc.Awaitable[None]:
         r"""
@@ -1580,18 +1687,61 @@ class IggyClient:
         r"""
         Gets stream by id.
         Returns the stream details, or `None` if the stream does not exist.
-        Raises `RuntimeError` on failure.
+        Raises `RuntimeError` on failure. Over TCP, QUIC and WebSocket, a reply
+        larger than the reply size limit raises `IggyError` with code 97
+        (`ReplyTooLarge`). `get_topics_page` reads the topics in pages.
         """
     def get_streams(self) -> collections.abc.Awaitable[list[Stream]]:
         r"""
-        Return all streams.
+        Return the streams the user may read, in id order.
+
+        The list is read in pages of 1,000, so it is not one consistent read.
+        A stream that someone creates or deletes during the read can appear or
+        not appear. `get_streams_page` reads one page.
 
         Returns:
-            A list of `Stream` summaries.
+            A list of `Stream` summaries, the streams the user may read.
 
         Raises:
-            RuntimeError: If the client is not authenticated, the user lacks global
-                `read_streams` or `manage_streams` permission, or the request fails.
+            RuntimeError: If the client is not authenticated or the request fails.
+        """
+    def get_streams_page(
+        self,
+        *,
+        order: PageOrder | None = None,
+        descending: builtins.bool = False,
+        limit: builtins.int | None = None,
+        cursor: builtins.str | None = None,
+        name: builtins.str | None = None,
+    ) -> collections.abc.Awaitable[StreamsPage]:
+        r"""
+        Reads one page of the streams the user may read.
+
+        Pass the page's `next` as `cursor`, with the same other arguments, to
+        read the next page. The read ends at the first page whose `next` is
+        `None`. A page can be empty and still have a `next`.
+
+        Args:
+            order: `PageOrder.Id`, the default, or `PageOrder.Created`.
+            descending: Read from the last item to the first.
+            limit: Items per page, 1 to 1000. Defaults to 100.
+            cursor: The `next` of the previous page, `None` for the first page.
+            name: Keep only the items whose name holds this text, case-sensitive.
+                1 to 255 bytes.
+
+        Returns:
+            An awaitable that resolves to `StreamsPage`.
+
+        Raises:
+            OverflowError: If `limit` is outside the unsigned 32-bit range.
+            IggyError: If the request fails. A cursor or a query that breaks
+                the page rules raises it with the invalid command code before
+                anything is sent. The server refuses a cursor that it cannot
+                use, such as the cursor of another order, with the same code.
+                Over HTTP, a refusal from the server has code 300 (HTTP response
+                error), and its message holds the server error body. The page
+                holds the streams the user may read, so a user without a
+                grant gets an empty page.
         """
     def update_stream(
         self,
@@ -1690,13 +1840,22 @@ class IggyClient:
         r"""
         Gets topic by stream and id.
         Returns the topic details, or `None` if the topic does not exist.
-        Raises `RuntimeError` on failure.
+        Raises `RuntimeError` on failure. Over TCP, QUIC and WebSocket, a reply
+        larger than the reply size limit raises `IggyError` with code 97
+        (`ReplyTooLarge`). `get_partitions_page` reads the partitions in pages.
         """
     def get_topics(
         self, stream_id: builtins.str | builtins.int
     ) -> collections.abc.Awaitable[list[Topic]]:
         r"""
-        Get all topics in a stream.
+        Get the topics of a stream, in id order. The list holds only the
+        topics the user may read.
+
+        The list is read in pages of 1,000, so it is not one consistent read.
+        A topic that someone creates or deletes during the read can appear or
+        not appear. If the stream goes missing after the first page, the read
+        fails for a user with a global read grant, and ends there for any other
+        user. `get_topics_page` reads one page.
 
         Args:
             stream_id: Stream identifier as `str | int`.
@@ -1706,6 +1865,37 @@ class IggyClient:
 
         Raises:
             RuntimeError: If the identifier is invalid or the request fails.
+        """
+    def get_topics_page(
+        self,
+        stream_id: builtins.str | builtins.int,
+        *,
+        order: PageOrder | None = None,
+        descending: builtins.bool = False,
+        limit: builtins.int | None = None,
+        cursor: builtins.str | None = None,
+        name: builtins.str | None = None,
+    ) -> collections.abc.Awaitable[TopicsPage]:
+        r"""
+        Reads one page of the topics of a stream. A missing stream, or one the
+        user may read no topic of, gives an empty page without `next`. For a
+        user with a global read grant, a page read with a cursor raises
+        `IggyError` instead, because the stream was deleted during the walk.
+
+        Takes the keyword arguments of `get_streams_page`, with the same
+        cursor rules.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+
+        Returns:
+            An awaitable that resolves to `TopicsPage`.
+
+        Raises:
+            ValueError: If the identifier is invalid.
+            OverflowError: If `limit` is outside the unsigned 32-bit range.
+            IggyError: As for `get_streams_page`. The page holds the topics
+                the user may read.
         """
     def update_topic(
         self,
@@ -1717,6 +1907,17 @@ class IggyClient:
         reset: builtins.list[OptionKey] | None = None,
         options: builtins.dict[builtins.str, builtins.str] | None = None,
         raw_reset: builtins.list[builtins.str] | None = None,
+        tiered_storage: builtins.bool | None = None,
+        local_retention_age: IggyExpiry | None = None,
+        local_retention_size: MaxTopicSize | None = None,
+        fresh_upload_interval: datetime.timedelta | None = None,
+        consumer_offset_upload_interval: datetime.timedelta | None = None,
+        positions_publish_interval: datetime.timedelta | None = None,
+        tombstone_grace: datetime.timedelta | None = None,
+        positions_resume_timeout: datetime.timedelta | None = None,
+        long_term_rewrite_max_interval: datetime.timedelta | None = None,
+        read_cache_size: builtins.int | None = None,
+        read_ahead: builtins.int | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
         Update an existing topic.
@@ -1737,19 +1938,53 @@ class IggyClient:
                 nothing either, reset `OptionKey.MaxTopicSize` to return to the
                 default.
             reset: Keys to return to their defaults as `list[OptionKey] | None`:
-                `OptionKey.MessageExpiry` or `OptionKey.MaxTopicSize`.
+                `OptionKey.MessageExpiry`, `OptionKey.MaxTopicSize`,
+                `OptionKey.LocalRetentionAge` or `OptionKey.LocalRetentionSize`.
             options: Additional option keys as `dict[str, str] | None`, sent
                 verbatim so an updatable server key can be set from this build.
                 A create-only key is refused by name.
             raw_reset: Additional reset names as `list[str] | None`, sent
                 verbatim so a key newer than this build can be reset. The
                 server decides them.
+            tiered_storage: `True` turns tiered storage on, unchanged when
+                `None`. The server refuses `False`, an update never turns it
+                off, and refuses `True` with `FeatureUnavailable` until it
+                tiers topics.
+            local_retention_age: How long a tiered topic keeps an uploaded
+                segment on local disk as `IggyExpiry | None`, unchanged when
+                `None`. `IggyExpiry.ServerDefault()` changes nothing either,
+                reset `OptionKey.LocalRetentionAge` to return to the default.
+            local_retention_size: Topic-wide cap on the uploaded segments a
+                tiered topic keeps on local disk as `MaxTopicSize | None`,
+                unchanged when `None`. `MaxTopicSize.ServerDefault()` changes
+                nothing either, reset `OptionKey.LocalRetentionSize` to return
+                to the default.
+            fresh_upload_interval: A duration of a geo topic as
+                `datetime.timedelta | None`, unchanged when `None`. This and
+                the five durations below have the meaning and bounds
+                `TopicOptions` gives them, zero is a value, and none of them
+                can be reset. With `read_cache_size` and `read_ahead` they are
+                the only options an update changes on a geo topic, and the
+                server refuses them on a normal topic.
+            consumer_offset_upload_interval: As `fresh_upload_interval`.
+            positions_publish_interval: As `fresh_upload_interval`.
+            tombstone_grace: As `fresh_upload_interval`.
+            positions_resume_timeout: As `fresh_upload_interval`.
+            long_term_rewrite_max_interval: As `fresh_upload_interval`.
+            read_cache_size: Read cache bytes of the topic as `int | None`,
+                unchanged when `None`. This and `read_ahead` have the meaning
+                and bounds `TopicOptions` gives them, zero is a value, and
+                neither can be reset. An update can change them on any topic.
+            read_ahead: As `read_cache_size`.
 
         Returns:
             An awaitable that resolves to `None` when the topic is updated.
 
         Raises:
-            ValueError: If `message_expiry` or `max_topic_size` is out of range.
+            ValueError: If `message_expiry`, `max_topic_size`,
+                `local_retention_age` or `local_retention_size` is out of range,
+                or a duration is negative or longer than `2**64 - 1`
+                microseconds.
             OptionError: A `RuntimeError` carrying the error `code` and
                 `kind` when the client or the server refuses an option.
             RuntimeError: Before anything is sent, if the update changes
@@ -1833,6 +2068,37 @@ class IggyClient:
                 `manage_streams` or `manage_topics`, per-stream `manage_stream` or
                 `manage_topics`, or per-topic `manage_topic` permission, or the
                 request fails.
+        """
+    def get_partitions_page(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+        *,
+        order: PageOrder | None = None,
+        descending: builtins.bool = False,
+        limit: builtins.int | None = None,
+        cursor: builtins.str | None = None,
+    ) -> collections.abc.Awaitable[PartitionsPage]:
+        r"""
+        Reads one page of the partitions of a topic.
+
+        Takes the keyword arguments of `get_streams_page` except `name`,
+        because a partition has no name. The cursor rules are the same.
+        Partition ids follow creation, so `PageOrder.Created` gives the id
+        order too.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+
+        Returns:
+            An awaitable that resolves to `PartitionsPage`.
+
+        Raises:
+            ValueError: If an identifier is invalid.
+            OverflowError: If `limit` is outside the unsigned 32-bit range.
+            IggyError: As for `get_streams_page`. A user without the permission
+                to read the topic gets the unauthorized code.
         """
     def delete_segments(
         self,
@@ -1919,7 +2185,11 @@ class IggyClient:
         topic_id: builtins.str | builtins.int,
     ) -> collections.abc.Awaitable[list[ConsumerGroup]]:
         r"""
-        Get all consumer groups for the specified stream and topic.
+        Get all consumer groups for the specified stream and topic, in id order.
+
+        The list is read in pages of 1,000, so it is not one consistent read.
+        A group that someone creates or deletes during the read can appear or
+        not appear. `get_consumer_groups_page` reads one page.
 
         Args:
             stream_id: Stream identifier as `str | int`.
@@ -1931,6 +2201,37 @@ class IggyClient:
         Raises:
             ValueError: If an identifier is invalid.
             RuntimeError: If the request fails.
+        """
+    def get_consumer_groups_page(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+        *,
+        order: PageOrder | None = None,
+        descending: builtins.bool = False,
+        limit: builtins.int | None = None,
+        cursor: builtins.str | None = None,
+        name: builtins.str | None = None,
+    ) -> collections.abc.Awaitable[ConsumerGroupsPage]:
+        r"""
+        Reads one page of the consumer groups of a topic.
+
+        Takes the keyword arguments of `get_streams_page`, with the same
+        cursor rules. Group ids follow creation, so `PageOrder.Created` gives
+        the id order too.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+
+        Returns:
+            An awaitable that resolves to `ConsumerGroupsPage`.
+
+        Raises:
+            ValueError: If an identifier is invalid.
+            OverflowError: If `limit` is outside the unsigned 32-bit range.
+            IggyError: As for `get_streams_page`. A user without the permission
+                to read the topic gets the unauthorized code.
         """
     def delete_consumer_group(
         self,
@@ -2061,66 +2362,214 @@ class IggyClient:
         Raises `ValueError` for invalid names or numeric ranges and `RuntimeError`
         when stream/topic initialization fails.
         """
-    def poll_messages(
+    async def poll_messages(
+        self,
+        stream: builtins.str | builtins.int,
+        topic: builtins.str | builtins.int,
+        *,
+        partition_id: builtins.int,
+        consumer: Consumer,
+        polling_strategy: PollingStrategy,
+        options: PollOptions | None = None,
+    ) -> PolledMessages:
+        r"""
+        Polls one batch of messages of a partition on behalf of the given consumer.
+
+        `options` defaults to `PollOptions()`: at most 1000 messages and 1 MiB, answered at
+        once, and no offset stored. With `CommitPolicy.OnRead()`, the server stores the
+        offset of the last message as part of the reply. If that reply is lost, the poll raises
+        `PendingOperationError` of kind `fetch_progress_uncertain`, and every later poll of the
+        partition raises it of kind `lane_blocked` until `abandon_operation()` releases it. A
+        cancelled `OnRead` poll that already sent its request blocks the partition the same way,
+        so a cancel never loses a batch without a trace. `CommitPolicy.Auto` raises `IggyError`
+        with `InvalidConfiguration` (2): a one-shot poll has nothing to count.
+
+        To read on, pass `polled.continuation()` as the next `polling_strategy`. The poll is
+        then refused with `HistoryUnavailable` (87) if the partition was deleted and created
+        again, or if its consumer group owner changed, instead of reading the new partition at
+        that offset. A continuation of another partition is refused with `InvalidCommand` (3).
+
+        A consumer group member reads only the partitions assigned to it: another partition
+        raises `ConsumerGroupPartitionNotOwned` (5009).
+        Returns the batch, or raises `IggyError` on failure.
+        """
+    def store_consumer_position(
         self,
         stream: builtins.str | builtins.int,
         topic: builtins.str | builtins.int,
         *,
         consumer: Consumer,
-        polling_strategy: PollingStrategy,
-        count: builtins.int,
-        auto_commit: builtins.bool,
-        partition_id: builtins.int | None = None,
-        context: PartitionContext | None = None,
-    ) -> collections.abc.Awaitable[list[ReceiveMessage]]:
+        checkpoint: Checkpoint,
+    ) -> collections.abc.Awaitable[None]:
         r"""
-        Polls for messages from the specified topic on behalf of the given consumer.
-        Omitting `partition_id` reads partition 0 for a regular consumer, and
-        polls the member's assigned partitions for a consumer group.
-        `context` continues from a message received earlier, usually with
-        `PollingStrategy.Offset`: pass that message's `context()` and `partition_id()`.
-        The poll is then refused if the partition was deleted and created again, or if its
-        consumer group owner changed, instead of reading the new partition at that offset.
-        Without `context`, the poll takes the context its route reports. After another
-        client deleted and created the partition again, one such poll can fail with
-        `HistoryUnavailable` (87), or `ConsumerGroupPartitionNotOwned` (5009) for a
-        consumer group member. The failed route is dropped, and the next call routes again.
-        Returns a list of received messages or a RuntimeError on failure.
+        Stores the offset of `checkpoint` for `consumer`, under the partition history that
+        delivered the checkpoint, which covers every earlier message of its partition.
+
+        Raises `IggyError` with `HistoryUnavailable` (87) after the partition was deleted and
+        created again, and `ConsumerGroupPartitionNotOwned` (5009) after its consumer group owner
+        changed, instead of storing the offset on the new partition.
+        """
+    def store_consumer_offset(
+        self,
+        stream: builtins.str | builtins.int,
+        topic: builtins.str | builtins.int,
+        *,
+        consumer: Consumer,
+        partition_id: builtins.int,
+        offset: builtins.int,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Stores `offset` for `consumer` on `partition_id`, under the partition history of its
+        route. After another client deleted and created the partition again, it can fail once
+        with `HistoryUnavailable` (87), and the next call routes again. Prefer
+        `store_consumer_position()` with a checkpoint.
+        """
+    def get_consumer_offset(
+        self,
+        stream: builtins.str | builtins.int,
+        topic: builtins.str | builtins.int,
+        *,
+        consumer: Consumer,
+        partition_id: builtins.int,
+    ) -> collections.abc.Awaitable[ConsumerOffsetInfo | None]:
+        r"""
+        Returns the offset stored for `consumer` on `partition_id`, or `None` when nothing is
+        stored. In a cluster, the node of the connection answers from its own replica, which can
+        lag a store that just returned.
+        """
+    def delete_consumer_offset(
+        self,
+        stream: builtins.str | builtins.int,
+        topic: builtins.str | builtins.int,
+        *,
+        consumer: Consumer,
+        partition_id: builtins.int,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Deletes the offset stored for `consumer` on `partition_id`, under the partition history
+        of its route. Raises `IggyError` with `ConsumerOffsetNotFound` (3021) when nothing is
+        stored. Prefer `delete_consumer_position()` with a checkpoint.
+        """
+    def delete_consumer_position(
+        self,
+        stream: builtins.str | builtins.int,
+        topic: builtins.str | builtins.int,
+        *,
+        consumer: Consumer,
+        checkpoint: Checkpoint,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Deletes the stored offset of the partition of `checkpoint` for `consumer`, under the
+        partition history that delivered the checkpoint. The offset of the checkpoint is not
+        used.
+
+        Raises `IggyError` with `HistoryUnavailable` (87) after the partition was deleted and
+        created again, `ConsumerGroupPartitionNotOwned` (5009) after its consumer group owner
+        changed, and `ConsumerOffsetNotFound` (3021) when nothing is stored. HTTP sends no
+        partition history, so there the server deletes the offset of the history it holds.
+        """
+    def reader(
+        self,
+        stream: builtins.str | builtins.int,
+        topic: builtins.str | builtins.int,
+        *,
+        consumer: Consumer,
+        partitions: list[builtins.int] | None = None,
+        start: PollingStrategy | None = None,
+        options: PollOptions | None = None,
+        prefetch_bytes: builtins.int | None = None,
+        prefetch_messages: builtins.int | None = None,
+    ) -> collections.abc.Awaitable[PartitionReader]:
+        r"""
+        Builds a `PartitionReader` of `topic` in `stream` that reads as `consumer`.
+
+        A `Consumer.Single` reads `partitions`, which it requires. A `Consumer.Group` reads the
+        assignment of its member, so `partitions` must be `None`: the reader joins the group
+        here. Consumer groups are not available over HTTP.
+
+        `start` is where a partition without a stored position starts, `PollingStrategy.Next()`
+        by default. A continuation is refused, because it belongs to one partition. `options`
+        sets each request, and defaults to `PollOptions(max_wait=timedelta(seconds=5))`: a
+        reader without a wait polls an idle topic in a busy loop. `prefetch_bytes` (16 MiB by
+        default) and `prefetch_messages` (16,000 by default) request budgets for reads in flight
+        and queued batches. Each effective budget holds at least 32 reads at the configured
+        count and byte limit, even if a smaller budget is requested. Larger budgets allow more
+        queued batches; network requests have a separate per-consumer limit of 32.
+
+        Raises `IggyError` with `InvalidCommand` (3) for partitions of a group, a
+        `Consumer.Single` without partitions or a continuation as `start`,
+        `FeatureUnavailable` for a consumer group over HTTP, the errors of `options`, and the
+        error of the group join. A join with an unknown outcome raises `PendingOperationError`
+        after `reader()` abandoned it on the client, so the next `reader()` joins again. A join
+        that landed keeps its member in the group until the session ends.
         """
     def consumer_group(
         self,
         name: builtins.str,
         stream: builtins.str,
         topic: builtins.str,
-        partition_id: builtins.int | None = None,
+        *,
         polling_strategy: PollingStrategy | None = None,
-        batch_length: builtins.int | None = None,
-        auto_commit: AutoCommit | None = None,
+        poll_options: PollOptions | None = None,
+        prefetch_bytes: builtins.int | None = None,
+        prefetch_messages: builtins.int | None = None,
         create_consumer_group_if_not_exists: builtins.bool = True,
-        auto_join_consumer_group: builtins.bool = True,
-        poll_interval: datetime.timedelta | None = None,
+        polling_retry_interval: datetime.timedelta | None = None,
+        init_retries: builtins.int | None = None,
+        init_retry_interval: datetime.timedelta | None = None,
+        offset_drain_timeout: datetime.timedelta | None = None,
+        allow_replay: builtins.bool = False,
+    ) -> collections.abc.Awaitable[IggyConsumer]:
+        r"""
+        Creates a new consumer group consumer, which joins the group before it returns.
+        The member reads the partitions the server assigns to it.
+
+        `polling_strategy` is where a partition without a stored offset starts,
+        `PollingStrategy.Next()` by default. `poll_options` sets each request, and defaults to
+        `PollOptions(max_wait=timedelta(seconds=5))`: a consumer without a wait polls an idle
+        topic in a busy loop. Its `commit` says when offsets are stored: `CommitPolicy.Manual()`,
+        the default, stores none, so commit checkpoints after processing, or each restart reads
+        the same messages again. `CommitPolicy.OnRead()` makes the server store the offset of
+        each reply, and `CommitPolicy.Auto(...)` makes the consumer store counted positions.
+        `prefetch_bytes` (16 MiB by default) and `prefetch_messages` (16,000 by default) request
+        budgets for reads in flight and queued batches. Each effective budget holds at least
+        32 reads at the configured poll count and byte limit, even if a smaller budget is
+        requested. Larger budgets allow more queued batches; network requests have a separate
+        per-consumer limit of 32.
+        `offset_drain_timeout` controls how long shutdown waits for pending automatic offset
+        stores before closing the reader. It defaults to five seconds; zero skips that wait.
+        Call `shutdown()` before dropping the consumer.
+        Returns the consumer or raises `IggyError` on failure. Raises `ValueError` if
+        `polling_retry_interval` or `init_retry_interval` is negative or zero, or if
+        `offset_drain_timeout` is negative.
+
+        Consumer groups are not available over HTTP: this call raises `FeatureUnavailable`.
+        Use `Consumer.Single(...)` with `poll_messages(...)` or `reader(...)` there.
+        """
+    def consumer(
+        self,
+        name: builtins.str,
+        stream: builtins.str,
+        topic: builtins.str,
+        *,
+        partitions: typing.Sequence[builtins.int],
+        polling_strategy: PollingStrategy | None = None,
+        poll_options: PollOptions | None = None,
+        prefetch_bytes: builtins.int | None = None,
+        prefetch_messages: builtins.int | None = None,
         polling_retry_interval: datetime.timedelta | None = None,
         init_retries: builtins.int | None = None,
         init_retry_interval: datetime.timedelta | None = None,
         allow_replay: builtins.bool = False,
     ) -> collections.abc.Awaitable[IggyConsumer]:
         r"""
-        Creates a new consumer group consumer.
-        `partition_id` is ignored for a consumer group: the member reads the partitions
-        the server assigns to it.
-        Returns the consumer or a RuntimeError on failure. Raises `ValueError` if
-        `poll_interval`, `polling_retry_interval`, `init_retry_interval` or an
-        `AutoCommit` interval is negative, or if any of those except `poll_interval`
-        is zero.
+        Creates a standalone consumer of `partitions` of `topic`, identified by `name`: it
+        stores its offsets as `Consumer.Single(name)` and joins no group. A partition without a
+        stored offset starts at `polling_strategy`, `PollingStrategy.Next()` by default.
 
-        Consumer groups are not available over HTTP. With `auto_join_consumer_group`
-        left on, this call fails at the join with `Feature is unavailable`.
-        Turning it off is not a workaround: the join is skipped, but a group
-        member always polls without a partition, so the first poll fails with
-        the same error. Use `Consumer.Single(...)` with `poll_messages(...)`
-        instead - a `Consumer.Group(...)` poll with an explicit `partition_id`
-        does reach the server, but is served as an ordinary consumer named
-        after the group.
+        The other arguments are those of `consumer_group()`. Call `shutdown()` before dropping
+        the consumer. Raises `IggyError` with `InvalidCommand` (3) without partitions, and the
+        errors of `poll_options`.
         """
     def send_binary_request(
         self, code: builtins.int, payload: builtins.bytes
@@ -2173,6 +2622,11 @@ class IggyConsumer:
     A Python class representing the Iggy consumer.
     It provides asynchronous functionality through the contained runtime.
     """
+    @property
+    def commit_policy(self) -> CommitPolicy:
+        r"""
+        When the offsets of this consumer are stored, from its `PollOptions`.
+        """
     def get_last_consumed_offset(
         self, partition_id: builtins.int
     ) -> builtins.int | None:
@@ -2183,7 +2637,9 @@ class IggyConsumer:
     def get_last_stored_offset(self, partition_id: builtins.int) -> builtins.int | None:
         r"""
         Get the last offset successfully stored for this partition, or `None` until
-        this consumer has stored one. Polling under `AutoCommit.Disabled()` leaves it unset.
+        this consumer has stored one. `CommitPolicy.Manual()`, the default, leaves it unset
+        until a commit. Under `CommitPolicy.OnRead()` it is the end of the last batch that the
+        consumer took from its reader.
         """
     def name(self) -> builtins.str:
         r"""
@@ -2207,31 +2663,54 @@ class IggyConsumer:
         r"""
         Stores the provided offset for the provided partition id or if none is specified
         uses the current partition id for the consumer group.
-        The offset is stored under the context of the latest message consumed from the
-        partition. To commit a message held across a newer poll or an ownership change,
-        pass `message.position()` to `store_position()` instead.
-        Before a message is consumed from the partition, the write takes the context its
-        route reports. After another client deleted and created the partition again, one
-        such write can fail with `HistoryUnavailable` (87), or
-        `ConsumerGroupPartitionNotOwned` (5009) for a consumer group member. The failed
-        route is dropped, and the next call routes again.
-        Raises `RuntimeError` if the operation fails.
+        It always sends, also an offset below the stored one. The offset is stored under the
+        context of the latest message consumed from the partition, or without a context when
+        nothing was consumed from it. To commit a message held across a newer read or an
+        ownership change, pass `message.checkpoint()` to `commit()` instead.
+        Raises `IggyError` if the operation fails, for example `HistoryUnavailable` (87)
+        after the partition was deleted and created again.
         """
-    def store_position(
-        self, position: ConsumerPosition
-    ) -> collections.abc.Awaitable[None]:
+    def commit(self, checkpoint: Checkpoint) -> collections.abc.Awaitable[None]:
         r"""
-        Stores the position of a received message, taken from `ReceiveMessage.position()`.
-        The write keeps the context that delivered the message, so it fails with
+        Stores the offset of a checkpoint that this consumer yielded, taken from
+        `ReceiveMessage.checkpoint()`, which covers every earlier message of its partition.
+        The write keeps the partition history that delivered the message, so it fails with
         `HistoryUnavailable` (87) after the partition was deleted and created again, and
         with `ConsumerGroupPartitionNotOwned` (5009) after its consumer group owner
         changed, instead of committing the offset to the new partition.
-        A position that is not ahead of the last one stored under the same partition
-        incarnation and owner is skipped without a request, unless the consumer was
-        created with `allow_replay=True`. The same holds for an offset that
-        `store_offset()` stored before a message was consumed from the partition,
-        but a position at offset 0 is never skipped in that case.
-        Raises `RuntimeError` if the operation fails.
+        A checkpoint of an older generation of its partition, after `seek()` or a new
+        assignment, or at or below the last commit of its generation, stores nothing.
+        Raises `IggyError` with `InvalidCommand` (3) under `CommitPolicy.OnRead()` and for a
+        checkpoint that this consumer did not yield, or if the operation fails.
+        """
+    def mark(self, checkpoint: Checkpoint) -> None:
+        r"""
+        Counts a checkpoint that this consumer yielded under `CommitPolicy.Auto` and stores
+        nothing now: the policy stores the latest counted position of its partition. With
+        `CommitAfter.Marked` only marks count, so messages processed concurrently count once
+        they are done. It works also in a `consume_messages()` callback.
+        Raises `IggyError` with `InvalidCommand` (3) without `CommitPolicy.Auto` and for a
+        checkpoint that this consumer did not yield.
+        """
+    def seek(
+        self, partition_id: builtins.int, start: PollingStrategy
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Sets the next read position of a partition and drops the rest of its batch that the
+        consumer yields from. With `CommitPolicy.OnRead()`, a seek to an offset above 0 first
+        stores the offset before it, so a restart resumes at the new position. A seek to offset 0
+        or `PollingStrategy.First()` deletes the stored offset. A seek to a timestamp stores the
+        offset before the first message at the timestamp, if there is one. Every other seek
+        stores nothing. It resumes a stopped partition.
+        `start` is a new strategy or a continuation of the same partition, such as
+        `ReadError.skip`. After `HistoryUnavailable` (87), the partition reads nothing until
+        this call picks a start in its new history.
+        Raises `IggyError` with `InvalidCommand` (3) for a partition that the consumer does not
+        read and for a continuation of another partition, `PendingOperationError` under
+        `CommitPolicy.OnRead()` while a read of the partition has an unknown outcome
+        (abandon its operation first), the errors of the read, lookup, store or delete with
+        `OnRead`, and `RuntimeError` while `consume_messages()` runs, also from its callback:
+        seek after the run ends.
         """
     def delete_offset(
         self, partition_id: builtins.int | None
@@ -2239,26 +2718,45 @@ class IggyConsumer:
         r"""
         Deletes the offset for the provided partition id or if none is specified
         uses the current partition id for the consumer group.
-        The write takes the context its route reports. After another client deleted and
-        created the partition again, one such write can fail with `HistoryUnavailable` (87),
-        or `ConsumerGroupPartitionNotOwned` (5009) for a consumer group member. The failed
-        route is dropped, and the next call routes again.
-        Raises `RuntimeError` if the operation fails.
+        Raises `IggyError` if the operation fails, for example `ConsumerOffsetNotFound`
+        when nothing is stored for the partition.
+        """
+    def shutdown(self) -> collections.abc.Awaitable[None]:
+        r"""
+        Shuts the consumer down. Under `CommitPolicy.Auto` it stores the latest counted position
+        of each partition first, then it closes the reader and leaves the consumer group. With
+        `CommitPolicy.OnRead()`, it moves the offset back to the last yielded message, which a
+        dropped consumer does not do.
+        It ends a parked iteration at once, which then raises `StopAsyncIteration`, and it waits
+        for a running `consume_messages()` to end. Repeated calls are safe.
+        Raises `IggyError` for the first failed store of the `OnRead` close, or else
+        `PendingOperationError` for a partition with an unknown outcome: abandon its operation
+        before another consumer reads the partition. Raises `RuntimeError` in a
+        `consume_messages()` callback of this consumer, because the run waits for the callback:
+        set the shutdown event or cancel the run instead.
+        """
+    def __aenter__(self) -> collections.abc.Awaitable[IggyConsumer]: ...
+    def __aexit__(
+        self, _exc_type: typing.Any, _exc_value: typing.Any, _traceback: typing.Any
+    ) -> collections.abc.Awaitable[builtins.bool]:
+        r"""
+        Shuts the consumer down as `shutdown()` does, also when the block raised.
         """
     def iter_messages(self) -> collections.abc.AsyncIterator[ReceiveMessage]:
         r"""
         Asynchronously iterate over `ReceiveMessage`s.
-        Returns an async iterator that raises `StopAsyncIteration` when no more messages are available
-        or a `RuntimeError` on failure.
-        Note: This method does not currently support `AutoCommit.After`.
-        For `AutoCommit.IntervalOrAfter(datetime.timedelta, AutoCommitAfter)`,
-        only the interval part is applied; the `after` mode is ignored.
-        Use `consume_messages()` if you need commit-after-processing semantics.
-        After another client deleted and created a partition again, or after the consumer
-        group moved a partition to another member, one iteration can raise `RuntimeError`
-        with `HistoryUnavailable` (87), or `ConsumerGroupPartitionNotOwned` (5009) for a
-        consumer group member. The consumer drops the failed route and the position it
-        continued from, and the next iteration routes again.
+        Returns an async iterator that raises `StopAsyncIteration` when no more messages are
+        available or a `ReadError` on a failed read. The consumer stays usable after it and
+        retries by itself.
+        Under `CommitPolicy.Auto`, a message counts when it is yielded with
+        `CommitAfter.Delivery`, and when the next iteration starts with `CommitAfter.Processing`.
+        After another client deleted and created a partition again, one iteration raises
+        `ReadError` with `HistoryUnavailable` (87), and the partition reads nothing until
+        `seek()` picks a start in its new history. After six refusals in a row that a retry does
+        not change, such as `Unauthorized` (41), one iteration raises a `ReadError` whose
+        `is_lasting_refusal` is true, and the partition reads nothing until `seek()`.
+        A cancelled iteration leaves its message for the next one. Iterating in a
+        `consume_messages()` callback of this consumer raises `RuntimeError`.
         """
     def consume_messages(
         self,
@@ -2269,11 +2767,22 @@ class IggyConsumer:
     ) -> collections.abc.Awaitable[None]:
         r"""
         Consumes messages continuously using a callback function and an optional `asyncio.Event` for signaling shutdown.
-        Returns an awaitable that completes when shutdown is signaled or a RuntimeError on failure.
-        After another client deleted and created a partition again, one poll can fail with
-        `HistoryUnavailable` (87), or `ConsumerGroupPartitionNotOwned` (5009) for a consumer
-        group member. The error is logged, not raised: the failed route is dropped, and the
-        next poll routes again.
+        Returns an awaitable that completes when shutdown is signaled. A cancel of the awaitable
+        ends the run once the running callback returns, with or without an event.
+        Under `CommitPolicy.Auto`, a message counts before its callback with
+        `CommitAfter.Delivery`, and after its callback returns with `CommitAfter.Processing`.
+        With `CommitAfter.Processing`, a callback that raises ends the run with its exception,
+        and its message stays uncounted, so the next run reads it again. Otherwise a callback
+        that raises is logged and the run goes on.
+        A failed read is logged, and the consumer retries by itself. The run raises `ReadError`
+        if the client cannot go on without the caller, or if a read stops its partition until
+        `seek()`: `HistoryUnavailable` (87), six refusals in a row that a retry does not change,
+        such as `Unauthorized` (41) or a missing partition, or an unknown outcome under
+        `CommitPolicy.OnRead()`. For a stopped partition, `ReadError.partition_id` names it.
+        To resume it, abandon the operation of an unknown outcome, seek the partition and consume
+        again.
+        Raises `RuntimeError` in a callback of a run of this consumer, because the run waits for
+        the callback.
         """
 
 class IggyError(builtins.RuntimeError):
@@ -3117,7 +3626,7 @@ class MetadataSessionClosedReason:
     Expired: typing.ClassVar[MetadataSessionClosedReason]
     Revoked: typing.ClassVar[MetadataSessionClosedReason]
     r"""
-    The user was deactivated or deleted.
+    A user delete, deactivation, password change, or delete of the session's token.
     """
     def __str__(self) -> builtins.str: ...
 
@@ -3515,6 +4024,10 @@ class OptionKey:
     r"""
     Topic segment preallocation, fixed at creation.
     """
+    ReplicationFactor: typing.ClassVar[OptionKey]
+    r"""
+    Topic replication factor, fixed at creation.
+    """
     EncryptionKey: typing.ClassVar[OptionKey]
     r"""
     Stream encryption key, write-only and fixed at creation.
@@ -3531,6 +4044,76 @@ class OptionKey:
     r"""
     Fingerprints of the server keys wrapping the stream's key, computed by
     the server.
+    """
+    SegmentMaxAge: typing.ClassVar[OptionKey]
+    r"""
+    Topic segment age roll, fixed at creation.
+    """
+    TieredStorage: typing.ClassVar[OptionKey]
+    r"""
+    Topic tiered storage. An update only turns it on.
+    """
+    LocalRetentionAge: typing.ClassVar[OptionKey]
+    r"""
+    Time a tiered topic keeps an uploaded segment on local disk,
+    resettable to one day.
+    """
+    LocalRetentionSize: typing.ClassVar[OptionKey]
+    r"""
+    Cap on the uploaded segments a tiered topic keeps on local disk,
+    resettable to unlimited.
+    """
+    TopicType: typing.ClassVar[OptionKey]
+    r"""
+    Topic type, normal or geo, fixed at creation.
+    """
+    GeoMode: typing.ClassVar[OptionKey]
+    r"""
+    How a geo topic writes its messages, fixed at creation.
+    """
+    FreshUploadInterval: typing.ClassVar[OptionKey]
+    r"""
+    Longest time a send to a geo topic waits for its upload to start.
+    An update can set it, not reset it.
+    """
+    ConsumerOffsetUploadInterval: typing.ClassVar[OptionKey]
+    r"""
+    Shortest time between two uploads of the positions a geo topic's
+    stored offsets wait for. An update can set it, not reset it.
+    """
+    PositionsPublishInterval: typing.ClassVar[OptionKey]
+    r"""
+    How often a node uploads a geo topic's changed positions. An update
+    can set it, not reset it.
+    """
+    TombstoneGrace: typing.ClassVar[OptionKey]
+    r"""
+    How long a deleted geo topic's tombstone and objects stay. An update
+    can set it, not reset it.
+    """
+    PositionsResumeTimeout: typing.ClassVar[OptionKey]
+    r"""
+    How long a geo topic's group polls wait for the peers' positions after
+    a node starts. An update can set it, not reset it.
+    """
+    LongTermRewriteMaxInterval: typing.ClassVar[OptionKey]
+    r"""
+    Longest wait between two long-term rewrites of a geo topic's
+    partition. An update can set it, not reset it.
+    """
+    ShadowOrigin: typing.ClassVar[OptionKey]
+    r"""
+    The geo origin a shadow stream serves, computed by the server.
+    """
+    ReadCacheSize: typing.ClassVar[OptionKey]
+    r"""
+    Memory each node keeps for what a topic's reads fetch from the object
+    store. An update can set it, not reset it.
+    """
+    ReadAhead: typing.ClassVar[OptionKey]
+    r"""
+    Most bytes readahead fetches in front of a sequential reader of a
+    topic. An update can set it, not reset it.
     """
     def __str__(self) -> builtins.str: ...
 
@@ -3596,6 +4179,16 @@ class OptionSpec:
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
+class PageOrder:
+    r"""
+    The order of a list page: `Id` by id, `Created` by creation time and then
+    by id.
+    """
+
+    Id: typing.ClassVar[PageOrder]
+    Created: typing.ClassVar[PageOrder]
+
+@typing.final
 class Partition:
     @property
     def id(self) -> builtins.int:
@@ -3633,15 +4226,27 @@ class Partition:
         The partition incarnation and the metadata operation the details were read at.
         The owner generation is `0` because the details belong to no consumer group.
         """
+    @property
+    def members(self) -> builtins.list[builtins.int]:
+        r"""
+        Node ids that store the partition, in member order. While one is down, a write
+        still commits if a quorum of the others is in sync.
+        """
+    @property
+    def in_sync_members(self) -> builtins.list[builtins.int]:
+        r"""
+        Node ids among `members` that the partition's primary last reported in sync and
+        that are up. Empty until the primary first reports, and while no member that is
+        up can lead it.
+        """
 
 @typing.final
 class PartitionContext:
     r"""
-    The partition incarnation and consumer group owner a poll was served under.
+    The partition incarnation and consumer group owner a request was served under.
 
-    Keep it with an offset to continue or commit under the same partition later: the
-    server refuses a context whose partition was deleted and created again, or whose
-    consumer group owner changed, instead of applying the offset to the new partition.
+    The server refuses a context whose partition was deleted and created again, or whose
+    consumer group owner changed, instead of applying an offset to the new partition.
     """
     @property
     def incarnation(self) -> builtins.int:
@@ -3669,6 +4274,132 @@ class PartitionContext:
         metadata_op: builtins.int,
     ) -> PartitionContext: ...
     def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class PartitionReader:
+    r"""
+    Reads the partitions of a topic in batches, with routing, prefetch and the position of each
+    partition inside. Build one with `IggyClient.reader()`.
+
+    - A `Consumer.Single` reads the partitions given to `reader()`. A `Consumer.Group` reads the
+      assignment of its member: the reader joins the group, joins it again after a session loss
+      and leaves it in `close()`.
+    - `next()` returns the next batch of one partition, in offset order within one generation of
+      the partition: from its first read, from each `seek()` and from each new assignment to
+      this member.
+    - The `commit` of its `PollOptions` says when offsets are stored. With `CommitPolicy.Manual()`
+      and `CommitPolicy.Auto`, `commit()` stores the offset of a checkpoint. `CommitPolicy.Auto`
+      also stores the latest counted position by itself, and `mark()` counts one. With
+      `CommitPolicy.OnRead()`, the server stores the offset of each reply, the reader reads only
+      while `next()` waits and then fills its budget (one fetch per primary that may wait for
+      messages, the partitions with messages left behind spread over the other slots), a `seek()`
+      to an offset stores the offset before it, and `close()` moves the offset back to the last
+      delivered message. A crash, or a reader dropped without `close()`, loses the batches that
+      the server stored before the application took them, up to the effective budget, which
+      holds at least 32 batches.
+    - The reader stays usable after a `ReadError` and retries by itself. `HistoryUnavailable`
+      (87) stops its partition until `seek()`. With `OnRead`, an unknown outcome stops its
+      partition until `IggyClient.abandon_operation()` and `seek()`.
+    - The calls on one reader run one at a time, so each call waits for the pending ones, and
+      `close()` waits for all of them. `next()` is cancel safe. Cancel a pending `next()` or
+      `commit()` before `close()`.
+    - Dropping the reader stops its tasks without waiting, and it moves no offset back.
+    - `async for` reads its batches until `close()`, and `async with` closes it on exit.
+    """
+    async def next(self) -> PolledMessages:
+        r"""
+        Returns the next batch of one partition. It is never empty, and it has no time limit.
+        A cancelled call leaves its batch in the reader for the next call.
+
+        Raises `ReadError` for a failed read, and `RuntimeError` after `close()`.
+        """
+    def commit(self, checkpoint: Checkpoint) -> collections.abc.Awaitable[None]:
+        r"""
+        Stores the offset of a checkpoint that this reader delivered, which covers every earlier
+        message of its partition. A checkpoint of an older generation of its partition, or at or
+        below the last commit of its generation, stores nothing.
+
+        When the offset store gets `ConsumerGroupPartitionNotOwned` (5009) for a partition that
+        the reader still has, `commit()` reads the owner of the partition again. The server can
+        refuse that read for a short time, and `commit()` repeats it after each such refusal, with
+        no time limit. To bound `commit()`, use `asyncio.wait_for()`. A cancelled `commit()` sends
+        nothing more, but a write that it already sent can still take effect. `close()` waits for
+        a pending `commit()`, so cancel it before `close()`.
+
+        Raises `IggyError` with `InvalidCommand` (3) under `CommitPolicy.OnRead()` and for a
+        checkpoint that this reader did not deliver, the errors of the offset store, and
+        `RuntimeError` after `close()`.
+        """
+    def mark(self, checkpoint: Checkpoint) -> collections.abc.Awaitable[None]:
+        r"""
+        Counts a checkpoint that this reader delivered under `CommitPolicy.Auto` and stores
+        nothing now: the policy stores the latest counted position of its partition. With
+        `CommitAfter.Marked` only marks count, so batches processed concurrently count once they
+        are done. Like every call of the reader, it waits for a pending `next()`.
+
+        Raises `IggyError` with `InvalidCommand` (3) without `CommitPolicy.Auto` and for a
+        checkpoint that this reader did not deliver, and `RuntimeError` after `close()`.
+        """
+    def seek(
+        self, partition_id: builtins.int, start: PollingStrategy
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Sets the next read position of a partition and starts a new generation of it. It drops
+        the queued batches of the partition, ignores its late replies and resumes a stopped
+        partition. `start` is a new strategy or a continuation of the same partition, such as
+        `ReadError.skip`.
+
+        With `CommitPolicy.OnRead()`, a seek to an offset above 0 first stores the offset before
+        it, under the history of a continuation or else of the last delivered message, so a
+        restart resumes at the new position. A seek to offset 0 or `PollingStrategy.First()`
+        deletes the stored offset under the same history when the server holds one, because the
+        commit of a read never moves the offset back. A seek to a timestamp first reads one
+        message at the timestamp without a commit, and then acts as a seek to the offset of that
+        message. Without such a message it stores nothing. A failed read, lookup, store or delete
+        fails the seek and nothing moves. Every other seek stores nothing. The new position waits
+        for the end of the committing read in flight, whose reply the new generation drops.
+
+        Raises `IggyError` with `InvalidCommand` (3) for a partition that the reader does not read
+        and for a continuation of another partition, `PendingOperationError` with `OnRead` while
+        a read of the partition has an unknown outcome (abandon its operation first), the errors
+        of the read, lookup, store or delete with `OnRead`, and `RuntimeError` after `close()`.
+        """
+    def partitions(self) -> collections.abc.Awaitable[list[builtins.int]]:
+        r"""
+        Returns the partitions that the reader reads: those given to `reader()`, or the current
+        assignment of a consumer group member.
+
+        Raises `RuntimeError` after `close()`.
+        """
+    def close(self) -> collections.abc.Awaitable[None]:
+        r"""
+        Stops the reader. It waits at most until the deadlines of the reads in flight. With
+        `CommitPolicy.Manual()` it commits nothing. With `CommitPolicy.Auto`, it counts the last
+        batch under `CommitAfter.Processing` and stores the latest counted position of each
+        partition. A group reader then leaves its group. Repeated calls are safe.
+
+        With `CommitPolicy.OnRead()`, it moves the offset of each partition with undelivered
+        batches back to its last delivered message. A partition that delivered nothing and
+        started at `Next` gets the offset before its first undelivered message, or no offset at
+        offset 0.
+
+        Raises `IggyError` for the first failed store of the `OnRead` or the `Auto` close, or else
+        `PendingOperationError` for a partition with an unknown outcome: abandon its operation
+        before a new reader reads the partition.
+        """
+    def __aiter__(self) -> PartitionReader: ...
+    def __anext__(self) -> collections.abc.Awaitable[PolledMessages]: ...
+    async def _anext(self) -> PolledMessages:
+        r"""
+        `next()` for `async for`, which ends after `close()`.
+        """
+    def __aenter__(self) -> collections.abc.Awaitable[PartitionReader]: ...
+    def __aexit__(
+        self, _exc_type: typing.Any, _exc_value: typing.Any, _traceback: typing.Any
+    ) -> collections.abc.Awaitable[builtins.bool]:
+        r"""
+        Closes the reader as `close()` does, also when the block raised.
+        """
 
 @typing.final
 class PartitionResizePolicy:
@@ -3722,14 +4453,36 @@ class Partitioning:
         """
 
 @typing.final
+class PartitionsPage:
+    r"""
+    One page of a list, as `IggyClient.get_partitions_page` returns it.
+    """
+    @property
+    def items(self) -> builtins.list[Partition]:
+        r"""
+        The items of the page, in the order of the query.
+        """
+    @property
+    def next(self) -> builtins.str | None:
+        r"""
+        Pass it as `cursor`, with the same other arguments, to read the
+        next page. `None` on the last page.
+        """
+
+@typing.final
 class PendingOperationError(IggyError):
     r"""
-    An operation whose retained identity is needed to recover or release its lane.
+    An operation with an unknown outcome, or a call that such an operation blocks. `operation_id`
+    names the operation for `IggyClient.resolve_operation()` and `IggyClient.abandon_operation()`.
+    The client retains no operation for kind `not_retained`, and none for a group join that
+    `reader()` abandoned.
     """
     @property
     def operation_id(self) -> builtins.int: ...
     @property
     def kind(self) -> builtins.str: ...
+    @property
+    def partition_id(self) -> builtins.int | None: ...
 
 @typing.final
 class PendingOperationsConfig:
@@ -3779,37 +4532,145 @@ class Permissions:
                 treated as `None`.
         """
 
+@typing.final
+class PollOptions:
+    r"""
+    The limits of each read and when its offsets are stored. A read is a poll of one partition,
+    or a fetch that a partition reader sends for several partitions of one primary. A fetch
+    applies `count`, `min_count` and `max_bytes` to all of its partitions together. A reader that
+    commits nothing runs several fetches at once, each within these limits, for partitions with
+    more messages waiting.
+    """
+    @property
+    def count(self) -> builtins.int:
+        r"""
+        The most messages in one read, over all partitions of a fetch.
+        """
+    @property
+    def max_wait(self) -> datetime.timedelta:
+        r"""
+        How long the server waits for `min_count` messages. Zero answers at once.
+        """
+    @property
+    def min_count(self) -> builtins.int:
+        r"""
+        The messages to wait for.
+        """
+    @property
+    def max_bytes(self) -> builtins.int:
+        r"""
+        The most bytes in one read, over all partitions of a fetch.
+        """
+    @property
+    def commit(self) -> CommitPolicy:
+        r"""
+        When the offsets of a read are stored.
+        """
+    def __new__(
+        cls,
+        *,
+        count: builtins.int = 1000,
+        max_wait: datetime.timedelta | None = None,
+        min_count: builtins.int = 1,
+        max_bytes: builtins.int = 1048576,
+        commit: CommitPolicy | None = None,
+    ) -> PollOptions:
+        r"""
+        Constructs the options of a read.
+
+        Args:
+            count: The most messages in one read, over all partitions of a fetch.
+            max_wait: How long the server waits for `min_count` messages, at most 600 seconds.
+                `None` answers at once. A reader or a consumer with no wait on an idle topic
+                polls in a busy loop.
+            min_count: The messages to wait for, from 1 to `count`, over all partitions of a
+                fetch.
+            max_bytes: The most bytes in one read, over all partitions of a fetch. A message
+                larger than that comes alone.
+            commit: When offsets are stored. `None` stores none, as `CommitPolicy.Manual()`.
+
+        The limits are checked when the options are used, and a fault raises `IggyError`.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class PolledMessages:
+    r"""
+    One batch of messages of one partition, from `IggyClient.poll_messages()` or
+    `PartitionReader.next()`.
+    """
+    @property
+    def partition_id(self) -> builtins.int:
+        r"""
+        The partition the batch was read from.
+        """
+    @property
+    def current_offset(self) -> builtins.int:
+        r"""
+        The offset of the newest message in the partition when the batch was read.
+        """
+    @property
+    def messages(self) -> builtins.tuple[ReceiveMessage, ...]:
+        r"""
+        The messages of the batch, in offset order. Each read returns the same tuple.
+        """
+    def checkpoint(self) -> Checkpoint | None:
+        r"""
+        The position after the last message, to commit the whole batch. `None` for an empty
+        batch.
+        """
+    def checkpoint_at(self, index: builtins.int) -> Checkpoint | None:
+        r"""
+        The position after `messages[index]`, to commit a processed part of the batch. `None`
+        for an index out of range.
+        """
+    def continuation(self) -> PollingStrategy:
+        r"""
+        The position after the batch, for the next read of its partition.
+
+        After the last message, it reads from the next offset. An empty batch keeps the start of
+        its request: `Offset` and `Timestamp` keep their value, `First` reads from offset 0,
+        `Last` stays `Last`, and `Next` reads after the stored offset again.
+
+        The continuation belongs to the partition of the batch, so a read of another partition
+        refuses it with `InvalidCommand` (3). It keeps the partition history of the batch, so a
+        read after the partition was deleted and created again, or after its consumer group
+        owner changed, raises `HistoryUnavailable` (87) instead of reading the new partition.
+        """
+
+@typing.final
 class PollingStrategy:
-    @typing.final
-    class Offset(PollingStrategy):
-        __match_args__ = ("value",)
-        @property
-        def value(self) -> builtins.int: ...
-        def __new__(cls, value: builtins.int) -> PollingStrategy.Offset: ...
-
-    @typing.final
-    class Timestamp(PollingStrategy):
-        __match_args__ = ("value",)
-        @property
-        def value(self) -> builtins.int: ...
-        def __new__(cls, value: builtins.int) -> PollingStrategy.Timestamp: ...
-
-    @typing.final
-    class First(PollingStrategy):
-        __match_args__ = ()
-        def __new__(cls) -> PollingStrategy.First: ...
-
-    @typing.final
-    class Last(PollingStrategy):
-        __match_args__ = ()
-        def __new__(cls) -> PollingStrategy.Last: ...
-
-    @typing.final
-    class Next(PollingStrategy):
-        __match_args__ = ()
-        def __new__(cls) -> PollingStrategy.Next: ...
-
-    ...
+    r"""
+    Where a read starts. A strategy from a constructor reads from its own start in any
+    partition. A continuation from `PolledMessages.continuation()` belongs to the partition of
+    its batch and keeps its partition history.
+    """
+    @staticmethod
+    def Offset(value: builtins.int) -> PollingStrategy:
+        r"""
+        Reads from the offset `value`.
+        """
+    @staticmethod
+    def Timestamp(value: builtins.int) -> PollingStrategy:
+        r"""
+        Reads from the first message at or after the timestamp `value`, in microseconds.
+        """
+    @staticmethod
+    def First() -> PollingStrategy:
+        r"""
+        Reads from the first message of the partition.
+        """
+    @staticmethod
+    def Last() -> PollingStrategy:
+        r"""
+        Reads the last messages of the partition.
+        """
+    @staticmethod
+    def Next() -> PollingStrategy:
+        r"""
+        Reads after the offset stored for the consumer, or from offset 0 without one.
+        """
+    def __repr__(self) -> builtins.str: ...
 
 @typing.final
 class ProducerSendError(IggyError):
@@ -3934,7 +4795,8 @@ class QuicConfig:
             pending_operations: Client-wide mutation limits; defaults to 256 operations and 64 MiB.
             reconnection: Reconnection policy. Defaults to `QuicReconnectionConfig()`.
             heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
-            response_buffer_size: Size of the response buffer in bytes. Defaults to 10 MB.
+            response_buffer_size: Size of the response buffer in bytes. Defaults to one reply
+                that holds the largest message, about 64 MB.
             max_concurrent_bidi_streams: Maximum number of concurrent bidirectional
                 streams. Defaults to 10,000.
             datagram_send_buffer_size: Size of the datagram send buffer in bytes.
@@ -4012,6 +4874,52 @@ class QuicReconnectionConfig:
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
+class ReadError(IggyError):
+    r"""
+    A failed read of a `PartitionReader` or an `IggyConsumer`. The reader stays usable after
+    it and retries by itself. `code` is the code of `error`.
+    """
+    @property
+    def partition_id(self) -> builtins.int | None:
+        r"""
+        The partition of the error, or `None` for an error of the whole reader.
+        """
+    @property
+    def offset(self) -> builtins.int | None: ...
+    @property
+    def is_lasting_refusal(self) -> builtins.bool:
+        r"""
+        Whether the reader stopped the partition after six refusals in a row that a retry does
+        not change, such as `Unauthorized` (41), or after one `TieredReadFailed` (96). A `seek()`
+        of the partition reads it again.
+        """
+    @property
+    def lost(self) -> tuple[builtins.int, builtins.int] | None:
+        r"""
+        For messages that a lost read committed and that the reader could not read again: their
+        first and last offset, as `(first, last)`. The error is then `FetchProgressUncertain`
+        (14010). `None` for every other error. This error stops nothing and needs no `seek()`.
+        A batch that the reader holds after the range comes next, and a `seek()` before the
+        application takes it drops it. If the reader stopped the partition, the error that
+        stopped it comes after that batch.
+        """
+    @property
+    def error(self) -> IggyError:
+        r"""
+        The error as the client raises it for any other call: an `IggyError`, or a
+        `PendingOperationError` with the operation to abandon.
+        """
+    @property
+    def skip(self) -> PollingStrategy | None:
+        r"""
+        For a message that does not decode: the continuation after it. The messages before it
+        arrive in a batch before this error, and the reader reads the message again until
+        `seek()` to this continuation skips it. `None` for every other error.
+        """
+    @property
+    def record(self) -> bytes | None: ...
+
+@typing.final
 class ReceiveMessage:
     r"""
     A Python class representing a received message.
@@ -4056,17 +4964,11 @@ class ReceiveMessage:
         r"""
         Retrieves the partition this message belongs to.
         """
-    def context(self) -> PartitionContext:
+    def checkpoint(self) -> Checkpoint:
         r"""
-        Retrieves the partition incarnation and owner the poll that delivered this message
-        was served under.
-        """
-    def position(self) -> ConsumerPosition:
-        r"""
-        The position to commit for this message with `IggyConsumer.store_position()`.
-        It keeps the context that delivered the message, so a commit after the partition
-        was deleted and created again, or after its consumer group owner changed, is
-        refused instead of landing on the new partition.
+        The position after this message, to commit it and every earlier message of its
+        partition with `PartitionReader.commit()` or `IggyConsumer.commit()`. The reader or
+        consumer that delivered the message must commit it.
         """
     def user_headers(self) -> UserHeaders | None:
         r"""
@@ -4145,6 +5047,33 @@ class SendMessagesResponse:
         topic's policy: quorum commit, plus stable storage and crash-safe retry
         receipts for persisted topics.
         """
+
+@typing.final
+class SnapshotCompression:
+    r"""
+    Compression method for server snapshots.
+    """
+
+    Stored: typing.ClassVar[SnapshotCompression]
+    r"""
+    Store the file as is without compression.
+    """
+    Deflated: typing.ClassVar[SnapshotCompression]
+    r"""
+    Compress the file using Deflate.
+    """
+    Bzip2: typing.ClassVar[SnapshotCompression]
+    r"""
+    Compress the file using BZIP2.
+    """
+    Zstd: typing.ClassVar[SnapshotCompression]
+    r"""
+    Compress the file using ZStandard.
+    """
+    Xz: typing.ClassVar[SnapshotCompression]
+    r"""
+    Compress the file using XZ.
+    """
 
 @typing.final
 class Stats:
@@ -4413,6 +5342,12 @@ class Stream:
         Fingerprints of the server keys that wrap the stream's key: one outside
         a key rotation, empty for a plaintext stream.
         """
+    @property
+    def shadow_origin(self) -> builtins.str | None:
+        r"""
+        The geo origin whose topics this shadow stream serves, such as
+        `"dc-a"`. `None` for any stream that is not a shadow stream.
+        """
 
 @typing.final
 class StreamDetails:
@@ -4475,6 +5410,12 @@ class StreamDetails:
         r"""
         Fingerprints of the server keys that wrap the stream's key: one outside
         a key rotation, empty for a plaintext stream.
+        """
+    @property
+    def shadow_origin(self) -> builtins.str | None:
+        r"""
+        The geo origin whose topics this shadow stream serves, such as
+        `"dc-a"`. `None` for any stream that is not a shadow stream.
         """
 
 @typing.final
@@ -4600,6 +5541,58 @@ class StreamPermissions:
                 `dict[int, TopicPermissions] | None`; an empty dict is
                 treated as `None`.
         """
+
+@typing.final
+class StreamsPage:
+    r"""
+    One page of a list, as `IggyClient.get_streams_page` returns it.
+    """
+    @property
+    def items(self) -> builtins.list[Stream]:
+        r"""
+        The items of the page, in the order of the query.
+        """
+    @property
+    def next(self) -> builtins.str | None:
+        r"""
+        Pass it as `cursor`, with the same other arguments, to read the
+        next page. `None` on the last page.
+        """
+
+@typing.final
+class SystemSnapshotType:
+    r"""
+    Type of system data to include in a snapshot.
+    """
+
+    FilesystemOverview: typing.ClassVar[SystemSnapshotType]
+    r"""
+    Overview of the filesystem.
+    """
+    ProcessList: typing.ClassVar[SystemSnapshotType]
+    r"""
+    List of currently running processes.
+    """
+    ResourceUsage: typing.ClassVar[SystemSnapshotType]
+    r"""
+    Resource usage statistics of the system.
+    """
+    Test: typing.ClassVar[SystemSnapshotType]
+    r"""
+    Test snapshot type for development purposes.
+    """
+    ServerLogs: typing.ClassVar[SystemSnapshotType]
+    r"""
+    Server logs.
+    """
+    ServerConfig: typing.ClassVar[SystemSnapshotType]
+    r"""
+    Server configuration.
+    """
+    All: typing.ClassVar[SystemSnapshotType]
+    r"""
+    Everything.
+    """
 
 @typing.final
 class TcpConfig:
@@ -4787,6 +5780,70 @@ class Topic:
         not set one.
         """
     @property
+    def topic_type(self) -> TopicType:
+        r"""
+        What the topic is, normal or geo, fixed at creation.
+        """
+    @property
+    def geo_mode(self) -> GeoMode | None:
+        r"""
+        How a geo topic writes its messages, fixed at creation. `None` on a
+        normal topic.
+        """
+    @property
+    def fresh_upload_interval(self) -> datetime.timedelta | None:
+        r"""
+        Longest time a send to the geo topic waits for its upload to start, or
+        `None` when the topic leaves it to each node's server setting.
+        """
+    @property
+    def consumer_offset_upload_interval(self) -> datetime.timedelta | None:
+        r"""
+        Shortest time between two uploads of the positions the geo topic's
+        stored offsets wait for, or `None` when the topic leaves it to each
+        node's server setting.
+        """
+    @property
+    def positions_publish_interval(self) -> datetime.timedelta | None:
+        r"""
+        How often a node uploads the geo topic's changed positions, or `None`
+        when the topic leaves it to each node's server setting.
+        """
+    @property
+    def tombstone_grace(self) -> datetime.timedelta | None:
+        r"""
+        How long the tombstone and the objects of the deleted geo topic stay,
+        or `None` when the topic leaves it to each node's server setting.
+        """
+    @property
+    def positions_resume_timeout(self) -> datetime.timedelta | None:
+        r"""
+        How long the geo topic's group polls wait for the peers' positions
+        after a node starts, or `None` when the topic leaves it to each node's
+        server setting.
+        """
+    @property
+    def long_term_rewrite_max_interval(self) -> datetime.timedelta | None:
+        r"""
+        Longest wait between two long-term rewrites of a partition of the geo
+        topic, or `None` when the topic leaves it to each node's server
+        setting.
+        """
+    @property
+    def read_cache_size(self) -> builtins.int | None:
+        r"""
+        Memory in bytes each node keeps for what the topic's reads fetch from
+        the object store, or `None` when the topic leaves it to each node's
+        server setting. Zero keeps nothing they fetch.
+        """
+    @property
+    def read_ahead(self) -> builtins.int | None:
+        r"""
+        Most bytes readahead fetches in front of a sequential reader of the
+        topic, or `None` when the topic leaves it to each node's server
+        setting. Zero turns readahead off.
+        """
+    @property
     def options(self) -> UserHeaders:
         r"""
         Options the creating client set explicitly.
@@ -4854,6 +5911,70 @@ class TopicDetails:
         not set one.
         """
     @property
+    def topic_type(self) -> TopicType:
+        r"""
+        What the topic is, normal or geo, fixed at creation.
+        """
+    @property
+    def geo_mode(self) -> GeoMode | None:
+        r"""
+        How a geo topic writes its messages, fixed at creation. `None` on a
+        normal topic.
+        """
+    @property
+    def fresh_upload_interval(self) -> datetime.timedelta | None:
+        r"""
+        Longest time a send to the geo topic waits for its upload to start, or
+        `None` when the topic leaves it to each node's server setting.
+        """
+    @property
+    def consumer_offset_upload_interval(self) -> datetime.timedelta | None:
+        r"""
+        Shortest time between two uploads of the positions the geo topic's
+        stored offsets wait for, or `None` when the topic leaves it to each
+        node's server setting.
+        """
+    @property
+    def positions_publish_interval(self) -> datetime.timedelta | None:
+        r"""
+        How often a node uploads the geo topic's changed positions, or `None`
+        when the topic leaves it to each node's server setting.
+        """
+    @property
+    def tombstone_grace(self) -> datetime.timedelta | None:
+        r"""
+        How long the tombstone and the objects of the deleted geo topic stay,
+        or `None` when the topic leaves it to each node's server setting.
+        """
+    @property
+    def positions_resume_timeout(self) -> datetime.timedelta | None:
+        r"""
+        How long the geo topic's group polls wait for the peers' positions
+        after a node starts, or `None` when the topic leaves it to each node's
+        server setting.
+        """
+    @property
+    def long_term_rewrite_max_interval(self) -> datetime.timedelta | None:
+        r"""
+        Longest wait between two long-term rewrites of a partition of the geo
+        topic, or `None` when the topic leaves it to each node's server
+        setting.
+        """
+    @property
+    def read_cache_size(self) -> builtins.int | None:
+        r"""
+        Memory in bytes each node keeps for what the topic's reads fetch from
+        the object store, or `None` when the topic leaves it to each node's
+        server setting. Zero keeps nothing they fetch.
+        """
+    @property
+    def read_ahead(self) -> builtins.int | None:
+        r"""
+        Most bytes readahead fetches in front of a sequential reader of the
+        topic, or `None` when the topic leaves it to each node's server
+        setting. Zero turns readahead off.
+        """
+    @property
     def options(self) -> UserHeaders:
         r"""
         Options the creating client set explicitly.
@@ -4898,14 +6019,39 @@ class TopicOptions:
         messages_required_to_save: builtins.int | None = None,
         size_of_messages_required_to_save: builtins.int | None = None,
         preallocate_segments: builtins.bool | None = None,
+        replication_factor: builtins.int | None = None,
+        segment_max_age: IggyExpiry | None = None,
+        tiered_storage: builtins.bool | None = None,
+        local_retention_age: IggyExpiry | None = None,
+        local_retention_size: MaxTopicSize | None = None,
+        topic_type: TopicType | None = None,
+        geo_mode: GeoMode | None = None,
+        fresh_upload_interval: datetime.timedelta | None = None,
+        consumer_offset_upload_interval: datetime.timedelta | None = None,
+        positions_publish_interval: datetime.timedelta | None = None,
+        tombstone_grace: datetime.timedelta | None = None,
+        positions_resume_timeout: datetime.timedelta | None = None,
+        long_term_rewrite_max_interval: datetime.timedelta | None = None,
+        read_cache_size: builtins.int | None = None,
+        read_ahead: builtins.int | None = None,
         raw: builtins.dict[builtins.str, builtins.str] | None = None,
     ) -> TopicOptions:
         r"""
         Constructs topic create options.
 
         Every setting left as `None` resolves against the server default at
-        admission. Only `message_expiry`, `max_topic_size` and the name can
-        change after creation, through `update_topic`.
+        admission. Only `message_expiry`, `max_topic_size`, `tiered_storage`,
+        `local_retention_age`, `local_retention_size`, the six durations of a
+        geo topic, `read_cache_size`, `read_ahead` and the name can change
+        after creation, through `update_topic`.
+
+        The six durations, `fresh_upload_interval` to
+        `long_term_rewrite_max_interval`, are `datetime.timedelta | None` and
+        go only on a geo topic, where each overrides the server setting of the
+        same name on every node. `None` leaves a duration unset, so each node
+        applies its own setting, and zero is a value. The server refuses them
+        on a normal topic, and a value out of range, with an `OptionError` of
+        kind `invalid_option_value`.
 
         Args:
             partitions_count: Number of partitions as `int`, at most 1000.
@@ -4927,12 +6073,80 @@ class TopicOptions:
             size_of_messages_required_to_save: Byte flush threshold as
                 `int | None`.
             preallocate_segments: Reserve segment bytes on open as `bool | None`.
+            replication_factor: Nodes that store each partition as
+                `int | None`, 1 to 32 and at most the cluster's node count.
+                `None` applies the server's `[cluster] default_replication_factor`,
+                every node unless an operator set a number. A write commits on
+                a quorum of these nodes, so 2 keeps two copies but stops
+                accepting writes while either node is down. The server rejects
+                an out-of-range value with an `OptionError` of kind
+                `invalid_replication_factor`.
+            segment_max_age: Age past a segment's first batch at which a batch
+                starts the next segment, as `IggyExpiry | None`, at least 10
+                minutes. `IggyExpiry.ServerDefault()` is the same as `None`,
+                which rolls segments by size alone. The server refuses a
+                duration together with `preallocate_segments=True`.
+            tiered_storage: Move sealed segments to the object store as
+                `bool | None`. `None` leaves it off. The server refuses `True`
+                with `FeatureUnavailable` until it tiers topics.
+            local_retention_age: How long a tiered topic keeps an uploaded
+                segment on local disk as `IggyExpiry | None`, one day when
+                `None`. `IggyExpiry.ServerDefault()` is the same as `None`.
+                The server refuses an age above a finite `message_expiry`.
+            local_retention_size: Topic-wide cap on the uploaded segments a
+                tiered topic keeps on local disk as `MaxTopicSize | None`,
+                unlimited when `None`. `MaxTopicSize.ServerDefault()` is the
+                same as `None`. The server refuses a size above a finite
+                `max_topic_size`.
+            topic_type: `TopicType.Geo` also makes the topic's messages
+                readable in the other datacenters, through the object store.
+                `None` creates a normal topic. A geo topic needs an object
+                store on every node of the cluster: while one is not ready,
+                the server refuses `TopicType.Geo` with `FeatureUnavailable`.
+                A geo topic refuses tiered storage and an encrypted stream,
+                and keeps its name, options and partition count.
+            geo_mode: How a geo topic writes its messages, as `GeoMode | None`.
+                `None` resolves to `GeoMode.Geo` on a geo topic. The server
+                refuses `GeoMode.GeoTiered` with `FeatureUnavailable` for now,
+                and any mode on a normal topic.
+            fresh_upload_interval: Longest time a send waits for the upload of
+                its fresh object to start, at most 10 seconds. One object
+                carries the sends of every partition a shard leads.
+            consumer_offset_upload_interval: Shortest time between two uploads
+                of the positions that the offsets consumer groups store
+                themselves wait for, at most 1 second. Zero answers such a
+                store at its local commit.
+            positions_publish_interval: How often a node uploads the changed
+                positions of the topic's consumer groups, above zero.
+            tombstone_grace: How long the tombstone and the objects of the
+                deleted topic stay in the object store, above zero.
+            positions_resume_timeout: How long, after a node starts, the group
+                polls of the topic's partitions wait for the positions of the
+                geo peers. Zero does not wait.
+            long_term_rewrite_max_interval: Longest wait between two long-term
+                rewrites of a partition, at least 1 second.
+            read_cache_size: Memory in bytes as `int | None` that each node
+                keeps for what the topic's reads fetch from the object store,
+                divided between its partitions. A partition's share is a limit
+                within the read cache of its shard, not a reservation. Zero
+                keeps nothing they fetch, otherwise at least 512 KiB. `None`
+                leaves it unset, so each node applies its `[tiered_storage]`
+                setting of the same name. Any topic type takes it.
+            read_ahead: Most bytes as `int | None` that readahead fetches in
+                front of a sequential reader of the topic. Zero turns readahead
+                off, otherwise at least 128 KiB, and at most an eighth of a
+                `read_cache_size` above zero. `None` leaves it unset, so each
+                node applies its `[tiered_storage]` setting of the same name.
+                Any topic type takes it.
             raw: Additional option keys as `dict[str, str]`, sent as string
                 values so a key newer than this build can be set. A typed field
                 wins on collision.
 
         Raises:
-            ValueError: If `message_expiry` or `max_topic_size` is out of range.
+            ValueError: If `message_expiry`, `max_topic_size`,
+                `segment_max_age`, `local_retention_age` or
+                `local_retention_size` is out of range, or a duration is
+                negative or longer than `2**64 - 1` microseconds.
             RuntimeError: If `compression_algorithm` names no known algorithm.
             TypeError: If a durability is not a `Durability`.
         """
@@ -4991,6 +6205,39 @@ class TopicPermissions:
             poll_messages: Allow polling messages from the topic and managing
                 its consumer offsets.
             send_messages: Allow sending messages to the topic.
+        """
+
+@typing.final
+class TopicType:
+    r"""
+    What a topic is, fixed at creation.
+    """
+
+    Normal: typing.ClassVar[TopicType]
+    r"""
+    Its messages stay in this cluster.
+    """
+    Geo: typing.ClassVar[TopicType]
+    r"""
+    Its messages also become readable in the other datacenters, through
+    the object store.
+    """
+
+@typing.final
+class TopicsPage:
+    r"""
+    One page of a list, as `IggyClient.get_topics_page` returns it.
+    """
+    @property
+    def items(self) -> builtins.list[Topic]:
+        r"""
+        The items of the page, in the order of the query.
+        """
+    @property
+    def next(self) -> builtins.str | None:
+        r"""
+        Pass it as `cursor`, with the same other arguments, to read the
+        next page. `None` on the last page.
         """
 
 @typing.final
@@ -5138,6 +6385,23 @@ class UserStatus:
     """
 
 @typing.final
+class UsersPage:
+    r"""
+    One page of a list, as `IggyClient.get_users_page` returns it.
+    """
+    @property
+    def items(self) -> builtins.list[UserInfo]:
+        r"""
+        The items of the page, in the order of the query.
+        """
+    @property
+    def next(self) -> builtins.str | None:
+        r"""
+        Pass it as `cursor`, with the same other arguments, to read the
+        next page. `None` on the last page.
+        """
+
+@typing.final
 class WebSocketConfig:
     r"""
     Configuration for the WebSocket transport, accepted by `IggyClient(...)`.
@@ -5236,7 +6500,7 @@ class WebSocketFramingConfig:
         write_buffer_size: builtins.int | None = None,
         max_write_buffer_size: builtins.int | None = None,
         max_message_size: builtins.int | None = 64 << 20,
-        max_frame_size: builtins.int | None = 16 << 20,
+        max_frame_size: builtins.int | None = 64156564,
         accept_unmasked_frames: builtins.bool | None = None,
     ) -> WebSocketFramingConfig:
         r"""
@@ -5254,9 +6518,9 @@ class WebSocketFramingConfig:
                 Lifting the limit lets a peer queue an arbitrarily large message
                 in memory, so prefer a finite value.
             max_frame_size: Maximum frame size in bytes, or an explicit `None` to
-                lift the limit entirely. Omitting the argument keeps the
-                underlying default of 16 MiB, with the same caveat as
-                `max_message_size`.
+                lift the limit entirely. Omitting the argument keeps the SDK
+                default of 64,156,564 bytes, which holds the largest reply of one
+                record, with the same caveat as `max_message_size`.
             accept_unmasked_frames: Whether to accept unmasked frames. Defaults to
                 `False`; clients should typically keep this off for RFC compliance.
 

@@ -56,6 +56,14 @@ describe('CommandAPI.sendBinaryRequest', () => {
     });
   });
 
+  it('rejects the cancellation of a deferred request before reaching the client provider', async () => {
+    const client = new SimpleClient(mockRawClient());
+    await assert.rejects(
+      () => client.sendBinaryRequest(COMMAND_CODE.CancelDeferredRequest, Buffer.alloc(0)),
+      /code: 3, message: Invalid command/
+    );
+  });
+
   it('forwards a custom code and opaque payload to sendCommand', async () => {
     const customCode = 60_000;
     const payload = Buffer.from([0xAA, 0xBB, 0xCC]);
@@ -134,5 +142,19 @@ describe('CommandAPI.sendBinaryRequestToReplica', () => {
     const client = new SimpleClient(raw);
     const response = await client.sendBinaryRequestToReplica(COMMAND_CODE.GetStats, payload, 2);
     assert.deepEqual(response, expectedResponse);
+  });
+});
+
+describe('CommandAPI.cluster.retireGeoOrigin', () => {
+  it('sends the origin under code 18 and reads the empty reply as success', async () => {
+    const raw = mockRawClient();
+    raw.sendCommand = async (code, payload, options) => {
+      assert.equal(code, COMMAND_CODE.RetireGeoOrigin);
+      assert.deepEqual(payload, Buffer.from([4, ...Buffer.from('dc-a')]));
+      assert.equal(options, undefined);
+      return { status: 0, length: 0, data: Buffer.alloc(0) };
+    };
+
+    assert.equal(await new SimpleClient(raw).cluster.retireGeoOrigin({ origin: 'dc-a' }), true);
   });
 });

@@ -84,7 +84,7 @@ class ConsumerGroupsTcpClientTest extends ConsumerGroupsClientBaseTest {
 
         // when
         consumerGroupsClient.joinConsumerGroup(STREAM_NAME, TOPIC_NAME, groupId);
-        var assignment = awaitPartitionAssignment(groupId);
+        var assignment = awaitPartitionAssignment(groupId, 1);
 
         assertThat(assignment.partitions()).hasSize(1);
     }
@@ -110,7 +110,7 @@ class ConsumerGroupsTcpClientTest extends ConsumerGroupsClientBaseTest {
         var group = consumerGroupsClient.createConsumerGroup(STREAM_NAME, TOPIC_NAME, "consumer-group-42");
         ConsumerId groupId = ConsumerId.of(group.id());
         consumerGroupsClient.joinConsumerGroup(STREAM_NAME, TOPIC_NAME, groupId);
-        awaitPartitionAssignment(groupId);
+        awaitPartitionAssignment(groupId, 1);
         client.messages()
                 .sendMessages(
                         STREAM_NAME, TOPIC_NAME, Partitioning.partitionId(0L), List.of(Message.of("group message")));
@@ -150,12 +150,13 @@ class ConsumerGroupsTcpClientTest extends ConsumerGroupsClientBaseTest {
                 .isInstanceOf(IggyResourceNotFoundException.class);
     }
 
-    private ConsumerGroupAssignment awaitPartitionAssignment(ConsumerId groupId) throws InterruptedException {
+    private ConsumerGroupAssignment awaitPartitionAssignment(ConsumerId groupId, int partitions)
+            throws InterruptedException {
         long deadline = System.nanoTime() + ASSIGNMENT_TIMEOUT.toNanos();
         Optional<ConsumerGroupAssignment> assignment;
         do {
             assignment = consumerGroupsClient.syncConsumerGroup(STREAM_NAME, TOPIC_NAME, groupId);
-            if (assignment.isPresent() && !assignment.get().partitions().isEmpty()) {
+            if (assignment.isPresent() && assignment.get().partitions().size() >= partitions) {
                 return assignment.get();
             }
             Thread.sleep(ASSIGNMENT_POLL_INTERVAL.toMillis());

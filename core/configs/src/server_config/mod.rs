@@ -24,6 +24,8 @@
 pub mod cluster;
 pub mod defaults;
 pub mod displays;
+pub mod external_auth;
+pub mod geo;
 pub mod message_bus;
 pub mod metadata;
 pub mod node;
@@ -32,6 +34,7 @@ pub mod quic;
 pub mod server;
 pub mod sharding;
 pub mod tcp;
+pub mod tiered_storage;
 pub mod validators;
 pub mod websocket;
 

@@ -22,9 +22,15 @@ import "encoding/binary"
 // TopicOptionKey names a topic option of the server catalog.
 type TopicOptionKey string
 
-// Topic option keys. Only TopicOptionName, TopicOptionMessageExpiry and
-// TopicOptionMaxTopicSize are updatable, and only the last two resettable.
-// Every other key is create-only, so an update refuses it by name.
+// Topic option keys. TopicOptionName, TopicOptionMessageExpiry,
+// TopicOptionMaxTopicSize, TopicOptionLocalRetentionAge and
+// TopicOptionLocalRetentionSize are updatable, and all but the name
+// resettable. TopicOptionTieredStorage is enable-only: an update may turn it
+// on, never off, and may not reset it. The six durations of a geo topic,
+// TopicOptionFreshUploadInterval to TopicOptionLongTermRewriteMaxInterval,
+// are updatable and never resettable, and so are TopicOptionReadCacheSize and
+// TopicOptionReadAhead. Every other key is create-only, so an update refuses
+// it by name.
 // DescribeOptions enumerates the catalog one server serves, with the bounds
 // each value is checked against.
 const (
@@ -39,6 +45,21 @@ const (
 	TopicOptionMessagesRequiredToSave       TopicOptionKey = "messages_required_to_save"
 	TopicOptionSizeOfMessagesRequiredToSave TopicOptionKey = "size_of_messages_required_to_save"
 	TopicOptionPreallocateSegments          TopicOptionKey = "preallocate_segments"
+	TopicOptionReplicationFactor            TopicOptionKey = "replication_factor"
+	TopicOptionSegmentMaxAge                TopicOptionKey = "segment_max_age"
+	TopicOptionTieredStorage                TopicOptionKey = "tiered_storage"
+	TopicOptionLocalRetentionAge            TopicOptionKey = "local_retention_age"
+	TopicOptionLocalRetentionSize           TopicOptionKey = "local_retention_size"
+	TopicOptionTopicType                    TopicOptionKey = "topic_type"
+	TopicOptionGeoMode                      TopicOptionKey = "geo_mode"
+	TopicOptionFreshUploadInterval          TopicOptionKey = "fresh_upload_interval"
+	TopicOptionConsumerOffsetUploadInterval TopicOptionKey = "consumer_offset_upload_interval"
+	TopicOptionPositionsPublishInterval     TopicOptionKey = "positions_publish_interval"
+	TopicOptionTombstoneGrace               TopicOptionKey = "tombstone_grace"
+	TopicOptionPositionsResumeTimeout       TopicOptionKey = "positions_resume_timeout"
+	TopicOptionLongTermRewriteMaxInterval   TopicOptionKey = "long_term_rewrite_max_interval"
+	TopicOptionReadCacheSize                TopicOptionKey = "read_cache_size"
+	TopicOptionReadAhead                    TopicOptionKey = "read_ahead"
 )
 
 // TopicOptions are the options CreateTopic may carry. A nil *TopicOptions
@@ -72,6 +93,71 @@ type TopicOptions struct {
 	SizeOfMessagesRequiredToSave *uint64
 	// PreallocateSegments, see PreallocateSegmentsOption.
 	PreallocateSegments *bool
+	// ReplicationFactor, see ReplicationFactorOption.
+	ReplicationFactor *uint32
+	// SegmentMaxAge in microseconds rolls the active segment once a batch is
+	// stamped this long after the segment's first batch, IggyExpiryNeverExpire
+	// for never. IggyExpiryServerDefault leaves it derived. The server refuses
+	// values under 10 minutes, and the key alongside PreallocateSegments true.
+	SegmentMaxAge *Duration
+	// TieredStorage, see TieredStorageOption.
+	TieredStorage *bool
+	// LocalRetentionAge in microseconds is how long a tiered topic keeps an
+	// uploaded segment on local disk, IggyExpiryNeverExpire for never.
+	// IggyExpiryServerDefault leaves it derived. The server refuses a value
+	// above a finite MessageExpiry.
+	LocalRetentionAge *Duration
+	// LocalRetentionSize in bytes caps the uploaded segments a tiered topic
+	// keeps on local disk, split across all partitions, math.MaxUint64 for
+	// unlimited. Zero leaves it derived. The server refuses a value above a
+	// finite MaxTopicSize.
+	LocalRetentionSize *uint64
+	// TopicType, normal when nil. See TopicTypeOption.
+	TopicType *TopicType
+	// GeoMode, see GeoModeOption. A geo topic resolves nil to GeoModeGeo.
+	GeoMode *GeoMode
+	// FreshUploadInterval to LongTermRewriteMaxInterval are the durations of
+	// a geo topic, in microseconds. Each overrides the server setting of the
+	// same name on every node, and nil leaves that setting. Zero is a value
+	// here, not the server-default sentinel of MessageExpiry, so it is sent.
+	// A normal topic refuses them with InvalidOptionValue.
+	//
+	// FreshUploadInterval is the longest time a send waits for the upload of
+	// its fresh object to start, at most 10 seconds.
+	FreshUploadInterval *Duration
+	// ConsumerOffsetUploadInterval is the shortest time between two uploads
+	// of the positions that an offset the consumer group stores itself waits
+	// for, at most 1 second. Zero answers such a store at its local commit.
+	ConsumerOffsetUploadInterval *Duration
+	// PositionsPublishInterval is how often a node uploads the changed
+	// positions of the topic's consumer groups. The server refuses zero.
+	PositionsPublishInterval *Duration
+	// TombstoneGrace is how long the tombstone and the objects of the deleted
+	// topic stay in the object store. The server refuses zero.
+	TombstoneGrace *Duration
+	// PositionsResumeTimeout is how long, after a node starts, the group polls
+	// of the topic's partitions wait for the positions of the geo peers. Zero
+	// does not wait.
+	PositionsResumeTimeout *Duration
+	// LongTermRewriteMaxInterval is the longest wait between two long-term
+	// rewrites of a partition, at least 1 second.
+	LongTermRewriteMaxInterval *Duration
+	// ReadCacheSize and ReadAhead in bytes set how a normal or geo topic reads
+	// from the object store. Each overrides the [tiered_storage] server setting
+	// of the same name on every node, and nil leaves that setting. Zero is a
+	// value here, not the server-default sentinel of MaxTopicSize, so it is
+	// sent.
+	//
+	// ReadCacheSize is the memory each node keeps for what the topic's reads
+	// fetch, divided between its partitions. A partition's share is a limit
+	// within the read cache of its shard, not a reservation. Zero keeps
+	// nothing, any other value is at least 512 KiB.
+	ReadCacheSize *uint64
+	// ReadAhead is the most bytes that readahead fetches in front of a
+	// sequential reader of the topic. Zero turns readahead off, any other
+	// value is at least 128 KiB. With a nonzero ReadCacheSize, the server
+	// refuses a ReadAhead above one eighth of it.
+	ReadAhead *uint64
 	// Raw carries keys newer than this build.
 	Raw []HeaderEntry
 }
@@ -87,8 +173,35 @@ type TopicUpdate struct {
 	// MaxTopicSize sets the size cap in bytes. Zero changes nothing, Reset
 	// returns the key to its default.
 	MaxTopicSize *uint64
-	// Reset names keys to return to their defaults: TopicOptionMessageExpiry
-	// or TopicOptionMaxTopicSize.
+	// TieredStorage turns tiering on when true. False is refused with
+	// OptionNotUpdatable before sending, as is a Reset of the key: the local
+	// segments tiering removed cannot come back.
+	TieredStorage *bool
+	// LocalRetentionAge sets the local retention in microseconds.
+	// IggyExpiryServerDefault changes nothing, Reset returns the key to its
+	// default.
+	LocalRetentionAge *Duration
+	// LocalRetentionSize sets the local size cap in bytes. Zero changes
+	// nothing, Reset returns the key to its default.
+	LocalRetentionSize *uint64
+	// FreshUploadInterval to LongTermRewriteMaxInterval set the durations of
+	// a geo topic in microseconds, see TopicOptions. A normal topic refuses
+	// them. Zero is a value and is sent. None of them can be reset.
+	FreshUploadInterval          *Duration
+	ConsumerOffsetUploadInterval *Duration
+	PositionsPublishInterval     *Duration
+	TombstoneGrace               *Duration
+	PositionsResumeTimeout       *Duration
+	LongTermRewriteMaxInterval   *Duration
+	// ReadCacheSize and ReadAhead set the read cache of any topic in bytes,
+	// see TopicOptions. Zero is a value and is sent. Neither can be reset.
+	// They and the durations above are the only keys an update may change on
+	// a geo topic.
+	ReadCacheSize *uint64
+	ReadAhead     *uint64
+	// Reset names keys to return to their defaults: TopicOptionMessageExpiry,
+	// TopicOptionMaxTopicSize, TopicOptionLocalRetentionAge or
+	// TopicOptionLocalRetentionSize.
 	Reset []TopicOptionKey
 	// RawReset names keys to reset that this build may not know. The server
 	// decides whether each one may be reset, and a patch that carries any raw
@@ -154,6 +267,61 @@ func SizeOfMessagesRequiredToSaveOption(bytes uint64) HeaderEntry {
 // a create whose product crosses its preallocation cap.
 func PreallocateSegmentsOption(enabled bool) HeaderEntry {
 	return boolOption(TopicOptionPreallocateSegments, enabled)
+}
+
+// ReplicationFactorOption sets how many nodes store each partition of the
+// topic: 1 to 32 and at most the cluster's node count. Omitted, the server's
+// [cluster] default_replication_factor applies: every node unless an operator
+// set a number. A write commits on a quorum of those nodes, so 2 keeps two
+// copies but stops taking writes while either node is down, like Kafka with
+// min.insync.replicas=2. A value out of range is refused with
+// InvalidReplicationFactor.
+func ReplicationFactorOption(nodes uint32) HeaderEntry {
+	return uint32Option(TopicOptionReplicationFactor, nodes)
+}
+
+// TieredStorageOption moves sealed segments to the object store and keeps only
+// the local retention on disk. The server does not offer tiering yet and
+// refuses true with FeatureUnavailable, on create and on update.
+func TieredStorageOption(enabled bool) HeaderEntry {
+	return boolOption(TopicOptionTieredStorage, enabled)
+}
+
+// TopicType says what a topic is. It is fixed at create and never changes.
+type TopicType string
+
+const (
+	// TopicTypeNormal keeps the topic's messages in this cluster.
+	TopicTypeNormal TopicType = "normal"
+	// TopicTypeGeo also makes the topic's messages readable in the other
+	// datacenters, through the object store.
+	TopicTypeGeo TopicType = "geo"
+)
+
+// TopicTypeOption fixes the type at create. A geo topic needs an object store
+// on every node of the cluster: while one is not ready, the server refuses
+// TopicTypeGeo with FeatureUnavailable. A geo topic refuses tiered storage and
+// an encrypted stream, and keeps its name, options and partition count.
+func TopicTypeOption(value TopicType) HeaderEntry {
+	return stringOption(TopicOptionTopicType, string(value))
+}
+
+// GeoMode says how a geo topic writes its messages.
+type GeoMode string
+
+const (
+	// GeoModeGeo uploads a batch to the object store before it commits.
+	GeoModeGeo GeoMode = "geo"
+	// GeoModeGeoTiered replicates a batch first and uploads sealed segments
+	// later.
+	GeoModeGeoTiered GeoMode = "geo_tiered"
+)
+
+// GeoModeOption fixes a geo topic's mode at create. The server refuses
+// GeoModeGeoTiered with FeatureUnavailable for now. A normal topic takes no
+// mode, so the server refuses one there with InvalidOptionValue.
+func GeoModeOption(value GeoMode) HeaderEntry {
+	return stringOption(TopicOptionGeoMode, string(value))
 }
 
 func stringOption(key TopicOptionKey, value string) HeaderEntry {

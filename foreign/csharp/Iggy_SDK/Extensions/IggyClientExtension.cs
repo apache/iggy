@@ -59,6 +59,21 @@ public static class IggyClientExtension
     }
 
     /// <summary>
+    ///     Creates a <see cref="ReaderBuilder" /> for a <see cref="PartitionReader" /> of the topic. A standalone
+    ///     consumer names its partitions with <see cref="ReaderBuilder.WithPartitions" />, and a consumer group reads
+    ///     the assignment of its member.
+    /// </summary>
+    /// <param name="client">Existing iggy client</param>
+    /// <param name="streamId">Stream identifier from which to read</param>
+    /// <param name="topicId">Topic identifier from which to read</param>
+    /// <param name="consumer">The consumer whose offsets the reader reads and stores</param>
+    public static ReaderBuilder Reader(this IIggyClient client, Identifier streamId, Identifier topicId,
+        Consumer consumer)
+    {
+        return new ReaderBuilder(client, streamId, topicId, consumer);
+    }
+
+    /// <summary>
     ///     Creates a new <see cref="IggyPublisherBuilder" /> from <see cref="IIggyClient" /> for the specified stream and
     ///     topic.
     /// </summary>

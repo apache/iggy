@@ -85,10 +85,10 @@
 //! | `pause` | each node in turn: SIGSTOP for `d`, then SIGCONT | fails on master like `isolate`: the cluster evicts the frozen node's client sessions and the standalone consumers stay at `unauthenticated` |
 //! | `isolate` | each node in turn: every replica-to-replica connection of the node reset and redials refused for `d`, then restored; clients still reach it | fails on master: session eviction leaves the standalone consumers at `unauthenticated` until the end (see below) |
 //! | `kill-storm` | four SIGKILL and restart cycles `g` apart, `d` down each | pass |
-//! | `cascading-crash` | for each node: SIGKILL it, SIGKILL its successor `SECOND_KILL_DELAY_SECS` later during the view change, restart both `d` after the second kill; `persisted` | fails on master with `persisted`: after the restarted pair elected a new view, the surviving node fenced partition 0 as divergent (`partition WAL append does not extend its history`, then a ShardFatal and a process exit) and the partition stayed frozen. With `replicated` on 3 nodes one node stays alive alone for `d`, so acknowledged writes held only by the killed pair are lost by design, the same mechanism as `full-outage`. #4476 and #4500 cover the fenced replica and the survivor election, not that loss |
-//! | `full-outage` | SIGKILL every node at once after `g`, restart all after `d`; `persisted` | fails on master with `persisted`: the cluster recovers and loses nothing, but every producer stays `disconnected` until the end, the producer stall described below. With `replicated`, unflushed acknowledged writes are lost by design, so that setting is expected to fail |
+//! | `cascading-crash` | for each node: SIGKILL it, SIGKILL its successor `SECOND_KILL_DELAY_SECS` later during the view change, restart both `d` after the second kill; `persisted` | fails on master with `persisted`: after the restarted pair elected a new view, the surviving node fenced partition 0 as divergent (`partition WAL append does not extend its history`, then a ShardFatal and a process exit) and the partition stayed frozen. With `replicated` on 3 nodes one node stays alive alone for `d`, so acknowledged writes held only by the killed pair, and not yet handed to the OS there, are lost by design, the same mechanism as `full-outage`. #4476 and #4500 cover the fenced replica and the survivor election, not that loss |
+//! | `full-outage` | SIGKILL every node at once after `g`, restart all after `d`; `persisted` | fails on master with `persisted`: the cluster recovers and loses nothing, but every producer stays `disconnected` until the end, the producer stall described below. With `replicated`, acknowledged writes that a server had not yet handed to the OS are lost by design, so that setting can fail |
 //! | `rolling-crash` | `crash-restart` on 1 partition at 30k messages/s from 12 producers in batches of 100, `persisted`, a kill every 80 s and 40 s down, for 360 s | #4438: a restarted replica logs `needs state transfer`, never finishes the transfer and keeps serving a stale prefix. Timing dependent; the loss reaches millions of messages at this load. Expected: pass |
-//! | `split-primaries` | `crash-restart`, then a 60 s window without faults, opened once the replica mesh has formed, in which the p99 latency of an acknowledged batch and the longest gap between acknowledgements must stay under `IGGY_TEST_CHAOS_P99_LIMIT_MS` | #4436: once partition primaries sit on different nodes, the SDK moves its session on nearly every send. #4437 is the deterministic test. Expected: pass |
+//! | `split-primaries` | `crash-restart`, then a 60 s window without faults, opened once the replica mesh has formed, in which the p99 latency of an acknowledged batch and the longest gap between acknowledgements must stay under `IGGY_TEST_CHAOS_P99_LIMIT_MS` | #4436: once partition primaries sit on different nodes, the SDK moves its session on nearly every send. `given_partitions_on_different_primaries_when_sending_round_robin_should_keep_the_session` in `partition_primary_routing.rs` is the deterministic test. Expected: pass |
 //!
 //! `isolate` needs no privileges: the harness relays every replica link over
 //! loopback. A cut closes the node's relayed connections, so its peers see EOF
@@ -246,20 +246,18 @@ use std::io::Read;
 use std::ops::RangeInclusive;
 use std::panic::{AssertUnwindSafe, resume_unwind};
 use std::path::PathBuf;
-use std::process::Command;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use assert_cmd::cargo::CommandCargoExt;
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
 use iggy::prelude::*;
 use integration::harness::handle::common::SIGTERM_TIMEOUT;
 use integration::harness::{
-    ServerHandle, StopOutcome, TestBinary, TestBinaryError, TestHarness, TestServerConfig, disk,
-    resolve_config_paths,
+    GroupPoller, ServerHandle, StopOutcome, TestBinary, TestBinaryError, TestHarness,
+    TestServerConfig, cargo_bin_path, disk, log_capture, resolve_config_paths,
 };
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -332,8 +330,10 @@ const CLEANER_INTERVAL: &str = "1s";
 /// The server's own shutdown budget has to end inside the harness's SIGTERM
 /// grace, or a wedged shard reads as a SIGKILL instead of the server's
 /// `abandoning it` line and its failure exit. Shard 0 may wait the join
-/// budget plus one drain and one poll interval, 3.05 s here against the 5 s
-/// grace; the defaults (10 s drain, 30 s join) outlast it.
+/// budget plus one drain and one poll interval, 3.05 s here, after a primary
+/// handoff of at most 1 s, against the 5 s grace; the defaults (15 s handoff,
+/// 10 s drain, 30 s join) outlast it.
+const SHUTDOWN_PRIMARY_HANDOFF_TIMEOUT: &str = "1s";
 const SHUTDOWN_DRAIN_TIMEOUT: &str = "1s";
 const SHUTDOWN_POLL_INTERVAL: &str = "50ms";
 const SHUTDOWN_JOIN_TIMEOUT: &str = "2s";
@@ -386,7 +386,7 @@ type SharedLog = Arc<Mutex<ObservedLog>>;
 #[parallel]
 #[ignore = "runs for minutes against a multi-node cluster; run with --run-ignored only"]
 async fn given_cluster_when_scenario_faults_hit_should_keep_acked_messages() {
-    crate::use_saved_logs_on_failure();
+    log_capture::use_saved_logs_on_failure();
     let config = ChaosConfig::from_env();
     let mut harness = build_cluster(&config);
     let mut report =
@@ -1251,6 +1251,10 @@ fn build_cluster(config: &ChaosConfig) -> TestHarness {
             CLEANER_INTERVAL.to_owned(),
         ),
         (
+            "sharding.shutdown_primary_handoff_timeout".to_owned(),
+            SHUTDOWN_PRIMARY_HANDOFF_TIMEOUT.to_owned(),
+        ),
+        (
             "sharding.shutdown_drain_timeout".to_owned(),
             SHUTDOWN_DRAIN_TIMEOUT.to_owned(),
         ),
@@ -1604,13 +1608,9 @@ impl Workload {
         }
         let client = dialer.connect().await;
         let builder = client
-            .consumer(
-                STANDALONE_ICONSUMER_NAME,
-                STREAM_NAME,
-                TOPIC_NAME,
-                STANDALONE_ICONSUMER_PARTITION,
-            )
-            .expect("standalone IggyConsumer builder");
+            .consumer(STANDALONE_ICONSUMER_NAME, STREAM_NAME, TOPIC_NAME)
+            .expect("standalone IggyConsumer builder")
+            .partitions([STANDALONE_ICONSUMER_PARTITION]);
         let reader = Reader::new(
             format!("consumer {STANDALONE_ICONSUMER_NAME}"),
             Consumer::new(Identifier::named(STANDALONE_ICONSUMER_NAME).expect("valid name")),
@@ -1707,11 +1707,6 @@ impl Workload {
         };
 
         println!("{} drain over, readers stop", stamp(started));
-        // The group's `IggyConsumer` stops before the members leave. Its
-        // shutdown flush stores the last offset it consumed in every partition
-        // it ever held, unless it stored that offset already. A leave can move
-        // such a partition back to it, and the fence then admits the old
-        // offset, so the group offset moves back.
         group_iconsumer_phase.send_replace(ConsumerPhase::Stop);
         let mut consumer_outcomes = Vec::with_capacity(consumers.len() + 1);
         consumer_outcomes.push(group_iconsumer.await.expect("consumer task panicked"));
@@ -2314,24 +2309,38 @@ impl ConsumerOutcome {
     }
 }
 
-/// Polls the reader's next batch and stores its last offset.
+/// Polls the reader's next batch and stores its last offset. The group
+/// reader polls through the member's `GroupPoller`.
 async fn poll_and_commit(
     client: &IggyClient,
     reader: &Reader,
+    group_poller: Option<&mut GroupPoller>,
     outcome: &mut ConsumerOutcome,
     context: &TaskContext,
 ) -> Result<(), Failure> {
     let target = &context.target;
-    let polled = call(client.poll_messages(
-        &target.stream,
-        &target.topic,
-        reader.partition,
-        &reader.consumer,
-        &PollingStrategy::next(),
-        POLL_BATCH,
-        false,
-    ))
-    .await?;
+    let strategy = PollingStrategy::next();
+    let options = PollOptions {
+        count: POLL_BATCH,
+        ..PollOptions::default()
+    };
+    let polled = match reader.partition {
+        Some(partition) => {
+            call(client.poll_messages(
+                &target.stream,
+                &target.topic,
+                partition,
+                &reader.consumer,
+                &strategy,
+                options,
+            ))
+            .await?
+        }
+        None => {
+            let poller = group_poller.expect("a group member polls through its GroupPoller");
+            call(poller.poll(client, &target.stream, &target.topic, &strategy, options)).await?
+        }
+    };
     outcome.errors.succeeded();
     let Some(last) = polled.messages.last().map(|message| message.header.offset) else {
         sleep(POLL_PAUSE).await;
@@ -2377,6 +2386,7 @@ async fn run_member(
             continue;
         }
         churn.joins += 1;
+        let mut poller = GroupPoller::new(target.group.clone());
         let session_end =
             Instant::now() + Duration::from_millis(rng.random_range(MEMBER_SESSION_MS));
         loop {
@@ -2386,7 +2396,9 @@ async fn run_member(
             {
                 break;
             }
-            if let Err(failure) = poll_and_commit(&client, &group, &mut outcome, &context).await {
+            if let Err(failure) =
+                poll_and_commit(&client, &group, Some(&mut poller), &mut outcome, &context).await
+            {
                 let lost_membership = matches!(
                     failure,
                     Failure::Iggy(IggyError::ConsumerGroupMemberNotFound(..))
@@ -2421,7 +2433,8 @@ async fn run_consumer(
 ) -> ConsumerOutcome {
     let mut outcome = ConsumerOutcome::new(reader.name.clone(), context.started);
     while *phase.borrow() != ConsumerPhase::Stop {
-        if let Err(failure) = poll_and_commit(&client, &reader, &mut outcome, &context).await {
+        if let Err(failure) = poll_and_commit(&client, &reader, None, &mut outcome, &context).await
+        {
             outcome.errors.record(&failure);
             sleep(RETRY_PAUSE).await;
         }
@@ -2433,15 +2446,18 @@ async fn start_iggy_consumer(builder: IggyConsumerBuilder) -> IggyConsumer {
     let commit_interval =
         NonZeroIggyDuration::new(ICONSUMER_COMMIT_INTERVAL).expect("non-zero commit interval");
     let mut consumer = builder
-        // Commits only what was handed over. The default commits with the
-        // poll and can skip a batch whose reply was lost, which would break
-        // the no-loss check.
-        .auto_commit(AutoCommit::IntervalOrWhen(
-            commit_interval,
-            AutoCommitWhen::ConsumingAllMessages,
-        ))
-        .batch_length(POLL_BATCH)
-        .poll_interval(IggyDuration::from(POLL_PAUSE))
+        // Commits only what was handed over. `OnRead` commits with the read
+        // and can skip a batch whose reply was lost, which would break the
+        // no-loss check.
+        .poll_options(PollOptions {
+            count: POLL_BATCH,
+            commit: CommitPolicy::Auto(AutoCommit {
+                interval: Some(commit_interval),
+                every: Some(CommitEvery::Batch),
+                after: CommitAfter::Delivery,
+            }),
+            ..PollOptions::wait(IggyDuration::from(POLL_PAUSE))
+        })
         .build();
     consumer.init().await.expect("init the IggyConsumer");
     consumer
@@ -2476,7 +2492,7 @@ async fn run_iggy_consumer(
                         &context,
                     );
                 }
-                Some(Err(error)) => outcome.errors.record(&Failure::Iggy(error)),
+                Some(Err(error)) => outcome.errors.record(&Failure::Iggy(error.into())),
                 None => break,
             },
         }
@@ -3449,11 +3465,13 @@ async fn read_log(
             let polled = call(client.poll_messages(
                 &target.stream,
                 &target.topic,
-                Some(partition),
+                partition,
                 &consumer,
                 &PollingStrategy::offset(next),
-                VERIFY_BATCH,
-                false,
+                PollOptions {
+                    count: VERIFY_BATCH,
+                    ..PollOptions::default()
+                },
             ))
             .await?;
             if polled.messages.is_empty() {
@@ -4194,7 +4212,7 @@ fn record_summary(
 }
 
 fn run_metadata(config: &ChaosConfig) -> serde_json::Value {
-    let mut system = System::new();
+    let mut system = System::new().expect("sysinfo supports this platform");
     system.refresh_all();
     let recorded_unix_ms = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -4237,8 +4255,8 @@ fn run_metadata(config: &ChaosConfig) -> serde_json::Value {
             "cleaner_interval": CLEANER_INTERVAL,
         },
         "host": {
-            "os": System::name(), "os_version": System::os_version(),
-            "kernel": System::kernel_version(), "arch": std::env::consts::ARCH,
+            "os": System::name().ok(), "os_version": System::os_version().ok(),
+            "kernel": System::kernel_version().ok(), "arch": std::env::consts::ARCH,
             "cpu": system.cpus().first().map(|cpu| cpu.brand()),
             "logical_cpus": system.cpus().len(),
             "available_parallelism": std::thread::available_parallelism().ok().map(|count| count.get()),
@@ -4250,8 +4268,7 @@ fn run_metadata(config: &ChaosConfig) -> serde_json::Value {
 }
 
 fn server_binary_metadata() -> serde_json::Value {
-    let command = Command::cargo_bin("iggy-server").expect("locate the prebuilt server");
-    let path = PathBuf::from(command.get_program());
+    let path = cargo_bin_path("iggy-server").expect("locate the prebuilt server");
     let fingerprint = || -> std::io::Result<String> {
         let mut file = File::open(&path)?;
         let mut digest = Context::new(&SHA256);

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy_kafka_wire::KafkaWireError;
 use thiserror::Error;
 
 use crate::bridge::BridgeError;
@@ -23,27 +24,12 @@ use crate::bridge::BridgeError;
 pub enum KafkaProtocolError {
     #[error("invalid server configuration: {0}")]
     InvalidConfig(String),
-    #[error("buffer underflow: needed {needed} bytes, remaining {remaining}")]
-    BufferUnderflow { needed: usize, remaining: usize },
-    #[error("invalid frame length: {0}")]
-    InvalidFrameLength(i32),
-    #[error("request exceeds max frame size ({max_bytes} bytes): {actual_bytes} bytes")]
-    FrameTooLarge {
-        max_bytes: usize,
-        actual_bytes: usize,
-    },
-    /// Metadata's per-topic `name` is nullable on the wire (v10+ allows topic-id-only lookups),
-    /// but this stub only echoes names back, so a null name has no response to build.
-    #[error("null topic name in request")]
-    NullTopicName,
-    /// Wraps a `kafka_protocol` decode/encode failure (`anyhow::Error`, no stable variant
-    /// taxonomy on the wire-format crate's side).
-    #[error("malformed request: {0}")]
-    Malformed(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("Iggy bridge error: {0}")]
     Bridge(#[from] BridgeError),
+    #[error(transparent)]
+    Wire(#[from] KafkaWireError),
 }
 
 pub type Result<T> = std::result::Result<T, KafkaProtocolError>;

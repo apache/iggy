@@ -1,0 +1,94 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: swift-post-merge
+description: Swift post-merge tag preparation github iggy actions
+
+inputs:
+  version:
+    description: "Version for tagging (without the 'v' prefix)"
+    required: true
+  tag:
+    description: "Git tag the publish workflow creates for this version"
+    required: true
+  dry_run:
+    description: "Dry run mode"
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    # Build metadata cannot distinguish versions with the same SwiftPM precedence.
+    - name: Validate version and tag
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        TAG: ${{ inputs.tag }}
+      run: |
+        set -euo pipefail
+        PRERELEASE='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
+        SEMVER="^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-${PRERELEASE}(\.${PRERELEASE})*)?$"
+        if ! [[ "$VERSION" =~ $SEMVER ]]; then
+          echo "❌ Invalid Swift SDK version: $VERSION"
+          echo "Expected X.Y.Z or X.Y.Z-prerelease, without build metadata"
+          exit 1
+        fi
+        if [ "$TAG" != "v${VERSION}" ]; then
+          echo "❌ Tag $TAG does not match version $VERSION, expected v${VERSION}"
+          exit 1
+        fi
+        echo "✅ Version $VERSION, tag $TAG"
+
+    # SwiftPM consumers receive the root manifest and legal files with the repository.
+    - name: Check package and legal files
+      shell: bash
+      run: |
+        set -euo pipefail
+        for file in Package.swift LICENSE NOTICE foreign/swift/LICENSE foreign/swift/NOTICE; do
+          if [ ! -f "$file" ]; then
+            echo "❌ Missing $file"
+            exit 1
+          fi
+        done
+        echo "✅ Root manifest and legal files present"
+
+    - name: Summary
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        TAG: ${{ inputs.tag }}
+        DRY_RUN: ${{ inputs.dry_run }}
+      run: |
+        {
+          echo "## 🏷️ Swift Package Tag"
+          echo ""
+          echo "| Property | Value |"
+          echo "|----------|-------|"
+          echo "| **Version** | \`${VERSION}\` |"
+          echo "| **Git Tag** | \`${TAG}\` |"
+          echo "| **Package URL** | \`https://github.com/${{ github.repository }}.git\` |"
+          echo ""
+          echo "\`\`\`swift"
+          echo ".package(url: \"https://github.com/${{ github.repository }}.git\", exact: \"${VERSION}\")"
+          echo ".product(name: \"Iggy\", package: \"iggy\")"
+          echo "\`\`\`"
+          echo ""
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "**Note:** Dry run, no tag will be created"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"

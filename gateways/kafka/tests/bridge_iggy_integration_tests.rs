@@ -22,25 +22,30 @@
 
 use iggy::prelude::StreamCreateOptions;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::str::FromStr;
 use std::time::Duration;
 
 use iggy::prelude::{
-    Identifier, IggyError, IggyMessage, MessageClient, Partitioning, StreamClient, TopicClient,
+    ClusterMetadata, ClusterNode, ClusterNodeRole, ClusterNodeStatus, Identifier, IggyError,
+    IggyMessage, MessageClient, Partitioning, StreamClient, TopicClient, TransportEndpoints,
 };
 use secrecy::SecretString;
 use serial_test::serial;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, copy};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
+use iggy_gateway_kafka::auth::{IggyAuthenticator, SaslAuthenticator};
 use iggy_gateway_kafka::bridge::{
-    BridgeError, DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig, IggyTls, OffsetCalls,
-    ProduceSessionLimits, Producer, TopicCreationOutcome, TopicMapping, TopicOverride,
+    BridgeError, DEFAULT_FETCH_SLOTS, DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig,
+    IggyTls, KnownNodes, OffsetCalls, PartitionBatch, ProduceSessionLimits, Producer, Reach,
+    TopicCreationOutcome, TopicDefaults, TopicMapping, TopicOverride,
 };
 use iggy_gateway_kafka::protocol::api::ERROR_REQUEST_TIMED_OUT;
+use iggy_gateway_kafka::protocol::sasl::PlainCredentials;
 
 #[path = "common/certs.rs"]
 mod certs;
@@ -130,13 +135,13 @@ async fn given_timed_out_writes_when_writing_again_should_resolve_all_client_lan
             );
         }
         replies.send(true).expect("resume replies");
-        assert_eq!(
+        assert!(matches!(
             bridge
                 .create_kafka_topic(next, 1)
                 .await
                 .expect("next create"),
-            TopicCreationOutcome::Created
-        );
+            TopicCreationOutcome::Created { .. }
+        ));
         assert!(
             bridge
                 .get_kafka_topic(next)
@@ -169,8 +174,11 @@ async fn given_timed_out_writes_when_writing_again_should_resolve_all_client_lan
                     turn,
                     (),
                     &target,
-                    0,
-                    vec![IggyMessage::from_str(payload).expect("message")],
+                    PartitionBatch {
+                        partition: 0,
+                        producer: None,
+                        messages: vec![IggyMessage::from_str(payload).expect("message")],
+                    },
                     deadline,
                 )
                 .await
@@ -192,6 +200,11 @@ async fn given_timed_out_writes_when_writing_again_should_resolve_all_client_lan
             result.expect("produce recovers the prior retained send");
         }
     }
+    assert_eq!(
+        bridge.sends_in_doubt(),
+        1,
+        "the held send may have landed although the client got an error"
+    );
     for (offset, hold) in [(0, false), (1, true), (2, false)] {
         replies.send(!hold).expect("reply gate");
         let calls = OffsetCalls::new(Instant::now() + CALL_DEADLINE);
@@ -612,8 +625,12 @@ async fn connect_to_unreachable_iggy_returns_err_not_panic() {
         topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
             .expect("valid mapping for this test's fixture data"),
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        fetch_slots: DEFAULT_FETCH_SLOTS,
         tls: IggyTls::default(),
         produce_sessions: ProduceSessionLimits::default(),
+        idempotent_producers: false,
+        nodes: KnownNodes::default(),
+        topic_defaults: TopicDefaults::default(),
     };
 
     let result = IggyBridge::connect(config).await;
@@ -637,8 +654,12 @@ async fn connect_to_a_black_hole_address_times_out_instead_of_hanging() {
         topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
             .expect("valid mapping for this test's fixture data"),
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        fetch_slots: DEFAULT_FETCH_SLOTS,
         tls: IggyTls::default(),
         produce_sessions: ProduceSessionLimits::default(),
+        idempotent_producers: false,
+        nodes: KnownNodes::default(),
+        topic_defaults: TopicDefaults::default(),
     };
 
     let start = tokio::time::Instant::now();
@@ -1136,4 +1157,115 @@ async fn list_kafka_topics_lists_an_override_target_in_a_non_default_stream_alon
     assert_eq!(topics[0].partitions_count, 2);
     assert_eq!(topics[1].kafka_topic, "payments");
     assert_eq!(topics[1].partitions_count, 1);
+}
+
+/// A roster of one node: the server at `address`.
+fn roster_at(address: &str) -> ClusterMetadata {
+    let socket: SocketAddr = address
+        .parse()
+        .expect("the test server listens on an IP address");
+    ClusterMetadata {
+        name: "iggy-cluster".to_string(),
+        nodes: vec![ClusterNode {
+            replica_id: 0,
+            name: "iggy-node-0".to_string(),
+            ip: socket.ip().to_string(),
+            endpoints: TransportEndpoints::new(socket.port(), 0, 0, 0),
+            role: ClusterNodeRole::Leader,
+            status: ClusterNodeStatus::Healthy,
+        }],
+    }
+}
+
+/// Beside a stopped node, the configured address is down. A new client then dials the nodes of
+/// the last roster the bridge read, so the gateway still opens clients through the other nodes.
+#[tokio::test]
+#[serial]
+async fn given_a_stopped_configured_node_when_connecting_should_dial_the_next_known_node() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let live = server.test_config();
+    let stopped = PortGuard::acquire(); // locked but never bound, like a stopped node
+    let config = IggyBridgeConfig {
+        address: format!("127.0.0.1:{}", stopped.port),
+        ..live.clone()
+    };
+    config.nodes.learn(&roster_at(&live.address));
+
+    let bridge = IggyBridge::connect(config)
+        .await
+        .expect("the bridge connects through the next known node");
+    bridge
+        .ensure_stream_and_topic("orders", 1)
+        .await
+        .expect("the bridge serves through that node");
+}
+
+/// The readiness probe dials every known node at once after a failed ping. So when the
+/// configured node stops and another answers, the gateway stays ready: a dial of the stopped node
+/// alone outlasts two checks.
+#[tokio::test]
+#[serial]
+async fn given_the_configured_node_stops_when_another_answers_should_stay_reachable() {
+    let first_dir = tempfile::tempdir().expect("tempdir");
+    let first = TestServer::spawn(first_dir.path()).await;
+    let second_dir = tempfile::tempdir().expect("tempdir");
+    let second = TestServer::spawn(second_dir.path()).await;
+    let config = first.test_config();
+    let nodes = config.nodes.clone();
+    let bridge = IggyBridge::connect(config).await.expect("bridge");
+    // After the connect, which reads the first node's own roster.
+    nodes.learn(&roster_at(&second.test_config().address));
+    let mut reach = bridge.reach();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        reach.wait_for(|reach| *reach == Reach::Reachable),
+    )
+    .await
+    .expect("the probe reaches the first node")
+    .expect("the probe runs");
+
+    let _stopped = first.stop();
+
+    let turned_unreachable = tokio::time::timeout(
+        Duration::from_secs(8),
+        reach.wait_for(|reach| matches!(reach, Reach::Unreachable(_))),
+    )
+    .await
+    .is_ok();
+    assert!(
+        !turned_unreachable,
+        "the second node answers: {:?}",
+        *reach.borrow()
+    );
+    assert_eq!(*reach.borrow(), Reach::Reachable);
+    bridge.close().await.ok();
+}
+
+/// A SASL login dials the same known nodes, so it is checked beside a stopped node too.
+#[tokio::test]
+#[serial]
+async fn given_a_stopped_configured_node_when_checking_a_login_should_verify_it_on_the_next_node() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let root = server.test_config();
+    let stopped = PortGuard::acquire();
+    let nodes = KnownNodes::default();
+    nodes.learn(&roster_at(&root.address));
+    let authenticator =
+        IggyAuthenticator::new(format!("127.0.0.1:{}", stopped.port)).with_nodes(nodes);
+    let credentials = PlainCredentials {
+        username: root.username.clone(),
+        password: root.password.clone(),
+    };
+    let slots = Semaphore::new(1);
+
+    let principal = authenticator
+        .authenticate(
+            &credentials,
+            slots.acquire().await.expect("an open semaphore"),
+        )
+        .await
+        .expect("the login is verified on the next known node");
+    assert_eq!(principal.username, root.username);
 }

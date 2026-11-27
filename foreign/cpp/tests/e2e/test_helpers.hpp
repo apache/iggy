@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <initializer_list>
 #include <memory>
 #include <random>
@@ -62,6 +63,22 @@ inline rust::Vec<std::uint8_t> partition_id_bytes(std::uint32_t id) {
     v.push_back(static_cast<std::uint8_t>((id >> 16) & 0xFF));
     v.push_back(static_cast<std::uint8_t>((id >> 24) & 0xFF));
     return v;
+}
+
+inline iggy::ffi::PollingStrategy make_polling_strategy(const std::string &kind, const std::uint64_t value) {
+    iggy::ffi::PollingStrategy strategy{};
+    strategy.kind  = kind;
+    strategy.value = value;
+    return strategy;
+}
+
+inline iggy::ffi::PollOptions make_poll_options(
+    const std::uint32_t count,
+    const iggy::ffi::CommitPolicy commit = iggy::ffi::CommitPolicy::Manual) {
+    iggy::ffi::PollOptions options = iggy::ffi::default_poll_options();
+    options.count                  = count;
+    options.commit                 = commit;
+    return options;
 }
 
 inline rust::Vec<rust::String> make_snapshot_types(std::initializer_list<const char *> values) {
@@ -378,15 +395,27 @@ class E2ETestFixture : public ::testing::Test {
 
     void CleanupStreams(iggy::ffi::Client *client) {
         for (const auto &stream_name : tracked_stream_names_) {
-            iggy::ffi::ErrorInfo error_info{};
-            EXPECT_NO_THROW(client->delete_stream(make_string_identifier(stream_name), error_info));
+            EXPECT_NO_THROW(DeleteTrackedStream(client, make_string_identifier(stream_name)));
         }
         for (const auto stream_id : tracked_stream_ids_) {
-            iggy::ffi::ErrorInfo error_info{};
-            EXPECT_NO_THROW(client->delete_stream(make_numeric_identifier(stream_id), error_info));
+            EXPECT_NO_THROW(DeleteTrackedStream(client, make_numeric_identifier(stream_id)));
         }
         tracked_stream_names_.clear();
         tracked_stream_ids_.clear();
+    }
+
+    static void DeleteTrackedStream(iggy::ffi::Client *client, iggy::ffi::Identifier stream) {
+        iggy::ffi::ErrorInfo error_info{};
+        try {
+            client->delete_stream(std::move(stream), error_info);
+        } catch (const std::exception &) {
+            if (!error_info.has_operation_id || std::string(error_info.kind) != "operation_uncertain") {
+                throw;
+            }
+            constexpr auto timeout = std::chrono::duration_cast<std::chrono::microseconds>(
+                iggy::IggyBlockingClient::kDefaultResolutionTimeout);
+            client->resolve_operation(error_info.operation_id, timeout.count(), error_info);
+        }
     }
 
     void CleanupStreamsBestEffort(iggy::ffi::Client *client) noexcept {

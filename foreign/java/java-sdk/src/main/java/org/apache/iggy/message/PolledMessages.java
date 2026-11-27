@@ -23,6 +23,39 @@ import org.apache.iggy.partition.PartitionContext;
 
 import java.math.BigInteger;
 import java.util.List;
+import java.util.Optional;
 
+/**
+ * One batch of one partition.
+ *
+ * @param partitionId   the partition of the batch
+ * @param currentOffset the offset of the last message of the partition when the server read it
+ * @param count         the number of messages
+ * @param messages      the messages in offset order
+ * @param context       the history of the partition that the messages came from
+ */
 public record PolledMessages(
-        Long partitionId, BigInteger currentOffset, Long count, List<Message> messages, PartitionContext context) {}
+        Long partitionId, BigInteger currentOffset, Long count, List<Message> messages, PartitionContext context) {
+
+    /** The position after the last message, or empty for an empty batch. */
+    public Optional<Checkpoint> checkpoint() {
+        return messages.isEmpty() ? Optional.empty() : checkpointAt(messages.size() - 1);
+    }
+
+    /** The position after the message at {@code index}, or empty for an index outside the batch. */
+    public Optional<Checkpoint> checkpointAt(int index) {
+        if (index < 0 || index >= messages.size()) {
+            return Optional.empty();
+        }
+        return Optional.of(
+                new Checkpoint(partitionId, messages.get(index).header().offset(), context));
+    }
+
+    /**
+     * Where the next poll of this partition starts: after the last message. Empty for an empty batch, whose start the
+     * caller keeps. A poll or a seek of another partition refuses it.
+     */
+    public Optional<PollingStrategy> continuation() {
+        return checkpoint().map(Checkpoint::next);
+    }
+}

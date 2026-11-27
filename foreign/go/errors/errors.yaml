@@ -351,6 +351,18 @@
   code: 89
   format: "the replica is not the primary of the target group"
   fields: []
+- name: DeferredPollCapacityExceeded
+  code: 90
+  format: "deferred poll capacity exceeded; retry after backoff on the same replica"
+  fields: []
+- name: TieredReadFailed
+  code: 96
+  format: "tiered data cannot be read from the object store; a retry does not help"
+  fields: []
+- name: ReplyTooLarge
+  code: 97
+  format: "the reply is larger than the reply size limit"
+  fields: []
 - name: ClientNotFound
   code: 100
   format: "client with id: %d was not found."
@@ -526,6 +538,10 @@
 - name: TooManyStreams
   code: 1020
   format: "too many streams"
+  fields: []
+- name: ShadowStreamReadOnly
+  code: 1021
+  format: "the stream is a shadow of another cluster's stream and takes no writes"
   fields: []
 - name: CannotCreateTopicsDirectory
   code: 2000
@@ -1383,6 +1399,20 @@
 - name: OperationNotRetained
   code: 14008
   format: "operation %d is not retained"
+  fields:
+    - name: OperationID
+      type: uint64
+- name: PartitionLaneBlocked
+  code: 14009
+  format: "partition %d lane blocked by operation %d"
+  fields:
+    - name: PartitionID
+      type: uint32
+    - name: OperationID
+      type: uint64
+- name: FetchProgressUncertain
+  code: 14010
+  format: "read %d has an unknown outcome: the server can have stored its offset"
   fields:
     - name: OperationID
       type: uint64

@@ -107,10 +107,42 @@ const PATCH_MASK: u32 = COMPONENT_MAX;
 /// fields from the topic header (50 to 33 fixed bytes, the values live in the
 /// option blocks), adds derived option blocks to stream and user responses and
 /// a flags byte to each `DescribeOptions` descriptor.
+/// Version 0.12.1 replaces `WaitForMessages` (107) with `FetchMessages` (109).
+/// Version 0.12.2 gives each `GetTopic` partition its `members` and
+/// `in_sync_members` node lists, so a partition record is no longer 64 bytes.
+/// Version 0.12.3 adds a required page block to `GetStreams`, `GetTopics`,
+/// `GetConsumerGroups` and `GetUsers`, answers each of them with one page, and
+/// adds `GetPartitions` (404).
 /// Finalize this number and the minimum during stable release preparation.
 /// Released servers using protocol 0.11.0 accept every 0.11.x patch, so an
 /// incompatible release needs a new minor version for those servers to reject it.
-pub const IGGY_PROTOCOL_VERSION: u32 = pack_protocol_version(0, 12, 0);
+pub const IGGY_PROTOCOL_VERSION: u32 = pack_protocol_version(0, 12, 3);
+
+/// Revision of what replicas send each other, which clients never see.
+///
+/// Bump this revision when replicas can no longer read each other's frames or state transfer artifacts, including metadata snapshots, client tables, state manifests and partition transfers. The same rule applies to incompatible changes to the HTTP relay between nodes or configuration defaults required for interoperability. If a shared setting supports both releases, pin it on every node before upgrading the first binary and switch to the new default only after the last node rejoins. For a metadata journal capacity increase, raise the backups first and the metadata primary last.
+///
+/// Revision 1 adds partition member lists, partition status bodies on metadata probes and
+/// replies, retirement debt on session finalization and the paid-through mark
+/// on session retirement. Revision 2 batches `Commit` and `CommitReply`
+/// frames, one entry per group. Revision 3 retires ended sessions in batches:
+/// retirement reports and session finalization carry a walk watermark instead
+/// of one session and a namespace revision. Revision 4 binds sessions to the
+/// credential that opened them: `Register` carries an access revision and a
+/// token id, a password change carries the revision it verified, and the client
+/// table transfer carries each session's token. Revision 5 lets a `ReplicaHello`
+/// carry, as its body, the identities of the releases its sender lists as
+/// compatible. An earlier build ignores that body, so it must never match a
+/// listed identity. Revision 6 adds a `ShadowTopic` kind that sets the read
+/// cache options of a shadow topic, lets an update of a geo topic set
+/// `read_cache_size` and `read_ahead`, refuses at commit a topic update that
+/// leaves that pair invalid, stores persisted durability for the consumer
+/// offsets of geo and shadow topics, and sends in a partition state transfer
+/// every segment of the stored front as its chain record alone, even while
+/// its `.log` is still on the sender's disk. An earlier build cannot decode
+/// the new kind, and it reaches other verdicts and stores other options for
+/// the same metadata operations.
+pub const REPLICA_WIRE_REVISION: u32 = 6;
 
 /// Oldest protocol version this build accepts at login.
 ///
@@ -120,7 +152,12 @@ pub const IGGY_PROTOCOL_VERSION: u32 = pack_protocol_version(0, 12, 0);
 ///
 /// Keep this equal to the current protocol unless compatibility with older
 /// released protocols has been verified. Decide the range per stable release.
-pub const IGGY_PROTOCOL_VERSION_MIN: u32 = pack_protocol_version(0, 12, 0);
+///
+/// Version 0.12.0 clients can send the retired `WaitForMessages` (107) command,
+/// 0.12.1 clients read every `GetTopic` partition as a 64-byte record, and
+/// 0.12.2 clients send the list commands without a page block and read each
+/// list whole.
+pub const IGGY_PROTOCOL_VERSION_MIN: u32 = pack_protocol_version(0, 12, 3);
 const _: () =
     assert!(IGGY_PROTOCOL_VERSION_MIN > 0 && IGGY_PROTOCOL_VERSION_MIN <= IGGY_PROTOCOL_VERSION);
 
@@ -263,11 +300,14 @@ mod tests {
     }
 
     #[test]
-    fn login_from_a_per_resource_update_protocol_is_outside_the_compatible_window() {
+    fn login_from_an_older_protocol_is_outside_the_compatible_window() {
         assert!(!is_protocol_compatible(pack_protocol_version(0, 11, 0)));
         assert!(!is_protocol_compatible(pack_protocol_version(0, 11, 1)));
-        assert!(is_protocol_compatible(pack_protocol_version(0, 12, 0)));
+        assert!(!is_protocol_compatible(pack_protocol_version(0, 12, 0)));
         assert!(!is_protocol_compatible(pack_protocol_version(0, 12, 1)));
+        assert!(!is_protocol_compatible(pack_protocol_version(0, 12, 2)));
+        assert!(is_protocol_compatible(pack_protocol_version(0, 12, 3)));
+        assert!(!is_protocol_compatible(pack_protocol_version(0, 12, 4)));
     }
 
     #[test]
@@ -277,8 +317,8 @@ mod tests {
     }
 
     #[test]
-    fn min_requires_the_generic_update_wire_layout() {
-        assert_eq!(IGGY_PROTOCOL_VERSION_MIN, pack_protocol_version(0, 12, 0));
+    fn min_requires_the_page_block_protocol() {
+        assert_eq!(IGGY_PROTOCOL_VERSION_MIN, pack_protocol_version(0, 12, 3));
     }
 
     #[test]

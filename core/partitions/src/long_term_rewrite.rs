@@ -1,0 +1,1437 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! The rewrite of a placing partition's committed batches into a long-term
+//! segment, by its primary.
+//!
+//! A rewrite reads the batches above the long-term floor the way a poll
+//! does, with the messages their placements name. It puts them back to back
+//! as a `.log`, with an `.index` beside it, in the layout of a tiered
+//! segment, and stores both from memory under the partition's own prefix. A
+//! reader of the bucket then needs no placement and no fresh object to read
+//! the partition.
+//!
+//! The segment ends where the rewrite stops: at the commit point, or once
+//! it holds [`LONG_TERM_SEGMENT_BYTES`]. Its key names both its offsets, so
+//! a segment another primary stored from the same offset, just before it
+//! lost primacy, is another object when it ends elsewhere. The long-term log
+//! lists the one whose command commits. One that ends at the same offset
+//! holds the same bytes, and the rewrite takes it as its own.
+//!
+//! The long-term log holds the registration of a segment before its object
+//! is stored. A plan reads the headers of the batches to find where the
+//! segment ends, the primary commits the registration of those offsets, and
+//! the rewrite that follows stores exactly them. The object of a primary
+//! that lost primacy before its command committed is then deleted once its
+//! registration expires, whatever the next primary stores.
+
+use std::cell::{Cell, RefCell};
+use std::future;
+use std::io;
+use std::rc::Rc;
+
+use bytes::Bytes;
+use compio::io::AsyncWriteAtExt;
+use futures::FutureExt;
+use futures::future::LocalBoxFuture;
+use iggy_binary_protocol::batch::BATCH_HEADER_SIZE;
+use iggy_binary_protocol::placement::PlacedBatch;
+use iggy_common::IggyTimestamp;
+use iggy_object_store::{
+    KeyLayout, LongTermKey, ManifestSegment, ObjectPrefix, ObjectStore, PutParts, SegmentKey,
+    SegmentObject, TierExecutor, TierJobCancelled, TierJobClass, TierJobRequest, TierScope,
+    TierScopeToken,
+};
+use journal::superblock::SuperblockStore;
+use message_bus::MessageBus;
+use tracing::{debug, warn};
+
+use crate::IggyPartition;
+use crate::Partition;
+use crate::iggy_index::IGGY_INDEX_SIZE;
+use crate::journal::MessageLookup;
+use crate::long_term::{LONG_TERM_SEGMENTS_MAX, LongTermLog, ObjectRegistration, REGISTER_OBJECT};
+use crate::placed_read::{BatchPiece, PlacedReadPlan, REWRITE_PACED_YIELD_BYTES};
+use crate::poll_plan::DiskFault;
+use crate::remote_segments::{ReadPolicy, RemoteRange, RemoteSegments};
+use crate::rewrite_share::{RewriteBudget, RewriteShare};
+use crate::segment_chain::{HashSource, SegmentHasher, SegmentRecord};
+use crate::segment_upload::{LogPut, UploadError, memory_body, store_segment};
+use crate::state_machine::CommandKind;
+use crate::state_transfer::ChunkHasher;
+
+/// Bytes of batches at which a rewrite ends its segment. The rewrite holds
+/// the batches of one segment in memory while it writes them.
+pub const LONG_TERM_SEGMENT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Bytes of a segment between two entries of its index.
+pub const INDEX_STRIDE_BYTES: u64 = 64 * 1024;
+
+/// Bytes of a segment that a rewrite sums at a time. The pieces it copies
+/// can be as short as a batch header, and blake3 and CRC32C cost less over
+/// one long run than over many short ones. A run takes no longer than the
+/// stride of a rewrite that keeps to its share.
+const SUM_STRIDE_BYTES: usize = REWRITE_PACED_YIELD_BYTES;
+
+/// One rewrite, as the partition's owner captured it.
+pub struct SegmentRewrite {
+    pub prefix: ObjectPrefix,
+    /// The first offset of the segment: the long-term floor plus one.
+    pub start_offset: u64,
+    /// The last offset of the segment, where its plan found it ends.
+    pub up_to: u64,
+    pub(crate) read: PlacedReadPlan,
+    /// The share of its shard's time that the rewrite keeps to, `None` for
+    /// a rewrite that keeps to none.
+    pub(crate) budget: Option<Rc<RewriteBudget>>,
+    /// Where the rewrite leaves the copy into the cache, `None` for one that
+    /// copies before it ends.
+    pub(crate) later_carry: Option<LaterCarry>,
+}
+
+/// The plan of a rewrite, as the partition's owner captured it: where the
+/// segment ends, found from the headers of its batches alone.
+pub struct SegmentPlan {
+    /// The first offset of the segment: the long-term floor plus one.
+    pub start_offset: u64,
+    /// The last offset the segment may hold: the commit point.
+    pub up_to: u64,
+    pub(crate) read: PlacedReadPlan,
+}
+
+/// The offsets of the segment a plan found, which name its object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlannedSegment {
+    pub start_offset: u64,
+    pub end_offset: u64,
+}
+
+/// What a rewrite pass over a partition starts.
+pub enum RewriteStart {
+    /// Run this plan off the pump, and hand its result to
+    /// [`IggyPartition::finish_segment_plan`] with the number.
+    Plan(u64, SegmentPlan),
+    /// Commit this registration of the segment the rewrite stores. The pass
+    /// after it commits starts the rewrite.
+    Register(ObjectRegistration),
+    /// Run this rewrite under the scope of the token, and hand its result to
+    /// [`IggyPartition::finish_segment_rewrite`] with the number.
+    Rewrite(u64, SegmentRewrite, TierScopeToken),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RewriteError {
+    /// A batch could not be read, from the disk or from the object store.
+    #[error("cannot read the batches to rewrite: {0:?}")]
+    Read(DiskFault),
+    /// The batches read are not the run of offsets the segment needs.
+    #[error("the batches read from offset {expected} continue at {found:?}")]
+    Gap { expected: u64, found: Option<u64> },
+    /// The batches end elsewhere than the registered segment does, so
+    /// nothing is stored under offsets the log may never list.
+    #[error("the batches end at offset {end_offset}, not where the registered segment ends")]
+    Unregistered { end_offset: u64 },
+    #[error(transparent)]
+    Upload(UploadError),
+}
+
+/// What a rewrite ended as: the segment it stored, or why it stored none,
+/// or a cancellation before it finished.
+pub type RewriteOutcome = Result<Result<ManifestSegment, RewriteError>, TierJobCancelled>;
+
+/// Where a rewrite leaves the copy of the end of its segment into the
+/// shard's cache, for the caller to run once it reported the segment.
+///
+/// The copy keeps to the rewrite's share and can sleep, and the store holds
+/// the segment already. See [`SegmentRewrite::carrying_later`].
+#[derive(Clone, Default)]
+pub struct LaterCarry(Rc<RefCell<Option<CacheCarry>>>);
+
+impl LaterCarry {
+    /// The copy the rewrite left, once it stored its segment.
+    #[must_use]
+    pub fn take(&self) -> Option<CacheCarry> {
+        self.0.borrow_mut().take()
+    }
+}
+
+/// The end of a stored long-term segment, for the shard's cache, see
+/// [`LaterCarry`].
+pub struct CacheCarry {
+    remote: Rc<RemoteSegments>,
+    segment: RemoteRange,
+    log: Bytes,
+    index: Bytes,
+    /// What the segment's partition reads with when the copy runs.
+    policy: ReadPolicy,
+    budget: Option<Rc<RewriteBudget>>,
+}
+
+impl CacheCarry {
+    /// Copy the end of the segment into the cache.
+    pub async fn run(self) {
+        let mut share = self
+            .budget
+            .map_or_else(RewriteShare::unpaced, RewriteShare::paced);
+        self.remote
+            .carry_long_term(
+                &self.segment,
+                &self.log,
+                &self.index,
+                &self.policy.current(),
+                &mut share,
+            )
+            .await;
+    }
+}
+
+/// Runs the rewrites of a shard, behind a pointer, so the shard does not
+/// carry the executor's type.
+pub trait LongTermWriter {
+    /// Run `rewrite` under `scope`. The rewrite stops when the scope is
+    /// cancelled, as when its partition loses primacy.
+    fn write(
+        &self,
+        rewrite: SegmentRewrite,
+        scope: TierScopeToken,
+    ) -> LocalBoxFuture<'static, RewriteOutcome>;
+}
+
+/// Rewrites through a tier executor, in its upload class.
+pub struct ExecutorLongTermWriter<E> {
+    executor: E,
+    layout: KeyLayout,
+}
+
+impl<E> ExecutorLongTermWriter<E> {
+    #[must_use]
+    pub const fn new(executor: E, layout: KeyLayout) -> Self {
+        Self { executor, layout }
+    }
+
+    /// The executor the rewrites go through.
+    #[must_use]
+    pub const fn executor(&self) -> &E {
+        &self.executor
+    }
+}
+
+impl<E: TierExecutor> LongTermWriter for ExecutorLongTermWriter<E> {
+    fn write(
+        &self,
+        rewrite: SegmentRewrite,
+        scope: TierScopeToken,
+    ) -> LocalBoxFuture<'static, RewriteOutcome> {
+        let layout = self.layout.clone();
+        let request = TierJobRequest::new(TierJobClass::Upload, scope)
+            .with_bytes(LONG_TERM_SEGMENT_BYTES as u64);
+        self.executor
+            .submit(request, move |store: Rc<E::Store>| async move {
+                rewrite.run(&*store, &layout).await
+            })
+            .boxed_local()
+    }
+}
+
+impl SegmentRewrite {
+    /// Keep the rewrite to the share of its shard's time of `budget`.
+    #[must_use]
+    pub fn paced_by(self, budget: Rc<RewriteBudget>) -> Self {
+        Self {
+            budget: Some(budget),
+            ..self
+        }
+    }
+
+    /// Leave the copy of the end of the segment into the cache in the
+    /// returned slot, for the caller to run once it reported the segment,
+    /// rather than copy it before the rewrite ends.
+    #[must_use]
+    pub fn carrying_later(self) -> (Self, LaterCarry) {
+        let later = LaterCarry::default();
+        let rewrite = Self {
+            later_carry: Some(later.clone()),
+            ..self
+        };
+        (rewrite, later)
+    }
+
+    /// Read the batches into the segment's bytes, summing them as they are
+    /// copied, and store the segment and its index from memory.
+    ///
+    /// Nothing is written to the disk. A stored segment whose command is
+    /// lost is found again in the store by the rewrite that repeats it, so
+    /// a local copy would guard nothing.
+    async fn run<S: ObjectStore>(
+        self,
+        store: &S,
+        layout: &KeyLayout,
+    ) -> Result<ManifestSegment, RewriteError> {
+        let placed = placed_batches(&self.read, self.start_offset, self.up_to).await?;
+        let built = BuiltSegment::of(self.start_offset, &placed)?;
+        if built.end_offset != self.up_to {
+            return Err(RewriteError::Unregistered {
+                end_offset: built.end_offset,
+            });
+        }
+        let mut log = SegmentBytes::sized(built.size)?;
+        let mut share = self
+            .budget
+            .map_or_else(RewriteShare::unpaced, RewriteShare::paced);
+        self.read
+            .read_blobs(&placed, |piece| log.push(piece), &mut share)
+            .await
+            .map_err(RewriteError::Read)?;
+        drop(placed);
+        let (log, sums) = log.finish();
+        if log.len() as u64 != built.size {
+            return Err(RewriteError::Read(DiskFault::Unreadable));
+        }
+        let hashes = sums.finalize();
+        let record = SegmentRecord {
+            start_offset: self.start_offset,
+            end_offset: built.end_offset,
+            start_timestamp: built.start_timestamp,
+            end_timestamp: built.end_timestamp,
+            max_timestamp: built.max_timestamp,
+            size: built.size,
+            incarnation: 0,
+            hash: hashes.blake3,
+            crc32c: hashes.crc32c,
+            source: HashSource::CommitPath,
+        };
+        let log = Bytes::from(log);
+        let index = Bytes::from(built.index);
+        let key = |object| {
+            layout.long_term_key(&LongTermKey {
+                prefix: self.prefix,
+                start_offset: record.start_offset,
+                end_offset: record.end_offset,
+                object,
+            })
+        };
+        let index_crc32c = crc32c::crc32c(&index);
+        share
+            .wait_for_store(store_segment(
+                store,
+                &record,
+                LogPut {
+                    key: key(SegmentObject::Log),
+                    body: future::ready(Ok(memory_body(&log))),
+                    // The one put of a large object that no producer waits for,
+                    // where the round trips of an upload in parts pay off.
+                    parts: PutParts::Allowed,
+                },
+                &key(SegmentObject::Index),
+                future::ready(Ok(memory_body(&index))),
+                index_crc32c,
+            ))
+            .await
+            .map_err(RewriteError::Upload)?;
+        let carry = self.read.remote.map(|remote| CacheCarry {
+            remote,
+            segment: RemoteRange {
+                key: SegmentKey {
+                    prefix: self.prefix,
+                    start_offset: record.start_offset,
+                    object: SegmentObject::Log,
+                },
+                keyed_end_offset: Some(record.end_offset),
+                range: 0..record.size,
+            },
+            log,
+            index,
+            policy: self.read.read_settings.clone(),
+            budget: share.budget(),
+        });
+        match (self.later_carry, carry) {
+            (Some(later), carry) => *later.0.borrow_mut() = carry,
+            (None, Some(carry)) => carry.run().await,
+            (None, None) => {}
+        }
+        Ok(ManifestSegment {
+            start_offset: record.start_offset,
+            end_offset: record.end_offset,
+            start_timestamp: record.start_timestamp,
+            end_timestamp: record.end_timestamp,
+            max_timestamp: record.max_timestamp,
+            size: record.size,
+            crc32c: record.crc32c,
+            hash: record.hash,
+        })
+    }
+}
+
+impl SegmentPlan {
+    /// Read the headers of the batches from the long-term floor on, and
+    /// find where the segment of the rewrite ends. The messages are not
+    /// read.
+    ///
+    /// # Errors
+    /// Returns an error when the batches cannot be read, or leave a gap.
+    pub async fn run(self) -> Result<PlannedSegment, RewriteError> {
+        let placed = placed_batches(&self.read, self.start_offset, self.up_to).await?;
+        let built = BuiltSegment::of(self.start_offset, &placed)?;
+        Ok(PlannedSegment {
+            start_offset: self.start_offset,
+            end_offset: built.end_offset,
+        })
+    }
+}
+
+/// The batches of a segment from `start_offset` on, up to `up_to` or
+/// [`LONG_TERM_SEGMENT_BYTES`], whichever comes first. The same batches for
+/// the plan and for the rewrite of the offsets it found.
+async fn placed_batches(
+    read: &PlacedReadPlan,
+    start_offset: u64,
+    up_to: u64,
+) -> Result<Vec<PlacedBatch>, RewriteError> {
+    let query = MessageLookup::Offset {
+        offset: start_offset,
+        count: u32::MAX,
+        ceiling: up_to,
+    };
+    read.placed_batches(query, LONG_TERM_SEGMENT_BYTES)
+        .await
+        .map_err(RewriteError::Read)
+}
+
+/// What a run of whole batches makes as one segment.
+struct BuiltSegment {
+    end_offset: u64,
+    start_timestamp: u64,
+    end_timestamp: u64,
+    max_timestamp: u64,
+    size: u64,
+    index: Vec<u8>,
+}
+
+impl BuiltSegment {
+    /// The segment of `batches`, which must hold every offset from
+    /// `start_offset` on without a gap.
+    fn of(start_offset: u64, batches: &[PlacedBatch]) -> Result<Self, RewriteError> {
+        let mut next_offset = start_offset;
+        let mut built: Option<Self> = None;
+        let mut index = SegmentIndex::default();
+        for batch in batches {
+            let header = &batch.header;
+            // The bytes of the segment are sized by the headers and filled
+            // by the placements, so the two have to agree.
+            if header.batch_length != BATCH_HEADER_SIZE as u64 + batch.placement.length {
+                return Err(RewriteError::Read(DiskFault::Unreadable));
+            }
+            if header.base_offset != next_offset || header.message_count == 0 {
+                return Err(RewriteError::Gap {
+                    expected: next_offset,
+                    found: Some(header.base_offset),
+                });
+            }
+            index.push(
+                header.base_offset,
+                header.base_timestamp,
+                header.batch_length,
+            );
+            let end_offset = header.base_offset + u64::from(header.message_count) - 1;
+            let timestamp = header.base_timestamp;
+            let size = index.position();
+            next_offset = end_offset + 1;
+            built = Some(built.map_or(
+                Self {
+                    end_offset,
+                    start_timestamp: timestamp,
+                    end_timestamp: timestamp,
+                    max_timestamp: timestamp,
+                    size,
+                    index: Vec::new(),
+                },
+                |previous| Self {
+                    end_offset,
+                    end_timestamp: timestamp,
+                    max_timestamp: previous.max_timestamp.max(timestamp),
+                    size,
+                    ..previous
+                },
+            ));
+        }
+        let index = index.into_bytes();
+        debug_assert_eq!(index.len() % IGGY_INDEX_SIZE, 0);
+        built
+            .map(|built| Self { index, ..built })
+            .ok_or(RewriteError::Gap {
+                expected: start_offset,
+                found: None,
+            })
+    }
+}
+
+/// The index of a long-term segment, built from its batches in the order
+/// the segment holds them. It depends on nothing but the bytes of the
+/// segment, so every writer of the same segment builds the same index.
+#[derive(Default)]
+pub struct SegmentIndex {
+    /// The bytes of the segment before the next batch.
+    position: u64,
+    /// Where the batch of the last entry starts.
+    indexed_at: Option<u64>,
+    entries: Vec<u8>,
+}
+
+impl SegmentIndex {
+    /// Take the next batch of the segment. The first batch gets an entry,
+    /// and so does each batch that starts [`INDEX_STRIDE_BYTES`] or more
+    /// after the batch of the entry before.
+    pub fn push(&mut self, base_offset: u64, base_timestamp: u64, batch_length: u64) {
+        if self
+            .indexed_at
+            .is_none_or(|indexed| self.position - indexed >= INDEX_STRIDE_BYTES)
+        {
+            self.indexed_at = Some(self.position);
+            for field in [base_offset, base_timestamp, self.position] {
+                self.entries.extend_from_slice(&field.to_le_bytes());
+            }
+        }
+        self.position += batch_length;
+    }
+
+    /// The bytes of the batches taken so far.
+    pub const fn position(&self) -> u64 {
+        self.position
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.entries
+    }
+}
+
+pub async fn write_file(path: &str, bytes: Vec<u8>) -> io::Result<()> {
+    let mut file = compio::fs::File::create(path).await?;
+    let compio::BufResult(written, _) = file.write_all_at(bytes, 0).await;
+    written?;
+    file.sync_all().await
+}
+
+/// The bytes of a segment as its batches are put back together, and the
+/// sums of those bytes, taken [`SUM_STRIDE_BYTES`] at a time as they are
+/// copied in, while they are still in the cache.
+struct SegmentBytes {
+    bytes: Vec<u8>,
+    /// The bytes at the start of [`Self::bytes`] that the sums took.
+    summed: usize,
+    hasher: SegmentHasher,
+}
+
+impl SegmentBytes {
+    /// An empty segment with room for `size` bytes, so that no batch moves
+    /// the ones before it.
+    fn sized(size: u64) -> Result<Self, RewriteError> {
+        let size = usize::try_from(size).map_err(|_| RewriteError::Read(DiskFault::Unreadable))?;
+        Ok(Self {
+            bytes: Vec::with_capacity(size),
+            summed: 0,
+            hasher: SegmentHasher::default(),
+        })
+    }
+
+    /// Append `piece` of the next batch.
+    fn push(&mut self, piece: BatchPiece<'_>) {
+        let start = self.bytes.len();
+        match piece {
+            BatchPiece::Header(header) => {
+                self.bytes.resize(start + BATCH_HEADER_SIZE, 0);
+                header.encode_into(&mut self.bytes[start..]);
+            }
+            BatchPiece::Messages(messages) => self.bytes.extend_from_slice(messages),
+        }
+        while self.bytes.len() - self.summed >= SUM_STRIDE_BYTES {
+            let end = self.summed + SUM_STRIDE_BYTES;
+            self.hasher.update(&self.bytes[self.summed..end]);
+            self.summed = end;
+        }
+    }
+
+    /// The bytes of the segment and their sums.
+    fn finish(mut self) -> (Vec<u8>, SegmentHasher) {
+        self.sum_rest();
+        (self.bytes, self.hasher)
+    }
+
+    fn sum_rest(&mut self) {
+        self.hasher.update(&self.bytes[self.summed..]);
+        self.summed = self.bytes.len();
+    }
+}
+
+/// What a replica keeps of its rewrites while it is the primary of a
+/// partition that places its batches. Nothing here is persisted.
+#[derive(Default)]
+pub struct LongTermRewrites {
+    /// The view this state belongs to, `None` until the replica acts as the
+    /// primary.
+    view: Option<u32>,
+    /// The rewrite in flight: its number and the scope whose end stops it.
+    running: Option<(u64, TierScope)>,
+    /// A segment the store holds that the long-term log does not yet. Its
+    /// command is sent again until the log ends with it.
+    stored: Option<ManifestSegment>,
+    /// The segment this view's last plan found, registered at the time it
+    /// carries. Its rewrite stores it once the log holds the registration.
+    planned: Option<ObjectRegistration>,
+    /// The commit point the last plan started at.
+    committed_at_start: u64,
+    /// Whether a registration committed on this primary since the last
+    /// call to [`IggyPartition::take_long_term_registered`].
+    registered: Cell<bool>,
+}
+
+/// Bytes of the batches a partition committed above its long-term floor,
+/// as their headers state them: what its rewrites have yet to store.
+///
+/// A walk of the log above the floor counts them once. From then on the
+/// commits add to the count and the floor advances take from it, on a
+/// backup as on the primary, so a new primary has the count already.
+#[derive(Debug, Default)]
+pub struct LongTermBacklog {
+    /// `None` until a walk counted the backlog.
+    bytes: Option<u64>,
+    /// What commits added and floor advances took since the running walk
+    /// took its snapshot.
+    walk: Option<BacklogChanges>,
+    /// Number of the last walk, so the count of one started before a reset
+    /// is dropped.
+    walks: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct BacklogChanges {
+    added: u64,
+    taken: u64,
+}
+
+impl LongTermBacklog {
+    /// A batch of `bytes` committed.
+    pub(crate) const fn add(&mut self, bytes: u64) {
+        if let Some(backlog) = &mut self.bytes {
+            *backlog = backlog.saturating_add(bytes);
+        } else if let Some(walk) = &mut self.walk {
+            walk.added = walk.added.saturating_add(bytes);
+        }
+    }
+
+    /// The floor moved past a segment of `bytes`.
+    const fn take(&mut self, bytes: u64) {
+        if let Some(backlog) = &mut self.bytes {
+            *backlog = backlog.saturating_sub(bytes);
+        } else if let Some(walk) = &mut self.walk {
+            walk.taken = walk.taken.saturating_add(bytes);
+        }
+    }
+
+    /// Drop the count and the walk that runs, so the next walk counts again.
+    pub(crate) const fn forget(&mut self) {
+        self.bytes = None;
+        self.walk = None;
+    }
+}
+
+/// A count of the bytes of a partition's committed batches above its
+/// long-term floor, as the partition's owner captured it.
+pub struct BacklogWalk {
+    from: u64,
+    up_to: u64,
+    read: PlacedReadPlan,
+}
+
+impl BacklogWalk {
+    /// Read the headers of the batches and add up their lengths. `None` when
+    /// the log could not be read.
+    pub async fn run(self) -> Option<u64> {
+        self.read
+            .batch_bytes(self.from, self.up_to)
+            .await
+            .inspect_err(|fault| {
+                debug!(
+                    from = self.from,
+                    up_to = self.up_to,
+                    ?fault,
+                    "counting the long-term backlog failed and is tried again"
+                );
+            })
+            .ok()
+    }
+}
+
+impl<B, SB> IggyPartition<B, SB>
+where
+    B: MessageBus,
+    SB: SuperblockStore,
+{
+    /// Take the next step of the rewrite of the committed batches above the
+    /// long-term floor, when this replica is the primary of a partition that
+    /// places its batches, none is in flight, and a batch is there to
+    /// rewrite.
+    ///
+    /// The first step is a plan, which finds where the segment ends. Its
+    /// registration is the next, and the caller commits it. The rewrite
+    /// starts once the log holds it, and stores exactly the offsets the plan
+    /// found. A log that takes no more registrations gets the rewrite without
+    /// one, so the floor still moves.
+    ///
+    /// A replica that is not the primary cancels the rewrite it started, so
+    /// a pass over a demoted replica is what stops it.
+    pub fn begin_segment_rewrite(&mut self) -> Option<RewriteStart> {
+        if !self.places_batches() || !self.state_machines_current() {
+            *self.long_term_rewrites = LongTermRewrites::default();
+            return None;
+        }
+        // The log refuses a segment past this, and a stored segment whose
+        // command is refused holds back every later rewrite.
+        if self.long_term_segments().len() >= LONG_TERM_SEGMENTS_MAX {
+            return None;
+        }
+        let floor = self.long_term_floor();
+        let offsets = self.offsets();
+        let committed = self
+            .holds_committed_messages()
+            .then_some(offsets.commit_offset);
+        let rewrites = self.long_term_rewrites_of_this_view();
+        if rewrites
+            .stored
+            .is_some_and(|stored| floor >= Some(stored.end_offset))
+        {
+            rewrites.stored = None;
+        }
+        if rewrites.running.is_some() || rewrites.stored.is_some() {
+            return None;
+        }
+        let start_offset = floor.map_or(0, |floor| floor.saturating_add(1));
+        let committed = committed.filter(|committed| *committed >= start_offset)?;
+        // A plan from below the floor named a segment that was published.
+        rewrites.planned = rewrites
+            .planned
+            .filter(|planned| planned.start_offset == start_offset);
+        let Some(planned) = rewrites.planned else {
+            let (id, _token) = self.start_rewrite_job(Some(committed));
+            let plan = SegmentPlan {
+                start_offset,
+                up_to: committed,
+                read: self.placed_read_plan(None),
+            };
+            return Some(RewriteStart::Plan(id, plan));
+        };
+        let log = self.long_term_log()?;
+        let stores = log
+            .registration(planned.start_offset, planned.end_offset)
+            .map_or_else(
+                || log.registrations_full(),
+                // A registration of an earlier view keeps the later time.
+                |held| held.registered_at >= planned.registered_at,
+            );
+        if !stores {
+            return Some(RewriteStart::Register(planned));
+        }
+        let (id, token) = self.start_rewrite_job(None);
+        let rewrite = SegmentRewrite {
+            prefix: crate::object_prefix(self.namespace(), self.created_revision()),
+            start_offset,
+            up_to: planned.end_offset,
+            read: self.placed_read_plan(None),
+            budget: None,
+            later_carry: None,
+        };
+        Some(RewriteStart::Rewrite(id, rewrite, token))
+    }
+
+    /// Take the result of the plan numbered `id`, which ended at `now`, and
+    /// return the registration of the segment it found, which the caller
+    /// commits to the long-term log. A result of a plan this partition does
+    /// not wait for, or one that arrives after primacy moved, changes
+    /// nothing. A plan that failed is repeated by a later pass.
+    pub fn finish_segment_plan(
+        &mut self,
+        id: u64,
+        outcome: Result<PlannedSegment, RewriteError>,
+        now: IggyTimestamp,
+    ) -> Option<ObjectRegistration> {
+        if !self.awaits_rewrite_job(id) {
+            return None;
+        }
+        let next_start = self.long_term_log().map_or(0, LongTermLog::next_start);
+        let namespace_raw = self.namespace().inner();
+        let rewrites = &mut self.long_term_rewrites;
+        rewrites.running = None;
+        match outcome {
+            Ok(planned) if planned.start_offset == next_start => {
+                let registration = ObjectRegistration {
+                    start_offset: planned.start_offset,
+                    end_offset: planned.end_offset,
+                    registered_at: now.as_micros(),
+                };
+                rewrites.planned = Some(registration);
+                Some(registration)
+            }
+            Ok(_) => None,
+            Err(error) => {
+                warn!(
+                    namespace_raw,
+                    %error,
+                    "finding where the partition's next long-term segment ends failed and is tried again"
+                );
+                None
+            }
+        }
+    }
+
+    /// Take the result of the rewrite numbered `id`, and return the segment
+    /// it stored, which the caller commits to the long-term log. A result of
+    /// a rewrite this partition does not wait for, or one that arrives after
+    /// primacy moved, changes nothing. A rewrite that failed is repeated by
+    /// a later pass.
+    pub fn finish_segment_rewrite(
+        &mut self,
+        id: u64,
+        outcome: RewriteOutcome,
+    ) -> Option<ManifestSegment> {
+        if !self.awaits_rewrite_job(id) {
+            return None;
+        }
+        let namespace_raw = self.namespace().inner();
+        let rewrites = &mut self.long_term_rewrites;
+        rewrites.running = None;
+        match outcome {
+            Ok(Ok(segment)) => {
+                rewrites.stored = Some(segment);
+                debug!(
+                    namespace_raw,
+                    start_offset = segment.start_offset,
+                    end_offset = segment.end_offset,
+                    size = segment.size,
+                    "stored a long-term segment of the partition"
+                );
+                Some(segment)
+            }
+            Ok(Err(error)) => {
+                // The next pass plans again rather than repeat a rewrite
+                // that cannot store what was registered.
+                if matches!(error, RewriteError::Unregistered { .. }) {
+                    rewrites.planned = None;
+                }
+                warn!(
+                    namespace_raw,
+                    %error,
+                    "rewriting the partition's batches into a long-term segment failed and is tried again"
+                );
+                None
+            }
+            Err(TierJobCancelled) => None,
+        }
+    }
+
+    /// Whether a registration committed on this primary since the last
+    /// call. The rewrite or the merge that waited for it is due.
+    pub fn take_long_term_registered(&self) -> bool {
+        self.long_term_rewrites.registered.take()
+    }
+
+    /// A command of `kind` changed the long-term log. A registration leaves
+    /// the manifest as it is, so only this says that it committed.
+    pub(crate) fn note_long_term_registration(&self, kind: CommandKind) {
+        if kind == REGISTER_OBJECT && self.consensus().is_primary() {
+            self.long_term_rewrites.registered.set(true);
+        }
+    }
+
+    /// The segment the store holds that the long-term log does not end with
+    /// yet, whose command the primary sends until it does.
+    #[must_use]
+    pub fn unpublished_segment(&self) -> Option<ManifestSegment> {
+        let rewrites = &self.long_term_rewrites;
+        rewrites.stored.filter(|stored| {
+            rewrites.view == Some(self.consensus().view())
+                && self.state_machines_current()
+                && self.long_term_floor() < Some(stored.end_offset)
+        })
+    }
+
+    /// Whether the segment the last rewrite stored holds every message that
+    /// was committed when the rewrite started. A segment that ended earlier
+    /// has more behind it.
+    #[must_use]
+    pub fn stored_segment_reached_commit(&self) -> bool {
+        let rewrites = &self.long_term_rewrites;
+        rewrites
+            .stored
+            .is_none_or(|stored| stored.end_offset >= rewrites.committed_at_start)
+    }
+
+    /// Whether a plan or a rewrite this partition started has yet to hand
+    /// its result back.
+    #[must_use]
+    pub fn segment_rewrite_running(&self) -> bool {
+        self.long_term_rewrites.running.is_some()
+    }
+
+    /// Messages this partition committed that no long-term segment holds.
+    /// Zero on a replica that is not the primary of a partition that places
+    /// its batches: the primary is the one that rewrites them.
+    #[must_use]
+    pub fn long_term_lag(&self) -> u64 {
+        if !self.places_batches()
+            || !self.consensus().is_primary()
+            || !self.holds_committed_messages()
+        {
+            return 0;
+        }
+        let committed = self.offsets().commit_offset.saturating_add(1);
+        let rewritten = self
+            .long_term_floor()
+            .map_or(0, |floor| floor.saturating_add(1));
+        committed.saturating_sub(rewritten)
+    }
+
+    /// Bytes of the batches this partition committed above its long-term
+    /// floor, `None` until a walk counted them.
+    #[must_use]
+    pub fn long_term_backlog(&self) -> Option<u64> {
+        self.long_term_backlog.bytes
+    }
+
+    /// Start counting [`Self::long_term_backlog`] on a partition that places
+    /// its batches and has no count: a walk of the committed batches above
+    /// the floor, which the caller runs off the pump and hands back to
+    /// [`Self::finish_backlog_walk`] with the returned number. What commits
+    /// and floor advances change meanwhile is added to the walk's count.
+    pub fn begin_backlog_walk(&mut self) -> Option<(u64, BacklogWalk)> {
+        let backlog = &self.long_term_backlog;
+        if !self.places_batches() || backlog.bytes.is_some() || backlog.walk.is_some() {
+            return None;
+        }
+        let from = self
+            .long_term_floor()
+            .map_or(0, |floor| floor.saturating_add(1));
+        let committed = self
+            .holds_committed_messages()
+            .then_some(self.offsets().commit_offset)
+            .filter(|committed| *committed >= from);
+        let Some(up_to) = committed else {
+            self.long_term_backlog.bytes = Some(0);
+            return None;
+        };
+        let read = self.placed_read_plan(None);
+        let backlog = &mut self.long_term_backlog;
+        backlog.walks += 1;
+        backlog.walk = Some(BacklogChanges::default());
+        Some((backlog.walks, BacklogWalk { from, up_to, read }))
+    }
+
+    /// Take the count of the walk numbered `id`: `None` for a walk that could
+    /// not read the log, which a later pass starts again. The count of a
+    /// walk this partition does not wait for changes nothing.
+    pub fn finish_backlog_walk(&mut self, id: u64, counted: Option<u64>) {
+        let backlog = &mut self.long_term_backlog;
+        if id != backlog.walks {
+            return;
+        }
+        let Some(changes) = backlog.walk.take() else {
+            return;
+        };
+        backlog.bytes = counted.map(|counted| {
+            counted
+                .saturating_add(changes.added)
+                .saturating_sub(changes.taken)
+        });
+    }
+
+    /// A command applied to the long-term log, which ended at `floor`
+    /// before it. When the floor moved, the bytes of the segment it moved
+    /// past leave the backlog, and so do the proof rows of its batches.
+    pub(crate) fn note_long_term_advance(&mut self, floor: Option<u64>) {
+        if self.long_term_floor() <= floor {
+            return;
+        }
+        if let Some(size) = self.long_term_segments().last().map(|segment| segment.size) {
+            self.long_term_backlog.take(size);
+        }
+        self.prune_proof_rows();
+        self.note_long_term_floor_to_cache();
+    }
+
+    /// Tell the shard's cache where the long-term floor stands, so it lets go
+    /// of the fresh objects whose batches of this partition the floor
+    /// passed.
+    pub(crate) fn note_long_term_floor_to_cache(&self) {
+        if let (Some(remote), Some(floor)) = (self.remote_segments(), self.long_term_floor()) {
+            remote.note_long_term_floor(self.namespace(), floor);
+        }
+    }
+
+    /// The rewrite state of the current view. What an earlier view left is
+    /// dropped, and its rewrite cancelled.
+    fn long_term_rewrites_of_this_view(&mut self) -> &mut LongTermRewrites {
+        let view = self.consensus().view();
+        if self.long_term_rewrites.view != Some(view) {
+            *self.long_term_rewrites = LongTermRewrites {
+                view: Some(view),
+                ..LongTermRewrites::default()
+            };
+        }
+        &mut self.long_term_rewrites
+    }
+
+    /// Number the next plan or rewrite and take it as in flight. A plan
+    /// also notes the commit point it starts at. The numbers go on across
+    /// views, so the late result of an earlier view's plan or rewrite is
+    /// never taken for the one in flight.
+    fn start_rewrite_job(&mut self, committed: Option<u64>) -> (u64, TierScopeToken) {
+        let scope = TierScope::new();
+        let token = scope.token();
+        self.long_term_rewrite_jobs += 1;
+        let id = self.long_term_rewrite_jobs;
+        let rewrites = &mut self.long_term_rewrites;
+        rewrites.running = Some((id, scope));
+        if let Some(committed) = committed {
+            rewrites.committed_at_start = committed;
+        }
+        (id, token)
+    }
+
+    /// Whether the plan or the rewrite numbered `id` is the one in flight,
+    /// in the view that started it. A result that arrives after primacy
+    /// moved drops what the view kept.
+    fn awaits_rewrite_job(&mut self, id: u64) -> bool {
+        let awaited = self
+            .long_term_rewrites
+            .running
+            .as_ref()
+            .is_some_and(|(running, _)| *running == id);
+        if !awaited {
+            return false;
+        }
+        if !self.state_machines_current()
+            || self.long_term_rewrites.view != Some(self.consensus().view())
+        {
+            *self.long_term_rewrites = LongTermRewrites::default();
+            return false;
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ops::Range;
+
+    use iggy_binary_protocol::batch::BatchHeader;
+    use iggy_binary_protocol::placement::{PLACED_BATCH_SIZE, Placement};
+    use iggy_object_store::{
+        DeleteOutcome, ListPage, ListRequest, MemoryStore, ObjectMeta, ObjectRange,
+        ObjectStoreError, PutBody, PutOptions,
+    };
+
+    use crate::placed_read::{PlacedSegment, REWRITE_YIELD_BYTES};
+    use crate::poll_plan::PartitionDirResolution;
+    use crate::rewrite_share::{ManualClock, RewriteClock};
+    use crate::{ReadCache, ReadCacheSettings, RemoteObjects, RemoteSegments};
+
+    fn batch(base_offset: u64, blob: &[u8]) -> PlacedBatch {
+        let mut header = BatchHeader::new(0, 0, (BATCH_HEADER_SIZE + blob.len()) as u64, 1);
+        header.base_offset = base_offset;
+        PlacedBatch::new(header, Placement::of(1, 0, blob, 0))
+    }
+
+    /// The sums are taken a stride at a time as the pieces come in, never
+    /// more than a stride in one run, and come out as one pass over the
+    /// segment gives them. No piece moves the bytes before it.
+    #[test]
+    fn given_batches_when_putting_a_segment_together_should_sum_it_in_strides_and_move_none() {
+        let blobs = [
+            vec![1_u8; 700],
+            vec![2; 3],
+            vec![3; SUM_STRIDE_BYTES + 4096],
+            vec![4; 2 * SUM_STRIDE_BYTES + 5],
+        ];
+        let placed: Vec<_> = (0..)
+            .zip(&blobs)
+            .map(|(at, blob)| batch(at, blob))
+            .collect();
+        let built = BuiltSegment::of(0, &placed).unwrap();
+        let mut log = SegmentBytes::sized(built.size).unwrap();
+        let (start, capacity) = (log.bytes.as_ptr(), log.bytes.capacity());
+
+        for (placed, blob) in placed.iter().zip(&blobs) {
+            log.push(BatchPiece::Header(&placed.header));
+            for messages in blob.chunks(100_000) {
+                log.push(BatchPiece::Messages(messages));
+                assert_eq!(log.summed % SUM_STRIDE_BYTES, 0);
+                assert!(log.bytes.len() - log.summed < SUM_STRIDE_BYTES);
+            }
+        }
+
+        let (bytes, sums) = log.finish();
+        assert_eq!(bytes.len() as u64, built.size);
+        assert_eq!((bytes.as_ptr(), bytes.capacity()), (start, capacity));
+        let mut expected = Vec::new();
+        for (placed, blob) in placed.iter().zip(&blobs) {
+            let mut header = [0; BATCH_HEADER_SIZE];
+            placed.header.encode_into(&mut header);
+            expected.extend_from_slice(&header);
+            expected.extend_from_slice(blob);
+        }
+        assert_eq!(bytes, expected);
+        let mut one_pass = SegmentHasher::default();
+        one_pass.update(&expected);
+        let (sums, one_pass) = (sums.finalize(), one_pass.finalize());
+        assert_eq!(
+            (sums.crc32c, sums.blake3),
+            (one_pass.crc32c, one_pass.blake3)
+        );
+    }
+
+    const OBJECT_ID: u128 = 1;
+
+    fn layout() -> KeyLayout {
+        KeyLayout::new("iggy").unwrap()
+    }
+
+    const fn prefix() -> ObjectPrefix {
+        ObjectPrefix {
+            stream_id: 1,
+            topic_id: 1,
+            partition_id: 0,
+            created_revision: 0,
+        }
+    }
+
+    /// Batches of one message from offset 0 on, one with a blob of each
+    /// length of `blob_lens`, and the fresh object that holds the blobs back
+    /// to back.
+    fn placed_object(blob_lens: &[usize]) -> (Bytes, Vec<PlacedBatch>) {
+        let mut object = Vec::new();
+        let placed = (0..)
+            .zip(blob_lens)
+            .map(|(offset, &len)| {
+                let position = object.len() as u64;
+                object.extend((0..len).map(|at| u8::try_from((at + offset) % 251).unwrap()));
+                let blob = &object[object.len() - len..];
+                let mut header = BatchHeader::new(0, 0, (BATCH_HEADER_SIZE + len) as u64, 1);
+                header.base_offset = offset as u64;
+                header.base_timestamp = 1_000 + offset as u64;
+                PlacedBatch::new(header, Placement::of(OBJECT_ID, position, blob, 0))
+            })
+            .collect();
+        (Bytes::from(object), placed)
+    }
+
+    /// The rewrite of every batch of `placed`, which reads their records
+    /// from a segment file it writes in `directory`, and their blobs through
+    /// `remote`.
+    fn rewrite_of(
+        directory: &std::path::Path,
+        placed: &[PlacedBatch],
+        remote: Rc<RemoteSegments>,
+    ) -> SegmentRewrite {
+        let mut records = vec![0; placed.len() * PLACED_BATCH_SIZE];
+        for (record, placed) in records.chunks_mut(PLACED_BATCH_SIZE).zip(placed) {
+            placed.encode_into(record);
+        }
+        std::fs::write(directory.join(format!("{:020}.log", 0)), &records).unwrap();
+        let last = placed.last().unwrap().header;
+        SegmentRewrite {
+            prefix: prefix(),
+            start_offset: 0,
+            up_to: last.base_offset,
+            budget: None,
+            later_carry: None,
+            read: PlacedReadPlan {
+                partition_dir: PartitionDirResolution::Resolved(
+                    directory.to_string_lossy().into_owned(),
+                ),
+                segments: vec![PlacedSegment {
+                    start_offset: 0,
+                    end_offset: last.base_offset,
+                    max_timestamp: last.base_timestamp,
+                    size: records.len() as u64,
+                }],
+                resident: Vec::new(),
+                remote: Some(remote),
+                deadline: None,
+                prefix: prefix(),
+                long_term: Vec::new(),
+                long_term_floor: None,
+                long_term_next: None,
+                read_settings: ReadPolicy::default(),
+            },
+        }
+    }
+
+    async fn stored_bytes(store: &MemoryStore, key: &str, len: u64) -> Bytes {
+        ObjectStore::get_range(store, key, 0..len)
+            .await
+            .unwrap()
+            .bytes
+    }
+
+    /// A rewrite sums the bytes of its segment in strides, where it summed
+    /// each piece as it was copied in before. Its segment is the same either
+    /// way: the same `.log` and `.index`, and the same CRC32C and blake3 for
+    /// the manifest, whether the blobs come from the store or from the
+    /// shard's own upload. A blob never spans two fresh objects: a send is
+    /// never split.
+    #[compio::test]
+    async fn given_batches_when_rewriting_should_store_the_segment_that_summing_each_piece_gave() {
+        let stride = SUM_STRIDE_BYTES;
+        let cases: [&[usize]; 3] = [
+            &[700],
+            &[700, 3, 4096, 100_000, 5],
+            // Blobs that come in several pieces, and strides that end inside
+            // a batch.
+            &[stride + stride / 2, 10, 2 * stride + 7],
+        ];
+        for blob_lens in cases {
+            let (object, placed) = placed_object(blob_lens);
+            let mut log = Vec::new();
+            let mut index = SegmentIndex::default();
+            let mut hasher = SegmentHasher::default();
+            for placed in &placed {
+                let at = usize::try_from(placed.placement.position).unwrap();
+                let blob = &object[at..at + usize::try_from(placed.placement.length).unwrap()];
+                let mut header = [0; BATCH_HEADER_SIZE];
+                let mut whole = placed.header;
+                whole.batch_checksum = whole.checksum_for_blob(blob);
+                whole.encode_into(&mut header);
+                hasher.update(&header);
+                for piece in blob.chunks(REWRITE_YIELD_BYTES) {
+                    hasher.update(piece);
+                }
+                log.extend_from_slice(&header);
+                log.extend_from_slice(blob);
+                index.push(whole.base_offset, whole.base_timestamp, whole.batch_length);
+            }
+            let hashes = hasher.finalize();
+            let index = index.into_bytes();
+            for uploaded in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let store = Rc::new(MemoryStore::new());
+                store
+                    .put(
+                        &layout().fresh_key(OBJECT_ID),
+                        PutBody::from_bytes(object.clone()),
+                        &PutOptions::default(),
+                    )
+                    .await
+                    .unwrap();
+                let objects = Rc::clone(&store) as Rc<dyn RemoteObjects>;
+                let cache = ReadCache::new(ReadCacheSettings {
+                    cache_bytes: 0,
+                    block_bytes: 256 * 1024,
+                    read_ahead: 0,
+                    read_ahead_fetches: 4,
+                    read_ahead_fetch_bytes: 32 * 1024 * 1024,
+                });
+                let remote = Rc::new(
+                    RemoteSegments::new(Rc::clone(&objects), layout()).with_cache(objects, &cache),
+                );
+                if uploaded {
+                    remote.cache_fresh_object(OBJECT_ID, object.clone(), std::iter::empty());
+                }
+                let rewrite = rewrite_of(directory.path(), &placed, remote);
+
+                let stored = rewrite.run(&*store, &layout()).await.unwrap();
+
+                assert_eq!(
+                    (stored.size, stored.crc32c, stored.hash),
+                    (log.len() as u64, hashes.crc32c, hashes.blake3),
+                    "blobs {blob_lens:?}, uploaded {uploaded}"
+                );
+                let key = |object| {
+                    layout().long_term_key(&LongTermKey {
+                        prefix: prefix(),
+                        start_offset: 0,
+                        end_offset: stored.end_offset,
+                        object,
+                    })
+                };
+                assert_eq!(
+                    stored_bytes(&store, &key(SegmentObject::Log), stored.size).await,
+                    log
+                );
+                assert_eq!(
+                    stored_bytes(&store, &key(SegmentObject::Index), index.len() as u64).await,
+                    index
+                );
+            }
+        }
+    }
+
+    /// A store whose puts take `put_micros` of `clock`.
+    struct SlowPuts {
+        store: MemoryStore,
+        clock: Rc<ManualClock>,
+        put_micros: u64,
+    }
+
+    impl ObjectStore for SlowPuts {
+        async fn put(
+            &self,
+            key: &str,
+            body: PutBody,
+            options: &PutOptions,
+        ) -> Result<(), ObjectStoreError> {
+            self.clock.waited(self.put_micros).await;
+            self.store.put(key, body, options).await
+        }
+
+        async fn get_range(
+            &self,
+            key: &str,
+            range: Range<u64>,
+        ) -> Result<ObjectRange, ObjectStoreError> {
+            ObjectStore::get_range(&self.store, key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, ObjectStoreError> {
+            ObjectStore::head(&self.store, key).await
+        }
+
+        async fn delete(&self, keys: &[String]) -> Result<DeleteOutcome, ObjectStoreError> {
+            self.store.delete(keys).await
+        }
+
+        async fn list(&self, request: &ListRequest<'_>) -> Result<ListPage, ObjectStoreError> {
+            self.store.list(request).await
+        }
+    }
+
+    /// The rewrite of the batches of `object`, paced by `budget`, which
+    /// reads the blobs through a cache of `cache_bytes`.
+    async fn paced_rewrite(
+        directory: &std::path::Path,
+        object: &Bytes,
+        placed: &[PlacedBatch],
+        cache_bytes: usize,
+        budget: Rc<RewriteBudget>,
+    ) -> (SegmentRewrite, Rc<RemoteSegments>) {
+        let fresh = Rc::new(MemoryStore::new());
+        fresh
+            .put(
+                &layout().fresh_key(OBJECT_ID),
+                PutBody::from_bytes(object.clone()),
+                &PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        let objects = fresh as Rc<dyn RemoteObjects>;
+        let cache = ReadCache::new(ReadCacheSettings {
+            cache_bytes,
+            block_bytes: 256 * 1024,
+            read_ahead: 0,
+            read_ahead_fetches: 4,
+            read_ahead_fetch_bytes: 32 * 1024 * 1024,
+        });
+        let remote =
+            Rc::new(RemoteSegments::new(Rc::clone(&objects), layout()).with_cache(objects, &cache));
+        let rewrite = rewrite_of(directory, placed, Rc::clone(&remote)).paced_by(budget);
+        (rewrite, remote)
+    }
+
+    /// The put ends the rewrite, and no yield follows it when nothing is
+    /// carried into the cache. A put to a store elsewhere is a wait and
+    /// costs no sleep. A put to a store on the node is work, which the
+    /// next rewrite of the shard sleeps off.
+    #[compio::test]
+    async fn given_a_slow_put_and_nothing_to_carry_when_rewriting_under_sends_should_charge_the_wait_only_to_a_store_on_the_node()
+     {
+        let (object, placed) = placed_object(&[600 * 1024]);
+        let put_micros = 1_000_000;
+        for store_on_node in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let clock = Rc::new(ManualClock::default());
+            clock.sends_waiting.set(true);
+            let budget = Rc::new(RewriteBudget::new(
+                Rc::clone(&clock) as Rc<dyn RewriteClock>,
+                store_on_node,
+            ));
+            let (rewrite, _) =
+                paced_rewrite(directory.path(), &object, &placed, 0, Rc::clone(&budget)).await;
+            let store = SlowPuts {
+                store: MemoryStore::new(),
+                clock: Rc::clone(&clock),
+                put_micros,
+            };
+
+            rewrite.run(&store, &layout()).await.unwrap();
+            RewriteShare::paced(budget).give_way().await;
+
+            if store_on_node {
+                assert!(
+                    clock.slept.get() > put_micros,
+                    "slept {}",
+                    clock.slept.get()
+                );
+            } else {
+                assert_eq!(clock.slept.get(), 0);
+            }
+        }
+    }
+
+    /// The store holds the segment before the rewrite carries its end into
+    /// the cache, which keeps to the share and can sleep. So the rewrite
+    /// hands the segment over first, and the carry after.
+    #[compio::test]
+    async fn given_a_stored_segment_when_the_rewrite_ends_should_report_it_before_carrying_it() {
+        let (object, placed) = placed_object(&[600 * 1024]);
+        let directory = tempfile::tempdir().unwrap();
+        let clock = Rc::new(ManualClock::default());
+        clock.sends_waiting.set(true);
+        let budget = Rc::new(RewriteBudget::new(
+            Rc::clone(&clock) as Rc<dyn RewriteClock>,
+            false,
+        ));
+        let (rewrite, remote) =
+            paced_rewrite(directory.path(), &object, &placed, 64 * 1024 * 1024, budget).await;
+        let (rewrite, later) = rewrite.carrying_later();
+        let store = MemoryStore::new();
+
+        let stored = rewrite.run(&store, &layout()).await.unwrap();
+
+        assert_eq!(remote.take_read_metrics().unwrap().carried_bytes, 0);
+        let key = layout().long_term_key(&LongTermKey {
+            prefix: prefix(),
+            start_offset: 0,
+            end_offset: stored.end_offset,
+            object: SegmentObject::Log,
+        });
+        assert_eq!(
+            stored_bytes(&store, &key, stored.size).await.len() as u64,
+            stored.size
+        );
+        later.take().unwrap().run().await;
+        assert!(remote.take_read_metrics().unwrap().carried_bytes > 0);
+    }
+
+    #[test]
+    fn given_a_placement_of_another_length_than_its_header_when_building_should_refuse_it() {
+        let mut placed = batch(0, &[7; 100]);
+        placed.placement.length += 1;
+
+        assert!(matches!(
+            BuiltSegment::of(0, &[placed]),
+            Err(RewriteError::Read(DiskFault::Unreadable))
+        ));
+    }
+}

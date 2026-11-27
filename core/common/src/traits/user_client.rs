@@ -16,22 +16,34 @@
 // under the License.
 
 use crate::{
-    Identifier, IdentityInfo, IggyError, Permissions, UserCreateOptions, UserInfo, UserInfoDetails,
-    UserStatus, UserUpdateOptions,
+    Identifier, IdentityInfo, IggyError, NamedPageQuery, Page, Permissions, UserCreateOptions,
+    UserInfo, UserInfoDetails, UserStatus, UserUpdateOptions,
 };
 use async_trait::async_trait;
 
 /// This trait defines the methods to interact with the user module.
 #[async_trait]
+#[whichever::dispatchable]
 pub trait UserClient {
     /// Get the info about a specific user by unique ID or username.
     ///
     /// Authentication is required, and the permission to read the users, unless the provided user ID is the same as the authenticated user.
     async fn get_user(&self, user_id: &Identifier) -> Result<Option<UserInfoDetails>, IggyError>;
-    /// Get the info about all the users.
+    /// Get the info about all the users, in id order.
+    ///
+    /// The list is read page by page, so it is not one consistent read. A user
+    /// that someone creates or deletes during the read can appear or not
+    /// appear.
+    /// A server that answers a page with the cursor it was sent fails the read
+    /// with `IggyError::InvalidFormat`.
     ///
     /// Authentication is required, and the permission to read the users.
     async fn get_users(&self) -> Result<Vec<UserInfo>, IggyError>;
+    /// One page of the users. Read the next page with
+    /// [`NamedPageQuery::next`] until the page has no `next`.
+    ///
+    /// Authentication is required, and the permission to read the users.
+    async fn get_users_page(&self, query: &NamedPageQuery) -> Result<Page<UserInfo>, IggyError>;
     /// Create a new user.
     ///
     /// Authentication is required, and the permission to manage the users.

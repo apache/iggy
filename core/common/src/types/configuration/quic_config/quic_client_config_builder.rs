@@ -28,7 +28,7 @@ use crate::{
 /// - `server_name`: Default is "localhost".
 /// - `auto_login`: Default is AutoLogin::Disabled.
 /// - `reconnection`: Default is enabled unlimited retries and 1 second interval.
-/// - `response_buffer_size`: Default is 10MB (10,000,000 bytes).
+/// - `response_buffer_size`: Default is a reply that holds the largest message, about 64 MB.
 /// - `max_concurrent_bidi_streams`: Default is 10,000 streams.
 /// - `datagram_send_buffer_size`: Default is 100,000 bytes.
 /// - `initial_mtu`: Default is 1200 bytes.

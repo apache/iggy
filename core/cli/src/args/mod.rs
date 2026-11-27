@@ -33,6 +33,7 @@ use crate::args::{
     consumer_group::ConsumerGroupAction,
     consumer_offset::ConsumerOffsetAction,
     context::ContextAction,
+    geo::GeoAction,
     message::MessageAction,
     metadata::MetadataAction,
     partition::PartitionAction,
@@ -56,6 +57,7 @@ pub(crate) mod common;
 pub(crate) mod consumer_group;
 pub(crate) mod consumer_offset;
 pub(crate) mod context;
+pub(crate) mod geo;
 pub(crate) mod message;
 pub(crate) mod metadata;
 pub(crate) mod partition;
@@ -208,6 +210,9 @@ pub(crate) enum Command {
     /// cluster operations
     #[command(subcommand, visible_alias = "cl")]
     Cluster(ClusterAction),
+    /// geo peer operations
+    #[command(subcommand)]
+    Geo(GeoAction),
     /// consumer group operations
     #[command(subcommand, visible_alias = "g")]
     ConsumerGroup(ConsumerGroupAction),
@@ -298,6 +303,44 @@ impl IggyMergedConsoleArgs {
         Self {
             iggy: IggyArgs::from(vec![context.iggy, args.iggy]),
             cli: merged_cli_options,
+        }
+    }
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::IggyConsoleArgs;
+    use clap::Parser;
+
+    #[test]
+    fn given_stream_and_topic_output_options_when_parsed_should_accept_supported_formats() {
+        for args in [
+            vec!["iggy", "stream", "get", "sample", "-o", "json"],
+            vec![
+                "iggy", "topic", "get", "sample", "topic", "--output", "json",
+            ],
+            vec!["iggy", "stream", "list", "--output", "table"],
+            vec!["iggy", "stream", "list", "--output", "list"],
+            vec!["iggy", "stream", "list", "--output", "json"],
+            vec!["iggy", "stream", "list", "--list-mode", "list"],
+            vec!["iggy", "topic", "list", "sample", "--output", "json"],
+            vec!["iggy", "topic", "list", "sample", "-l", "table"],
+        ] {
+            assert!(IggyConsoleArgs::try_parse_from(&args).is_ok(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn given_conflicting_or_invalid_output_options_when_parsed_should_reject_them() {
+        for args in [
+            vec!["iggy", "stream", "list", "-l", "list", "-o", "json"],
+            vec![
+                "iggy", "topic", "list", "sample", "-l", "table", "-o", "json",
+            ],
+            vec!["iggy", "stream", "get", "sample", "-o", "list"],
+            vec!["iggy", "topic", "get", "sample", "topic", "-o", "toml"],
+        ] {
+            assert!(IggyConsoleArgs::try_parse_from(&args).is_err(), "{args:?}");
         }
     }
 }

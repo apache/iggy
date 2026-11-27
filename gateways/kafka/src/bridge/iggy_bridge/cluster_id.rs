@@ -26,8 +26,8 @@ use std::fmt;
 
 use iggy::prelude::{
     Consumer, Durability, Identifier, IggyError, IggyExpiry, IggyMessage, MaxTopicSize,
-    MessageClient, Partitioning, PollingStrategy, StreamClient, StreamCreateOptions, TopicClient,
-    TopicCreateOptions, TopicDetails,
+    MessageClient, Partitioning, PollOptions, PollingStrategy, StreamClient, StreamCreateOptions,
+    TopicClient, TopicCreateOptions, TopicDetails,
 };
 use tracing::{info, warn};
 
@@ -162,11 +162,13 @@ impl IggyBridge {
         let polled = with_request_timeout(self.client.poll_messages(
             &store.stream_id,
             &store.topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         ))
         .await;
         let polled = match polled {

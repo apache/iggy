@@ -19,20 +19,41 @@
 
 package org.apache.iggy.message;
 
+import org.apache.iggy.exception.IggyErrorCode;
+import org.apache.iggy.exception.IggyValidationException;
 import org.apache.iggy.partition.PartitionContext;
 
 import java.math.BigInteger;
 import java.util.Objects;
 import java.util.Optional;
 
-public record PollingStrategy(PollingKind kind, BigInteger value, Optional<PartitionContext> context) {
+/**
+ * Where a poll starts.
+ *
+ * @param kind        how {@code value} is read
+ * @param value       the offset or timestamp of {@code kind}, zero for the other kinds
+ * @param context     the history of the partition that an offset came from
+ * @param partitionId the partition of a continuation, which a poll or a seek of another partition refuses
+ */
+public record PollingStrategy(
+        PollingKind kind, BigInteger value, Optional<PartitionContext> context, Optional<Long> partitionId) {
 
     public PollingStrategy {
         Objects.requireNonNull(context, "context");
+        Objects.requireNonNull(partitionId, "partitionId");
+    }
+
+    public PollingStrategy(PollingKind kind, BigInteger value, Optional<PartitionContext> context) {
+        this(kind, value, context, Optional.empty());
     }
 
     public PollingStrategy(PollingKind kind, BigInteger value) {
         this(kind, value, Optional.empty());
+    }
+
+    /** The offset {@code next} of {@code partitionId} under {@code context}, as a poll or a checkpoint continues. */
+    static PollingStrategy continuation(long partitionId, BigInteger next, PartitionContext context) {
+        return new PollingStrategy(PollingKind.Offset, next, Optional.of(context), Optional.of(partitionId));
     }
 
     public static PollingStrategy offset(BigInteger value) {
@@ -62,12 +83,33 @@ public record PollingStrategy(PollingKind kind, BigInteger value, Optional<Parti
      * client sends this context with the poll and with every retry of it. If the partition
      * was deleted and recreated since, the server refuses the poll with error 87 instead of
      * reading the offset in the new partition. If a group consumer's partition changed
-     * owner, the server refuses it with error 5009.
+     * owner, the server refuses it with error 5009. Over TCP, a context with incarnation 0
+     * names no history. So the poll takes the incarnation of the partition route once, and
+     * keeps the owner and op of the context. A context that is all zero takes the whole
+     * context of the route. Over HTTP, a context that is all zero counts as no context,
+     * and any other context goes as it is.
      *
      * @param context the context of the poll the offset came from
      * @return a copy of this strategy that carries {@code context}
      */
     public PollingStrategy withContext(PartitionContext context) {
-        return new PollingStrategy(kind, value, Optional.of(context));
+        return new PollingStrategy(kind, value, Optional.of(context), partitionId);
+    }
+
+    /**
+     * Refuses a continuation of another partition.
+     *
+     * @param partition the partition that the strategy is used for
+     * @throws IggyValidationException with {@link IggyErrorCode#INVALID_COMMAND} for a continuation of another partition
+     */
+    public void requirePartition(long partition) {
+        if (partitionId.isPresent() && partitionId.get() != partition) {
+            throw new IggyValidationException(
+                    IggyErrorCode.INVALID_COMMAND,
+                    IggyErrorCode.INVALID_COMMAND.getCode(),
+                    "A continuation of partition " + partitionId.get() + " cannot start partition " + partition,
+                    Optional.empty(),
+                    Optional.empty());
+        }
     }
 }

@@ -27,6 +27,7 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
     case bindSession = 15
     case updateResource = 16
     case getMetadataChanges = 17
+    case retireGeoOrigin = 18
     case getMe = 20
     case getClient = 21
     case getClients = 22
@@ -50,6 +51,10 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
     // 102 was flush_unsaved_buffer; the server keeps the code reserved.
     // 103 and 104 are retired and must never be reused.
     case getPartitionRoute = 105
+    case pollMessagesDeferred = 106
+    // 107 was wait_for_messages and must never be reused.
+    case cancelDeferredRequest = 108
+    case fetchMessages = 109
     case getConsumerOffset = 120
     case storeConsumerOffset = 121
     case deleteConsumerOffset = 122
@@ -66,6 +71,7 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
     // 304 was update_topic and 305 purge_topic. The server keeps both retired.
     case createPartitions = 402
     case deletePartitions = 403
+    case getPartitions = 404
     case deleteSegments = 503
     case getConsumerGroup = 600
     case getConsumerGroups = 601
@@ -86,6 +92,7 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
         case .bindSession: "session.bind"
         case .updateResource: "resource.update"
         case .getMetadataChanges: "metadata.changes"
+        case .retireGeoOrigin: "geo.retire_origin"
         case .getMe: "me"
         case .getClient: "client.get"
         case .getClients: "client.list"
@@ -106,6 +113,9 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
         case .pollMessages: "message.poll"
         case .sendMessages: "message.send"
         case .getPartitionRoute: "partition.route"
+        case .pollMessagesDeferred: "message.poll_deferred"
+        case .cancelDeferredRequest: "message.cancel_deferred"
+        case .fetchMessages: "message.fetch"
         case .getConsumerOffset: "consumer_offset.get"
         case .storeConsumerOffset: "consumer_offset.store"
         case .deleteConsumerOffset: "consumer_offset.delete"
@@ -119,6 +129,7 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
         case .deleteTopic: "topic.delete"
         case .createPartitions: "partition.create"
         case .deletePartitions: "partition.delete"
+        case .getPartitions: "partition.list"
         case .deleteSegments: "segment.delete"
         case .getConsumerGroup: "consumer_group.get"
         case .getConsumerGroups: "consumer_group.list"
@@ -141,6 +152,12 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
         default:
             false
         }
+    }
+
+    /// Codes of requests that the server parks until their wait ends. Their
+    /// deadline is their own request timeout, and command 108 cancels them.
+    static func isDeferred(_ code: UInt32) -> Bool {
+        code == CommandCode.pollMessagesDeferred.rawValue || code == CommandCode.fetchMessages.rawValue
     }
 
     /// Codes that carry the sign-in handshake.

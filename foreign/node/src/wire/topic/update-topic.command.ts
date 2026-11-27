@@ -21,13 +21,18 @@ import { HeaderValue } from '../message/header.utils.js';
 import { wrapCommand } from '../command.utils.js';
 import { OptionsScope } from '../system/describe-options.command.js';
 import { UPDATE_RESOURCE, columnOption } from '../system/update-resource.command.js';
+import {
+  geoDurationOptions, readCacheOptions, type GeoTopicDurations, type TopicReadCache
+} from './topic.utils.js';
 
 
 /**
  * Parameters for the update topic command. Keys left out keep their values.
- * Settings fixed at create, compression among them, have no field here.
+ * Settings fixed at create, compression among them, have no field here. The
+ * durations of a geo topic and the read cache settings can be set, `0n`
+ * included, but not reset.
  */
-export type UpdateTopic = {
+export type UpdateTopic = GeoTopicDurations & TopicReadCache & {
   /** Stream identifier (ID or name) */
   streamId: Id,
   /** Topic identifier (ID or name) */
@@ -46,7 +51,28 @@ export type UpdateTopic = {
    * the server default.
    */
   maxTopicSize?: bigint,
-  /** Keys to reset to their defaults: `message_expiry` or `max_topic_size` */
+  /**
+   * Turns tiered storage on. `false` is refused before sending with error
+   * 4103, as is a reset of the key: the local segments tiering removed cannot
+   * come back.
+   */
+  tieredStorage?: boolean,
+  /**
+   * Local retention of a tiered topic in microseconds. `0n` is not "never": it
+   * omits the key, so the topic keeps whatever retention it currently has.
+   * Reset the key to return to the server default.
+   */
+  localRetentionAge?: bigint,
+  /**
+   * Local size cap of a tiered topic in bytes. `0n` is not "unlimited": it
+   * omits the key, so the topic keeps whatever cap it currently has. Reset the
+   * key to return to the server default.
+   */
+  localRetentionSize?: bigint,
+  /**
+   * Keys to reset to their defaults: `message_expiry`, `max_topic_size`,
+   * `local_retention_age` or `local_retention_size`
+   */
   reset?: TopicOptionKey[],
   /**
    * Reset names with no typed member, for a resettable key the server catalog
@@ -75,6 +101,17 @@ export const UPDATE_TOPIC = {
     name,
     messageExpiry = 0n,
     maxTopicSize = 0n,
+    tieredStorage,
+    localRetentionAge = 0n,
+    localRetentionSize = 0n,
+    freshUploadInterval,
+    consumerOffsetUploadInterval,
+    positionsPublishInterval,
+    tombstoneGrace,
+    positionsResumeTimeout,
+    longTermRewriteMaxInterval,
+    readCacheSize,
+    readAhead,
     reset,
     rawReset,
     options: rawOptions
@@ -92,6 +129,26 @@ export const UPDATE_TOPIC = {
         key: 'max_topic_size',
         value: HeaderValue.Uint64(maxTopicSize)
       });
+    if (tieredStorage !== undefined)
+      options.push({
+        key: 'tiered_storage',
+        value: HeaderValue.Bool(tieredStorage)
+      });
+    if (localRetentionAge !== 0n)
+      options.push({
+        key: 'local_retention_age',
+        value: HeaderValue.Uint64(localRetentionAge)
+      });
+    if (localRetentionSize !== 0n)
+      options.push({
+        key: 'local_retention_size',
+        value: HeaderValue.Uint64(localRetentionSize)
+      });
+    options.push(...geoDurationOptions({
+      freshUploadInterval, consumerOffsetUploadInterval, positionsPublishInterval,
+      tombstoneGrace, positionsResumeTimeout, longTermRewriteMaxInterval
+    }));
+    options.push(...readCacheOptions({ readCacheSize, readAhead }));
 
     return UPDATE_RESOURCE.serialize({
       target: { scope: OptionsScope.Topic, streamId, topicId }, options, reset, rawOptions, rawReset

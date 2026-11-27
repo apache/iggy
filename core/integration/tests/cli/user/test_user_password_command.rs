@@ -25,6 +25,8 @@ use iggy::prelude::Client;
 use iggy::prelude::UserCreateOptions;
 use iggy::prelude::UserId;
 use iggy::prelude::UserStatus;
+use iggy_common::TransportProtocol;
+use integration::harness::ServerHandle;
 use predicates::str::diff;
 use serial_test::parallel;
 
@@ -141,6 +143,85 @@ impl IggyCmdTestCase for TestUserPasswordCmd {
             .delete_user(&self.user_id.unwrap().try_into().unwrap())
             .await;
         assert!(deleted.is_ok());
+    }
+}
+
+/// A user changing its own password, signed in with that password. Over HTTP the
+/// change ends the session that made it, so the command's final logout finds none.
+struct TestSelfPasswordCmd {
+    transport: TransportProtocol,
+}
+
+const SELF_USERNAME: &str = "self-service";
+const SELF_PASSWORD: &str = "old-password";
+const SELF_NEW_PASSWORD: &str = "new-password";
+
+#[async_trait]
+impl IggyCmdTestCase for TestSelfPasswordCmd {
+    async fn prepare_server_state(&mut self, client: &dyn Client) {
+        client
+            .create_user(
+                SELF_USERNAME,
+                SELF_PASSWORD,
+                UserStatus::Active,
+                None,
+                &UserCreateOptions::default(),
+            )
+            .await
+            .expect("create the user");
+    }
+
+    fn get_command(&self) -> IggyCmdCommand {
+        IggyCmdCommand::new()
+            .opts(vec!["--transport", self.transport.as_str()])
+            .opts(vec![
+                "--username",
+                SELF_USERNAME,
+                "--password",
+                SELF_PASSWORD,
+            ])
+            .arg("user")
+            .arg("password")
+            .args(vec![SELF_USERNAME, SELF_PASSWORD, SELF_NEW_PASSWORD])
+    }
+
+    fn verify_command(&self, command_state: Assert) {
+        command_state.success().stdout(diff(format!(
+            "Executing change password for user with ID: {SELF_USERNAME}\nPassword for user with ID: {SELF_USERNAME} changed\n"
+        )));
+    }
+
+    async fn verify_server_state(&self, client: &dyn Client) {
+        client
+            .delete_user(&SELF_USERNAME.try_into().unwrap())
+            .await
+            .expect("delete the user");
+    }
+
+    fn protocol(&self, server: &ServerHandle) -> Vec<String> {
+        if self.transport == TransportProtocol::Http {
+            vec![
+                "--http-api-url".into(),
+                format!("http://{}", server.http_addr().expect("HTTP address")),
+            ]
+        } else {
+            vec![
+                "--tcp-server-address".into(),
+                server.raw_tcp_addr().expect("TCP address"),
+            ]
+        }
+    }
+}
+
+#[tokio::test]
+#[parallel]
+pub async fn given_own_password_when_changing_it_should_report_success() {
+    for transport in [TransportProtocol::Tcp, TransportProtocol::Http] {
+        let mut iggy_cmd_test = IggyCmdTest::default();
+        iggy_cmd_test.setup().await;
+        iggy_cmd_test
+            .execute_test(TestSelfPasswordCmd { transport })
+            .await;
     }
 }
 

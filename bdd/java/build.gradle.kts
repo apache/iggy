@@ -20,7 +20,7 @@
 plugins {
     java
     jacoco
-    id("com.diffplug.spotless") version "8.10.4"
+    id("com.diffplug.spotless") version "8.11.0"
 }
 
 repositories {
@@ -29,8 +29,8 @@ repositories {
 
 dependencies {
     testImplementation("org.apache.iggy:iggy")
-    testImplementation("io.cucumber:cucumber-java:8.0.4")
-    testImplementation("io.cucumber:cucumber-junit-platform-engine:8.0.4")
+    testImplementation("io.cucumber:cucumber-java:8.1.0")
+    testImplementation("io.cucumber:cucumber-junit-platform-engine:8.1.0")
     testImplementation("org.junit.jupiter:junit-jupiter:6.1.3")
     testImplementation("org.junit.platform:junit-platform-suite:6.1.3")
 }

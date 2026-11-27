@@ -86,21 +86,34 @@ pub async fn run(harness: &TestHarness) {
 }
 
 async fn assert_message_count(client: &IggyClient, expected_count: u32) {
-    // 4. Poll messages and validate the count
-    let polled_messages = client
-        .poll_messages(
-            &STREAM_NAME.try_into().unwrap(),
-            &TOPIC_NAME.try_into().unwrap(),
-            Some(PARTITION_ID),
-            &Consumer::default(),
-            &PollingStrategy::offset(0),
-            expected_count * 2,
-            false,
-        )
-        .await
-        .unwrap();
+    // 4. Poll messages until an empty reply and validate the count. A reply
+    // holds at most `max_bytes`, and a larger message comes alone, so the
+    // 10 MB messages take one poll each.
+    let mut strategy = PollingStrategy::offset(0);
+    let mut polled_count = 0;
+    loop {
+        let polled_messages = client
+            .poll_messages(
+                &STREAM_NAME.try_into().unwrap(),
+                &TOPIC_NAME.try_into().unwrap(),
+                PARTITION_ID,
+                &Consumer::default(),
+                &strategy,
+                PollOptions {
+                    count: expected_count * 2,
+                    ..PollOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        if polled_messages.messages.is_empty() {
+            break;
+        }
+        polled_count += polled_messages.messages.len() as u32;
+        strategy = polled_messages.continuation();
+    }
 
-    assert_eq!(polled_messages.messages.len() as u32, expected_count);
+    assert_eq!(polled_count, expected_count);
 }
 
 async fn init_system(client: &IggyClient) {

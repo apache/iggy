@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::WireError;
-use crate::codec::{WireDecode, WireEncode, read_u32_le, read_u64_le};
+use crate::codec::{WireDecode, WireEncode, read_u8, read_u32_le, read_u64_le};
 use bytes::{BufMut, BytesMut};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,11 +26,82 @@ pub struct CreatedPartitionAssignment {
     /// Committed placement seed, sealed by the request body checksum and never
     /// restamped when a later metadata view retransmits the create.
     pub initial_view: u32,
+    /// Node ids storing the partition, in member order. Empty means every
+    /// node, the only layout before replication factors. Encoded by the
+    /// enclosing request through [`encode_members`], not in
+    /// [`Self::ENCODED_SIZE`].
+    pub members: Vec<u8>,
 }
 
 impl CreatedPartitionAssignment {
     /// Fixed wire size: partition id, consensus group id and initial view.
     pub const ENCODED_SIZE: usize = 16;
+}
+
+/// Bytes [`encode_members`] writes for `partitions`.
+#[must_use]
+pub const fn members_encoded_size(partitions: &[CreatedPartitionAssignment]) -> usize {
+    match partitions.first() {
+        Some(first) if !first.members.is_empty() => 1 + partitions.len() * first.members.len(),
+        _ => 0,
+    }
+}
+
+/// Append the member lists after the fixed assignment records.
+///
+/// The group size, then that many node ids per partition. Nothing when the
+/// members are empty, which keeps a create from before replication factors
+/// byte-identical.
+///
+/// # Panics
+/// If the partitions do not all carry the same number of members, or more
+/// than `u8::MAX`.
+pub fn encode_members(partitions: &[CreatedPartitionAssignment], buf: &mut BytesMut) {
+    let Some(first) = partitions.first().filter(|first| !first.members.is_empty()) else {
+        return;
+    };
+    let size = u8::try_from(first.members.len()).expect("member count exceeds u8");
+    buf.put_u8(size);
+    for partition in partitions {
+        assert_eq!(
+            partition.members.len(),
+            usize::from(size),
+            "every partition of one create carries the same member count"
+        );
+        buf.put_slice(&partition.members);
+    }
+}
+
+/// Read what [`encode_members`] wrote at `offset` into `partitions`, returning
+/// the bytes consumed. An empty tail leaves every member list empty.
+///
+/// # Errors
+/// A zero group size or a section cut short.
+pub fn decode_members(
+    buf: &[u8],
+    offset: usize,
+    partitions: &mut [CreatedPartitionAssignment],
+) -> Result<usize, WireError> {
+    if offset >= buf.len() || partitions.is_empty() {
+        return Ok(0);
+    }
+    let size = usize::from(read_u8(buf, offset)?);
+    if size == 0 {
+        return Err(WireError::Validation("empty partition member list".into()));
+    }
+    let start = offset + 1;
+    let need = partitions.len() * size;
+    let section = buf
+        .get(start..start + need)
+        .ok_or_else(|| WireError::UnexpectedEof {
+            offset: start,
+            need,
+            have: buf.len().saturating_sub(start),
+        })?;
+    for (partition, members) in partitions.iter_mut().zip(section.chunks_exact(size)) {
+        partition.members = members.to_vec();
+    }
+    Ok(1 + need)
 }
 
 impl WireEncode for CreatedPartitionAssignment {
@@ -60,6 +131,7 @@ impl WireDecode for CreatedPartitionAssignment {
                 partition_id: read_u32_le(buf, 0)?,
                 consensus_group_id: read_u64_le(buf, 4)?,
                 initial_view: read_u32_le(buf, 12)?,
+                members: Vec::new(),
             },
             Self::ENCODED_SIZE,
         ))
@@ -77,6 +149,7 @@ mod tests {
             partition_id: 0x0102_0304,
             consensus_group_id: 0x0506_0708_090A_0B0C,
             initial_view: 0x0D0E_0F10,
+            members: Vec::new(),
         };
         let bytes = request.to_bytes();
         let (decoded, consumed) = CreatedPartitionAssignment::decode(&bytes).unwrap();

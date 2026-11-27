@@ -245,7 +245,7 @@ func TestUserIdentifierCommandsMarshalBinary(t *testing.T) {
 }
 
 func TestGetUsersMarshalBinary(t *testing.T) {
-	request := &GetUsers{}
+	request := &GetUsers{Query: iggcon.NamedPageQuery{PageQuery: iggcon.NewPageQuery()}}
 	if got := request.Code(); got != 32 {
 		t.Fatalf("GetUsers code = %d, want 32", got)
 	}
@@ -254,8 +254,10 @@ func TestGetUsersMarshalBinary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 0 {
-		t.Fatalf("GetUsers body = %v, want empty", got)
+	// Order id, ascending, limit 100, no cursor, no name.
+	want := []byte{0, 0, 100, 0, 0, 0, 0, 0}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("GetUsers body = %v, want %v", got, want)
 	}
 }
 

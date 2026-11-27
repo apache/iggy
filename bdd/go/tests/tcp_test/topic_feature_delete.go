@@ -54,7 +54,7 @@ var _ = ginkgo.Describe("DELETE TOPIC:", func() {
 		ginkgo.Context("and tries to delete non-existing topic and stream", func() {
 			client := createAuthorizedConnection()
 
-			err := client.DeleteTopic(context.Background(), randomU32Identifier(), randomU32Identifier())
+			err := client.DeleteTopic(context.Background(), nonExistingStreamIdentifier(client), randomU32Identifier())
 
 			itShouldReturnSpecificError(err, ierror.ErrStreamIdNotFound)
 		})

@@ -16,12 +16,15 @@
 // under the License.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use ext_php_rs::{exception::PhpResult, php_class, php_impl, zend::ce};
 use futures::StreamExt;
 use iggy::prelude::IggyConsumer as RustIggyConsumer;
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 
+use crate::consumer::lock_consumer;
 use crate::error::to_php_exception;
 use crate::receive_message::ReceiveMessage;
 use crate::runtime::runtime;
@@ -31,15 +34,17 @@ use crate::runtime::runtime;
 #[php(implements(ce = ce::iterator, stub = "\\Iterator"))]
 pub struct MessageIterator {
     pub(crate) inner: Arc<Mutex<RustIggyConsumer>>,
+    idle_timeout: Option<Duration>,
     current: Option<ReceiveMessage>,
     key: u64,
     started: bool,
 }
 
 impl MessageIterator {
-    pub(crate) fn new(inner: Arc<Mutex<RustIggyConsumer>>) -> Self {
+    pub(crate) fn new(inner: Arc<Mutex<RustIggyConsumer>>, idle_timeout: Option<Duration>) -> Self {
         Self {
             inner,
+            idle_timeout,
             current: None,
             key: 0,
             started: false,
@@ -47,12 +52,22 @@ impl MessageIterator {
     }
 
     fn poll_next(&mut self) -> PhpResult {
-        let inner = self.inner.clone();
+        // A read that throws leaves no message, so the message before it is not yielded again.
+        self.current = None;
+        let mut consumer = lock_consumer(&self.inner, "iterMessages()")?;
+        let idle_timeout = self.idle_timeout;
 
-        self.current = runtime().block_on(async move {
-            let mut inner = inner.lock().await;
-
-            match inner.next().await {
+        self.current = runtime().block_on(async {
+            // An idle iteration ends without a message. The read is cancel safe, so a message
+            // that arrives later stays in the consumer for the next one.
+            let next = match idle_timeout {
+                Some(idle_timeout) => match timeout(idle_timeout, consumer.next()).await {
+                    Ok(next) => next,
+                    Err(_) => return Ok(None),
+                },
+                None => consumer.next().await,
+            };
+            match next {
                 Some(Ok(message)) => Ok(Some(ReceiveMessage::from(message))),
                 Some(Err(err)) => Err(to_php_exception(err)),
                 None => Ok(None),
@@ -84,13 +99,15 @@ impl MessageIterator {
         self.poll_next()
     }
 
+    /// Reads the first message, and on a started iterator the message after the last one it
+    /// yielded, as a stream has no earlier messages to go back to.
     pub fn rewind(&mut self) -> PhpResult {
         if !self.started {
             self.started = true;
-            self.poll_next()?;
+            return self.poll_next();
         }
 
-        Ok(())
+        self.next()
     }
 
     pub fn valid(&self) -> bool {

@@ -56,7 +56,7 @@ use crate::server::raw_tcp::{
 
 /// A code no `COMMAND_TABLE` entry claims.
 const UNKNOWN_CODE: u32 = 9999;
-const RETIRED_ROUTING_CODES: [u32; 3] = [103, 104, 123];
+const RETIRED_COMMAND_CODES: [u32; 4] = [103, 104, 107, 123];
 
 /// An operation byte `Operation` does not declare.
 /// `reserved_codes_remain_unknown` pins 131 as never reused, so a new
@@ -82,7 +82,7 @@ const CLIENT_ID: u128 = 0xBAD_C0DE;
 async fn given_bound_session_when_unknown_or_retired_code_sent_should_deny_invalid_command(
     harness: &TestHarness,
 ) {
-    for code in [UNKNOWN_CODE].into_iter().chain(RETIRED_ROUTING_CODES) {
+    for code in [UNKNOWN_CODE].into_iter().chain(RETIRED_COMMAND_CODES) {
         assert!(
             lookup_command(code).is_none(),
             "code {code} must stay retired"

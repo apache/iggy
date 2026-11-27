@@ -29,6 +29,45 @@ pub struct RetainedOperation {
     pub operation_id: String,
 }
 
+/// The page parameters of the list tools.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct PageParams {
+    #[schemars(
+        description = "page parameter: most items of the page (optional, 1 to 1000, defaults to 100). \
+                       With limit or cursor, a list tool returns one page"
+    )]
+    pub limit: Option<u32>,
+
+    #[schemars(
+        description = "page parameter: the next value of a page, to read the page after it (optional). \
+                       Give the same other parameters as for that page. The last page has no next"
+    )]
+    pub cursor: Option<String>,
+
+    #[schemars(
+        description = "page parameter: order of the items (optional, one of 'id', 'created'; defaults to 'id'). \
+                       Partitions and consumer groups come in id order for both, because their ids follow creation"
+    )]
+    pub order: Option<String>,
+
+    #[schemars(description = "page parameter: descending order (optional, defaults to false)")]
+    pub descending: Option<bool>,
+}
+
+/// The page parameters of the lists of named entities. A list tool that gets
+/// neither `limit` nor `cursor` returns the whole list, in the order and with
+/// the name filter of the other parameters.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct NamedPageParams {
+    #[serde(flatten)]
+    pub page: PageParams,
+
+    #[schemars(
+        description = "page parameter: only the items whose name holds this text (optional, case-sensitive)"
+    )]
+    pub name: Option<String>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetStream {
     #[schemars(description = "stream identifier (name or number)")]
@@ -66,6 +105,9 @@ pub struct DeleteStream {
 pub struct GetTopics {
     #[schemars(description = "stream identifier (name or number)")]
     pub stream_id: String,
+
+    #[serde(flatten)]
+    pub page: NamedPageParams,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -85,7 +127,9 @@ pub struct CreateTopic {
     #[schemars(description = "name (required, must be unique)")]
     pub name: String,
 
-    #[schemars(description = "partitions count (required, must be greater than 0)")]
+    #[schemars(
+        description = "partitions count (required, zero creates a topic with no partitions. Add partitions before sending messages)"
+    )]
     pub partitions_count: u32,
 
     #[schemars(description = "compression algorithm (optional, can be one of 'none', 'gzip')")]
@@ -148,6 +192,18 @@ pub struct DeleteTopic {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetPartitions {
+    #[schemars(description = "stream identifier (name or number)")]
+    pub stream_id: String,
+
+    #[schemars(description = "topic identifier (name or number)")]
+    pub topic_id: String,
+
+    #[serde(flatten)]
+    pub page: PageParams,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct CreatePartitions {
     #[schemars(description = "stream identifier (name or number)")]
     pub stream_id: String,
@@ -197,16 +253,27 @@ pub struct PollMessages {
     #[schemars(description = "partition identifier (optional, number)")]
     pub partition_id: Option<u32>,
 
-    #[schemars(description = "strategy (optional, string)")]
+    #[schemars(
+        description = "polling strategy (optional, one of 'offset', 'first', 'last', 'next', \
+                       'timestamp'; defaults to 'offset'; 'next' resumes from the stored consumer \
+                       offset and always auto-commits; unknown values fall back to 'offset')"
+    )]
     pub strategy: Option<String>,
 
-    #[schemars(description = "offset to start from (optional)")]
+    #[schemars(
+        description = "offset to start from (optional, used with strategy 'offset', defaults to 0)"
+    )]
     pub offset: Option<u64>,
 
-    #[schemars(description = "timestamp to start from (optional, microseconds from Unix Epoch)")]
+    #[schemars(
+        description = "timestamp to start from (optional, microseconds from Unix Epoch, used with \
+                       strategy 'timestamp', defaults to now)"
+    )]
     pub timestamp: Option<u64>,
 
-    #[schemars(description = "count (optional, must be greater than 0)")]
+    #[schemars(
+        description = "count (optional, must be greater than 0); one reply stops at 1 MiB of messages, so it can return fewer than count"
+    )]
     pub count: Option<u32>,
 
     #[schemars(description = "auto commit (optional, boolean)")]
@@ -221,13 +288,20 @@ pub struct SendMessages {
     #[schemars(description = "topic identifier (name or number)")]
     pub topic_id: String,
 
-    #[schemars(description = "partition identifier (optional, number)")]
+    #[schemars(
+        description = "partition identifier (optional, number, used with partitioning 'partition', \
+                       defaults to 0)"
+    )]
     pub partition_id: Option<u32>,
 
-    #[schemars(description = "partitioning (optional, string)")]
+    #[schemars(
+        description = "partitioning (optional, one of 'balanced', 'key', 'partition'; defaults to \
+                       'balanced'; 'key' requires messages_key, 'partition' uses partition_id; \
+                       unknown values fall back to 'balanced')"
+    )]
     pub partitioning: Option<String>,
 
-    #[schemars(description = "messages key (optional, string)")]
+    #[schemars(description = "messages key (optional, string, required with partitioning 'key')")]
     pub messages_key: Option<String>,
 
     #[schemars(description = "messages collection")]
@@ -239,7 +313,9 @@ pub struct Message {
     #[schemars(description = "message identifier (optional, number)")]
     pub id: Option<u128>,
 
-    #[schemars(description = "message payload as a UTF-8 string")]
+    #[schemars(
+        description = "message payload as a UTF-8 string, which poll_messages returns base64 encoded"
+    )]
     pub payload: String,
 }
 
@@ -277,6 +353,9 @@ pub struct GetConsumerGroups {
 
     #[schemars(description = "topic identifier (name or number)")]
     pub topic_id: String,
+
+    #[serde(flatten)]
+    pub page: NamedPageParams,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -371,10 +450,10 @@ pub struct CreateUser {
     #[schemars(description = "password")]
     pub password: String,
 
-    #[schemars(description = "active (optional)")]
+    #[schemars(description = "whether the user can sign in (optional, defaults to true)")]
     pub active: Option<bool>,
 
-    #[schemars(description = "permissions (optional)")]
+    #[schemars(description = "permissions (optional, a flag left out is false)")]
     pub permissions: Option<Permissions>,
 }
 
@@ -408,7 +487,9 @@ pub struct UpdatePermissions {
     #[schemars(description = "user identifier (name or number)")]
     pub user_id: String,
 
-    #[schemars(description = "permissions (optional)")]
+    #[schemars(
+        description = "the complete new permissions, which replace the current ones. A flag left out is false, and leaving permissions out removes all of them (optional)"
+    )]
     pub permissions: Option<Permissions>,
 }
 
@@ -441,55 +522,55 @@ pub struct Permissions {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GlobalPermissions {
-    #[schemars(description = "manage servers (optional)")]
+    #[schemars(description = "manage servers (optional, defaults to false)")]
     pub manage_servers: Option<bool>,
 
-    #[schemars(description = "read servers (optional)")]
+    #[schemars(description = "read servers (optional, defaults to false)")]
     pub read_servers: Option<bool>,
 
-    #[schemars(description = "manage users (optional)")]
+    #[schemars(description = "manage users (optional, defaults to false)")]
     pub manage_users: Option<bool>,
 
-    #[schemars(description = "read users (optional)")]
+    #[schemars(description = "read users (optional, defaults to false)")]
     pub read_users: Option<bool>,
 
-    #[schemars(description = "manage streams (optional)")]
+    #[schemars(description = "manage streams (optional, defaults to false)")]
     pub manage_streams: Option<bool>,
 
-    #[schemars(description = "read streams (optional)")]
+    #[schemars(description = "read streams (optional, defaults to false)")]
     pub read_streams: Option<bool>,
 
-    #[schemars(description = "manage topics (optional)")]
+    #[schemars(description = "manage topics (optional, defaults to false)")]
     pub manage_topics: Option<bool>,
 
-    #[schemars(description = "read topics (optional)")]
+    #[schemars(description = "read topics (optional, defaults to false)")]
     pub read_topics: Option<bool>,
 
-    #[schemars(description = "poll messages (optional)")]
+    #[schemars(description = "poll messages (optional, defaults to false)")]
     pub poll_messages: Option<bool>,
 
-    #[schemars(description = "send messages (optional)")]
+    #[schemars(description = "send messages (optional, defaults to false)")]
     pub send_messages: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct StreamPermissions {
-    #[schemars(description = "manage stream (optional)")]
+    #[schemars(description = "manage stream (optional, defaults to false)")]
     pub manage_stream: Option<bool>,
 
-    #[schemars(description = "read stream (optional)")]
+    #[schemars(description = "read stream (optional, defaults to false)")]
     pub read_stream: Option<bool>,
 
-    #[schemars(description = "manage topics (optional)")]
+    #[schemars(description = "manage topics (optional, defaults to false)")]
     pub manage_topics: Option<bool>,
 
-    #[schemars(description = "read topics (optional)")]
+    #[schemars(description = "read topics (optional, defaults to false)")]
     pub read_topics: Option<bool>,
 
-    #[schemars(description = "poll messages (optional)")]
+    #[schemars(description = "poll messages (optional, defaults to false)")]
     pub poll_messages: Option<bool>,
 
-    #[schemars(description = "send messages (optional)")]
+    #[schemars(description = "send messages (optional, defaults to false)")]
     pub send_messages: Option<bool>,
 
     #[schemars(description = "topics permissions (optional)")]
@@ -498,16 +579,16 @@ pub struct StreamPermissions {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TopicPermissions {
-    #[schemars(description = "manage topic (optional)")]
+    #[schemars(description = "manage topic (optional, defaults to false)")]
     pub manage_topic: Option<bool>,
 
-    #[schemars(description = "read topic (optional)")]
+    #[schemars(description = "read topic (optional, defaults to false)")]
     pub read_topic: Option<bool>,
 
-    #[schemars(description = "poll messages (optional)")]
+    #[schemars(description = "poll messages (optional, defaults to false)")]
     pub poll_messages: Option<bool>,
 
-    #[schemars(description = "send messages (optional)")]
+    #[schemars(description = "send messages (optional, defaults to false)")]
     pub send_messages: Option<bool>,
 }
 
@@ -578,7 +659,9 @@ impl From<TopicPermissions> for prelude::TopicPermissions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmcp::handler::server::common::schema_for_type;
     use rmcp::schemars::schema_for;
+    use std::collections::BTreeSet;
 
     #[test]
     fn given_stream_tool_schema_when_describing_should_exclude_encryption_key() {
@@ -609,6 +692,67 @@ mod tests {
             serde_json::from_str(r#"{"stream_id":"orders","name":"orders-v2"}"#)
                 .expect("a rename still parses");
         assert_eq!(rename.name.as_deref(), Some("orders-v2"));
+    }
+
+    #[test]
+    fn given_list_tool_schemas_when_describing_should_hold_optional_page_parameters_at_the_top() {
+        const PAGE: [&str; 4] = ["limit", "cursor", "order", "descending"];
+        for (tool, schema, ids, named) in [
+            (
+                "get_streams",
+                schema_for_type::<NamedPageParams>(),
+                &[][..],
+                true,
+            ),
+            (
+                "get_topics",
+                schema_for_type::<GetTopics>(),
+                &["stream_id"][..],
+                true,
+            ),
+            (
+                "get_consumer_groups",
+                schema_for_type::<GetConsumerGroups>(),
+                &["stream_id", "topic_id"][..],
+                true,
+            ),
+            (
+                "get_partitions",
+                schema_for_type::<GetPartitions>(),
+                &["stream_id", "topic_id"][..],
+                false,
+            ),
+        ] {
+            let properties: BTreeSet<&str> = schema
+                .get("properties")
+                .and_then(|properties| properties.as_object())
+                .expect("object schema")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            let mut expected: BTreeSet<&str> = ids.iter().chain(&PAGE).copied().collect();
+            if named {
+                expected.insert("name");
+            }
+            assert_eq!(properties, expected, "{tool}");
+
+            let required: BTreeSet<&str> = schema
+                .get("required")
+                .and_then(|required| required.as_array())
+                .map(|required| required.iter().filter_map(|id| id.as_str()).collect())
+                .unwrap_or_default();
+            assert_eq!(required, ids.iter().copied().collect(), "{tool}");
+
+            let description = schema
+                .get("description")
+                .and_then(|description| description.as_str())
+                .unwrap_or_default();
+            assert_eq!(
+                description.contains("whole list"),
+                named,
+                "{tool}: only a list of named entities is whole without page parameters"
+            );
+        }
     }
 
     #[test]

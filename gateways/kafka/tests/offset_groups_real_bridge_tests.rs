@@ -853,8 +853,12 @@ async fn given_a_group_deletion_past_its_deadline_commits_should_wait_for_it_to_
 async fn lanes_through(server: &TestServer, relay: &PausingRelay) -> (GatewayState, usize, usize) {
     seed_topic_with(server, "orders", 2).await;
     let state = state_through(server, relay).await;
-    let (error, _) = retried(|| list(&state, &[], &[]), |(error, _)| *error).await;
-    assert_eq!(error, ERROR_NONE, "the scan client connected");
+    // `ListGroups` reads the change log, so a deletion that finds nothing connects the scan client.
+    assert_eq!(
+        delete_groups(&state, &["never-committed"]).await,
+        vec![("never-committed".to_string(), ERROR_GROUP_ID_NOT_FOUND)],
+        "the scan client connected"
+    );
     let first = relay.opened();
     assert_eq!(
         commit_partition(&state, GROUP, "orders", 0, 5).await,

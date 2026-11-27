@@ -56,7 +56,7 @@ public enum IggyExpiry: Sendable, Hashable {
             // Anything under a microsecond would travel as 0 (server default)
             // and anything past the u64 range would wrap; both are refused.
             guard duration >= .microseconds(1), let microseconds = duration.wholeMicroseconds, microseconds < UInt64.max else {
-                throw IggyError(.invalidOptionValue, context: "message expiry must be between 1 microsecond and 2^64 - 2 microseconds, got \(duration)")
+                throw IggyError(.invalidOptionValue, context: "an expiry must be between 1 microsecond and 2^64 - 2 microseconds, got \(duration)")
             }
             return microseconds
         case .never:
@@ -233,10 +233,15 @@ public struct Partition: Sendable, Hashable {
     public var currentOffset: UInt64
     public var sizeBytes: UInt64
     public var messagesCount: UInt64
+    /// Node ids that store the partition, in member order.
+    public var members: [UInt8]
+    /// The members the partition's primary last reported in sync and that are
+    /// up. Empty until the primary first reports.
+    public var inSyncMembers: [UInt8]
 
     public init(
         id: UInt32, createdAt: IggyTimestamp, segmentsCount: UInt32, currentOffset: UInt64, sizeBytes: UInt64, messagesCount: UInt64,
-        context: PartitionContext = .empty
+        context: PartitionContext = .empty, members: [UInt8] = [], inSyncMembers: [UInt8] = []
     ) {
         self.context = context
         self.id = id
@@ -245,6 +250,8 @@ public struct Partition: Sendable, Hashable {
         self.currentOffset = currentOffset
         self.sizeBytes = sizeBytes
         self.messagesCount = messagesCount
+        self.members = members
+        self.inSyncMembers = inSyncMembers
     }
 }
 
@@ -646,8 +653,10 @@ extension Duration {
     /// Whole microseconds, or nil when the duration is negative or does not
     /// fit a `UInt64`.
     var wholeMicroseconds: UInt64? {
+        // A duration between -1 s and zero has zero seconds and negative
+        // attoseconds.
         let (seconds, attoseconds) = components
-        guard seconds >= 0 else {
+        guard seconds >= 0, attoseconds >= 0 else {
             return nil
         }
         let (scaled, overflow) = UInt64(seconds).multipliedReportingOverflow(by: 1_000_000)

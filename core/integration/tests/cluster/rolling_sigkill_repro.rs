@@ -296,11 +296,13 @@ async fn read_partition(addresses: &[String], partition: u32) -> HashSet<String>
                 .poll_messages(
                     &stream,
                     &topic,
-                    Some(partition),
+                    partition,
                     &Consumer::default(),
                     &PollingStrategy::offset(next),
-                    1_000,
-                    false,
+                    PollOptions {
+                        count: 1_000,
+                        ..PollOptions::default()
+                    },
                 )
                 .await
             {

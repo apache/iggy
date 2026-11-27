@@ -17,6 +17,7 @@
 
 import { translateCommandCode } from './command.code.js';
 import { translateErrorCode } from './error.code.js';
+import type { PartitionContext } from './vsr/header.js';
 
 export class ResponseError extends Error {
   readonly commandCode: number;
@@ -40,10 +41,31 @@ export class ResponseError extends Error {
 export const responseError = (cmdCode: number, errCode: number, detail?: string) =>
   new ResponseError(cmdCode, errCode, detail);
 
+export type DeserializeErrorOptions = {
+  cause?: unknown,
+  /** The offset of a record that does not decode, when its frame decoded and a later step failed. */
+  offset?: bigint,
+  /**
+   * The received bytes that do not decode: the frame of the record whose
+   * offset is known, otherwise the remaining bytes from where decoding stopped.
+   */
+  record?: Buffer
+};
+
 export class DeserializeError extends Error {
-  constructor(message: string, cause?: Record<string , unknown>) {
-    super(message, cause);
+  readonly offset?: bigint;
+  readonly record?: Buffer;
+  /**
+   * For the records of a poll reply that do not decode: the context of that
+   * reply, the partition history and owner that served them.
+   */
+  context?: PartitionContext;
+
+  constructor(message: string, options?: DeserializeErrorOptions) {
+    super(message, options?.cause === undefined ? undefined : { cause: options.cause });
     this.name = "DeserializeError";
+    this.offset = options?.offset;
+    this.record = options?.record;
     Object.setPrototypeOf(this, DeserializeError.prototype);
   }
 }

@@ -26,8 +26,9 @@ use thiserror::Error;
 /// The replica-keyed variants separate three physically distinct failure
 /// modes so operators can tell apart routing bugs from transient
 /// disconnects:
-/// - `*NotFound` / `*NotConnected` - the key is unknown to this shard's
-///   local registry (genuine peer state, often recoverable by reconnect).
+/// - `*NotFound` / `*NotConnected` - the client is unknown to this shard's
+///   local registry, or this node has no complete set of links to the
+///   replica (genuine peer state, often recoverable by reconnect).
 /// - `*RouteMissing` - the bus cannot forward to the owning shard
 ///   because no forward fn was installed (bootstrap ordering bug).
 /// - `*ForwardFailed` - the forward fn rejected the frame (inter-shard
@@ -43,7 +44,7 @@ pub enum SendError {
     #[error("client {0} not found in local registry")]
     ClientNotFound(u128),
 
-    #[error("replica {0} not connected on this shard")]
+    #[error("replica {0} not reachable from this node")]
     ReplicaNotConnected(u8),
 
     #[error("replica {0}: no inter-shard forward fn installed")]

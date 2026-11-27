@@ -15,17 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Buffers.Binary;
 using System.Text;
 using Apache.Iggy.Consumers;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
+using Apache.Iggy.Extensions;
 using Apache.Iggy.Headers;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Publishers;
 using Apache.Iggy.Tests.Integrations.Fixtures;
+using Apache.Iggy.Vsr;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
@@ -151,24 +155,62 @@ public class MessageEncryptionIntegrationTests
         var consumer = IggyConsumerBuilder
             .Create(wrongKeyClient, streamId, topicId, Consumer.New(3))
             .WithPollingStrategy(PollingStrategy.First())
-            .WithBatchSize(10)
-            .WithPartitionId(0)
-            .WithAutoCommitMode(AutoCommitMode.Disabled)
+            .WithPartitions(0)
             .Build();
 
         await consumer.InitAsync();
 
-        // A bad key is not transient: it must surface out of the stream, not loop re-polling the same offset.
+        // A bad key is not transient: it must surface out of the stream with the continuation that skips it.
         var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-        await Should.ThrowAsync<MessageDecryptionException>(async () =>
+        var error = await Should.ThrowAsync<ReadException>(async () =>
         {
             await foreach (var _ in consumer.ReceiveAsync(cts.Token))
             {
                 break;
             }
         });
+        error.InnerException.ShouldBeOfType<MessageDecryptionException>();
+        error.Skip.ShouldNotBeNull();
 
         await consumer.DisposeAsync();
+    }
+
+    [Test]
+    public async Task Reader_WithWrongKey_Should_ReportTheRecordAsServed()
+    {
+        var publisherClient = await CreateClient(Protocol.Tcp, CreateEncryptor());
+        var (streamId, topicId) = await CreateTestStream(publisherClient, Protocol.Tcp);
+        await SendBatch(publisherClient, streamId, topicId, true);
+
+        var wrongKeyClient = await CreateClient(Protocol.Tcp, CreateEncryptor());
+        await using var reader = await wrongKeyClient.Reader(streamId, topicId, Consumer.New(4))
+            .WithPartitions(0)
+            .WithStart(PollingStrategy.First())
+            .BuildAsync();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+
+        var error = await Should.ThrowAsync<ReadException>(async () => await reader.NextAsync(cts.Token));
+        await reader.SeekAsync(0, error.Skip!.Value, cts.Token);
+        var next = await Should.ThrowAsync<ReadException>(async () => await reader.NextAsync(cts.Token));
+
+        error.InnerException.ShouldBeOfType<MessageDecryptionException>();
+        error.Offset.ShouldBe(0ul);
+        error.Record.ShouldBe(await FrameAsServed(wrongKeyClient, streamId, topicId, 0));
+        next.Offset.ShouldBe(1ul);
+        next.Record.ShouldBe(await FrameAsServed(wrongKeyClient, streamId, topicId, 1));
+    }
+
+    /// <summary>The ciphertext frame of the message at <paramref name="offset" />, as a fetch serves it.</summary>
+    private static async Task<byte[]> FrameAsServed(IIggyClient client, Identifier streamId, Identifier topicId,
+        ulong offset)
+    {
+        using var fetched = await ((IPartitionFetchClient)client).FetchMessagesAsync(streamId, topicId,
+            [(0u, PollingStrategy.Offset(offset))], Consumer.New(5), 1, false, new PollOptions().Wire);
+        var records = fetched.Sections.Single().Records.Span;
+        var frame = records[BatchWireFormat.BATCH_HEADER_SIZE..];
+        var headersLength = BinaryPrimitives.ReadInt32LittleEndian(frame[32..]);
+        var payloadLength = BinaryPrimitives.ReadInt32LittleEndian(frame[36..]);
+        return frame[..(BatchWireFormat.FRAME_HEADER_SIZE + payloadLength + headersLength)].ToArray();
     }
 
     private async Task SendBatch(IIggyClient client, Identifier streamId, Identifier topicId, bool withHeaders)

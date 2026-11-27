@@ -30,11 +30,20 @@ extension IggyClient {
         return body.isEmpty ? nil : try Responses.streamDetails(body[...])
     }
 
-    /// Every stream.
+    /// Every stream the caller may read, read in pages of ``PageQuery/maxLimit``
+    /// in id order. The pages are separate reads, so a stream that someone
+    /// creates or deletes during the read can appear or not appear. The read
+    /// keeps the sign-in it started with, and one request timeout covers every
+    /// page. If the server answers with the cursor it was sent, the read fails
+    /// with ``IggyErrorCode/invalidCommand``.
     public func getStreams() async throws -> [StreamInfo] {
-        let lineage = try await requireAuthenticated()
-        let body = try await send(.getStreams, lineage: lineage)
-        return body.isEmpty ? [] : try Responses.streams(body[...])
+        try await readWholeList(.getStreams, item: Responses.stream(from:)) { try Requests.listPage(query: $0) }
+    }
+
+    /// One page of the streams the caller may read. A query that breaks a page
+    /// rule fails with ``IggyErrorCode/invalidCommand`` before anything is sent.
+    public func getStreamsPage(_ query: NamedPageQuery = NamedPageQuery()) async throws -> Page<StreamInfo> {
+        try await listPage(.getStreams, Requests.listPage(query: query), item: Responses.stream(from:))
     }
 
     /// Creates a stream and returns it. A key in ``StreamCreateOptions/encryptionKey``
@@ -88,11 +97,30 @@ extension IggyClient {
         return details
     }
 
-    /// Every topic of a stream.
+    /// Every topic the caller may read in a stream, read in pages of
+    /// ``PageQuery/maxLimit`` in id order. The pages are separate reads, so a
+    /// topic that someone creates or deletes during the read can appear or not
+    /// appear. The read keeps the sign-in it started with, and one request
+    /// timeout covers every page. A stream that does not exist, or one the
+    /// caller may read no topic of, gives no topics. If someone deletes the
+    /// stream between two pages, the read fails with
+    /// ``IggyErrorCode/streamIdNotFound`` for a caller with a global read
+    /// grant, and ends there for any other caller. If the server answers with
+    /// the cursor it was sent, the read fails with
+    /// ``IggyErrorCode/invalidCommand``.
     public func getTopics(streamID: Identifier) async throws -> [Topic] {
-        let lineage = try await requireAuthenticated()
-        let body = try await send(.getTopics, Requests.identifierOnly(streamID), lineage: lineage)
-        return body.isEmpty ? [] : try Responses.topics(body[...])
+        try await readWholeList(.getTopics, item: Responses.topic(from:)) { try Requests.listPage(streamID, query: $0) }
+    }
+
+    /// One page of the topics the caller may read in a stream. For a stream
+    /// that does not exist, or one the caller may read no topic of, the first
+    /// page is empty and has no ``Page/next``. For a caller with a global read
+    /// grant, a page read with a cursor fails with
+    /// ``IggyErrorCode/streamIdNotFound`` instead, because the stream was
+    /// deleted during the walk. A query that breaks a page rule fails with
+    /// ``IggyErrorCode/invalidCommand`` before anything is sent.
+    public func getTopicsPage(streamID: Identifier, query: NamedPageQuery = NamedPageQuery()) async throws -> Page<Topic> {
+        try await listPage(.getTopics, Requests.listPage(streamID, query: query), item: Responses.topic(from:))
     }
 
     /// Creates a topic and returns it. Every knob rides `options`; an absent
@@ -145,6 +173,12 @@ extension IggyClient {
         core.groupState.invalidateTopicDiscovery()
     }
 
+    /// One page of the partitions of a topic. A query that breaks a page rule
+    /// fails with ``IggyErrorCode/invalidCommand`` before anything is sent.
+    public func getPartitionsPage(streamID: Identifier, topicID: Identifier, query: PageQuery = PageQuery()) async throws -> Page<Partition> {
+        try await listPage(.getPartitions, Requests.listPage(streamID, topicID, query: query), item: Responses.partition(from:))
+    }
+
     /// Removes the oldest `count` closed segments of a partition.
     public func deleteSegments(streamID: Identifier, topicID: Identifier, partitionID: UInt32, count: UInt32) async throws {
         let lineage = try await requireAuthenticated()
@@ -163,11 +197,23 @@ extension IggyClient {
         return body.isEmpty ? nil : try Responses.consumerGroupDetails(body[...])
     }
 
-    /// Every consumer group of a topic.
+    /// Every consumer group of a topic, read in pages of
+    /// ``PageQuery/maxLimit`` in id order. The pages are separate reads, so a
+    /// group that someone creates or deletes during the read can appear or not
+    /// appear. The read keeps the sign-in it started with, and one request
+    /// timeout covers every page. If the server answers with the cursor it was
+    /// sent, the read fails with ``IggyErrorCode/invalidCommand``.
     public func getConsumerGroups(streamID: Identifier, topicID: Identifier) async throws -> [ConsumerGroup] {
-        let lineage = try await requireAuthenticated()
-        let body = try await send(.getConsumerGroups, Requests.streamAndTopic(streamID, topicID), lineage: lineage)
-        return body.isEmpty ? [] : try Responses.consumerGroups(body[...])
+        try await readWholeList(.getConsumerGroups, item: Responses.consumerGroup(from:)) { try Requests.listPage(streamID, topicID, query: $0) }
+    }
+
+    /// One page of the consumer groups of a topic. A query that breaks a page
+    /// rule fails with ``IggyErrorCode/invalidCommand`` before anything is
+    /// sent.
+    public func getConsumerGroupsPage(
+        streamID: Identifier, topicID: Identifier, query: NamedPageQuery = NamedPageQuery()
+    ) async throws -> Page<ConsumerGroup> {
+        try await listPage(.getConsumerGroups, Requests.listPage(streamID, topicID, query: query), item: Responses.consumerGroup(from:))
     }
 
     /// Creates a consumer group and returns it.
@@ -211,11 +257,20 @@ extension IggyClient {
         return body.isEmpty ? nil : try Responses.userDetails(body[...])
     }
 
-    /// Every user.
+    /// Every user, read in pages of ``PageQuery/maxLimit`` in id order. The
+    /// pages are separate reads, so a user that someone creates or deletes
+    /// during the read can appear or not appear. The read keeps the sign-in it
+    /// started with, and one request timeout covers every page. If the server
+    /// answers with the cursor it was sent, the read fails with
+    /// ``IggyErrorCode/invalidCommand``.
     public func getUsers() async throws -> [UserInfo] {
-        let lineage = try await requireAuthenticated()
-        let body = try await send(.getUsers, lineage: lineage)
-        return body.isEmpty ? [] : try Responses.users(body[...])
+        try await readWholeList(.getUsers, item: Responses.user(from:)) { try Requests.listPage(query: $0) }
+    }
+
+    /// One page of the users. A query that breaks a page rule fails with
+    /// ``IggyErrorCode/invalidCommand`` before anything is sent.
+    public func getUsersPage(_ query: NamedPageQuery = NamedPageQuery()) async throws -> Page<UserInfo> {
+        try await listPage(.getUsers, Requests.listPage(query: query), item: Responses.user(from:))
     }
 
     /// Creates a user and returns it.
@@ -278,5 +333,48 @@ extension IggyClient {
     public func deletePersonalAccessToken(name: String) async throws {
         let lineage = try await requireAuthenticated()
         _ = try await send(.deletePersonalAccessToken, try Requests.nameOnly(name), lineage: lineage)
+    }
+}
+
+// MARK: - List pages
+
+extension IggyClient {
+    /// Reads the whole list that `code` answers one page at a time, in
+    /// ascending id order and in pages of ``PageQuery/maxLimit``, until a page
+    /// has no next cursor. The walk is one call: it keeps the lineage it
+    /// started with, and one request timeout covers every page. A page can be
+    /// empty and still have a next cursor. A next that equals the cursor
+    /// just sent can never end the walk, so it fails as a malformed reply.
+    func readWholeList<Item: Sendable & Hashable>(
+        _ code: CommandCode, item: (inout ByteReader) throws -> Item, payload: (PageQuery) throws -> [UInt8]
+    ) async throws -> [Item] {
+        let deadline = ContinuousClock.now + core.configuration.requestTimeout
+        let lineage = try await requireAuthenticated(within: deadline)
+        var query = PageQuery(limit: PageQuery.maxLimit)
+        var items: [Item] = []
+        while true {
+            let page = try await listPage(code, try payload(query), lineage: lineage, deadline: deadline, item: item)
+            items += page.items
+            guard let next = page.next else {
+                return items
+            }
+            guard next != query.cursor else {
+                throw IggyError(.invalidCommand, context: "the server answered the page cursor it was sent")
+            }
+            query.cursor = next
+        }
+    }
+
+    /// One page of the list that `code` answers. `captured` is the lineage
+    /// and `limit` the deadline that the call started with, so every page of
+    /// a walk is refused once the caller signed in or out, and the walk keeps
+    /// one budget. Nil takes the current lineage and a full request timeout,
+    /// for a call of this one page.
+    func listPage<Item: Sendable & Hashable>(
+        _ code: CommandCode, _ payload: [UInt8], lineage captured: UInt64? = nil, deadline limit: ContinuousClock.Instant? = nil,
+        item: (inout ByteReader) throws -> Item
+    ) async throws -> Page<Item> {
+        let lineage = try await requireAuthenticated(under: captured, within: limit)
+        return try Responses.page(try await send(code, payload, lineage: lineage, deadline: limit)[...], item: item)
     }
 }

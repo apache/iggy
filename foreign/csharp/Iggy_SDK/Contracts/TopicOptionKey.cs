@@ -19,7 +19,11 @@ namespace Apache.Iggy.Contracts;
 
 /// <summary>
 ///     The client-visible option keys of a topic, in catalog order. Names a key to reset in a
-///     <see cref="TopicUpdate" />: only <see cref="MessageExpiry" /> and <see cref="MaxTopicSize" /> reset to a default.
+///     <see cref="TopicUpdate" />: only <see cref="MessageExpiry" />, <see cref="MaxTopicSize" />,
+///     <see cref="LocalRetentionAge" /> and <see cref="LocalRetentionSize" /> reset to a default. The six durations
+///     of a geo topic, <see cref="FreshUploadInterval" /> to <see cref="LongTermRewriteMaxInterval" />, and
+///     <see cref="ReadCacheSize" /> and <see cref="ReadAhead" /> have no default, so the server refuses a reset of
+///     them.
 /// </summary>
 public enum TopicOptionKey
 {
@@ -54,5 +58,50 @@ public enum TopicOptionKey
     SizeOfMessagesRequiredToSave,
 
     /// <summary><c>preallocate_segments</c>, create-only.</summary>
-    PreallocateSegments
+    PreallocateSegments,
+
+    /// <summary><c>replication_factor</c>, create-only.</summary>
+    ReplicationFactor,
+
+    /// <summary><c>segment_max_age</c>, create-only.</summary>
+    SegmentMaxAge,
+
+    /// <summary><c>tiered_storage</c>, enable-only: an update turns it on and never off.</summary>
+    TieredStorage,
+
+    /// <summary><c>local_retention_age</c>, updatable and resettable to one day.</summary>
+    LocalRetentionAge,
+
+    /// <summary><c>local_retention_size</c>, updatable and resettable to unlimited.</summary>
+    LocalRetentionSize,
+
+    /// <summary><c>topic_type</c>, create-only.</summary>
+    TopicType,
+
+    /// <summary><c>geo_mode</c>, create-only.</summary>
+    GeoMode,
+
+    /// <summary><c>fresh_upload_interval</c>, only on a geo topic, updatable and not resettable.</summary>
+    FreshUploadInterval,
+
+    /// <summary><c>consumer_offset_upload_interval</c>, only on a geo topic, updatable and not resettable.</summary>
+    ConsumerOffsetUploadInterval,
+
+    /// <summary><c>positions_publish_interval</c>, only on a geo topic, updatable and not resettable.</summary>
+    PositionsPublishInterval,
+
+    /// <summary><c>tombstone_grace</c>, only on a geo topic, updatable and not resettable.</summary>
+    TombstoneGrace,
+
+    /// <summary><c>positions_resume_timeout</c>, only on a geo topic, updatable and not resettable.</summary>
+    PositionsResumeTimeout,
+
+    /// <summary><c>long_term_rewrite_max_interval</c>, only on a geo topic, updatable and not resettable.</summary>
+    LongTermRewriteMaxInterval,
+
+    /// <summary><c>read_cache_size</c>, updatable and not resettable.</summary>
+    ReadCacheSize,
+
+    /// <summary><c>read_ahead</c>, updatable and not resettable.</summary>
+    ReadAhead
 }

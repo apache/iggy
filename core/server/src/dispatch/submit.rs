@@ -24,7 +24,8 @@
 //! their replica forwards) delegate to `session_ops`, which owns that
 //! machinery. A backup relays partition completions to the metadata primary
 //! here, because only the primary proposes and it may hold no replica of the
-//! partition.
+//! partition. The retention decision of a tiered partition's primary takes the
+//! same relay, because that primary can sit on a metadata backup.
 
 use crate::consumer_group::lease::ConsumerGroupLiveness;
 use crate::dispatch::session_ops::{
@@ -35,22 +36,29 @@ use crate::reply_frame::committed_reply_header;
 use crate::shell::{ShellBus, ShellShard};
 use ahash::AHashMap;
 use consensus::{Consensus, MetadataHandle};
+use futures::future::join_all;
+use iggy_binary_protocol::requests::messages::MIN_DEFERRED_POLL_REPLY_MARGIN_US;
+use iggy_binary_protocol::requests::partitions::CreatePartitionsRequest;
+use iggy_binary_protocol::requests::topics::CreateTopicRequest;
 use iggy_binary_protocol::{
     Command, ConsensusHeader, ForwardCompletionHeader, GenericHeader, HEADER_SIZE, Operation,
     PrepareHeader, RoutedRequestHeader, WireDecode, WireEncode, WireIdentifier,
 };
+use iggy_common::BINARY_OPERATION_TIMEOUT;
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use metadata::MetadataSubmitError;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::consumer_group::CompleteConsumerGroupRevocationRequest;
 use metadata::stm::lifecycle::CompleteLifecycleRequest;
-use metadata::stm::stream::Streams;
+use metadata::stm::stream::{Streams, TruncatePartitionRequest};
 use secrecy::ExposeSecret;
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
+use shard::{PartitionRead, PartitionReadReply, bus_timeout};
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::task::Poll;
 use std::time::Duration;
 use tracing::{trace, warn};
 
@@ -62,6 +70,13 @@ const COMPLETION_RELAY_BROADCASTS: u32 = 2;
 
 /// Covers the commit of the completion and the delivery of the broadcasts.
 const COMPLETION_RELAY_MARGIN: Duration = Duration::from_millis(500);
+
+/// How long after the arrival of a create its committed reply waits for the
+/// partition builds at most. A binary client stops its wait
+/// [`BINARY_OPERATION_TIMEOUT`] after it sent the request and then reports an
+/// unknown outcome, so the reply leaves one reply margin before that.
+const CREATE_REPLY_BUDGET: Duration = BINARY_OPERATION_TIMEOUT
+    .saturating_sub(Duration::from_micros(MIN_DEFERRED_POLL_REPLY_MARGIN_US));
 
 /// Shard 0's end of the RPC, run for an inbound [`shard::MetadataSubmit`]:
 /// a peer shard has verified credentials and owns the session locally, and
@@ -98,6 +113,28 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
             }
             shard::MetadataSubmit::ForwardedSegmentDelete(query) => {
                 super::segment_delete::answer(&shard, *query.header()).await;
+            }
+            shard::MetadataSubmit::RetentionTruncate {
+                namespace,
+                created_revision,
+                up_to_offset,
+            } => {
+                if relay_retention_truncate(&shard, namespace, created_revision, up_to_offset)
+                    .await
+                {
+                    return;
+                }
+                let committed =
+                    commit_retention_truncate(&shard, namespace, created_revision, up_to_offset)
+                        .await;
+                if let Some(Err(error)) = committed {
+                    trace!(
+                        ?error,
+                        namespace_raw = namespace.inner(),
+                        up_to_offset,
+                        "retention truncation not committed; the next pass decides again"
+                    );
+                }
             }
 
             shard::MetadataSubmit::ConsumerSessionHeartbeat(message) => {
@@ -300,6 +337,15 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
             shard::MetadataSubmit::ForwardedCompletion(message) => {
                 propose_relayed_completion(&shard, &message).await;
             }
+            shard::MetadataSubmit::IsMetadataPrimary { reply } => {
+                let primary = shard
+                    .plane
+                    .metadata()
+                    .consensus
+                    .as_ref()
+                    .is_some_and(|c| c.is_normal() && c.is_primary());
+                let _ = reply.try_send(primary);
+            }
         }
     });
 }
@@ -315,8 +361,51 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
 /// `None` = no verdict, for example after shard 0 refused the forward. The
 /// outcome is unknown, so callers answer `TransientNotCommitted`, which
 /// licenses only a replay of the same request id.
+///
+/// The committed reply of a create that adds partitions returns only after
+/// `await_created_partitions`. A replay of that create gets its cached reply
+/// through here too, so it waits the same way on the node that serves it.
+/// That wait ends [`CREATE_REPLY_BUDGET`] after `arrived_us`, the bus clock
+/// reading at which the request arrived, so a create that committed late
+/// still answers its client in time.
 #[allow(clippy::future_not_send)]
 pub async fn submit_client_request_on_owner<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    request: Message<RoutedRequestHeader>,
+    arrived_us: u64,
+) -> Option<Message<GenericHeader>>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let create = PartitionCreate::named_by(&request);
+    let reply = submit_before_partition_wait(shard, request).await?;
+    if let Some(create) = &create {
+        let budget = u64::try_from(CREATE_REPLY_BUDGET.as_micros()).unwrap_or(u64::MAX);
+        let remaining = arrived_us
+            .saturating_add(budget)
+            .saturating_sub(shard.bus.monotonic_micros());
+        // A wait that ends here drops its reply receivers only: the owners
+        // end their holds as they do after a read timeout.
+        if remaining > 0 {
+            let wait = await_created_partitions(shard, create, &reply);
+            let _ = bus_timeout(&shard.bus, Duration::from_micros(remaining), wait).await;
+        }
+    }
+    Some(reply)
+}
+
+/// [`submit_client_request_on_owner`] without its wait for the partitions of
+/// a create.
+///
+/// Only for a caller that holds a lock across the submit which the wait must
+/// not extend. That caller reads [`PartitionCreate::named_by`] before the
+/// submit and runs [`await_created_partitions`] before it answers the client.
+#[allow(clippy::future_not_send)]
+pub async fn submit_before_partition_wait<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     request: Message<RoutedRequestHeader>,
 ) -> Option<Message<GenericHeader>>
@@ -328,19 +417,255 @@ where
     SB: SuperblockStore + 'static,
 {
     if shard.id == 0 {
-        return shard
+        shard
             .plane
             .metadata()
             .submit_request_in_process(request)
             .await
-            .ok();
+            .ok()
+    } else {
+        let (reply, rx) = shard::channel::<Option<Message<GenericHeader>>>(1);
+        shard.forward_metadata_submit(shard::MetadataSubmit::ClientRequest {
+            request: request.into_generic(),
+            reply,
+        });
+        rx.recv().await.ok().flatten()
     }
-    let (reply, rx) = shard::channel::<Option<Message<GenericHeader>>>(1);
-    shard.forward_metadata_submit(shard::MetadataSubmit::ClientRequest {
-        request: request.into_generic(),
-        reply,
-    });
-    rx.recv().await.ok().flatten()
+}
+
+/// The topic that a client request adds partitions to, read before the submit
+/// consumes the request. The committed reply does not name the stream.
+pub struct PartitionCreate {
+    stream_id: WireIdentifier,
+    topic_id: WireIdentifier,
+}
+
+impl PartitionCreate {
+    /// `None` for a request that creates no partition, or whose body does not
+    /// decode, which the metadata primary refuses.
+    pub fn named_by(request: &Message<RoutedRequestHeader>) -> Option<Self> {
+        match request.header().operation {
+            Operation::CreateTopic => {
+                let create = CreateTopicRequest::decode_from(request.body()).ok()?;
+                Some(Self {
+                    stream_id: create.stream_id,
+                    topic_id: WireIdentifier::String(create.name),
+                })
+            }
+            Operation::CreatePartitions => {
+                let create = CreatePartitionsRequest::decode_from(request.body()).ok()?;
+                Some(Self {
+                    stream_id: create.stream_id,
+                    topic_id: create.topic_id,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Wait until the shards of this node have built the partitions that the
+/// committed `reply` created and that this node stores.
+///
+/// The create is committed whatever the builds do, and the reply is not
+/// changed. The wait only makes a request that follows the reply find the
+/// partitions on this node. It asks the owner shard of each partition for its
+/// primary: the owner holds that read until it inserts the partition, also
+/// while it still has an older incarnation under the same ids, and answers
+/// at once when the partition is there. Every answer ends the wait
+/// for its partition, also the `NotFound` of an owner whose hold ended and
+/// the missing answer of an owner that did not reply within the read budget.
+///
+/// The names resolve against metadata that already holds the create. A
+/// rename or a delete that commits before this runs leaves nothing to wait
+/// for, because no other partition has the op of `reply`.
+#[allow(clippy::future_not_send)]
+pub async fn await_created_partitions<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    create: &PartitionCreate,
+    reply: &Message<GenericHeader>,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let Some(created_op) = committed_reply_header(reply)
+        .filter(|header| {
+            matches!(
+                header.operation,
+                Operation::CreateTopicWithAssignments | Operation::CreatePartitionsWithAssignments
+            )
+        })
+        .map(|header| header.op)
+    else {
+        return;
+    };
+    let created = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .partitions_created_at(
+            &create.stream_id,
+            &create.topic_id,
+            created_op,
+            shard.replica_topology().self_replica_id,
+        );
+    let mut reads = Vec::with_capacity(created.len());
+    let mut refusing_owners = Vec::new();
+    for namespace in created {
+        let owner = shard.partition_shards().shard_for(&namespace);
+        if refusing_owners.contains(&owner) {
+            continue;
+        }
+        let mut read = Box::pin(shard.partition_read(namespace, PartitionRead::Primary));
+        // The first poll sends the read. A `Rejected` on that poll comes from
+        // an owner inbox that refused it, or from an owner that answered
+        // before the poll ended: the reply does not tell them apart. A full
+        // inbox refuses the next reads too and logs each refusal, so the
+        // other partitions of that owner get no read and no wait. At worst
+        // the reply leaves before their build, and the owner then holds the
+        // first request for them. The other owners still get their reads.
+        match futures::poll!(read.as_mut()) {
+            Poll::Ready(Some(PartitionReadReply::Rejected(_))) => refusing_owners.push(owner),
+            Poll::Ready(_) => {}
+            Poll::Pending => reads.push(read),
+        }
+    }
+    join_all(reads).await;
+}
+
+/// Commit the retention decision of a tiered partition's primary as a
+/// `TruncatePartition`, which every replica's reconciler then enforces.
+///
+/// `None` when nothing is proposed: the decision is of another incarnation,
+/// or the committed watermark already covers it. `Some(Ok(true))` when the
+/// truncation committed and applied.
+///
+/// Only the metadata primary proposes, so every other node gets `NotPrimary`
+/// here. A backup hands its decision to the primary with
+/// [`relay_retention_truncate`] instead, and the primary runs a relayed
+/// decision through this same function, so both origins pass the same checks
+/// against the committed state of the node that proposes.
+#[allow(clippy::future_not_send)]
+async fn commit_retention_truncate<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    namespace: IggyNamespace,
+    created_revision: u64,
+    up_to_offset: u64,
+) -> Option<Result<bool, MetadataSubmitError>>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let metadata = shard.plane.metadata();
+    let request = retention_truncate_request(
+        metadata.mux_stm.streams(),
+        namespace,
+        created_revision,
+        up_to_offset,
+    )?;
+    Some(
+        metadata
+            .submit_truncate_partition_in_process(&request)
+            .await,
+    )
+}
+
+/// The truncation that raises the committed watermark of `namespace` to
+/// `up_to_offset`. `None` when the partition is gone or is another
+/// incarnation than `created_revision`, and when the watermark is there
+/// already: the frame that carried the decision can be older than a commit.
+#[allow(clippy::cast_possible_truncation)]
+fn retention_truncate_request(
+    streams: &Streams,
+    namespace: IggyNamespace,
+    created_revision: u64,
+    up_to_offset: u64,
+) -> Option<TruncatePartitionRequest> {
+    let committed_up_to = streams
+        .with_committed_partition(namespace, |partition| {
+            (partition.created_revision == created_revision)
+                .then_some(partition.deleted_up_to_offset)
+        })
+        .flatten()?;
+    (up_to_offset > committed_up_to).then(|| TruncatePartitionRequest {
+        stream_id: WireIdentifier::numeric(namespace.stream_id() as u32),
+        topic_id: WireIdentifier::numeric(namespace.topic_id() as u32),
+        partition_id: namespace.partition_id() as u32,
+        up_to_offset,
+        expected_history: Some(created_revision),
+    })
+}
+
+/// Relays the retention decision to the metadata primary when this node is a
+/// backup that serves its view. `true` for such a backup, relayed or not:
+/// only the primary proposes, and the next timed pass decides again, so a
+/// relay that cannot be sent is not kept. `false` in every other state, where
+/// the caller proposes in process: a primary commits, and a node in a view
+/// change refuses.
+///
+/// A decision that this node's committed state already rules out is not sent.
+/// The primary checks it again against its own state, which can be ahead.
+#[allow(clippy::future_not_send)]
+async fn relay_retention_truncate<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    namespace: IggyNamespace,
+    created_revision: u64,
+    up_to_offset: u64,
+) -> bool
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let metadata = shard.plane.metadata();
+    let Some(consensus) = metadata.consensus.as_ref() else {
+        return false;
+    };
+    if !consensus.is_normal_backup() {
+        return false;
+    }
+    let Some(request) = retention_truncate_request(
+        metadata.mux_stm.streams(),
+        namespace,
+        created_revision,
+        up_to_offset,
+    ) else {
+        return true;
+    };
+    let view = consensus.view();
+    let message = relay_message(
+        consensus.cluster(),
+        view,
+        consensus.replica(),
+        Operation::TruncatePartition,
+        0,
+        &request.to_bytes(),
+    );
+    if let Err(error) = shard
+        .bus
+        .send_to_replica(
+            consensus.primary_index(view),
+            message.into_generic().into_frozen(),
+        )
+        .await
+    {
+        trace!(
+            ?error,
+            namespace_raw = namespace.inner(),
+            up_to_offset,
+            "retention truncation relay not sent; the next pass decides again"
+        );
+    }
+    true
 }
 
 /// The commit position a SUCCESSFULLY COMMITTED metadata reply carries, or
@@ -413,11 +738,11 @@ pub(in crate::dispatch) struct CompletionRelays {
 
 impl CompletionRelays {
     /// The interval is [`COMPLETION_RELAY_BROADCASTS`] periods of
-    /// `commit_broadcast_interval` plus [`COMPLETION_RELAY_MARGIN`], so 1.5 s
+    /// `commit_busy_heartbeat_interval` plus [`COMPLETION_RELAY_MARGIN`], so 1.5 s
     /// at the default 500 ms broadcast.
-    pub(in crate::dispatch) fn new(commit_broadcast_interval: Duration) -> Self {
+    pub(in crate::dispatch) fn new(commit_busy_heartbeat_interval: Duration) -> Self {
         Self {
-            interval: commit_broadcast_interval
+            interval: commit_busy_heartbeat_interval
                 .saturating_mul(COMPLETION_RELAY_BROADCASTS)
                 .saturating_add(COMPLETION_RELAY_MARGIN),
             since: AHashMap::default(),
@@ -512,6 +837,10 @@ where
 /// dropped before it takes a prepare. A refusal while this primary catches up,
 /// or while the reporter's own batch is in its pipeline, also drops the frame,
 /// and the backup relays it again one relay interval later.
+///
+/// A relayed retention truncation is checked against the committed state of
+/// this node the way a local decision is, so a relay of another incarnation,
+/// or one that the watermark covers, takes no prepare either.
 #[allow(clippy::future_not_send)]
 async fn propose_relayed_completion<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
@@ -526,8 +855,29 @@ async fn propose_relayed_completion<B, MJ, S, SB>(
     let header = *message.header();
     let metadata = shard.plane.metadata();
     let streams = metadata.mux_stm.streams();
-    // `validate` admits only the two completion operations.
-    if header.operation == Operation::CompleteLifecycle {
+    // `validate` admits only the two completion operations and the truncation.
+    if header.operation == Operation::TruncatePartition {
+        let Some((namespace, created_revision, up_to_offset)) =
+            decode_relayed_truncation(message.body())
+        else {
+            trace!(
+                header.replica,
+                "dropping an undecodable relayed retention truncation"
+            );
+            return;
+        };
+        let committed =
+            commit_retention_truncate(shard, namespace, created_revision, up_to_offset).await;
+        if !matches!(committed, Some(Ok(true))) {
+            trace!(
+                ?committed,
+                header.replica,
+                namespace_raw = namespace.inner(),
+                up_to_offset,
+                "relayed retention truncation not committed"
+            );
+        }
+    } else if header.operation == Operation::CompleteLifecycle {
         let Ok(request) = CompleteLifecycleRequest::decode_from(message.body()) else {
             trace!(
                 header.replica,
@@ -586,7 +936,20 @@ fn decode_relayed_revocation(
     Some((request, namespace))
 }
 
-#[allow(clippy::cast_possible_truncation)]
+/// The partition, the incarnation and the offset of a relayed retention
+/// truncation. `None` when the body does not decode, names no partition by
+/// number, or names no incarnation: without one the truncation could not be
+/// bound to the partition the sender decided for.
+fn decode_relayed_truncation(body: &[u8]) -> Option<(IggyNamespace, u64, u64)> {
+    let request = TruncatePartitionRequest::decode_from(body).ok()?;
+    let namespace = IggyNamespace::try_new(
+        request.stream_id.as_u32()? as usize,
+        request.topic_id.as_u32()? as usize,
+        request.partition_id as usize,
+    )?;
+    Some((namespace, request.expected_history?, request.up_to_offset))
+}
+
 fn forward_completion_message(
     cluster: u128,
     view: u32,
@@ -598,6 +961,18 @@ fn forward_completion_message(
         CompletionKey::Lifecycle { reporter, .. } => (Operation::CompleteLifecycle, reporter),
         CompletionKey::Revocation { .. } => (Operation::CompleteConsumerGroupRevocation, 0),
     };
+    relay_message(cluster, view, replica, operation, reporter, body)
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn relay_message(
+    cluster: u128,
+    view: u32,
+    replica: u8,
+    operation: Operation,
+    reporter: u16,
+    body: &[u8],
+) -> Message<ForwardCompletionHeader> {
     let size = HEADER_SIZE + body.len();
     let mut message = Message::<ForwardCompletionHeader>::new(size);
     message.as_mut_slice()[HEADER_SIZE..size].copy_from_slice(body);
@@ -617,13 +992,15 @@ fn forward_completion_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        CompletionKey, CompletionRelays, committed_reply_commit, forward_completion_message,
-        handle_metadata_submit,
+        CREATE_REPLY_BUDGET, CompletionKey, CompletionRelays, commit_retention_truncate,
+        committed_reply_commit, decode_relayed_truncation, forward_completion_message,
+        handle_metadata_submit, relay_message, retention_truncate_request,
+        submit_client_request_on_owner,
     };
     use crate::dispatch::host::ServerHost;
     use crate::dispatch::test_support::{
-        FIRST_BOOT, SpyBus, TestShard, create_one_partition, prepare_message, request_message,
-        test_shard,
+        FIRST_BOOT, SpyBus, TestShard, attach_root_session, create_one_partition, prepare_message,
+        request_message, test_shard,
     };
     use crate::reply_frame::{build_deny_reply, build_reply_from_bytes};
     use bytes::Bytes;
@@ -634,13 +1011,20 @@ mod tests {
     };
     use futures::FutureExt as _;
     use futures::channel::oneshot;
+    use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::consumer_groups::CreateConsumerGroupRequest;
-    use iggy_binary_protocol::requests::topics::DeleteTopicRequest;
-    use iggy_binary_protocol::{
-        ForwardCompletionHeader, GenericHeader, Operation, WireEncode, WireIdentifier, WireName,
+    use iggy_binary_protocol::requests::streams::CreateStreamRequest;
+    use iggy_binary_protocol::requests::topics::{
+        CreateTopicRequest, CreateTopicWithAssignmentsRequest, DeleteTopicRequest,
     };
-    use iggy_common::{IggyDuration, IggyError};
+    use iggy_binary_protocol::{
+        Command, ConsensusHeader, ForwardCompletionHeader, GenericHeader, HEADER_SIZE, Operation,
+        PrepareHeader, RoutedRequestHeader, StartViewChangeHeader, WireEncode, WireIdentifier,
+        WireName, WireOptions,
+    };
+    use iggy_common::{IggyDuration, IggyError, TopicCreateOptions};
     use journal::prepare_journal::PrepareJournal;
+    use message_bus::MessageBus as _;
     use metadata::MetadataSubmitError;
     use metadata::impls::metadata::StreamsFrontend;
     use metadata::stm::StateMachine as _;
@@ -651,10 +1035,15 @@ mod tests {
     use metadata::stm::lifecycle::{
         CompleteLifecycleRequest, LIFECYCLE_COMPLETIONS_MAX, LifecycleCompletion,
     };
+    use metadata::stm::stream::TruncatePartitionRequest;
     use server_common::iobuf::Owned;
     use server_common::sharding::IggyNamespace;
     use server_common::{MESSAGE_ALIGN, Message};
-    use shard::ShardHost as _;
+    use shard::shards_table::PartitionShards;
+    use shard::{
+        LifecycleFrame, PartitionRead, PartitionReadReply, ShardFrame, ShardHost as _,
+        shard_channel,
+    };
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::sync::Arc;
@@ -667,7 +1056,7 @@ mod tests {
     const REPORTER: u16 = 3;
     /// The completion arms do not read it.
     const SESSION_TIMEOUT: Duration = Duration::from_secs(30);
-    /// The default `cluster.commit_broadcast_interval`.
+    /// The default `cluster.commit_busy_heartbeat_interval`.
     const BROADCAST: Duration = Duration::from_millis(500);
     /// Two broadcasts of [`BROADCAST`] and the 500 ms margin.
     const RELAY_INTERVAL_MICROS: u64 = 1_500_000;
@@ -747,6 +1136,380 @@ mod tests {
             committed_reply_commit(&request.into_generic()),
             None,
             "only a `Reply` carries a commit position"
+        );
+    }
+
+    /// The client whose `CreateTopic` the [`CreateFixture`] commits.
+    const CREATOR: u128 = 1;
+    /// The session that `prepare_message` stamps.
+    const CREATOR_SESSION: u64 = 1;
+    const CREATE_REQUEST: u64 = 2;
+    const CREATE_OP: u64 = 7;
+
+    /// Replica 0 of [`REPLICAS`] with one stream. The test owns the inbox of
+    /// every shard, so it plays the owner of every partition and decides when
+    /// a partition counts as built.
+    struct CreateFixture {
+        shard: Rc<TestShard>,
+        owner_inboxes: Vec<shard::Receiver<ShardFrame>>,
+        create: CreateTopicWithAssignmentsRequest,
+    }
+
+    impl CreateFixture {
+        /// One shard. `members` lists the nodes of each partition of the
+        /// topic that [`Self::commit_create`] creates. An empty list is every
+        /// node.
+        fn new(bus: &SpyBus, inbox_capacity: usize, members: &[&[u8]]) -> Self {
+            Self::with_owners(bus, &[inbox_capacity], members)
+        }
+
+        /// One shard for each entry of `inbox_capacities`.
+        fn with_owners(bus: &SpyBus, inbox_capacities: &[usize], members: &[&[u8]]) -> Self {
+            let mut shard = test_shard(bus, PRIMARY, REPLICAS, FIRST_BOOT);
+            let (senders, owner_inboxes) = (0u16..)
+                .zip(inbox_capacities)
+                .map(|(owner, capacity)| {
+                    let (sender, inbox, _replies) = shard_channel(owner, *capacity, 1);
+                    (sender, inbox)
+                })
+                .unzip();
+            shard.attach_senders(senders);
+            let mux_stm = &shard.plane.metadata().mux_stm;
+            mux_stm.users().ensure_root_user("iggy", "hash");
+            attach_root_session(&shard, CREATOR, CREATOR_SESSION);
+            mux_stm
+                .update(prepare_message(
+                    Operation::CreateStream,
+                    CREATOR,
+                    1,
+                    &CreateStreamRequest {
+                        name: WireName::new("stream").unwrap(),
+                        options: WireOptions::empty(),
+                    }
+                    .to_bytes(),
+                ))
+                .unwrap();
+            let replication_factor = members
+                .first()
+                .filter(|members| !members.is_empty())
+                .map(|members| u32::try_from(members.len()).unwrap());
+            let partitions: Vec<_> = (0u32..)
+                .zip(members)
+                .map(|(partition_id, members)| CreatedPartitionAssignment {
+                    initial_view: 0,
+                    partition_id,
+                    consensus_group_id: u64::from(partition_id) + 1,
+                    members: members.to_vec(),
+                })
+                .collect();
+            let create = CreateTopicWithAssignmentsRequest {
+                request: CreateTopicRequest {
+                    stream_id: WireIdentifier::String(WireName::new("stream").unwrap()),
+                    partitions_count: u32::try_from(partitions.len()).unwrap(),
+                    name: WireName::new("topic").unwrap(),
+                    options: TopicCreateOptions {
+                        replication_factor,
+                        ..Default::default()
+                    }
+                    .to_wire()
+                    .unwrap(),
+                },
+                derived_options: WireOptions::empty(),
+                partitions,
+            };
+            Self {
+                shard: Rc::new(shard),
+                owner_inboxes,
+                create,
+            }
+        }
+
+        /// Commits the `CreateTopic` as request `request` of [`CREATOR`] at
+        /// metadata op `op`, and returns the client request. Its reply is in
+        /// the client table, as after a commit whose reply never reached the
+        /// client, so the returned request gets that reply.
+        fn commit_create(&self, request: u64, op: u64) -> Message<RoutedRequestHeader> {
+            let metadata = self.shard.plane.metadata();
+            let prepare = prepare_message(
+                Operation::CreateTopicWithAssignments,
+                CREATOR,
+                request,
+                &self.create.to_bytes(),
+            )
+            .transmute_header(|old, header: &mut PrepareHeader| {
+                *header = old;
+                header.op = op;
+            });
+            metadata::apply_committed_prepare(
+                &*metadata.mux_stm,
+                &metadata.client_table,
+                true,
+                |_| {},
+                prepare,
+            );
+            request_message(
+                Operation::CreateTopic,
+                CREATOR,
+                CREATOR_SESSION,
+                request,
+                &self.create.request.to_bytes(),
+            )
+        }
+
+        /// The bus clock reading of a request that arrives now.
+        fn arrived_now(&self) -> u64 {
+            self.shard.bus.monotonic_micros()
+        }
+
+        /// The read that the owner of a new partition was asked: the
+        /// partition, and the sender of the answer.
+        fn asked(&self) -> Option<(IggyNamespace, shard::Sender<PartitionReadReply>)> {
+            self.asked_on(0)
+        }
+
+        /// [`Self::asked`] for the shard `owner`.
+        fn asked_on(
+            &self,
+            owner: u16,
+        ) -> Option<(IggyNamespace, shard::Sender<PartitionReadReply>)> {
+            match self.owner_inboxes[usize::from(owner)].try_recv().ok()? {
+                ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
+                    namespace,
+                    read: PartitionRead::Primary,
+                    reply,
+                    ..
+                }) => Some((namespace, reply)),
+                _ => panic!("only primary reads go to the owner"),
+            }
+        }
+    }
+
+    /// A create that committed late must answer its client before the client
+    /// stops waiting, so the reply budget ends the wait for an owner that
+    /// stays silent.
+    #[compio::test]
+    async fn given_committed_create_when_reply_budget_ends_should_reply_without_owner_answer() {
+        const NOW: u64 = 100_000_000;
+        const LEFT: Duration = Duration::from_secs(5);
+        let bus = SpyBus::default();
+        bus.monotonic.set(Some(NOW));
+        // The read budget of the owner takes the first timer and never ends,
+        // so only the reply budget can end the wait.
+        let (_read_budget, held) = oneshot::channel();
+        *bus.held_timer.borrow_mut() = Some(held);
+        bus.instant_timers.set(true);
+        let fixture = CreateFixture::new(&bus, 1, &[&[]]);
+        let request = fixture.commit_create(CREATE_REQUEST, CREATE_OP);
+        let spent = u64::try_from(CREATE_REPLY_BUDGET.saturating_sub(LEFT).as_micros()).unwrap();
+
+        let reply = submit_client_request_on_owner(&fixture.shard, request, NOW - spent)
+            .now_or_never()
+            .expect("the reply budget ends the wait");
+
+        assert!(
+            fixture.asked().is_some(),
+            "the owner was asked and did not answer"
+        );
+        assert_eq!(bus.sleeps.borrow().last(), Some(&LEFT));
+        assert_eq!(committed_reply_commit(&reply.unwrap()), Some(CREATE_OP));
+    }
+
+    #[compio::test]
+    async fn given_committed_create_when_reply_budget_is_spent_should_reply_at_once() {
+        const NOW: u64 = 100_000_000;
+        let bus = SpyBus::default();
+        bus.monotonic.set(Some(NOW));
+        bus.frozen_timers.set(true);
+        let fixture = CreateFixture::new(&bus, 1, &[&[]]);
+        let request = fixture.commit_create(CREATE_REQUEST, CREATE_OP);
+        let spent = u64::try_from(CREATE_REPLY_BUDGET.as_micros()).unwrap();
+
+        let reply = submit_client_request_on_owner(&fixture.shard, request, NOW - spent)
+            .now_or_never()
+            .expect("no time is left for the wait");
+
+        assert!(fixture.asked().is_none(), "no owner is asked");
+        assert_eq!(committed_reply_commit(&reply.unwrap()), Some(CREATE_OP));
+    }
+
+    /// Sends the committed create again and plays the owner of its partition.
+    /// The reply must wait for `answer`, and then be the committed success.
+    async fn assert_reply_waits_for_owner(answer: PartitionReadReply) {
+        let bus = SpyBus::default();
+        // The answer of the owner ends the wait, never the read budget.
+        bus.frozen_timers.set(true);
+        let fixture = CreateFixture::new(&bus, 1, &[&[]]);
+        let request = fixture.commit_create(CREATE_REQUEST, CREATE_OP);
+
+        let mut reply = Box::pin(submit_client_request_on_owner(
+            &fixture.shard,
+            request,
+            fixture.arrived_now(),
+        ));
+        assert!(
+            futures::poll!(reply.as_mut()).is_pending(),
+            "the reply waits for the owner of the new partition"
+        );
+        let (namespace, answer_to) = fixture.asked().expect("the owner is asked");
+        assert_eq!(namespace, IggyNamespace::new(0, 0, 0));
+        answer_to.try_send(answer).unwrap();
+
+        assert_eq!(
+            committed_reply_commit(&reply.await.unwrap()),
+            Some(CREATE_OP)
+        );
+    }
+
+    #[compio::test]
+    async fn given_committed_create_when_partition_is_unbuilt_should_hold_reply_until_insert() {
+        assert_reply_waits_for_owner(PartitionReadReply::Primary {
+            view: 0,
+            primary: PRIMARY,
+        })
+        .await;
+    }
+
+    /// The owner ends its hold with `NotFound` when it did not build the
+    /// partition in time. The create is committed all the same.
+    #[compio::test]
+    async fn given_committed_create_when_hold_ends_without_a_build_should_reply_success() {
+        assert_reply_waits_for_owner(PartitionReadReply::NotFound).await;
+    }
+
+    #[compio::test]
+    async fn given_committed_create_when_node_stores_no_partition_should_reply_at_once() {
+        let bus = SpyBus::default();
+        let fixture = CreateFixture::new(&bus, 1, &[&[1, 2]]);
+        let request = fixture.commit_create(CREATE_REQUEST, CREATE_OP);
+
+        let reply = submit_client_request_on_owner(&fixture.shard, request, fixture.arrived_now())
+            .now_or_never()
+            .expect("no partition to wait for");
+
+        assert_eq!(committed_reply_commit(&reply.unwrap()), Some(CREATE_OP));
+        assert!(fixture.asked().is_none());
+    }
+
+    /// The second create of one topic name commits as a rejection. The
+    /// partition of the first create is still unbuilt, and is not waited for.
+    #[compio::test]
+    async fn given_failed_create_when_replying_should_not_wait() {
+        let bus = SpyBus::default();
+        let fixture = CreateFixture::new(&bus, 1, &[&[]]);
+        fixture.commit_create(CREATE_REQUEST, CREATE_OP);
+        let request = fixture.commit_create(CREATE_REQUEST + 1, CREATE_OP + 1);
+
+        let reply = submit_client_request_on_owner(&fixture.shard, request, fixture.arrived_now())
+            .now_or_never()
+            .expect("a rejection waits for nothing")
+            .unwrap();
+
+        assert_eq!(reply.header().command, Command::Reply);
+        assert_eq!(committed_reply_commit(&reply), None);
+        assert!(fixture.asked().is_none());
+    }
+
+    /// An owner inbox with room for one frame takes the read of partition 0
+    /// and refuses the read of partition 1. The reply waits for the read that
+    /// the owner took, and for nothing else.
+    #[compio::test]
+    async fn given_committed_create_when_owner_inbox_refuses_a_read_should_wait_for_the_reads_it_took()
+     {
+        let bus = SpyBus::default();
+        bus.frozen_timers.set(true);
+        let fixture = CreateFixture::new(&bus, 1, &[&[], &[]]);
+        let request = fixture.commit_create(CREATE_REQUEST, CREATE_OP);
+
+        let mut reply = Box::pin(submit_client_request_on_owner(
+            &fixture.shard,
+            request,
+            fixture.arrived_now(),
+        ));
+        assert!(futures::poll!(reply.as_mut()).is_pending());
+        let (namespace, answer_to) = fixture.asked().expect("the owner took one read");
+        assert_eq!(namespace, IggyNamespace::new(0, 0, 0));
+        answer_to
+            .try_send(PartitionReadReply::Primary {
+                view: 0,
+                primary: PRIMARY,
+            })
+            .unwrap();
+
+        assert_eq!(
+            committed_reply_commit(&reply.await.unwrap()),
+            Some(CREATE_OP)
+        );
+        assert!(fixture.asked().is_none());
+    }
+
+    /// The inbox of the owner of partition 0 has room for one frame, so it
+    /// refuses the read of its next partition. The partitions of the other
+    /// owner come after that refusal too, and the reply must wait for them.
+    #[compio::test]
+    async fn given_committed_create_when_one_owner_inbox_refuses_should_wait_for_the_other_owner() {
+        const PARTITIONS: usize = 8;
+        let placement = PartitionShards::new(2, false);
+        let owner_of = |partition: usize| placement.shard_for(&IggyNamespace::new(0, 0, partition));
+        let full = owner_of(0);
+        let roomy = 1 - full;
+        let mut inbox_capacities = [PARTITIONS; 2];
+        inbox_capacities[usize::from(full)] = 1;
+        let refused = (1..PARTITIONS)
+            .find(|partition| owner_of(*partition) == full)
+            .expect("the full owner has a second partition");
+        let roomy_partitions: Vec<_> = (0..PARTITIONS)
+            .filter(|partition| owner_of(*partition) == roomy)
+            .collect();
+        assert!(
+            roomy_partitions.last().is_some_and(|last| *last > refused),
+            "a partition of the other owner follows the refusal"
+        );
+        let bus = SpyBus::default();
+        bus.frozen_timers.set(true);
+        let every_node: &[u8] = &[];
+        let fixture =
+            CreateFixture::with_owners(&bus, &inbox_capacities, &[every_node; PARTITIONS]);
+        assert_eq!(fixture.shard.partition_shards(), placement);
+        let request = fixture.commit_create(CREATE_REQUEST, CREATE_OP);
+
+        let mut reply = Box::pin(submit_client_request_on_owner(
+            &fixture.shard,
+            request,
+            fixture.arrived_now(),
+        ));
+        assert!(futures::poll!(reply.as_mut()).is_pending());
+        let (taken, answer_to) = fixture
+            .asked_on(full)
+            .expect("the full owner took one read");
+        assert_eq!(taken, IggyNamespace::new(0, 0, 0));
+        let primary = || PartitionReadReply::Primary {
+            view: 0,
+            primary: PRIMARY,
+        };
+        answer_to.try_send(primary()).unwrap();
+        let asked: Vec<_> = std::iter::from_fn(|| fixture.asked_on(roomy)).collect();
+        assert_eq!(
+            asked
+                .iter()
+                .map(|(namespace, _)| *namespace)
+                .collect::<Vec<_>>(),
+            roomy_partitions
+                .iter()
+                .map(|partition| IggyNamespace::new(0, 0, *partition))
+                .collect::<Vec<_>>(),
+            "every partition of the other owner is asked"
+        );
+        assert!(
+            futures::poll!(reply.as_mut()).is_pending(),
+            "the reply waits for the other owner"
+        );
+        for (_, answer_to) in asked {
+            answer_to.try_send(primary()).unwrap();
+        }
+
+        assert_eq!(
+            committed_reply_commit(&reply.await.unwrap()),
+            Some(CREATE_OP)
         );
     }
 
@@ -1104,11 +1867,24 @@ mod tests {
             .as_ref()
             .expect("shard 0 holds the metadata consensus");
         for _ in 0..TimeoutManager::NORMAL_HEARTBEAT_TICKS {
+            consensus.tick_clock().advance();
             consensus.tick(PlaneKind::Metadata);
         }
+        let vote = Message::<StartViewChangeHeader>::new(HEADER_SIZE).transmute_header(
+            |_, header: &mut StartViewChangeHeader| {
+                header.command = Command::StartViewChange;
+                header.cluster = consensus.cluster();
+                header.group = consensus.group();
+                header.view = 1;
+                header.replica = PRIMARY;
+                header.size = u32::try_from(HEADER_SIZE).unwrap();
+                header.seal();
+            },
+        );
+        consensus.handle_start_view_change(PlaneKind::Metadata, vote.header());
         assert!(
             !consensus.is_normal(),
-            "a silent primary starts a view change"
+            "a quorum of votes starts a view change"
         );
         assert_eq!(
             metadata
@@ -1303,6 +2079,510 @@ mod tests {
         assert!(bus.sleeps.borrow().is_empty());
     }
 
+    /// The committed truncation watermark of `namespace`, next to the
+    /// incarnation that holds it.
+    fn committed_truncation(shard: &TestShard, namespace: IggyNamespace) -> (u64, u64) {
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .with_committed_partition(namespace, |partition| {
+                (partition.created_revision, partition.deleted_up_to_offset)
+            })
+            .expect("the partition is committed")
+    }
+
+    #[compio::test]
+    async fn given_a_retention_decision_when_this_node_leads_metadata_should_commit_each_offset_once()
+     {
+        const SINGLE_REPLICA: u8 = 1;
+        const DECIDED: u64 = 9;
+        let directory = tempfile::tempdir().expect("create the metadata journal directory");
+        let bus = SpyBus::default();
+        let mut shard = test_shard(&bus, PRIMARY, SINGLE_REPLICA, FIRST_BOOT);
+        shard.plane.metadata_mut().journal = Some(
+            PrepareJournal::open(&directory.path().join("journal.wal"), 0)
+                .await
+                .expect("open the metadata journal"),
+        );
+        let shard = Rc::new(shard);
+        let namespace = create_one_partition(&shard);
+        let (created_revision, untrimmed) = committed_truncation(&shard, namespace);
+        assert_eq!(untrimmed, 0);
+        let consensus = shard
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .expect("shard 0 holds the metadata consensus");
+        let before_commit = consensus.commit_min();
+
+        handle_metadata_submit(
+            Rc::clone(&shard),
+            shard::MetadataSubmit::RetentionTruncate {
+                namespace,
+                created_revision,
+                up_to_offset: DECIDED,
+            },
+            &Rc::default(),
+            SESSION_TIMEOUT,
+            &relay_map(),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while committed_truncation(&shard, namespace).1 != DECIDED {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the truncation did not commit"
+            );
+            compio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(consensus.commit_min(), before_commit + 1);
+
+        // What the watermark covers, and a decision read from another
+        // incarnation, propose nothing.
+        for (revision, up_to_offset) in [
+            (created_revision, DECIDED),
+            (created_revision, DECIDED - 1),
+            (created_revision + 1, DECIDED + 1),
+        ] {
+            assert_eq!(
+                commit_retention_truncate(&shard, namespace, revision, up_to_offset).await,
+                None
+            );
+        }
+        assert_eq!(consensus.commit_min(), before_commit + 1);
+        assert_eq!(committed_truncation(&shard, namespace).1, DECIDED);
+
+        assert_eq!(
+            commit_retention_truncate(&shard, namespace, created_revision, DECIDED + 1).await,
+            Some(Ok(true))
+        );
+        assert_eq!(committed_truncation(&shard, namespace).1, DECIDED + 1);
+        assert_eq!(consensus.commit_min(), before_commit + 2);
+
+        // A truncation that commits as a rejection is not reported as applied.
+        let other_incarnation = TruncatePartitionRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            partition_id: 0,
+            up_to_offset: DECIDED + 2,
+            expected_history: Some(created_revision + 1),
+        };
+        assert_eq!(
+            shard
+                .plane
+                .metadata()
+                .submit_truncate_partition_in_process(&other_incarnation)
+                .await,
+            Ok(false)
+        );
+        assert_eq!(committed_truncation(&shard, namespace).1, DECIDED + 1);
+    }
+
+    #[compio::test]
+    async fn given_a_retention_decision_when_building_its_truncation_should_bind_it_to_the_incarnation()
+     {
+        let bus = SpyBus::default();
+        let shard = test_shard(&bus, PRIMARY, REPLICAS, FIRST_BOOT);
+        let namespace = create_one_partition(&shard);
+        let (created_revision, _) = committed_truncation(&shard, namespace);
+
+        let request = retention_truncate_request(
+            shard.plane.metadata().mux_stm.streams(),
+            namespace,
+            created_revision,
+            9,
+        )
+        .expect("the watermark is below the decision");
+
+        assert_eq!(request.up_to_offset, 9);
+        assert_eq!(request.partition_id as usize, namespace.partition_id());
+        assert_eq!(
+            request.expected_history,
+            Some(created_revision),
+            "a partition recreated before the commit must not be truncated"
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_full_primary_pipeline_when_a_retention_decision_arrives_should_refuse_it() {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, PRIMARY, REPLICAS, FIRST_BOOT));
+        let namespace = create_one_partition(&shard);
+        let (created_revision, _) = committed_truncation(&shard, namespace);
+        let metadata = shard.plane.metadata();
+        let consensus = metadata
+            .consensus
+            .as_ref()
+            .expect("shard 0 holds the metadata consensus");
+        for up_to_offset in (1..).take(PIPELINE_PREPARE_QUEUE_MAX) {
+            assert!(
+                commit_retention_truncate(&shard, namespace, created_revision, up_to_offset)
+                    .now_or_never()
+                    .is_none(),
+                "the truncation stays in the pipeline without a journal or quorum"
+            );
+        }
+        assert!(consensus.pipeline_is_full());
+
+        assert_eq!(
+            commit_retention_truncate(&shard, namespace, created_revision, u64::MAX).await,
+            Some(Err(MetadataSubmitError::PipelineFull))
+        );
+        assert_eq!(consensus.pipeline_len(), PIPELINE_PREPARE_QUEUE_MAX);
+    }
+
+    #[compio::test]
+    async fn given_a_retention_decision_when_this_node_is_a_metadata_backup_should_commit_nothing()
+    {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, BACKUP, REPLICAS, FIRST_BOOT));
+        let namespace = create_one_partition(&shard);
+        let (created_revision, _) = committed_truncation(&shard, namespace);
+
+        assert_eq!(
+            commit_retention_truncate(&shard, namespace, created_revision, 9).await,
+            Some(Err(MetadataSubmitError::NotPrimary))
+        );
+
+        assert_eq!(committed_truncation(&shard, namespace).1, 0);
+        assert!(
+            bus.replica_sends.borrow().is_empty(),
+            "a refused proposal relays nothing, so a relayed decision takes one hop"
+        );
+    }
+
+    /// The body a backup relays for a retention decision.
+    fn retention_truncation(
+        namespace: IggyNamespace,
+        created_revision: u64,
+        up_to_offset: u64,
+    ) -> TruncatePartitionRequest {
+        TruncatePartitionRequest {
+            stream_id: WireIdentifier::numeric(u32::try_from(namespace.stream_id()).unwrap()),
+            topic_id: WireIdentifier::numeric(u32::try_from(namespace.topic_id()).unwrap()),
+            partition_id: u32::try_from(namespace.partition_id()).unwrap(),
+            up_to_offset,
+            expected_history: Some(created_revision),
+        }
+    }
+
+    /// Hands shard 0 the retention decision of a partition primary on this
+    /// node, and lets the arm run to its first suspension.
+    async fn submit_retention_decision(
+        shard: &Rc<TestShard>,
+        namespace: IggyNamespace,
+        created_revision: u64,
+        up_to_offset: u64,
+    ) {
+        handle_metadata_submit(
+            Rc::clone(shard),
+            shard::MetadataSubmit::RetentionTruncate {
+                namespace,
+                created_revision,
+                up_to_offset,
+            },
+            &Rc::default(),
+            SESSION_TIMEOUT,
+            &relay_map(),
+        );
+        compio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    /// Hands shard 0 the retention truncation that a backup relayed, and lets
+    /// the arm run to its first suspension.
+    async fn receive_retention_relay(shard: &Rc<TestShard>, request: &TruncatePartitionRequest) {
+        handle_metadata_submit(
+            Rc::clone(shard),
+            shard::MetadataSubmit::ForwardedCompletion(relay_message(
+                1,
+                0,
+                BACKUP,
+                Operation::TruncatePartition,
+                0,
+                &request.to_bytes(),
+            )),
+            &Rc::default(),
+            SESSION_TIMEOUT,
+            &relay_map(),
+        );
+        compio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    /// Applies `request` to the committed state of `shard`, as replication
+    /// from the primary does.
+    fn apply_truncation(shard: &TestShard, request: &TruncatePartitionRequest) {
+        let applied = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .update(prepare_message(
+                Operation::TruncatePartition,
+                0,
+                1,
+                &request.to_bytes(),
+            ))
+            .expect("the truncation applies");
+        assert_eq!(applied.code, 0);
+    }
+
+    /// How many of the frames this node sent to replicas are relays.
+    fn relays_sent(bus: &SpyBus) -> usize {
+        bus.replica_sends
+            .borrow()
+            .iter()
+            .filter(|(_, frame)| {
+                let mut owned = Owned::<MESSAGE_ALIGN>::zeroed(frame.len());
+                owned.as_mut_slice().copy_from_slice(frame);
+                Message::<GenericHeader>::try_from(owned)
+                    .is_ok_and(|message| message.header().command == Command::ForwardCompletion)
+            })
+            .count()
+    }
+
+    fn pipeline_len(shard: &TestShard) -> usize {
+        shard
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .expect("shard 0 holds the metadata consensus")
+            .pipeline_len()
+    }
+
+    #[compio::test]
+    async fn given_a_retention_decision_when_this_node_is_a_metadata_backup_should_relay_it_to_the_primary()
+     {
+        const DECIDED: u64 = 9;
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, BACKUP, REPLICAS, FIRST_BOOT));
+        let namespace = create_one_partition(&shard);
+        let (created_revision, _) = committed_truncation(&shard, namespace);
+
+        submit_retention_decision(&shard, namespace, created_revision, DECIDED).await;
+
+        let relays = relays(&bus);
+        assert_eq!(relays.len(), 1, "one decision is one relay");
+        let (target, relay) = &relays[0];
+        assert_eq!(*target, PRIMARY, "a relay goes to the primary of the view");
+        assert_eq!(relay.header().operation, Operation::TruncatePartition);
+        assert_eq!(relay.header().reporter, 0);
+        assert_eq!(relay.header().replica, BACKUP);
+        assert_eq!(
+            relay.body(),
+            &retention_truncation(namespace, created_revision, DECIDED).to_bytes()[..],
+            "the body is the truncation bound to the incarnation"
+        );
+        assert_eq!(
+            decode_relayed_truncation(relay.body()),
+            Some((namespace, created_revision, DECIDED)),
+            "the primary reads back what the backup decided"
+        );
+        assert_eq!(pipeline_len(&shard), 0, "a backup proposes nothing");
+        assert_eq!(committed_truncation(&shard, namespace).1, 0);
+    }
+
+    /// The backup's committed state can only be behind the primary's, so what
+    /// it rules out the primary would drop too.
+    #[compio::test]
+    async fn given_a_ruled_out_retention_decision_when_this_node_is_a_metadata_backup_should_relay_nothing()
+     {
+        const COMMITTED: u64 = 9;
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, BACKUP, REPLICAS, FIRST_BOOT));
+        let namespace = create_one_partition(&shard);
+        let (created_revision, _) = committed_truncation(&shard, namespace);
+        apply_truncation(
+            &shard,
+            &retention_truncation(namespace, created_revision, COMMITTED),
+        );
+        assert_eq!(committed_truncation(&shard, namespace).1, COMMITTED);
+
+        for (revision, up_to_offset) in [
+            (created_revision, COMMITTED),
+            (created_revision, COMMITTED - 1),
+            (created_revision + 1, COMMITTED + 1),
+        ] {
+            submit_retention_decision(&shard, namespace, revision, up_to_offset).await;
+            assert!(
+                bus.replica_sends.borrow().is_empty(),
+                "offset {up_to_offset} of incarnation {revision} is not relayed"
+            );
+        }
+
+        submit_retention_decision(&shard, namespace, created_revision, COMMITTED + 1).await;
+        assert_eq!(
+            relays(&bus).len(),
+            1,
+            "a decision above the watermark relays"
+        );
+    }
+
+    /// The test shard has no journal, so the prepare stays in the pipeline.
+    #[compio::test]
+    async fn given_a_retention_decision_when_this_node_leads_metadata_should_propose_it_and_relay_nothing()
+     {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, PRIMARY, REPLICAS, FIRST_BOOT));
+        let namespace = create_one_partition(&shard);
+        let (created_revision, _) = committed_truncation(&shard, namespace);
+
+        submit_retention_decision(&shard, namespace, created_revision, 9).await;
+
+        assert_eq!(pipeline_len(&shard), 1, "the primary proposes in process");
+        assert_eq!(relays_sent(&bus), 0, "the primary has no one to relay to");
+    }
+
+    #[compio::test]
+    async fn given_a_relayed_retention_truncation_when_this_node_leads_metadata_should_commit_it() {
+        const SINGLE_REPLICA: u8 = 1;
+        const DECIDED: u64 = 9;
+        let directory = tempfile::tempdir().expect("create the metadata journal directory");
+        let bus = SpyBus::default();
+        let mut shard = test_shard(&bus, PRIMARY, SINGLE_REPLICA, FIRST_BOOT);
+        shard.plane.metadata_mut().journal = Some(
+            PrepareJournal::open(&directory.path().join("journal.wal"), 0)
+                .await
+                .expect("open the metadata journal"),
+        );
+        let shard = Rc::new(shard);
+        let namespace = create_one_partition(&shard);
+        let (created_revision, _) = committed_truncation(&shard, namespace);
+        let consensus = shard
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .expect("shard 0 holds the metadata consensus");
+        let before_commit = consensus.commit_min();
+
+        receive_retention_relay(
+            &shard,
+            &retention_truncation(namespace, created_revision, DECIDED),
+        )
+        .await;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while committed_truncation(&shard, namespace).1 != DECIDED {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the relayed truncation did not commit"
+            );
+            compio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(consensus.commit_min(), before_commit + 1);
+        assert_eq!(relays_sent(&bus), 0, "a relay takes one hop");
+    }
+
+    /// A relay can be older than a commit, and slab ids are reused after a
+    /// delete, so the primary checks a relay against its own committed state.
+    /// The test shard has no journal, so a proposed relay stays in the pipeline.
+    #[compio::test]
+    async fn given_a_relayed_retention_truncation_when_the_committed_state_rules_it_out_should_propose_nothing()
+     {
+        const COMMITTED: u64 = 9;
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, PRIMARY, REPLICAS, FIRST_BOOT));
+        let namespace = create_one_partition(&shard);
+        let (created_revision, _) = committed_truncation(&shard, namespace);
+        apply_truncation(
+            &shard,
+            &retention_truncation(namespace, created_revision, COMMITTED),
+        );
+
+        for (revision, up_to_offset) in [
+            (created_revision, COMMITTED),
+            (created_revision, COMMITTED - 1),
+            (created_revision + 1, COMMITTED + 1),
+        ] {
+            receive_retention_relay(
+                &shard,
+                &retention_truncation(namespace, revision, up_to_offset),
+            )
+            .await;
+            assert_eq!(
+                pipeline_len(&shard),
+                0,
+                "offset {up_to_offset} of incarnation {revision} takes no prepare"
+            );
+        }
+        let gone = IggyNamespace::new(0, 0, 1);
+        receive_retention_relay(
+            &shard,
+            &retention_truncation(gone, created_revision, COMMITTED + 1),
+        )
+        .await;
+        assert_eq!(pipeline_len(&shard), 0, "an unknown partition takes none");
+
+        receive_retention_relay(
+            &shard,
+            &retention_truncation(namespace, created_revision, COMMITTED + 1),
+        )
+        .await;
+        assert_eq!(
+            pipeline_len(&shard),
+            1,
+            "a relay above the watermark of the same incarnation is proposed"
+        );
+        assert_eq!(committed_truncation(&shard, namespace).1, COMMITTED);
+    }
+
+    #[compio::test]
+    async fn given_a_relayed_retention_truncation_when_receiver_is_a_backup_should_neither_propose_nor_relay_again()
+     {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, BACKUP, REPLICAS, FIRST_BOOT));
+        let namespace = create_one_partition(&shard);
+        let (created_revision, _) = committed_truncation(&shard, namespace);
+
+        receive_retention_relay(
+            &shard,
+            &retention_truncation(namespace, created_revision, 9),
+        )
+        .await;
+
+        assert_eq!(pipeline_len(&shard), 0, "only the primary proposes");
+        assert!(
+            bus.replica_sends.borrow().is_empty(),
+            "a relay received by a backup is dropped, not relayed again"
+        );
+        assert_eq!(committed_truncation(&shard, namespace).1, 0);
+    }
+
+    /// Both bodies have the size the frame admits for a truncation, or decode
+    /// as one, and neither names a partition incarnation by number.
+    #[test]
+    fn given_a_relayed_truncation_body_when_it_is_not_bound_to_a_numbered_incarnation_should_not_decode()
+     {
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let bound = retention_truncation(namespace, 7, 9);
+        assert_eq!(
+            decode_relayed_truncation(&bound.to_bytes()),
+            Some((namespace, 7, 9))
+        );
+
+        let unbound = TruncatePartitionRequest {
+            expected_history: None,
+            ..bound.clone()
+        };
+        assert_eq!(decode_relayed_truncation(&unbound.to_bytes()), None);
+
+        // A four-byte name encodes to the size of a numeric id.
+        let by_stream_name = TruncatePartitionRequest {
+            stream_id: WireIdentifier::named("abcd").expect("a short name"),
+            ..bound.clone()
+        };
+        assert_eq!(by_stream_name.to_bytes().len(), bound.to_bytes().len());
+        assert_eq!(decode_relayed_truncation(&by_stream_name.to_bytes()), None);
+        let by_topic_name = TruncatePartitionRequest {
+            topic_id: WireIdentifier::named("abcd").expect("a short name"),
+            ..bound
+        };
+        assert_eq!(decode_relayed_truncation(&by_topic_name.to_bytes()), None);
+        assert_eq!(decode_relayed_truncation(&[]), None);
+    }
+
     #[compio::test]
     async fn given_full_primary_pipeline_when_lifecycle_batch_is_submitted_should_not_wake_the_reporter()
      {
@@ -1346,12 +2626,12 @@ mod tests {
         );
     }
 
-    /// The relay interval follows `[cluster] commit_broadcast_interval`.
+    /// The relay interval follows `[cluster] commit_busy_heartbeat_interval`.
     #[compio::test]
     async fn given_configured_commit_broadcast_when_backup_answers_lifecycle_batch_should_wait_two_broadcasts_and_the_margin()
      {
         let mut server_config = ServerConfig::default();
-        server_config.cluster.commit_broadcast_interval =
+        server_config.cluster.commit_busy_heartbeat_interval =
             IggyDuration::from(Duration::from_secs(1));
         let bus = SpyBus::default();
         bus.instant_timers.set(true);

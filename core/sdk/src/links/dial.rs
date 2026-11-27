@@ -67,6 +67,28 @@ impl Dialer {
         }
     }
 
+    /// The largest reply body that a link reads, where the transport caps it.
+    pub(crate) fn reply_body_limit(&self) -> Option<usize> {
+        match self {
+            Self::Quic { config, .. } => Some(
+                usize::try_from(config.response_buffer_size)
+                    .unwrap_or(usize::MAX)
+                    .saturating_sub(iggy_binary_protocol::HEADER_SIZE),
+            ),
+            // The server sends each reply as one frame of one message, and a reply above
+            // either cap fails the whole link.
+            Self::WebSocket(config) => [
+                config.ws_config.max_frame_size,
+                config.ws_config.max_message_size,
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .map(|size| size.saturating_sub(iggy_binary_protocol::HEADER_SIZE)),
+            _ => None,
+        }
+    }
+
     /// Opens a link to `endpoint` within `DIAL_TIMEOUT`.
     ///
     /// `CannotEstablishConnection` means that this endpoint failed, and
@@ -347,6 +369,8 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use crate::links::test_support::{LOCALHOST, SERVER_NAME, quic_server};
+    use iggy_binary_protocol::{HEADER_SIZE, MAX_RECORD_REPLY_SIZE};
+    use iggy_common::WebSocketConfig;
     use rustls::RootCertStore;
     use tokio::net::TcpListener;
 
@@ -469,6 +493,65 @@ mod tests {
         });
         assert!(accepted.is_err(), "the untrusted certificate must fail TLS");
         assert_eq!(result.err(), Some(IggyError::CannotEstablishConnection));
+    }
+
+    #[tokio::test]
+    async fn given_a_quic_response_buffer_when_limiting_replies_should_leave_room_for_the_header() {
+        let quic = quic_dialer(QuicClientConfig {
+            response_buffer_size: 1 << 20,
+            ..Default::default()
+        });
+        assert_eq!(
+            quic.reply_body_limit(),
+            Some((1 << 20) - iggy_binary_protocol::HEADER_SIZE)
+        );
+        assert_eq!(
+            Dialer::Tcp(Arc::new(TcpClientConfig::default())).reply_body_limit(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn given_default_configs_when_limiting_replies_should_hold_the_largest_record() {
+        for dialer in [
+            Dialer::WebSocket(Arc::new(WebSocketClientConfig::default())),
+            quic_dialer(QuicClientConfig::default()),
+        ] {
+            assert_eq!(
+                dialer.reply_body_limit(),
+                Some(MAX_RECORD_REPLY_SIZE - HEADER_SIZE),
+                "{:?}",
+                dialer.protocol()
+            );
+        }
+    }
+
+    #[test]
+    fn given_websocket_frame_and_message_caps_when_limiting_replies_should_take_the_smaller_less_the_header()
+     {
+        const FRAME: usize = 1 << 20;
+        const MESSAGE: usize = 4 << 20;
+        for (max_frame_size, max_message_size, limit) in [
+            (Some(FRAME), Some(MESSAGE), Some(FRAME - HEADER_SIZE)),
+            (Some(MESSAGE), Some(FRAME), Some(FRAME - HEADER_SIZE)),
+            (None, Some(MESSAGE), Some(MESSAGE - HEADER_SIZE)),
+            (None, None, None),
+        ] {
+            let dialer = Dialer::WebSocket(Arc::new(WebSocketClientConfig {
+                ws_config: WebSocketConfig {
+                    max_frame_size,
+                    max_message_size,
+                    ..WebSocketConfig::default()
+                },
+                ..WebSocketClientConfig::default()
+            }));
+
+            assert_eq!(
+                dialer.reply_body_limit(),
+                limit,
+                "frame: {max_frame_size:?}, message: {max_message_size:?}"
+            );
+        }
     }
 
     #[test]

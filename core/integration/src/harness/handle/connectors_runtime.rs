@@ -15,13 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Starts the `iggy-connectors` binary next to a test server.
+//!
+//! No test in this repository uses this module. The connector tests live in
+//! apache/iggy-connectors and reach it through a git dependency on this
+//! crate, so it is not dead code.
+
 use super::common;
 use crate::harness::config::ConnectorsRuntimeConfig;
 use crate::harness::context::TestContext;
 use crate::harness::error::TestBinaryError;
 use crate::harness::port_reserver::SinglePortReserver;
 use crate::harness::traits::{IggyServerDependent, TestBinary};
-use assert_cmd::prelude::CommandCargoExt;
+use configs::CONNECTORS_CONFIG_PATH_ENV;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -89,6 +95,17 @@ impl ConnectorsRuntimeHandle {
         self.iggy_connection_options = None;
     }
 
+    /// Kills the runtime with SIGKILL, so that no flush or offset store of a graceful stop
+    /// runs. Start it again with [`TestBinary::start`] and [`IggyServerDependent::wait_ready`].
+    pub fn kill(&mut self) -> Result<(), TestBinaryError> {
+        let Some(mut child) = self.child_handle.take() else {
+            return Ok(());
+        };
+        child.kill()?;
+        child.wait()?;
+        Ok(())
+    }
+
     fn build_envs(&mut self) {
         let state_path = self.context.connectors_runtime_state_path(self.server_id);
         self.envs.insert(
@@ -111,7 +128,7 @@ impl ConnectorsRuntimeHandle {
 
         if let Some(ref config_path) = self.config.config_path {
             self.envs.insert(
-                "IGGY_CONNECTORS_CONFIG_PATH".to_string(),
+                CONNECTORS_CONFIG_PATH_ENV.to_string(),
                 config_path.display().to_string(),
             );
         }
@@ -158,14 +175,10 @@ impl TestBinary for ConnectorsRuntimeHandle {
     fn start(&mut self) -> Result<(), TestBinaryError> {
         self.build_envs();
 
-        #[allow(deprecated)]
         let mut command = if let Some(ref path) = self.config.executable_path {
             Command::new(path)
         } else {
-            Command::cargo_bin("iggy-connectors").map_err(|e| TestBinaryError::ProcessSpawn {
-                binary: "iggy-connectors".to_string(),
-                source: std::io::Error::other(e.to_string()),
-            })?
+            common::cargo_bin_command("iggy-connectors")?
         };
 
         command.envs(&self.envs);
@@ -180,13 +193,14 @@ impl TestBinary for ConnectorsRuntimeHandle {
             let stdout_path = self.context.connectors_runtime_stdout_path(self.server_id);
             let stderr_path = self.context.connectors_runtime_stderr_path(self.server_id);
 
+            // Appended, so that a start after a kill keeps the logs of the killed run.
             let stdout_file =
-                File::create(&stdout_path).map_err(|e| TestBinaryError::FileSystemError {
+                append_to(&stdout_path).map_err(|e| TestBinaryError::FileSystemError {
                     path: stdout_path.clone(),
                     source: e,
                 })?;
             let stderr_file =
-                File::create(&stderr_path).map_err(|e| TestBinaryError::FileSystemError {
+                append_to(&stderr_path).map_err(|e| TestBinaryError::FileSystemError {
                     path: stderr_path.clone(),
                     source: e,
                 })?;
@@ -321,4 +335,8 @@ impl Drop for ConnectorsRuntimeHandle {
         let _ = self.stop();
         common::dump_logs_on_panic("Iggy connectors", &self.stdout_path, &self.stderr_path);
     }
+}
+
+fn append_to(path: &std::path::Path) -> std::io::Result<File> {
+    OpenOptions::new().create(true).append(true).open(path)
 }

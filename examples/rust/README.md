@@ -162,7 +162,7 @@ cargo run --example new-sdk-producer
 cargo run --example new-sdk-consumer
 ```
 
-Showcases the newer SDK APIs with simplified setup, automatic topic creation, consumer groups, and AutoCommit configuration.
+Showcases the newer SDK APIs with simplified setup, automatic topic creation, consumer groups, and offsets that the server stores on each poll.
 
 ### High-Volume Data Generation
 
@@ -195,7 +195,7 @@ cargo run --example stream-producer-config
 cargo run --example stream-consumer-config
 ```
 
-These examples document all available configuration options including partitioning strategies, retry policies, batching, AutoCommit strategies, polling strategies, and retry mechanisms.
+These examples document all available configuration options including partitioning strategies, retry policies, batching, offset commit policies, polling strategies, and retry mechanisms.
 
 ## Security Examples
 

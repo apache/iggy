@@ -150,21 +150,25 @@ public abstract class SystemClientBaseTest extends IntegrationTest {
     }
 
     @Test
-    void shouldGetClusterMetadataForSingleNode() {
+    void shouldGetClusterMetadata() {
         // when
         var metadata = systemClient.getClusterMetadata();
 
         // then
         assertThat(metadata).isNotNull();
-        // The server runs standalone (cluster disabled), so it synthesizes
-        // itself as the sole leader of a single-node roster.
-        assertThat(metadata.name()).isEqualTo("single-node");
-        assertThat(metadata.nodes()).hasSize(1);
-        var node = metadata.nodes().get(0);
-        assertThat(node.name()).isEqualTo("iggy-node");
-        assertThat(node.role()).isEqualTo(ClusterNodeRole.Leader);
-        assertThat(node.status()).isEqualTo(ClusterNodeStatus.Healthy);
-        assertThat(node.endpoints().tcp()).isPositive();
+        assertThat(metadata.nodes()).isNotEmpty();
+        assertThat(metadata.nodes())
+                .allSatisfy(node -> assertThat(node.endpoints().tcp()).isPositive());
+        assertThat(metadata.nodes())
+                .filteredOn(node -> node.role() == ClusterNodeRole.Leader)
+                .hasSize(1);
+        if (metadata.nodes().size() == 1) {
+            // A server with the cluster disabled synthesizes itself as the sole leader of a single-node roster.
+            assertThat(metadata.name()).isEqualTo("single-node");
+            var node = metadata.nodes().get(0);
+            assertThat(node.name()).isEqualTo("iggy-node");
+            assertThat(node.status()).isEqualTo(ClusterNodeStatus.Healthy);
+        }
     }
 
     @Test

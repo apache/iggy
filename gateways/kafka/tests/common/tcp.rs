@@ -27,7 +27,9 @@ use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::tcp::OwnedReadHalf;
+use tokio::net::{TcpSocket, TcpStream};
+use tokio::task::JoinHandle;
 use tokio::time;
 
 use iggy_gateway_kafka::protocol::header::{request_header_version, response_header_version};
@@ -174,6 +176,46 @@ pub fn build_metadata_legacy_request(topic_names: &[&str]) -> Bytes {
         body.extend_from_slice(name_bytes);
     }
     body.freeze()
+}
+
+/// A connection whose answers the client never reads, so the gateway's write blocks until
+/// `IGGY_KAFKA_WRITE_TIMEOUT_SECS`, and a shutdown drain waits that long.
+pub struct HeldConnection {
+    _answers: OwnedReadHalf,
+    requests: JoinHandle<()>,
+}
+
+impl Drop for HeldConnection {
+    fn drop(&mut self) {
+        self.requests.abort();
+    }
+}
+
+/// Sends `addr` Metadata requests for 4,096 topics of 249 characters each, about 16 MiB of
+/// answers in all, on a small receive buffer that it never reads. More than the socket buffers
+/// hold. The default 8 MiB frame cap fits each request.
+pub async fn hold_answers(addr: SocketAddr) -> HeldConnection {
+    let socket = TcpSocket::new_v4().expect("a socket");
+    socket
+        .set_recv_buffer_size(4 * 1024)
+        .expect("a small receive buffer");
+    let stream = socket.connect(addr).await.expect("connect");
+    let (answers, mut requests) = stream.into_split();
+    let names: Vec<String> = (0..4_096).map(|index| format!("{index:0>249}")).collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let body = build_metadata_legacy_request(&names);
+    let requests = tokio::spawn(async move {
+        for correlation_id in 0..16 {
+            let frame = build_request_frame(3, 0, correlation_id, Some("held"), &body);
+            if requests.write_all(&frame).await.is_err() {
+                return;
+            }
+        }
+    });
+    HeldConnection {
+        _answers: answers,
+        requests,
+    }
 }
 
 /// Read one length-prefixed response frame, returning `None` on timeout.

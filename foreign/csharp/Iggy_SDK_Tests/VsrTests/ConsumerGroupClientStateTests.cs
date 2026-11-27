@@ -66,6 +66,20 @@ public sealed class ConsumerGroupClientStateTests
     }
 
     [Fact]
+    public void AssignedPartitions_KeepAssignmentOrderAndFollowTheLatestAssignment()
+    {
+        var state = new ConsumerGroupClientState();
+        Assert.Empty(state.AssignedPartitions(Key));
+
+        state.SetAssignment(Key, 1, [2, 0, 1]);
+        state.NextGroupPartition(Key);
+        Assert.Equal<uint[]>([2, 0, 1], [.. state.AssignedPartitions(Key)]);
+
+        state.SetAssignment(Key, 2, [4]);
+        Assert.Equal<uint[]>([4], [.. state.AssignedPartitions(Key)]);
+    }
+
+    [Fact]
     public void NextGroupPartition_WithoutAssignmentIsNull()
     {
         var state = new ConsumerGroupClientState();

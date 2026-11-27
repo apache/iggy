@@ -32,6 +32,7 @@ import java.util.Map;
 public enum IggyErrorCode {
     // General errors
     ERROR(1),
+    INVALID_CONFIGURATION(2),
     INVALID_COMMAND(3),
     INVALID_FORMAT(4),
     FEATURE_UNAVAILABLE(5),
@@ -79,6 +80,18 @@ public enum IggyErrorCode {
     /** A committed lifecycle operation prevents this mutation. Retry as a new request. */
     LIFECYCLE_BUSY(88),
     NOT_PRIMARY(89),
+    DEFERRED_POLL_CAPACITY_EXCEEDED(90),
+    /**
+     * The object store refused a read of tiered data for a reason that a retry does not change. Do not send the
+     * request again.
+     */
+    TIERED_READ_FAILED(96),
+    /**
+     * The server sent this error in place of a reply above the reply size limit: a GetClients reply, or a reply to a
+     * read of streams, topics, partitions, consumer groups, users, tokens, options, stats or cluster metadata. The
+     * connection stays open. For a list, the page methods return the same items in smaller replies.
+     */
+    REPLY_TOO_LARGE(97),
 
     // Client errors
     CLIENT_NOT_FOUND(100),
@@ -91,6 +104,7 @@ public enum IggyErrorCode {
     INVALID_STREAM_NAME(1013),
     INVALID_STREAM_ID(1014),
     TOO_MANY_STREAMS(1020),
+    SHADOW_STREAM_READ_ONLY(1021),
 
     // Topic errors
     CANNOT_CREATE_TOPIC_DIRECTORY(2001),
@@ -124,6 +138,7 @@ public enum IggyErrorCode {
     TOO_MANY_MESSAGES(4023),
     EMPTY_MESSAGE_PAYLOAD(4024),
     INVALID_MESSAGE_CHECKSUM(4027),
+    INVALID_OFFSET(4100),
 
     // Resource option errors
     UNSUPPORTED_OPTION_KEY(4041),
@@ -143,6 +158,7 @@ public enum IggyErrorCode {
     CONSUMER_GROUP_NAME_ALREADY_EXISTS(5004),
     INVALID_CONSUMER_GROUP_NAME(5005),
     CONSUMER_GROUP_MEMBER_NOT_FOUND(5006),
+    CONSUMER_GROUP_PARTITION_NOT_OWNED(5009),
     TOO_MANY_CONSUMER_GROUPS(5010),
 
     // VSR protocol errors
@@ -152,6 +168,8 @@ public enum IggyErrorCode {
     OPERATION_UNCERTAIN(14006),
     LANE_BLOCKED(14007),
     OPERATION_NOT_RETAINED(14008),
+    PARTITION_LANE_BLOCKED(14009),
+    FETCH_PROGRESS_UNCERTAIN(14010),
 
     // Unknown error code
     UNKNOWN(-1);

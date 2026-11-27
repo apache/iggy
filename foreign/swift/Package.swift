@@ -34,7 +34,7 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.80.0"),
         .package(url: "https://github.com/apple/swift-nio-ssl.git", from: "2.29.0"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.6.0"),
-        .package(url: "https://github.com/apple/swift-crypto.git", "3.0.0"..<"4.0.0"),
+        .package(url: "https://github.com/apple/swift-crypto.git", "3.0.0"..<"6.0.0"),
     ],
     targets: [
         .target(
@@ -62,6 +62,11 @@ let package = Package(
         .testTarget(
             name: "IggyE2ETests",
             dependencies: ["Iggy"]
+        ),
+        .executableTarget(
+            name: "reader-example",
+            dependencies: ["Iggy"],
+            path: "Examples/Reader"
         ),
     ],
     swiftLanguageModes: [.v6]

@@ -26,15 +26,22 @@ covered by `test_client_config.py`.
 """
 
 import ast
+import json
 import socket
 from collections.abc import Callable
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 
 from apache_iggy import AutoLogin, IggyClient, QuicConfig, QuicReconnectionConfig
 
 from .utils import get_quic_server_config, wait_for_ping
+
+# One reply that holds the largest message, as the Rust SDK sizes the QUIC buffer.
+MAX_RECORD_REPLY_SIZE = json.loads(
+    (Path(__file__).parent / "fixtures" / "deferred_polling.json").read_text()
+)["constants"]["max_record_reply_size"]
 
 
 @pytest.mark.unit
@@ -163,7 +170,7 @@ class TestQuicConfig:
         assert config.auto_login.enabled is False
         assert config.reconnection.enabled is True
         assert config.heartbeat_interval == timedelta(seconds=5)
-        assert config.response_buffer_size == 10_000_000
+        assert config.response_buffer_size == MAX_RECORD_REPLY_SIZE
         assert config.max_concurrent_bidi_streams == 10_000
         assert config.datagram_send_buffer_size == 100_000
         assert config.initial_mtu == 1200

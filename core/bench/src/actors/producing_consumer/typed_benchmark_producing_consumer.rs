@@ -30,7 +30,7 @@ use crate::{
         },
         producing_consumer::BenchmarkProducingConsumer,
     },
-    utils::finish_condition::BenchmarkFinishCondition,
+    utils::{finish_condition::BenchmarkFinishCondition, warmup::BenchmarkWarmup},
 };
 use bench_report::{
     benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics,
@@ -40,8 +40,8 @@ use bench_report::{
 use iggy::prelude::*;
 
 pub enum TypedBenchmarkProducingConsumer {
-    High(BenchmarkProducingConsumer<HighLevelProducerClient, HighLevelConsumerClient>),
-    Low(BenchmarkProducingConsumer<LowLevelProducerClient, LowLevelConsumerClient>),
+    High(Box<BenchmarkProducingConsumer<HighLevelProducerClient, HighLevelConsumerClient>>),
+    Low(Box<BenchmarkProducingConsumer<LowLevelProducerClient, LowLevelConsumerClient>>),
 }
 impl TypedBenchmarkProducingConsumer {
     #[allow(clippy::too_many_arguments)]
@@ -57,11 +57,12 @@ impl TypedBenchmarkProducingConsumer {
         message_size: BenchmarkNumericParameter,
         send_finish_condition: Arc<BenchmarkFinishCondition>,
         poll_finish_condition: Arc<BenchmarkFinishCondition>,
-        warmup_time: IggyDuration,
+        warmup: BenchmarkWarmup,
         sampling_time: IggyDuration,
         moving_average_window: u32,
         limit_bytes_per_second: Option<IggyByteSize>,
         polling_kind: PollingKind,
+        poll_options: PollOptions,
         origin_timestamp_latency_calculation: bool,
         pretty: bool,
     ) -> Self {
@@ -71,7 +72,7 @@ impl TypedBenchmarkProducingConsumer {
             partitions: partitions_count,
             messages_per_batch,
             message_size,
-            warmup_time,
+            warmup,
             pretty,
         };
 
@@ -80,8 +81,9 @@ impl TypedBenchmarkProducingConsumer {
             consumer_group_id,
             stream_id,
             messages_per_batch,
-            warmup_time,
+            warmup,
             polling_kind,
+            poll_options,
             origin_timestamp_latency_calculation,
             pretty,
         };
@@ -90,7 +92,7 @@ impl TypedBenchmarkProducingConsumer {
             let producer =
                 HighLevelProducerClient::new(client_factory.clone(), producer_config.clone());
             let consumer = HighLevelConsumerClient::new(client_factory, consumer_config.clone());
-            Self::High(BenchmarkProducingConsumer::new(
+            Self::High(Box::new(BenchmarkProducingConsumer::new(
                 producer,
                 consumer,
                 benchmark_kind,
@@ -101,12 +103,12 @@ impl TypedBenchmarkProducingConsumer {
                 limit_bytes_per_second,
                 producer_config,
                 consumer_config,
-            ))
+            )))
         } else {
             let producer =
                 LowLevelProducerClient::new(client_factory.clone(), producer_config.clone());
             let consumer = LowLevelConsumerClient::new(client_factory, consumer_config.clone());
-            Self::Low(BenchmarkProducingConsumer::new(
+            Self::Low(Box::new(BenchmarkProducingConsumer::new(
                 producer,
                 consumer,
                 benchmark_kind,
@@ -117,7 +119,7 @@ impl TypedBenchmarkProducingConsumer {
                 limit_bytes_per_second,
                 producer_config,
                 consumer_config,
-            ))
+            )))
         }
     }
 

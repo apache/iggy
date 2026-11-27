@@ -361,7 +361,8 @@ class AsyncIggyTcpClientFailoverSignInTest {
                     false,
                     Optional.empty(),
                     Optional.empty(),
-                    AsyncTcpConnection.DEFAULT_IO_THREADS);
+                    AsyncTcpConnection.DEFAULT_IO_THREADS,
+                    EventLoopShutdown.resolve(null, null));
         }
 
         @Override

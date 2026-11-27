@@ -42,6 +42,7 @@ const (
 	OperationUpdateTopicResolved             Operation = 73
 	OperationUpdateUserResolved              Operation = 74
 	OperationRewrapStreamKeys                Operation = 75
+	OperationShadowTopic                     Operation = 76
 
 	// 129, 133 and 142 were the per-resource updates. Never reuse them.
 	OperationCreateStream              Operation = 128
@@ -62,6 +63,7 @@ const (
 	OperationJoinConsumerGroup         Operation = 148
 	OperationLeaveConsumerGroup        Operation = 149
 	OperationUpdateResource            Operation = 150
+	OperationRetireGeoOrigin           Operation = 151
 
 	OperationSendMessages               Operation = 160
 	OperationStoreConsumerOffset        Operation = 161
@@ -70,6 +72,7 @@ const (
 	OperationInstallConsumerGroupOwner  Operation = 167
 	OperationTransitionPartitionHistory Operation = 168
 	OperationRetireConsumerGroupOwners  Operation = 169
+	OperationStateMachineCommand        Operation = 170
 )
 
 // Band boundaries. The internal band is never client-sent.
@@ -96,6 +99,7 @@ var allOperations = []Operation{
 	OperationUpdateTopicResolved,
 	OperationUpdateUserResolved,
 	OperationRewrapStreamKeys,
+	OperationShadowTopic,
 	OperationCreateStream,
 	OperationDeleteStream,
 	OperationCreateTopic,
@@ -114,6 +118,7 @@ var allOperations = []Operation{
 	OperationJoinConsumerGroup,
 	OperationLeaveConsumerGroup,
 	OperationUpdateResource,
+	OperationRetireGeoOrigin,
 	OperationSendMessages,
 	OperationStoreConsumerOffset,
 	OperationDeleteConsumerOffset,
@@ -121,6 +126,7 @@ var allOperations = []Operation{
 	OperationInstallConsumerGroupOwner,
 	OperationTransitionPartitionHistory,
 	OperationRetireConsumerGroupOwners,
+	OperationStateMachineCommand,
 }
 
 var knownOperations = newOperationSet(allOperations)
@@ -151,6 +157,7 @@ var replicatedOperation = map[uint32]Operation{
 	uint32(command.JoinGroupCode):            OperationJoinConsumerGroup,
 	uint32(command.LeaveGroupCode):           OperationLeaveConsumerGroup,
 	uint32(command.UpdateResourceCode):       OperationUpdateResource,
+	uint32(command.RetireGeoOriginCode):      OperationRetireGeoOrigin,
 }
 
 func newOperationSet(operations []Operation) map[Operation]struct{} {
@@ -197,7 +204,7 @@ func IsKnownOperation(operation Operation) bool {
 // IsInternal reports whether the operation belongs to the replica-internal
 // band, which a client never sends.
 func IsInternal(operation Operation) bool {
-	return operation == OperationRetireSession || operation == OperationInstallConsumerGroupOwner || operation == OperationTransitionPartitionHistory || operation == OperationRetireConsumerGroupOwners || operation >= internalBandStart && operation < metadataBandStart
+	return operation == OperationRetireSession || operation == OperationInstallConsumerGroupOwner || operation == OperationTransitionPartitionHistory || operation == OperationRetireConsumerGroupOwners || operation == OperationStateMachineCommand || operation >= internalBandStart && operation < metadataBandStart
 }
 
 // IsMetadata reports whether the operation replicates through the metadata
@@ -211,7 +218,7 @@ func IsMetadata(operation Operation) bool {
 	if operation == OperationDeleteSegments {
 		return false
 	}
-	return operation >= metadataBandStart && operation <= OperationUpdateResource
+	return operation >= metadataBandStart && operation <= OperationRetireGeoOrigin
 }
 
 // IsResultFramed reports whether the reply body leads with a committed result

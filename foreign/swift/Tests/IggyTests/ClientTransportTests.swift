@@ -89,8 +89,8 @@ private struct GatedCloseConnector: IggyConnector {
             self.released = released
         }
 
-        func exchange(_ frame: [UInt8], timeout: Duration) async throws -> RawFrame {
-            try await underlying.exchange(frame, timeout: timeout)
+        func exchange(_ frame: [UInt8], timeout: Duration, cancellation: DeferredCancellation?) async throws -> RawFrame {
+            try await underlying.exchange(frame, timeout: timeout, cancellation: cancellation)
         }
 
         func close() async {
@@ -569,6 +569,28 @@ struct ClientTransportTests {
         let reads = await server.requests.filter { $0.code == CommandCode.getStreams.rawValue }
         #expect(reads.map(\.context.metadataOp) == [0, commit])
         #expect(await server.requests.first { $0.operation == .deleteStream }?.context == .empty)
+        await client.shutdown()
+    }
+
+    /// The origin travels as a wire name under its replicated operation. An
+    /// origin no wire name can carry is refused before anything is sent.
+    @Test func retiringAGeoOriginSendsItsNameAsAMetadataWrite() async throws {
+        let encoded: [UInt8] = [4] + Array("dc-a".utf8)
+        #expect(try Requests.retireGeoOrigin(origin: "dc-a") == encoded)
+        for invalid in ["", String(repeating: "o", count: 256)] {
+            #expect(throws: IggyError(.invalidFormat)) { try Requests.retireGeoOrigin(origin: invalid) }
+        }
+
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let client = makeClient(server)
+        try await client.connect()
+        try await client.retireGeoOrigin(origin: "dc-a")
+        let retired = await server.requests.filter { $0.code == CommandCode.retireGeoOrigin.rawValue }
+        #expect(retired.map(\.operation) == [.retireGeoOrigin])
+        #expect(retired.map(\.payload) == [encoded])
+        await expectCode(.invalidFormat) { try await client.retireGeoOrigin(origin: "") }
+        #expect(await server.requests.filter { $0.code == CommandCode.retireGeoOrigin.rawValue }.count == 1)
         await client.shutdown()
     }
 

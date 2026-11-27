@@ -73,6 +73,7 @@ fn main() -> Result<()> {
     content = content.replace("(apacheIggyError)", "(IggyError)");
     // The same split hits a pyclass-typed field of a complex enum variant.
     content = content.replace("apacheMetadataChangeCursor", "MetadataChangeCursor");
+    content = content.replace("apacheAutoCommit", "AutoCommit");
     // The runtime creates a str-backed Enum, whose str() differs from StrEnum.
     content.push_str("\nclass Durability(str, enum.Enum):  # noqa: UP042\n    REPLICATED = 'replicated'\n    PERSISTED = 'persisted'\n");
 

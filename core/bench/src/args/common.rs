@@ -30,11 +30,17 @@ use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
 use iggy::prelude::{
-    DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, IggyByteSize, IggyDuration, IggyExpiry,
-    TransportProtocol,
+    DEFAULT_POLL_MAX_BYTES, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, IggyByteSize,
+    IggyDuration, IggyError, IggyExpiry, MaxTopicSize, PollOptions, TransportProtocol,
 };
+use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BATCH_MESSAGE_HEADER_SIZE};
+use iggy_binary_protocol::requests::messages::{
+    MAX_DEFERRED_POLL_WAIT_US, MIN_DEFERRED_POLL_MAX_BYTES,
+};
+use iggy_binary_protocol::responses::messages::poll_messages::POLL_RESPONSE_HEADER_SIZE;
 use std::num::NonZeroU32;
 use std::str::FromStr;
+use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -51,6 +57,19 @@ pub struct IggyBenchArgs {
     /// Number of messages per batch
     #[arg(long, short = 'P', value_parser = BenchmarkNumericParameter::from_str, default_value_t = BenchmarkNumericParameter::Value(DEFAULT_MESSAGES_PER_BATCH.get()))]
     pub messages_per_batch: BenchmarkNumericParameter,
+
+    /// Maximum deliberate wait for the readiness minimum.
+    #[arg(long, default_value_t = IggyDuration::ONE_SECOND)]
+    pub max_wait: IggyDuration,
+
+    /// Readiness minimum, independent of the maximum messages per batch.
+    #[arg(long, default_value_t = 1)]
+    pub min_count: u32,
+
+    /// Maximum encoded poll reply bytes, including response and batch headers.
+    /// Defaults to 1 MiB, or to one full batch when that is larger.
+    #[arg(long)]
+    pub max_bytes: Option<u32>,
 
     /// Number of message batches per actor (producer / consumer / producing consumer).
     /// This argument is mutually exclusive with `total_messages_size`.
@@ -115,9 +134,82 @@ pub struct IggyBenchArgs {
     /// Topic option at creation, so it has no effect with `--reuse-streams`.
     #[arg(long)]
     pub messages_required_to_save: Option<NonZeroU32>,
+
+    /// Type of the newly created benchmark topics. A geo topic uploads each
+    /// send to the object store before it commits it, so the server needs
+    /// one. Topic option at creation, so it has no effect with
+    /// `--reuse-streams`.
+    #[arg(long, default_value_t = iggy::prelude::TopicType::Normal)]
+    pub topic_type: iggy::prelude::TopicType,
+
+    /// Create the benchmark topics with tiered storage, which moves sealed
+    /// segments to the object store. A geo topic cannot have it. Topic option
+    /// at creation, so it has no effect with `--reuse-streams`.
+    #[arg(long, default_value_t = false)]
+    pub tiered_storage: bool,
 }
 
 impl IggyBenchArgs {
+    /// Each actor sets its own `count` and `commit`. The `count` here is the smallest
+    /// batch, which `--min-count` must fit.
+    pub fn poll_options(&self) -> PollOptions {
+        PollOptions {
+            count: self.messages_per_batch.min(),
+            max_wait: self.max_wait,
+            min_count: self.min_count,
+            max_bytes: self
+                .max_bytes
+                .unwrap_or_else(|| self.batch_reply_bytes().max(DEFAULT_POLL_MAX_BYTES)),
+            ..PollOptions::default()
+        }
+    }
+
+    /// Reply bytes of the largest batch of the largest messages. A poll that starts inside a
+    /// stored batch reads one more stored batch than the batches it covers.
+    fn batch_reply_bytes(&self) -> u32 {
+        let messages = u64::from(self.messages_per_batch.max());
+        let stored_batches = messages.div_ceil(u64::from(self.messages_per_batch.min())) + 1;
+        let bytes = POLL_RESPONSE_HEADER_SIZE as u64
+            + stored_batches * BATCH_HEADER_SIZE as u64
+            + messages * (BATCH_MESSAGE_HEADER_SIZE as u64 + u64::from(self.message_size.max()));
+        u32::try_from(bytes).unwrap_or(u32::MAX)
+    }
+
+    fn poll_options_error(&self, error: &IggyError) -> String {
+        let duration = |micros| IggyDuration::from(Duration::from_micros(micros));
+        match error {
+            IggyError::InvalidMessagesCount => format!(
+                "--min-count {} must be in 1..={}, the smallest --messages-per-batch",
+                self.min_count,
+                self.messages_per_batch.min()
+            ),
+            IggyError::InvalidCommand => format!(
+                "--max-wait {} must be at most {}",
+                self.max_wait,
+                duration(MAX_DEFERRED_POLL_WAIT_US)
+            ),
+            IggyError::InvalidSizeBytes => format!(
+                "--max-bytes {} must be at least {MIN_DEFERRED_POLL_MAX_BYTES}",
+                self.poll_options().max_bytes
+            ),
+            error => error.to_string(),
+        }
+    }
+
+    /// Producer-only kinds never poll, so their names and reports leave out the poll options.
+    pub const fn polls(&self) -> bool {
+        !matches!(
+            self.benchmark_kind,
+            BenchmarkKindCommand::PinnedProducer(_) | BenchmarkKindCommand::BalancedProducer(_)
+        )
+    }
+
+    /// The request timeout that the SDK derives from `--max-wait`. Result names keep it, so
+    /// they stay comparable with older results.
+    fn request_timeout(&self) -> IggyDuration {
+        self.poll_options().request_timeout()
+    }
+
     pub fn transport_command(&self) -> &BenchmarkTransportCommand {
         self.benchmark_kind.transport_command()
     }
@@ -138,6 +230,19 @@ impl IggyBenchArgs {
     }
 
     pub fn validate(&mut self) {
+        if let Err(error) = self.poll_options().validate() {
+            Self::command()
+                .error(ErrorKind::ValueValidation, self.poll_options_error(&error))
+                .exit();
+        }
+        if let Some(max_bytes) = self.max_bytes
+            && max_bytes < self.batch_reply_bytes()
+        {
+            println!(
+                "Warning: --max-bytes {max_bytes} holds less than one batch ({} B), so polls return partial batches.",
+                self.batch_reply_bytes()
+            );
+        }
         if self.output_dir().is_none()
             && (self.gitref().is_some()
                 || self.identifier().is_some()
@@ -149,6 +254,15 @@ impl IggyBenchArgs {
                 .error(
                     ErrorKind::ArgumentConflict,
                     "--git-ref, --git-ref-date, --identifier, --remark, --extra-info can only be used with --output-dir",
+                )
+                .exit();
+        }
+
+        if self.tiered_storage && self.topic_type == iggy::prelude::TopicType::Geo {
+            Self::command()
+                .error(
+                    ErrorKind::ArgumentConflict,
+                    "--tiered-storage cannot be used with --topic-type geo",
                 )
                 .exit();
         }
@@ -311,6 +425,28 @@ impl IggyBenchArgs {
             })
     }
 
+    pub fn suite(&self) -> Option<String> {
+        self.benchmark_kind
+            .inner()
+            .transport_command()
+            .output_command()
+            .as_ref()
+            .and_then(|cmd| match cmd {
+                BenchmarkOutputCommand::Output(args) => args.suite.clone(),
+            })
+    }
+
+    pub fn workload(&self) -> Option<String> {
+        self.benchmark_kind
+            .inner()
+            .transport_command()
+            .output_command()
+            .as_ref()
+            .and_then(|cmd| match cmd {
+                BenchmarkOutputCommand::Output(args) => args.workload.clone(),
+            })
+    }
+
     pub fn open_charts(&self) -> bool {
         self.benchmark_kind
             .inner()
@@ -326,12 +462,14 @@ impl IggyBenchArgs {
         self.benchmark_kind.inner().max_topic_size()
     }
 
-    pub fn message_expiry(&self) -> IggyExpiry {
-        self.benchmark_kind.inner().message_expiry()
+    /// The size limit that the bench creates topics with: no limit without `--max-topic-size`.
+    pub fn new_topic_max_size(&self) -> MaxTopicSize {
+        self.max_topic_size()
+            .map_or(MaxTopicSize::Unlimited, MaxTopicSize::Custom)
     }
 
-    pub fn read_amplification(&self) -> Option<f32> {
-        self.benchmark_kind.inner().read_amplification()
+    pub fn message_expiry(&self) -> IggyExpiry {
+        self.benchmark_kind.inner().message_expiry()
     }
 
     pub const fn high_level_api(&self) -> bool {
@@ -348,6 +486,22 @@ impl IggyBenchArgs {
 
     pub const fn consumer_offset_durability(&self) -> iggy::prelude::Durability {
         self.consumer_offset_durability
+    }
+
+    /// The type the benchmark topics are created with, `None` for the
+    /// server's own default.
+    pub fn topic_type(&self) -> Option<iggy::prelude::TopicType> {
+        (self.topic_type != iggy::prelude::TopicType::Normal).then_some(self.topic_type)
+    }
+
+    /// Whether the benchmark topics are created with tiered storage, `None`
+    /// for the server's own default.
+    pub const fn tiered_storage(&self) -> Option<bool> {
+        if self.tiered_storage {
+            Some(true)
+        } else {
+            None
+        }
     }
 
     pub const fn messages_required_to_save(&self) -> Option<NonZeroU32> {
@@ -411,6 +565,16 @@ impl IggyBenchArgs {
             transport.to_string(),
         ];
 
+        if self.polls() {
+            parts.push(format!(
+                "wait{}_min{}_bytes{}_timeout{}",
+                self.max_wait,
+                self.min_count,
+                self.poll_options().max_bytes,
+                self.request_timeout()
+            ));
+        }
+
         if let Some(remark) = &self.remark() {
             parts.push(remark.clone());
         }
@@ -462,10 +626,97 @@ impl IggyBenchArgs {
             self.messages_per_batch(),
         );
 
+        if self.polls() {
+            name = format!(
+                "{name}, wait {}, min {}, max {}B, timeout {}",
+                self.max_wait,
+                self.min_count,
+                self.poll_options().max_bytes,
+                self.request_timeout()
+            );
+        }
+
         if let Some(remark) = &self.remark() {
             name = format!("{name} ({remark})");
         }
 
         name
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(arguments: &[&str]) -> IggyBenchArgs {
+        parse_kind("pinned-consumer", arguments)
+    }
+
+    fn parse_kind(kind: &str, arguments: &[&str]) -> IggyBenchArgs {
+        let mut command = vec!["iggy-bench"];
+        command.extend_from_slice(arguments);
+        command.extend_from_slice(&[kind, "tcp"]);
+        IggyBenchArgs::try_parse_from(command).unwrap()
+    }
+
+    fn poll_error(arguments: &[&str]) -> String {
+        let args = parse(arguments);
+        let error = args.poll_options().validate().unwrap_err();
+        args.poll_options_error(&error)
+    }
+
+    #[test]
+    fn default_max_bytes_should_fit_one_full_batch() {
+        assert_eq!(parse(&[]).poll_options().max_bytes, DEFAULT_POLL_MAX_BYTES);
+
+        let larger = parse(&["-m", "1024"]);
+        let max_bytes = larger.poll_options().max_bytes;
+        assert!(max_bytes > DEFAULT_POLL_MAX_BYTES);
+        assert!(u64::from(max_bytes) >= 1000 * (BATCH_MESSAGE_HEADER_SIZE as u64 + 1024));
+
+        let explicit = parse(&["-m", "1024", "--max-bytes", "4096"]);
+        assert_eq!(explicit.poll_options().max_bytes, 4096);
+    }
+
+    #[test]
+    fn poll_option_errors_should_name_the_flag() {
+        assert!(poll_error(&["-P", "10", "--min-count", "11"]).starts_with("--min-count 11 "));
+        assert_eq!(
+            poll_error(&["--max-wait", "11m"]),
+            "--max-wait 11m must be at most 10m"
+        );
+        assert!(poll_error(&["--max-bytes", "1"]).starts_with("--max-bytes 1 "));
+    }
+
+    #[test]
+    fn given_topic_flags_when_parsed_should_set_only_the_options_they_name() {
+        let unset = parse(&[]);
+        assert_eq!(unset.topic_type(), None);
+        assert_eq!(unset.tiered_storage(), None);
+
+        let geo = parse(&["--topic-type", "geo"]);
+        assert_eq!(geo.topic_type(), Some(iggy::prelude::TopicType::Geo));
+        assert_eq!(geo.tiered_storage(), None);
+
+        let tiered = parse(&["--tiered-storage"]);
+        assert_eq!(tiered.topic_type(), None);
+        assert_eq!(tiered.tiered_storage(), Some(true));
+    }
+
+    #[test]
+    fn producer_only_names_should_leave_out_poll_options() {
+        let producer = parse_kind("pinned-producer", &["-b", "10"]);
+        assert!(!producer.generate_dir_name().contains("_wait"));
+        assert!(!producer.generate_pretty_name().contains("wait"));
+
+        let consumer = parse(&["-b", "10"]);
+        assert!(consumer.generate_dir_name().contains("_wait1s_min1_"));
+        assert!(consumer.generate_dir_name().contains("_timeout11s"));
+        assert!(
+            consumer
+                .generate_pretty_name()
+                .contains(", wait 1s, min 1,")
+        );
+        assert!(consumer.generate_pretty_name().contains(", timeout 11s"));
     }
 }

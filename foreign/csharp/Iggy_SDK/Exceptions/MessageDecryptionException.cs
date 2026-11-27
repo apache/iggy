@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Contracts;
+
 namespace Apache.Iggy.Exceptions;
 
 /// <summary>
@@ -39,15 +41,27 @@ public sealed class MessageDecryptionException : Exception
     public uint PartitionId { get; }
 
     /// <summary>
+    ///     The record of the message as the reply carried it: its 48-byte frame header, payload and user headers
+    ///     before decryption. Null for a message of a JSON reply over HTTP, which carries no records.
+    /// </summary>
+    public byte[]? Record { get; }
+
+    /// <summary>The context of the poll reply over TCP that carried the message. Null for any other reply.</summary>
+    internal PartitionContext? Context { get; set; }
+
+    /// <summary>
     ///     Initializes a new instance of the <see cref="MessageDecryptionException" /> class.
     /// </summary>
     /// <param name="offset">Offset of the message that failed to decrypt.</param>
     /// <param name="partitionId">Partition the failing message was polled from.</param>
     /// <param name="innerException">The underlying cryptographic failure.</param>
-    public MessageDecryptionException(ulong offset, uint partitionId, Exception innerException)
+    /// <param name="record">The record of the message as the reply carried it, when the reply carried records.</param>
+    public MessageDecryptionException(ulong offset, uint partitionId, Exception innerException,
+        byte[]? record = null)
         : base($"Failed to decrypt message at offset {offset} in partition {partitionId}.", innerException)
     {
         Offset = offset;
         PartitionId = partitionId;
+        Record = record;
     }
 }

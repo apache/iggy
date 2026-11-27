@@ -42,6 +42,25 @@ it('translates the lifecycle refusal', () => {
   assert.equal(translateErrorCode(88), 'A committed lifecycle operation prevents this mutation. Retry as a new request.');
 });
 
+it('translates the deferred poll capacity refusal', () => {
+  assert.equal(translateErrorCode(90), 'Deferred poll capacity exceeded; retry after backoff on the same replica');
+});
+
+it('translates the tiered read failure', () => {
+  assert.equal(translateErrorCode(96), 'Tiered data cannot be read from the object store; a retry does not help');
+});
+
+it('translates the reply size refusal', () => {
+  assert.equal(translateErrorCode(97), 'The reply is larger than the reply size limit');
+});
+
+it('translates the shadow stream write refusal', () => {
+  assert.equal(
+    translateErrorCode(1021),
+    "The stream is a shadow of another cluster's stream and takes no writes"
+  );
+});
+
 it('translates the consumer-offset capacity error', () => {
   assert.equal(translateErrorCode(3024), 'Consumer offset limit reached for partition, raise [partition] consumer_offsets_max');
 });
@@ -93,4 +112,10 @@ it('translates the resource option refusals', () => {
   assert.equal(translateErrorCode(4106), 'Stream encryption key requires a server encryption key');
   assert.equal(translateErrorCode(4107), 'Unsupported critical option: {0}');
   assert.equal(translateErrorCode(4108), 'Cannot modify root user');
+});
+
+it('translates the local lane and read recovery codes', () => {
+  assert.equal(translateErrorCode(14007), 'Lane blocked by operation {0} with an unknown outcome');
+  assert.equal(translateErrorCode(14009), 'Lane of partition {0} blocked by operation {1} with an unknown outcome');
+  assert.equal(translateErrorCode(14010), 'Read {0} has unknown progress and requires explicit abandonment');
 });

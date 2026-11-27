@@ -20,10 +20,13 @@
 //! builders below assemble minimal shards and wire frames.
 
 use bytes::Bytes;
+use consensus::client_table::SessionAttachment;
 use consensus::{LocalPipeline, MetadataHandle, VsrConsensus};
 use futures::channel::oneshot;
 use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
-use iggy_binary_protocol::requests::consumer_groups::CreateConsumerGroupRequest;
+use iggy_binary_protocol::requests::consumer_groups::{
+    CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
+};
 use iggy_binary_protocol::requests::streams::CreateStreamRequest;
 use iggy_binary_protocol::requests::topics::{
     CreateTopicRequest, CreateTopicWithAssignmentsRequest, DeleteTopicRequest,
@@ -33,6 +36,7 @@ use iggy_binary_protocol::{
     Command, Operation, PrepareHeader, ReplyHeader, RoutedRequestHeader, WireEncode,
     WireGlobalPermissions, WireIdentifier, WireName, WireOptions, WirePermissions,
 };
+use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 use iggy_common::{EncryptorKind, ServerKeyContext, UserStatus, variadic};
 use journal::prepare_journal::PrepareJournal;
 use message_bus::client_listener::RequestHandler;
@@ -42,12 +46,13 @@ use message_bus::installer::conn_info::ClientConnMeta;
 use message_bus::replica::listener::MessageHandler;
 use message_bus::{
     BusMessage, ClientConnectionLostFn, ConnectionLostFn, ConnectionPermit, ConnectionRegistry,
-    InstanceToken, JoinHandle, MessageBus, ReplicaForwardFn, ReplicaHandshakeDoneFn, SendError,
-    SharedTlsServerConfig,
+    InstanceToken, JoinHandle, MessageBus, ReplicaForwardFn, ReplicaHandshakeDoneFn, ReplicaLinkId,
+    SendError, SharedTlsServerConfig,
 };
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
 use metadata::stm::StateMachine as _;
 use metadata::stm::lifecycle::{CompleteLifecycleRequest, LifecycleCompletion};
+use metadata::stm::result::ApplyReply;
 use metadata::stm::stream::Streams;
 use metadata::stm::user::Users;
 use metadata::{IggyMetadata, MuxStateMachine};
@@ -57,15 +62,16 @@ use server_common::send_messages::{
     COMMAND_HEADER_SIZE, IggyMessage, IggyMessageHeader, IggyMessages, PREPARE_SPLIT_POINT,
     SendMessagesOwned, encrypt_batch_request,
 };
-use server_common::sharding::{IggyNamespace, ShardId};
+use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use server_common::{MESSAGE_ALIGN, Message};
-use shard::shards_table::PapayaShardsTable;
+use shard::shards_table::{PapayaShardsTable, ShardsTable};
 use shard::{IggyShard, PartitionConsensusConfig, ReplicaTopology, ShardIdentity};
 use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::mem::size_of;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 pub type TestMux = MuxStateMachine<variadic!(Users, Streams)>;
 pub type TestShard = IggyShard<SpyBus, PrepareJournal, IggySnapshot, TestMux, PapayaShardsTable>;
@@ -103,6 +109,8 @@ pub struct SpyBus {
     pub sleeps: Rc<RefCell<Vec<std::time::Duration>>>,
     /// Pins [`MessageBus::realtime_micros`]. `None` reads the system clock.
     pub realtime: Rc<Cell<Option<u64>>>,
+    /// Pins the monotonic clock when a test also controls the bus timers.
+    pub monotonic: Rc<Cell<Option<u64>>>,
     /// One installation per client connection, as the production registry
     /// keeps them. [`ConnectionInstaller::client_instance`] opens one on
     /// first sight, so every client is connected until
@@ -183,6 +191,13 @@ impl MessageBus for SpyBus {
             .get()
             .unwrap_or_else(|| iggy_common::IggyTimestamp::now().as_micros())
     }
+    fn monotonic_micros(&self) -> u64 {
+        static ORIGIN: OnceLock<Instant> = OnceLock::new();
+        self.monotonic.get().unwrap_or_else(|| {
+            u64::try_from(ORIGIN.get_or_init(Instant::now).elapsed().as_micros())
+                .unwrap_or(u64::MAX)
+        })
+    }
     fn set_connection_lost_fn(&self, _f: ConnectionLostFn) {}
     fn set_replica_forward_fn(&self, _f: ReplicaForwardFn) {}
 }
@@ -191,6 +206,8 @@ impl ConnectionInstaller for SpyBus {
     fn install_replica_inbound_fd(
         &self,
         _fd: DupedFd,
+        _link: ReplicaLinkId,
+        _deadline: Instant,
         _on_message: MessageHandler,
         _on_done: ReplicaHandshakeDoneFn,
     ) {
@@ -198,13 +215,15 @@ impl ConnectionInstaller for SpyBus {
     fn install_replica_outbound_fd(
         &self,
         _fd: DupedFd,
-        _replica_id: u8,
+        _link: ReplicaLinkId,
         _on_message: MessageHandler,
         _on_done: ReplicaHandshakeDoneFn,
     ) {
     }
-    fn release_replica_handshake_slot(&self, _slot: u64) {}
-    fn clear_replica_dial_pending(&self, _replica_id: u8) {}
+    fn replica_inbound_handshake_done(&self, _slot: u64, _link: ReplicaLinkId) {}
+    fn replica_outbound_handshake_done(&self, _link: ReplicaLinkId) {}
+    fn replica_link_closed(&self, _link: ReplicaLinkId) {}
+    fn close_replica_link(&self, _link: ReplicaLinkId) {}
     fn install_client_fd(
         &self,
         _fd: DupedFd,
@@ -500,6 +519,10 @@ pub fn prepare_message(
 /// The client that issues the setup operations below.
 const VSR_CLIENT_ID: u128 = 1;
 
+/// The consensus group of partition 0. Each later partition takes the next
+/// group.
+const FIRST_PARTITION_GROUP: u64 = 1;
+
 /// Creates one stream with one single-partition topic, and returns the
 /// namespace of its partition. No route names the partition yet.
 pub fn create_one_partition(shard: &TestShard) -> IggyNamespace {
@@ -508,6 +531,12 @@ pub fn create_one_partition(shard: &TestShard) -> IggyNamespace {
 
 /// [`create_one_partition`] on the metadata state machine of any shard.
 pub fn create_one_partition_in(mux_stm: &TestMux) -> IggyNamespace {
+    create_partitions_in(mux_stm, 1)[0]
+}
+
+/// Creates one stream with one topic of `count` partitions, and returns the
+/// namespaces of its partitions in partition order. No route names them yet.
+pub fn create_partitions_in(mux_stm: &TestMux, count: u32) -> Vec<IggyNamespace> {
     mux_stm.users().ensure_root_user("iggy", "hash");
     mux_stm
         .update(prepare_message(
@@ -529,38 +558,97 @@ pub fn create_one_partition_in(mux_stm: &TestMux) -> IggyNamespace {
             &CreateTopicWithAssignmentsRequest {
                 request: CreateTopicRequest {
                     stream_id: WireIdentifier::numeric(0),
-                    partitions_count: 1,
+                    partitions_count: count,
                     name: WireName::new("topic").unwrap(),
                     options: WireOptions::empty(),
                 },
                 derived_options: WireOptions::empty(),
-                partitions: vec![CreatedPartitionAssignment {
-                    initial_view: 0,
-                    partition_id: 0,
-                    consensus_group_id: 1,
-                }],
+                partitions: (0..count)
+                    .map(|partition_id| CreatedPartitionAssignment {
+                        initial_view: 0,
+                        partition_id,
+                        consensus_group_id: FIRST_PARTITION_GROUP + u64::from(partition_id),
+                        members: Vec::new(),
+                    })
+                    .collect(),
             }
             .to_bytes(),
         ))
         .unwrap();
+    (0..count)
+        .map(|partition_id| {
+            mux_stm
+                .streams()
+                .namespace_from_partition(
+                    &WireIdentifier::numeric(0),
+                    &WireIdentifier::numeric(0),
+                    partition_id,
+                )
+                .unwrap()
+        })
+        .collect()
+}
+
+/// [`create_one_partition`] with the partition routed to shard 0, so
+/// authorization and resolution let a read reach the owner inbox.
+pub fn route_one_partition(shard: &TestShard) -> IggyNamespace {
+    route_partitions(shard, 1)[0]
+}
+
+/// [`create_partitions_in`] on `shard`, with every partition routed to
+/// shard 0.
+pub fn route_partitions(shard: &TestShard, count: u32) -> Vec<IggyNamespace> {
+    route_partitions_to(shard, count, 0)
+}
+
+/// [`route_partitions`] to the shard `owner`.
+pub fn route_partitions_to(shard: &TestShard, count: u32, owner: u16) -> Vec<IggyNamespace> {
+    let namespaces = create_partitions_in(&shard.plane.metadata().mux_stm, count);
+    for namespace in &namespaces {
+        shard
+            .shards_table()
+            .insert(*namespace, PartitionLocation::new(ShardId::new(owner), 0));
+    }
+    namespaces
+}
+
+/// Registers `client_id` as the root user and attaches `session`, the
+/// state of a bound TCP connection.
+pub fn attach_root_session(shard: &TestShard, client_id: u128, session: u64) -> SessionAttachment {
+    let mut table = shard.plane.metadata().client_table.borrow_mut();
+    table
+        .commit_register(
+            client_id,
+            DEFAULT_ROOT_USER_ID,
+            [0x5a; 32],
+            register_reply(client_id, session),
+        )
+        .unwrap();
+    table
+        .attach_session(client_id, session, DEFAULT_ROOT_USER_ID)
+        .unwrap()
+}
+
+/// Applies `body` as committed metadata op `op`.
+pub fn apply_metadata_op(
+    mux_stm: &TestMux,
+    op: u64,
+    operation: Operation,
+    body: &[u8],
+) -> ApplyReply {
     mux_stm
-        .streams()
-        .namespace_from_partition(&WireIdentifier::numeric(0), &WireIdentifier::numeric(0), 0)
+        .update(prepare_message(operation, 0, op, body).transmute_header(
+            |old, header: &mut iggy_binary_protocol::PrepareHeader| {
+                *header = old;
+                header.op = op;
+            },
+        ))
         .unwrap()
 }
 
 /// Delete and recreate the topic at the same slab ids through committed metadata operations.
 pub fn recreate_topic_in(mux_stm: &TestMux, namespace: IggyNamespace) {
-    let apply = |op, operation, body: Bytes| {
-        mux_stm
-            .update(prepare_message(operation, 0, op, &body).transmute_header(
-                |old, header: &mut iggy_binary_protocol::PrepareHeader| {
-                    *header = old;
-                    header.op = op;
-                },
-            ))
-            .unwrap()
-    };
+    let apply = |op, operation, body: Bytes| apply_metadata_op(mux_stm, op, operation, &body);
     let deleted = apply(
         4,
         Operation::DeleteTopic,
@@ -598,6 +686,7 @@ pub fn recreate_topic_in(mux_stm: &TestMux, namespace: IggyNamespace) {
                 partition_id: namespace.partition_id().try_into().unwrap(),
                 consensus_group_id: 2,
                 initial_view: 0,
+                members: Vec::new(),
             }],
         }
         .to_bytes(),
@@ -624,6 +713,56 @@ pub fn create_consumer_group(shard: &TestShard) {
             .to_bytes(),
         ))
         .unwrap();
+}
+
+/// Deletes the group of [`create_consumer_group`] and creates it again under
+/// its name, so that it gets a new id.
+pub fn recreate_consumer_group(shard: &TestShard) {
+    const DELETE_OP: u64 = 4;
+    const COMPLETE_OP: u64 = 5;
+    const CREATE_OP: u64 = 6;
+    let mux_stm = &shard.plane.metadata().mux_stm;
+    let deleted = apply_metadata_op(
+        mux_stm,
+        DELETE_OP,
+        Operation::DeleteConsumerGroup,
+        &DeleteConsumerGroupRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            group_id: WireIdentifier::named("group").unwrap(),
+        }
+        .to_bytes(),
+    );
+    assert_eq!(deleted.code, 0);
+    let completion = CompleteLifecycleRequest::new(
+        DELETE_OP,
+        0,
+        vec![LifecycleCompletion {
+            topic_id: 0,
+            partition_id: 0,
+            partition_op: 1,
+        }],
+    )
+    .unwrap();
+    let completed = apply_metadata_op(
+        mux_stm,
+        COMPLETE_OP,
+        Operation::CompleteLifecycle,
+        &completion.to_bytes(),
+    );
+    assert_eq!(completed.code, 0);
+    let created = apply_metadata_op(
+        mux_stm,
+        CREATE_OP,
+        Operation::CreateConsumerGroup,
+        &CreateConsumerGroupRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            name: WireName::new("group").unwrap(),
+        }
+        .to_bytes(),
+    );
+    assert_eq!(created.code, 0);
 }
 
 /// A `CreateUser` request for a user that may read server state and poll

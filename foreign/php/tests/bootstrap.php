@@ -22,6 +22,8 @@ use Iggy\Client as IggyClient;
 use Iggy\ReceiveMessage;
 use PHPUnit\Framework\Assert;
 
+const READ_UNTIL_POLL_MICROS = 10_000;
+
 function assert_true(bool $condition, string $message = 'expected condition to be true'): void
 {
     Assert::assertTrue($condition, $message);
@@ -226,26 +228,18 @@ function delete_user_by_name(IggyClient $client, string $username): void
     $client->sendBinaryRequest(34, chr(2) . chr(strlen($username)) . $username);
 }
 
-/**
- * Stream id to name, from the raw GetStreams answer (201): per stream its id, created_at,
- * topics_count, size, messages_count, name and the two length-prefixed option blocks.
- */
+/** Stream id to name, read page by page in id order. */
 function stream_list(IggyClient $client): array
 {
-    $payload = $client->sendBinaryRequest(201, '');
     $streams = [];
-    $position = 0;
-    while ($position < strlen($payload)) {
-        $id = unpack('V', $payload, $position)[1];
-        $position += 4 + 8 + 4 + 8 + 8;
-        $nameLength = ord($payload[$position]);
-        $streams[$id] = substr($payload, $position + 1, $nameLength);
-        $position += 1 + $nameLength;
-        for ($block = 0; $block < 2; $block++) {
-            $position += 4 + unpack('V', $payload, $position)[1];
+    $cursor = null;
+    do {
+        $page = $client->getStreamsPage(cursor: $cursor);
+        foreach ($page->items as $stream) {
+            $streams[$stream->id] = $stream->name;
         }
-    }
-    ksort($streams);
+        $cursor = $page->next;
+    } while ($cursor !== null);
 
     return $streams;
 }
@@ -263,6 +257,23 @@ function collect_offsets(array $messages): array
 function micros(int $seconds): int
 {
     return $seconds * 1_000_000;
+}
+
+/**
+ * Calls $read until it returns $expected or the timeout ends, and returns the last value read.
+ */
+function read_until(callable $read, mixed $expected, float $timeoutSeconds): mixed
+{
+    $deadline = microtime(true) + $timeoutSeconds;
+
+    while (true) {
+        $value = $read();
+        if ($value === $expected || microtime(true) >= $deadline) {
+            return $value;
+        }
+
+        usleep(READ_UNTIL_POLL_MICROS);
+    }
 }
 
 if (!extension_loaded('iggy-php')) {

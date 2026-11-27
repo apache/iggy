@@ -213,11 +213,13 @@ async fn require_readback(producer: &IggyClient, expected: &[(u64, String)]) {
             .poll_messages(
                 &stream,
                 &topic,
-                Some(PARTITION_ID),
+                PARTITION_ID,
                 &Consumer::default(),
                 &PollingStrategy::offset(0),
-                count,
-                false,
+                PollOptions {
+                    count,
+                    ..PollOptions::default()
+                },
             )
             .await
         {

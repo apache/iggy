@@ -26,7 +26,7 @@ use crate::{
             low_level::LowLevelConsumerClient,
         },
     },
-    utils::finish_condition::BenchmarkFinishCondition,
+    utils::{finish_condition::BenchmarkFinishCondition, warmup::BenchmarkWarmup},
 };
 use bench_report::{
     benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics,
@@ -50,10 +50,11 @@ impl TypedBenchmarkConsumer {
         stream_id: String,
         messages_per_batch: BenchmarkNumericParameter,
         finish_condition: Arc<BenchmarkFinishCondition>,
-        warmup_time: IggyDuration,
+        warmup: BenchmarkWarmup,
         sampling_time: IggyDuration,
         moving_average_window: u32,
         polling_kind: PollingKind,
+        poll_options: PollOptions,
         limit_bytes_per_second: Option<IggyByteSize>,
         origin_timestamp_latency_calculation: bool,
         pretty: bool,
@@ -63,8 +64,9 @@ impl TypedBenchmarkConsumer {
             consumer_group_id,
             stream_id,
             messages_per_batch,
-            warmup_time,
+            warmup,
             polling_kind,
+            poll_options,
             origin_timestamp_latency_calculation,
             pretty,
         };

@@ -44,7 +44,7 @@ pub struct Stream {
     /// The total number of topics in the stream.
     pub topics_count: u32,
     /// Options by provenance, plus the read-only encryption key source and
-    /// fingerprints as derived entries.
+    /// fingerprints, and the origin of a shadow stream, as derived entries.
     #[serde(default, with = "crate::resource_options_json")]
     pub options: ResourceOptions,
 }
@@ -75,7 +75,7 @@ pub struct StreamDetails {
     /// The collection of topics in the stream.
     pub topics: Vec<Topic>,
     /// Options by provenance, plus the read-only encryption key source and
-    /// fingerprints as derived entries.
+    /// fingerprints, and the origin of a shadow stream, as derived entries.
     #[serde(default, with = "crate::resource_options_json")]
     pub options: ResourceOptions,
 }
@@ -100,6 +100,13 @@ impl Stream {
     pub fn encryption_kek_fingerprints(&self) -> Vec<String> {
         kek_fingerprints(&self.options)
     }
+
+    /// The geo origin whose topics this shadow stream serves, `None` for
+    /// any other stream.
+    #[must_use]
+    pub fn shadow_origin(&self) -> Option<String> {
+        text_option(&self.options, OptionKey::ShadowOrigin)
+    }
 }
 
 impl StreamDetails {
@@ -121,6 +128,13 @@ impl StreamDetails {
     #[must_use]
     pub fn encryption_kek_fingerprints(&self) -> Vec<String> {
         kek_fingerprints(&self.options)
+    }
+
+    /// The geo origin whose topics this shadow stream serves, `None` for
+    /// any other stream.
+    #[must_use]
+    pub fn shadow_origin(&self) -> Option<String> {
+        text_option(&self.options, OptionKey::ShadowOrigin)
     }
 }
 

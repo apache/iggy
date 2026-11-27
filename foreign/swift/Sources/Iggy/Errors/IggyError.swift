@@ -31,7 +31,7 @@
 /// `context` carries whatever extra detail was available where the error was
 /// raised, such as the transport failure message or the protocol window the
 /// server accepts. It never carries credentials, and it takes no part in
-/// equality: two errors are equal when their codes are, as in the Rust SDK.
+/// equality. Recovery errors also compare their operation and partition IDs.
 public struct IggyError: Error, Sendable, Hashable, CustomStringConvertible {
     /// The classified code.
     public let code: IggyErrorCode
@@ -41,11 +41,17 @@ public struct IggyError: Error, Sendable, Hashable, CustomStringConvertible {
     public let rawCode: UInt32
     /// Extra detail about the failure, when any was available.
     public let context: String?
+    /// A client-local recovery handle, never a replayable fetch receipt.
+    public let operationID: UInt128Value?
+    /// The partition whose progress is blocked by `operationID`, when known.
+    public let partitionID: UInt32?
 
-    public init(_ code: IggyErrorCode, context: String? = nil) {
+    public init(_ code: IggyErrorCode, context: String? = nil, operationID: UInt128Value? = nil, partitionID: UInt32? = nil) {
         self.code = code
         self.rawCode = code.rawValue
         self.context = context
+        self.operationID = operationID
+        self.partitionID = partitionID
     }
 
     /// Maps a code received from the server, keeping unknown codes visible.
@@ -58,22 +64,28 @@ public struct IggyError: Error, Sendable, Hashable, CustomStringConvertible {
             self.context = "unknown error code \(wireCode)"
         }
         self.rawCode = wireCode
+        self.operationID = nil
+        self.partitionID = nil
     }
 
     public var description: String {
+        let identity = operationID.map { " operation=\($0)" } ?? ""
+        let partition = partitionID.map { " partition=\($0)" } ?? ""
         if let context {
-            return "\(code.name) (\(rawCode)): \(context)"
+            return "\(code.name) (\(rawCode))\(identity)\(partition): \(context)"
         }
-        return "\(code.name) (\(rawCode))"
+        return "\(code.name) (\(rawCode))\(identity)\(partition)"
     }
 
     public static func == (lhs: IggyError, rhs: IggyError) -> Bool {
-        lhs.code == rhs.code && lhs.rawCode == rhs.rawCode
+        lhs.code == rhs.code && lhs.rawCode == rhs.rawCode && lhs.operationID == rhs.operationID && lhs.partitionID == rhs.partitionID
     }
 
     public func hash(into hasher: inout Hasher) {
         hasher.combine(code)
         hasher.combine(rawCode)
+        hasher.combine(operationID)
+        hasher.combine(partitionID)
     }
 }
 

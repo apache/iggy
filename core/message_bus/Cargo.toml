@@ -43,7 +43,6 @@ futures-rustls = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 libc = { workspace = true }
-rand = { workspace = true }
 ring = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }

@@ -31,15 +31,14 @@ use std::task::{Poll, Waker};
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::Response;
 use configs::server::ServerConfig;
-use consensus::{MetadataHandle, VsrConsensus};
+use consensus::{Consensus, MetadataHandle, VsrConsensus};
 use futures::channel::oneshot;
-use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
-use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
-use iggy_common::{ClusterMetadata, IggyError, IggyTimestamp, UserStatus};
+use iggy_binary_protocol::requests::users::login_register::{CredentialProof, RegisterRequest};
+use iggy_common::{ClusterMetadata, IggyError, IggyTimestamp};
 use message_bus::InstanceToken;
+use message_bus::MessageBus;
 use metadata::MetadataSubmitError;
 use metadata::impls::metadata::StreamsFrontend;
-use metadata::stm::user::User;
 use send_wrapper::SendWrapper;
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -47,6 +46,7 @@ use tracing::warn;
 use crate::cluster_meta::ClusterRoster;
 use crate::consumer_group::lease::{ConsumerGroupLiveness, SessionActivity};
 use crate::dispatch::session_ops::{submit_logout_on_owner, submit_register_on_owner};
+use crate::external_auth::{AccountRejection, validate_provisioned_account};
 use crate::http::admission::RelayTargets;
 use crate::http::error::{AuthError, ReadError, primary_redirect_location};
 use crate::http::relay_proof::RelayKey;
@@ -58,6 +58,7 @@ use crate::http::session::{
     forget_if_same, live_entry, sweep_expired,
 };
 use crate::shell::ServerShard;
+use crate::store_identity::own_cluster_uid;
 
 /// Response header carrying the current VSR view number. Stamped by
 /// `insert_view_header` on success and redirect responses only (never on
@@ -183,9 +184,10 @@ pub(in crate::http) type HttpState = SendWrapper<Rc<HttpInner>>;
 /// (pinned-cert TLS when the listener serves HTTPS), the scheme it dials, the
 /// request-body buffer bound, the key that proves a relay comes from a node,
 /// the budget of the relays this node sends, and the separate budget of the
-/// relays it serves as their hop target. Built by
-/// `http::forward::build_forward_state`; lives here so the state hub never
-/// imports the forwarding middleware.
+/// relays it serves as their hop target. A relayed deferred poll holds its
+/// slots for its whole wait, so it takes them from a second pair of budgets.
+/// Built by `http::forward::build_forward_state`; lives here so the state hub
+/// never imports the forwarding middleware.
 pub(in crate::http) struct ForwardState {
     /// Derived from the cluster-wide bearer key material, so `None` when none
     /// exists (no configured JWT secret, no cluster PSK). Then forwarding is
@@ -197,7 +199,9 @@ pub(in crate::http) struct ForwardState {
     pub(in crate::http) scheme: &'static str,
     pub(in crate::http) body_limit: usize,
     pub(in crate::http) in_flight: Rc<Cell<u32>>,
+    pub(in crate::http) deferred_in_flight: Rc<Cell<u32>>,
     pub(in crate::http) relay_targets: RelayTargets,
+    pub(in crate::http) deferred_relay_targets: RelayTargets,
     pub(in crate::http) floor_reads: FloorReads,
 }
 
@@ -346,6 +350,18 @@ impl HttpInner {
             .is_some_and(VsrConsensus::is_primary)
     }
 
+    /// True when this node is both in normal status and the primary. Used
+    /// by the ext-auth gate to block callouts during view changes, matching
+    /// the binary transport path in `session_ops::is_metadata_primary`.
+    pub(in crate::http) fn is_normal_primary(&self) -> bool {
+        self.shard
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .is_some_and(|c| c.is_normal() && c.is_primary())
+    }
+
     /// Grade a linearizable read that reached a follower: redirect (307) to the
     /// current VSR primary's HTTP address when it resolves from the roster, else
     /// fail closed to the 503. The target is the roster node whose `replica_id`
@@ -389,12 +405,12 @@ impl HttpInner {
         &self,
         key: &str,
         user_id: u32,
-        user_created_at: IggyTimestamp,
+        credential: CredentialProof,
         expiry: u64,
     ) -> Result<Rc<HttpSession>, AuthError> {
         loop {
-            self.ensure_active_user(user_id, Some(user_created_at))?;
-            let now = IggyTimestamp::now().to_secs();
+            ensure_active_user(&self.shard, user_id, &credential)?;
+            let now = self.shard.bus.realtime_micros();
             if let Some(session) = self.live_session(key, now) {
                 return Ok(session);
             }
@@ -434,7 +450,7 @@ impl HttpInner {
                     // The guard reserves local capacity across Register and
                     // releases it on failure or cancellation, waking waiters.
                     let fresh = self
-                        .register_session(key.to_owned(), user_id, user_created_at, expiry)
+                        .register_session(key.to_owned(), user_id, credential, expiry)
                         .await?;
                     self.sessions
                         .borrow_mut()
@@ -445,48 +461,94 @@ impl HttpInner {
         }
     }
 
-    /// `created_at` of the active user at `user_id`. Refused when the id is
-    /// free, the user is not active, or `expected` is another account's stamp:
-    /// a delete frees the id for the next create, so a credential pins the
-    /// account it was issued to and every later check compares the stamp.
-    pub(in crate::http) fn ensure_active_user(
+    /// What a token issued now for `credential` proves, and the second its
+    /// source personal access token expires at, `u64::MAX` for none. A token
+    /// exchanged from a personal access token also proves the account's current
+    /// revision, so a password change refuses it like any other issued token.
+    /// Refused like [`ensure_active_user`].
+    pub(in crate::http) fn issuable_credential(
         &self,
         user_id: u32,
-        expected: Option<IggyTimestamp>,
-    ) -> Result<IggyTimestamp, IggyError> {
+        credential: &CredentialProof,
+    ) -> Result<(CredentialProof, u64), IggyError> {
+        let now = IggyTimestamp::from(self.shard.bus.realtime_micros());
         self.shard
             .plane
             .metadata()
             .mux_stm
             .users()
             .read(|users| {
-                users
-                    .items
-                    .get(user_id as usize)
-                    .filter(|user| user.status == UserStatus::Active)
-                    .map(|user| user.created_at)
-            })
-            // A token carries micros, so compare at that precision.
-            .filter(|created_at| {
-                expected.is_none_or(|expected| expected.as_micros() == created_at.as_micros())
+                let deadline = users.credential_deadline_at(user_id, credential, now)?;
+                let user = users.items.get(user_id as usize)?;
+                let source_expiry = if deadline == u64::MAX {
+                    u64::MAX
+                } else {
+                    IggyTimestamp::from(deadline).to_secs()
+                };
+                let issued = CredentialProof {
+                    access_revision: user.access_revision,
+                    ..*credential
+                };
+                Some((issued, source_expiry))
             })
             .ok_or(IggyError::Unauthenticated)
     }
 
-    /// `(id, created_at)` of the account a trusted issuer's tokens act as: the
+    /// Whether `credential` names a revision of its account or a token this
+    /// node has not applied. Revisions only grow and a token id is the op that
+    /// created it, so until it applies that op the node cannot tell a token
+    /// issued after a change from a revoked one.
+    pub(in crate::http) fn lags_behind(
+        &self,
+        user_id: u32,
+        credential: &CredentialProof,
+        cluster_uid: u128,
+    ) -> Result<bool, IggyError> {
+        let Some(local_uid) = own_cluster_uid(&self.shard) else {
+            return Ok(true);
+        };
+        if cluster_uid != local_uid {
+            return Err(IggyError::Unauthenticated);
+        }
+        let applied_op = self.shard.plane.metadata().applied_frontier().get();
+        Ok(self.shard.plane.metadata().mux_stm.users().read(|users| {
+            let Some(user) = users
+                .items
+                .get(user_id as usize)
+                .filter(|user| user.created_at.as_micros() == credential.user_created_at)
+            else {
+                return credential.access_revision.max(credential.token_id) > applied_op;
+            };
+            credential.access_revision > user.access_revision
+                || (credential.token_id > applied_op
+                    && users.token_of(user_id, credential.token_id).is_none())
+        }))
+    }
+
+    /// The account a trusted issuer's tokens act as and its current proof: the
     /// user named by the issuer, looked up per request. See
-    /// [`trusted_issuer_account`].
+    /// [`validate_provisioned_account`].
     pub(in crate::http) fn trusted_issuer_user(
         &self,
         issuer: &TrustedIssuer,
-    ) -> Result<(u32, IggyTimestamp), IggyError> {
+        started_at_op: u64,
+    ) -> Result<(u32, CredentialProof), IggyError> {
         self.shard
             .plane
             .metadata()
             .mux_stm
             .users()
-            .read(|users| trusted_issuer_account(users.user_by_name(&issuer.config.username)))
-            .ok_or_else(|| {
+            .read(|users| {
+                validate_provisioned_account(
+                    users.user_by_name(&issuer.config.username),
+                    started_at_op,
+                )
+            })
+            .map_err(|rejection| {
+                // A revision that moved during verification says nothing about the configured account.
+                if rejection == AccountRejection::CredentialChanged {
+                    return IggyError::TransientNotAccepted;
+                }
                 issuer.warn_invalid_account();
                 IggyError::Unauthenticated
             })
@@ -502,14 +564,14 @@ impl HttpInner {
     /// Whether this node holds a live session for `key`, which
     /// [`Self::resolve_session`] returns without a `Register`.
     pub(in crate::http) fn has_live_session(&self, key: &str) -> bool {
-        self.live_session(key, IggyTimestamp::now().to_secs())
+        self.live_session(key, self.shard.bus.realtime_micros())
             .is_some()
     }
 
     /// Clone the live (non-expired) entry for `key`, if present. Confines the
     /// shared `RefCell` borrow to this call so it can never span an `.await`.
-    fn live_session(&self, key: &str, now_secs: u64) -> Option<Rc<HttpSession>> {
-        let session = live_entry(&self.sessions.borrow(), key, now_secs)?;
+    fn live_session(&self, key: &str, now_micros: u64) -> Option<Rc<HttpSession>> {
+        let session = live_entry(&self.sessions.borrow(), key, now_micros)?;
         session.activity.touch();
         Some(session)
     }
@@ -539,7 +601,7 @@ impl HttpInner {
         &self,
         key: String,
         user_id: u32,
-        user_created_at: IggyTimestamp,
+        credential: CredentialProof,
         expiry: u64,
     ) -> Result<Rc<HttpSession>, AuthError> {
         /// A collision is rare enough that this many in a row means the minter
@@ -548,7 +610,7 @@ impl HttpInner {
 
         for attempt in 1..=MINT_ATTEMPTS {
             match self
-                .register_session_once(key.clone(), user_id, user_created_at, expiry)
+                .register_session_once(key.clone(), user_id, credential, expiry)
                 .await
             {
                 Ok(session) => return Ok(session),
@@ -572,7 +634,7 @@ impl HttpInner {
         &self,
         key: String,
         user_id: u32,
-        user_created_at: IggyTimestamp,
+        credential: CredentialProof,
         expiry: u64,
     ) -> Result<Rc<HttpSession>, AuthError> {
         let coordinator = self
@@ -598,7 +660,7 @@ impl HttpInner {
         let shard = Rc::clone(&self.shard);
         compio::runtime::spawn(async move {
             let registration = RegisterRequest {
-                user_created_at: user_created_at.as_micros(),
+                credential,
                 bind_verifier: consensus::client_table::bind_verifier(
                     client_id,
                     user_id,
@@ -654,7 +716,7 @@ impl HttpInner {
         .await
         .ok_or(AuthError::SessionUnavailable)?;
         // Register and catch-up may yield to a user revocation.
-        self.ensure_active_user(user_id, Some(user_created_at))?;
+        let source_deadline = ensure_active_user(&self.shard, user_id, &credential)?;
         let attachment = metadata
             .client_table
             .borrow_mut()
@@ -665,18 +727,20 @@ impl HttpInner {
                 client_id,
                 session: bound.epoch,
             },
+            source_deadline,
         ));
         self.session_liveness
             .borrow_mut()
             .observe_local_session(&activity);
         registration.identity = None;
         Ok(Rc::new(HttpSession {
-            attachment: RefCell::new(attachment),
+            attachment: RefCell::new(attachment.expiring_at(source_deadline)),
             activity,
             key,
             client_id,
             session: bound.epoch,
             user_id,
+            credential,
             expiry,
             gate: Mutex::new(FIRST_REQUEST_ID),
             data_gate: Mutex::new(FIRST_REQUEST_ID),
@@ -782,22 +846,35 @@ pub(in crate::http) fn insert_view_header(state: &HttpInner, mut response: Respo
     response
 }
 
-/// `(id, created_at)` of `user` when a trusted issuer may act as it: active and
-/// not root. A deleted user's id goes to the next user created, so the issuer
-/// is matched by username, and an external issuer never holds root.
-fn trusted_issuer_account(user: Option<&User>) -> Option<(u32, IggyTimestamp)> {
-    let user = user?;
-    if user.id == DEFAULT_ROOT_USER_ID {
-        return None;
-    }
-    (user.status == UserStatus::Active).then_some((user.id, user.created_at))
+/// Refused unless `credential` still proves the active user at `user_id`
+/// now: a delete frees the id for the next create, a password change or a
+/// revocation moves the access revision, and a personal access token can be
+/// deleted or expire. So a credential pins what it proved and every later
+/// check compares it. Returns the microsecond expiry of the source token,
+/// `u64::MAX` for none.
+pub(in crate::http) fn ensure_active_user(
+    shard: &ServerShard,
+    user_id: u32,
+    credential: &CredentialProof,
+) -> Result<u64, IggyError> {
+    let now = IggyTimestamp::from(shard.bus.realtime_micros());
+    shard
+        .plane
+        .metadata()
+        .mux_stm
+        .users()
+        .read(|users| users.credential_deadline_at(user_id, credential, now))
+        .ok_or(IggyError::Unauthenticated)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MetadataWatermarks, register_submit_auth_error, trusted_issuer_account};
+    use super::{MetadataWatermarks, register_submit_auth_error, validate_provisioned_account};
+    use crate::external_auth::AccountRejection;
     use crate::http::error::AuthError;
+    use iggy_binary_protocol::requests::users::login_register::CredentialProof;
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
+    use iggy_common::{HeaderKey, HeaderValue, OptionKey, OptionValue};
     use iggy_common::{IggyTimestamp, UserStatus};
     use metadata::MetadataSubmitError;
     use metadata::stm::user::User;
@@ -869,20 +946,49 @@ mod tests {
         let root = user(DEFAULT_ROOT_USER_ID, UserStatus::Active);
         let inactive = user(1, UserStatus::Inactive);
         assert_eq!(
-            trusted_issuer_account(Some(&root)),
-            None,
+            validate_provisioned_account(Some(&root), 9),
+            Err(AccountRejection::Root),
             "an external issuer must never act as root"
         );
-        assert_eq!(trusted_issuer_account(Some(&inactive)), None);
-        assert_eq!(trusted_issuer_account(None), None);
+        assert_eq!(
+            validate_provisioned_account(Some(&inactive), 9),
+            Err(AccountRejection::Inactive)
+        );
+        assert_eq!(
+            validate_provisioned_account(None, 9),
+            Err(AccountRejection::NotFound)
+        );
     }
 
     #[test]
     fn given_active_user_when_trusted_issuer_maps_onto_it_should_resolve_its_account() {
         let active = user(1, UserStatus::Active);
         assert_eq!(
-            trusted_issuer_account(Some(&active)),
-            Some((1, active.created_at))
+            validate_provisioned_account(Some(&active), 9),
+            Ok((
+                1,
+                CredentialProof::account(active.created_at.as_micros(), active.access_revision)
+            ))
+        );
+    }
+
+    #[test]
+    fn given_user_with_critical_options_when_trusted_issuer_maps_onto_it_should_refuse() {
+        let mut with_critical = user(2, UserStatus::Active);
+        // An unrecognized key listed in the critical-keys marker triggers
+        // check_critical_options to reject the user.
+        with_critical.options.insert(
+            HeaderKey::try_from("future_secret").unwrap(),
+            OptionValue::explicit(HeaderValue::try_from("opaque").unwrap()),
+        );
+        with_critical.options.insert(
+            HeaderKey::from(OptionKey::CriticalKeys),
+            OptionValue::derived(HeaderValue::try_from("future_secret").unwrap()),
+        );
+        assert_eq!(
+            validate_provisioned_account(Some(&with_critical), 9),
+            Err(AccountRejection::CriticalOptions),
+            "a user with unrecognized critical options must be rejected"
         );
     }
 
@@ -891,6 +997,7 @@ mod tests {
             id,
             status,
             created_at: IggyTimestamp::from(1_700_000_000_000_000),
+            access_revision: 9,
             ..User::default()
         }
     }

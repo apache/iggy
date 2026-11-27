@@ -62,6 +62,7 @@ case "${BDD_FEATURE:-all}" in
     resource_options_patch) tags=(--tags @resource-options-patch) ;;
     metadata_changes) tags=(--tags @metadata-changes) ;;
     session_contract) tags=(--tags @session-contract) ;;
+    deferred_polling) tags=(--tags @deferred-polling) ;;
 esac
 
 # --strict fails the run on undefined steps; without it a feature step with no matching C++

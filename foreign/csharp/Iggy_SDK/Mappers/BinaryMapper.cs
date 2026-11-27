@@ -20,6 +20,7 @@ using System.Buffers.Binary;
 using System.Text;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Auth;
+using Apache.Iggy.Contracts.Tcp;
 using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
@@ -31,6 +32,9 @@ using Apache.Iggy.Vsr;
 
 namespace Apache.Iggy.Mappers;
 
+/// <summary>Reads one item of a list page at <paramref name="position" /> and returns the bytes it took.</summary>
+internal delegate (T Item, int ReadBytes) PageItemReader<T>(ReadOnlySpan<byte> payload, int position);
+
 internal static partial class BinaryMapper
 {
     private const int CONSUMER_GROUP_HEADER_SIZE = 13;
@@ -39,6 +43,8 @@ internal static partial class BinaryMapper
     private const int CACHE_METRICS_ENTRY_SIZE = 32;
     private const int OPEN_FILES_FIELDS_SIZE = 8 + 8;
     private const int MIN_TOPIC_SIZE = 33 + 4 + 4;
+    private const int PARTITION_COUNTERS_SIZE = 40 + PartitionContext.ENCODED_SIZE;
+    private const int MIN_PARTITION_SIZE = PARTITION_COUNTERS_SIZE + 1 + 1;
     private const int MIN_OPTION_SPEC_SIZE = 1 + 1 + 1 + 4 + 4;
     private const int CLUSTER_NODE_TAIL_SIZE = 4 * 2 + 1 + 1;
     private const int MIN_CLUSTER_NODE_SIZE = 1 + 4 + 4 + CLUSTER_NODE_TAIL_SIZE;
@@ -85,26 +91,6 @@ internal static partial class BinaryMapper
             }, readBytes);
     }
 
-    internal static IReadOnlyList<UserResponse> MapUsers(ReadOnlySpan<byte> payload)
-    {
-        if (payload.Length == 0)
-        {
-            return Array.Empty<UserResponse>();
-        }
-
-        var result = new List<UserResponse>();
-        var length = payload.Length;
-        var position = 0;
-        while (position < length)
-        {
-            var (response, readBytes) = MapToUserResponse(payload, position);
-            result.Add(response);
-            position += readBytes;
-        }
-
-        return result.AsReadOnly();
-    }
-
     internal static UserResponse MapUser(ReadOnlySpan<byte> payload)
     {
         var (response, position) = MapToUserResponse(payload, 0);
@@ -138,7 +124,7 @@ internal static partial class BinaryMapper
         };
     }
 
-    private static (UserResponse response, int position) MapToUserResponse(ReadOnlySpan<byte> payload, int position)
+    internal static (UserResponse response, int position) MapToUserResponse(ReadOnlySpan<byte> payload, int position)
     {
         var id = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
         var createdAt = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 4)..(position + 12)]);
@@ -280,20 +266,48 @@ internal static partial class BinaryMapper
         IMemoryOwner<byte> payloadOwner, IMessageEncryptor? encryptor = null)
     {
         ReadOnlySpan<byte> span = payload.Span;
-        var length = payload.Length;
         var partitionId = BinaryPrimitives.ReadUInt32LittleEndian(span[..4]);
         var currentOffset = BinaryPrimitives.ReadUInt64LittleEndian(span[4..12]);
         var messagesCount = BinaryPrimitives.ReadUInt32LittleEndian(span[12..16]);
         var context = MapPartitionContext(span[16..]);
-        var position = 16 + PartitionContext.ENCODED_SIZE;
-        if (position >= length)
+        // The header decoded, so a caller that needs only the context of the reply can still take it.
+        try
+        {
+            return MapRentedRecords(payload[DeferredPollOptions.POLL_REPLY_HEADER_SIZE..], payloadOwner, partitionId,
+                currentOffset, messagesCount, context, encryptor);
+        }
+        catch (MalformedResponseException error)
+        {
+            error.Context = context;
+            throw;
+        }
+        catch (MessageDecryptionException error)
+        {
+            error.Context = context;
+            throw;
+        }
+    }
+
+    /// <summary>
+    ///     Maps whole batch records, each a batch header and its message frames, as a poll reply carries them after
+    ///     its header and a fetch reply in each section. The messages are slices of <paramref name="records" />,
+    ///     which <paramref name="recordsOwner" /> keeps valid until the rental is disposed.
+    /// </summary>
+    internal static PolledMessagesRental MapRentedRecords(ReadOnlyMemory<byte> records,
+        IMemoryOwner<byte> recordsOwner, uint partitionId, ulong currentOffset, uint messagesCount,
+        PartitionContext context, IMessageEncryptor? encryptor)
+    {
+        ReadOnlySpan<byte> span = records.Span;
+        var length = records.Length;
+        var position = 0;
+        if (length == 0)
         {
             if (messagesCount != 0)
             {
-                throw new MalformedResponseException("Poll count does not match its messages.");
+                throw new MalformedResponseException("Poll count does not match its messages.", span);
             }
 
-            return new PolledMessagesRental(payloadOwner)
+            return new PolledMessagesRental(recordsOwner)
             {
                 PartitionId = partitionId,
                 Context = context,
@@ -327,7 +341,7 @@ internal static partial class BinaryMapper
             {
                 var batchEnd = ReadBatchExtent(span, length, position, out var baseOffset, out var baseTimestamp,
                     out var batchOriginTimestamp);
-                // Broker append time is stamped once per batch record; the per-frame delta applies to the
+                // Broker append time is stamped once per batch record. The per-frame delta applies to the
                 // origin timestamp only.
                 var timestamp = DateTimeOffsetUtils.FromUnixTimeMicroSeconds(baseTimestamp);
                 var cursor = position + BatchWireFormat.BATCH_HEADER_SIZE;
@@ -344,13 +358,13 @@ internal static partial class BinaryMapper
                     var payloadRangeStart = cursor + BatchWireFormat.FRAME_HEADER_SIZE;
                     var headersRangeStart = payloadRangeStart + payloadLength;
 
-                    ReadOnlyMemory<byte> payloadSlice = payload.Slice(payloadRangeStart, payloadLength);
+                    ReadOnlyMemory<byte> payloadSlice = records.Slice(payloadRangeStart, payloadLength);
                     ReadOnlyMemory<byte> rawHeaders = headersLength > 0
-                        ? payload.Slice(headersRangeStart, headersLength)
+                        ? records.Slice(headersRangeStart, headersLength)
                         : ReadOnlyMemory<byte>.Empty;
 
                     // Decrypt into the shared buffer so the message looks like plaintext downstream. Wire lengths
-                    // still drive the cursor advance; only the decrypted lengths land on the header.
+                    // still drive the cursor advance. Only the decrypted lengths land on the header.
                     var storedPayloadLength = payloadLength;
                     var storedHeadersLength = headersLength;
                     if (encryptor is not null)
@@ -378,7 +392,9 @@ internal static partial class BinaryMapper
                         }
                         catch (Exception ex)
                         {
-                            throw new MessageDecryptionException(offset, partitionId, ex);
+                            throw new MessageDecryptionException(offset, partitionId, ex, records
+                                .Slice(cursor, BatchWireFormat.FRAME_HEADER_SIZE + payloadLength + headersLength)
+                                .ToArray());
                         }
                     }
 
@@ -407,10 +423,10 @@ internal static partial class BinaryMapper
 
             if (messages.Count != messagesCount)
             {
-                throw new MalformedResponseException("Poll count does not match its messages.");
+                throw new MalformedResponseException("Poll count does not match its messages.", span);
             }
 
-            return new PolledMessagesRental(payloadOwner, plaintextOwner)
+            return new PolledMessagesRental(recordsOwner, plaintextOwner)
             {
                 PartitionId = partitionId,
                 Context = context,
@@ -433,7 +449,8 @@ internal static partial class BinaryMapper
         if (position + BatchWireFormat.BATCH_HEADER_SIZE > length)
         {
             throw new MalformedResponseException(
-                $"Malformed batch record at byte {position}: {length - position} bytes cannot hold a batch header.");
+                $"Malformed batch record at byte {position}: {length - position} bytes cannot hold a batch header.",
+                span[position..]);
         }
 
         baseOffset = BinaryPrimitives.ReadUInt64LittleEndian(span[(position + 8)..(position + 16)]);
@@ -443,7 +460,8 @@ internal static partial class BinaryMapper
         if (batchLength < BatchWireFormat.BATCH_HEADER_SIZE || (ulong)position + batchLength > (ulong)length)
         {
             throw new MalformedResponseException(
-                $"Malformed batch record at byte {position}: batch length {batchLength} does not fit the response.");
+                $"Malformed batch record at byte {position}: batch length {batchLength} does not fit the response.",
+                span[position..]);
         }
 
         return position + (int)batchLength;
@@ -455,7 +473,8 @@ internal static partial class BinaryMapper
         if (cursor + BatchWireFormat.FRAME_HEADER_SIZE > batchEnd)
         {
             throw new MalformedResponseException(
-                $"Malformed message frame at byte {cursor}: {batchEnd - cursor} bytes cannot hold a frame header.");
+                $"Malformed message frame at byte {cursor}: {batchEnd - cursor} bytes cannot hold a frame header.",
+                span[cursor..]);
         }
 
         headersLength = BinaryPrimitives.ReadInt32LittleEndian(span[(cursor + 32)..(cursor + 36)]);
@@ -464,20 +483,20 @@ internal static partial class BinaryMapper
         {
             throw new MalformedResponseException(
                 $"Malformed message frame at byte {cursor}: negative payload ({payloadLength}) or header " +
-                $"({headersLength}) length.");
+                $"({headersLength}) length.", span[cursor..]);
         }
 
         if (BinaryPrimitives.ReadUInt64LittleEndian(span[(cursor + 40)..(cursor + 48)]) != 0)
         {
             throw new MalformedResponseException(
-                $"Malformed message frame at byte {cursor}: reserved bytes must be zero.");
+                $"Malformed message frame at byte {cursor}: reserved bytes must be zero.", span[cursor..]);
         }
 
         // Overflow-safe: server-controlled lengths can approach int.MaxValue, so compute the bound in long.
         if ((long)cursor + BatchWireFormat.FRAME_HEADER_SIZE + payloadLength + headersLength > batchEnd)
         {
             throw new MalformedResponseException(
-                $"Malformed message frame at byte {cursor}: frame runs past its batch record.");
+                $"Malformed message frame at byte {cursor}: frame runs past its batch record.", span[cursor..]);
         }
     }
 
@@ -485,7 +504,7 @@ internal static partial class BinaryMapper
     // and frame walk as the main loop, so both agree on which messages are included.
     private static int SumMaxDecryptedLength(ReadOnlySpan<byte> span, int length, IMessageEncryptor encryptor)
     {
-        var position = 16 + PartitionContext.ENCODED_SIZE;
+        var position = 0;
         var total = 0;
         while (position < length)
         {
@@ -527,31 +546,38 @@ internal static partial class BinaryMapper
             PartitionId = rental.PartitionId,
             Context = rental.Context,
             CurrentOffset = rental.CurrentOffset,
-            Messages = messages
+            Messages = messages,
+            RequestStart = rental.RequestStart
         };
     }
 
     internal static PolledMessagesRental ToRentedMessages(PolledMessages messages)
     {
-        var rentedMessages = new List<RentedMessageResponse>(messages.Messages.Count);
-        foreach (var message in messages.Messages)
-        {
-            rentedMessages.Add(new RentedMessageResponse
-            {
-                Header = message.Header,
-                Payload = message.Payload,
-                RawUserHeaders = message.RawUserHeaders ?? ReadOnlyMemory<byte>.Empty,
-                UserHeaders = message.UserHeaders
-            });
-        }
-
         return new PolledMessagesRental(EmptyMemoryOwner.Instance)
         {
             PartitionId = messages.PartitionId,
             Context = messages.Context,
             CurrentOffset = messages.CurrentOffset,
-            Messages = rentedMessages
+            Messages = [.. messages.Messages.Select(ToRentedMessage)]
         };
+    }
+
+    internal static RentedMessageResponse ToRentedMessage(MessageResponse message)
+    {
+        // Raw headers decode on first access, so only headers that came decoded are copied.
+        return message.RawUserHeaders is { } raw
+            ? new RentedMessageResponse
+            {
+                Header = message.Header,
+                Payload = message.Payload,
+                RawUserHeaders = raw
+            }
+            : new RentedMessageResponse
+            {
+                Header = message.Header,
+                Payload = message.Payload,
+                UserHeaders = message.UserHeaders
+            };
     }
 
     internal static Dictionary<HeaderKey, HeaderValue> MapHeaders(ReadOnlySpan<byte> payload)
@@ -840,20 +866,54 @@ internal static partial class BinaryMapper
         return bytes;
     }
 
-    internal static IReadOnlyList<StreamResponse> MapStreams(ReadOnlySpan<byte> payload)
+    /// <summary>
+    ///     Maps the reply of a list command: <c>[next_len:u8][next][count:u32][item]*</c>. A body that is short of
+    ///     its count of items, or that has bytes after them, is malformed.
+    /// </summary>
+    /// <remarks>
+    ///     The item readers index the payload without bounds checks, so an argument or index fault inside an item is a
+    ///     malformed reply. The next cursor keeps its bytes as they came, because only the server reads them.
+    /// </remarks>
+    internal static Page<T> MapPage<T>(ReadOnlySpan<byte> payload, PageItemReader<T> readItem)
     {
-        List<StreamResponse> streams = new();
-        var length = payload.Length;
-        var position = 0;
-
-        while (position < length)
+        if (payload.Length < 1 || payload.Length - 1 - payload[0] < sizeof(uint))
         {
-            var (stream, readBytes) = MapToStream(payload, position);
-            streams.Add(stream);
-            position += readBytes;
+            throw new MalformedResponseException(
+                $"Malformed page: {payload.Length} bytes cannot hold its next cursor and item count.");
         }
 
-        return streams.AsReadOnly();
+        var nextLength = payload[0];
+        var position = 1 + nextLength;
+        var count = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..]);
+        position += sizeof(uint);
+
+        // A server never sends more than MAX_LIMIT items, so a larger count does not size the allocation.
+        var items = new List<T>((int)Math.Min(count, PageQuery.MAX_LIMIT));
+        try
+        {
+            for (var index = 0u; index < count; index++)
+            {
+                var (item, readBytes) = readItem(payload, position);
+                items.Add(item);
+                position += readBytes;
+            }
+        }
+        catch (Exception error) when (error is ArgumentException or IndexOutOfRangeException)
+        {
+            throw new MalformedResponseException($"Malformed page: item {items.Count} of {count} does not decode.");
+        }
+
+        if (position != payload.Length)
+        {
+            throw new MalformedResponseException(
+                $"Malformed page: its {count} items end at byte {position} of {payload.Length}.");
+        }
+
+        return new Page<T>
+        {
+            Items = items,
+            Next = nextLength == 0 ? null : PageCursor.FromBytes(payload.Slice(1, nextLength))
+        };
     }
 
     /// <summary>
@@ -924,7 +984,7 @@ internal static partial class BinaryMapper
         };
     }
 
-    private static (StreamResponse stream, int readBytes) MapToStream(ReadOnlySpan<byte> payload, int position)
+    internal static (StreamResponse stream, int readBytes) MapToStream(ReadOnlySpan<byte> payload, int position)
     {
         var id = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
         var createdAt = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 4)..(position + 12)]);
@@ -954,30 +1014,14 @@ internal static partial class BinaryMapper
             }, readBytes);
     }
 
-    internal static IReadOnlyList<TopicResponse> MapTopics(ReadOnlySpan<byte> payload)
-    {
-        var topicsCount = BinaryPrimitives.ReadUInt32LittleEndian(payload[..4]);
-        var position = 4;
-        List<TopicResponse> topics = new(ValidatedCollectionSize(topicsCount, payload.Length - position,
-            MIN_TOPIC_SIZE, "Topics count"));
-
-        for (var i = 0; i < topicsCount; i++)
-        {
-            var (topic, readBytes) = MapToTopic(payload, position);
-            topics.Add(topic);
-            position += readBytes;
-        }
-
-        return topics.AsReadOnly();
-    }
-
     internal static TopicResponse MapTopic(ReadOnlySpan<byte> payload)
     {
         var (topic, position) = MapToTopic(payload, 0);
-        List<PartitionResponse> partitions = new();
-        var length = payload.Length;
+        var partitionsCount = ValidatedCollectionSize(topic.PartitionsCount, payload.Length - position,
+            MIN_PARTITION_SIZE, "Partitions count");
+        List<PartitionResponse> partitions = new(partitionsCount);
 
-        while (position < length)
+        for (var i = 0; i < partitionsCount; i++)
         {
             var (partition, readBytes) = MapToPartition(payload, position);
             partitions.Add(partition);
@@ -998,7 +1042,7 @@ internal static partial class BinaryMapper
         };
     }
 
-    private static (TopicResponse topic, int readBytes) MapToTopic(ReadOnlySpan<byte> payload, int position)
+    internal static (TopicResponse topic, int readBytes) MapToTopic(ReadOnlySpan<byte> payload, int position)
     {
         var id = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
         var createdAt = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 4)..(position + 12)]);
@@ -1027,43 +1071,59 @@ internal static partial class BinaryMapper
             }, readBytes);
     }
 
-    private static (PartitionResponse partition, int readBytes) MapToPartition(ReadOnlySpan<byte>
+    internal static (PartitionResponse partition, int readBytes) MapToPartition(ReadOnlySpan<byte>
         payload, int position)
     {
+        if (payload.Length - position < MIN_PARTITION_SIZE)
+        {
+            throw new MalformedResponseException($"Partition at byte {position} is truncated.");
+        }
+
         var id = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
         var createdAt = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 4)..(position + 12)]);
         var segmentsCount = BinaryPrimitives.ReadUInt32LittleEndian(payload[(position + 12)..(position + 16)]);
         var currentOffset = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 16)..(position + 24)]);
         var sizeBytes = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 24)..(position + 32)]);
         var messagesCount = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 32)..(position + 40)]);
-        var readBytes = 40 + PartitionContext.ENCODED_SIZE;
+        var context = MapPartitionContext(payload[(position + 40)..]);
+        var end = position + PARTITION_COUNTERS_SIZE;
+        var members = ReadNodeIds(payload, ref end, "Partition members");
+        var inSyncMembers = ReadNodeIds(payload, ref end, "Partition in-sync members");
 
         return (
             new PartitionResponse
             {
-                Context = MapPartitionContext(payload[(position + 40)..]),
+                Context = context,
                 Id = id,
                 SegmentsCount = segmentsCount,
                 CurrentOffset = currentOffset,
                 Size = sizeBytes,
                 CreatedAt = DateTimeOffsetUtils.FromUnixTimeMicroSeconds(createdAt).LocalDateTime,
-                MessagesCount = messagesCount
-            }, readBytes);
+                MessagesCount = messagesCount,
+                Members = members,
+                InSyncMembers = inSyncMembers
+            }, end - position);
     }
 
-    internal static List<ConsumerGroupResponse> MapConsumerGroups(ReadOnlySpan<byte> payload)
+    private static byte[] ReadNodeIds(ReadOnlySpan<byte> payload, ref int position, string field)
     {
-        List<ConsumerGroupResponse> consumerGroups = new();
-        var length = payload.Length;
-        var position = 0;
-        while (position < length)
+        if (position >= payload.Length)
         {
-            var (consumerGroup, readBytes) = MapToConsumerGroup(payload, position);
-            consumerGroups.Add(consumerGroup);
-            position += readBytes;
+            throw new MalformedResponseException($"{field} count at byte {position} is missing.");
         }
 
-        return consumerGroups;
+        var count = payload[position];
+        position += 1;
+        var remaining = payload.Length - position;
+        if (count > remaining)
+        {
+            throw new MalformedResponseException(
+                $"{field} count {count} exceeds remaining payload of {remaining} bytes.");
+        }
+
+        var nodeIds = payload.Slice(position, count).ToArray();
+        position += count;
+        return nodeIds;
     }
 
     internal static StatsResponse MapStats(ReadOnlySpan<byte> payload)
@@ -1238,7 +1298,7 @@ internal static partial class BinaryMapper
             (int)readBytes);
     }
 
-    private static (ConsumerGroupResponse consumerGroup, int readBytes) MapToConsumerGroup(ReadOnlySpan<byte> payload,
+    internal static (ConsumerGroupResponse consumerGroup, int readBytes) MapToConsumerGroup(ReadOnlySpan<byte> payload,
         int position)
     {
         if (position + CONSUMER_GROUP_HEADER_SIZE > payload.Length)
@@ -1348,6 +1408,96 @@ internal static partial class BinaryMapper
             Name = clusterName,
             Nodes = nodes
         };
+    }
+
+    /// <summary>
+    ///     Maps a FetchMessages reply (code 109): the section count, the section headers, then the records of each
+    ///     section in table order. The sections take the reply buffer, and decode with <paramref name="encryptor" />.
+    /// </summary>
+    internal static FetchedMessages MapFetchedMessages(IMemoryOwner<byte> reply, IMessageEncryptor? encryptor)
+    {
+        var body = reply.Memory;
+        var span = body.Span;
+        var headers = ReadFetchSections(span);
+        var fetched = new FetchedMessages(reply);
+        var sections = new FetchedSection[headers.Length];
+        for (var index = 0; index < sections.Length; index++)
+        {
+            var (partitionId, status, records, recordsLength) = headers[index];
+            var header = span[(FetchedMessages.SECTIONS_COUNT_SIZE + index * FetchedMessages.SECTION_HEADER_SIZE)..];
+            var progressError = reply is FetchProgressReply recovery && recovery.Partitions.Contains(partitionId)
+                ? new VsrFetchProgressUncertainException(recovery.OperationId, VsrError.FromServer((int)status,
+                    $"The committing fetch of partition {partitionId} has an unknown outcome."))
+                : null;
+            sections[index] = new FetchedSection(fetched, encryptor)
+            {
+                PartitionId = partitionId,
+                Status = progressError is null ? status : VsrFetchProgressUncertainException.STATUS_CODE,
+                CurrentOffset = BinaryPrimitives.ReadUInt64LittleEndian(header[8..]),
+                MessagesCount = BinaryPrimitives.ReadUInt32LittleEndian(header[16..]),
+                Context = MapPartitionContext(header[20..]),
+                NextOffset = BinaryPrimitives.ReadUInt64LittleEndian(header[44..]),
+                Records = body.Slice(records, recordsLength),
+                ProgressError = progressError
+            };
+        }
+        fetched.Sections = sections;
+        return fetched;
+    }
+
+    internal static (uint PartitionId, uint Status, int RecordsAt, int RecordsLength)[] ReadFetchSections(
+        ReadOnlySpan<byte> span)
+    {
+        if (span.Length < FetchedMessages.SECTIONS_COUNT_SIZE)
+        {
+            throw new MalformedResponseException("Fetch reply is shorter than its section count.");
+        }
+
+        var count = BinaryPrimitives.ReadUInt32LittleEndian(span);
+        if (count > TcpContracts.MAX_PARTITIONS_PER_REQUEST)
+        {
+            throw new MalformedResponseException(
+                $"Fetch reply holds {count} sections, more than {TcpContracts.MAX_PARTITIONS_PER_REQUEST}.");
+        }
+
+        var records = FetchedMessages.HeadSize((int)count);
+        if (span.Length < records)
+        {
+            throw new MalformedResponseException("Fetch reply section table does not fit its body.");
+        }
+
+        var sections = new (uint PartitionId, uint Status, int RecordsAt, int RecordsLength)[count];
+        var seen = new HashSet<uint>();
+        for (var index = 0; index < sections.Length; index++)
+        {
+            var header = span[(FetchedMessages.SECTIONS_COUNT_SIZE + index * FetchedMessages.SECTION_HEADER_SIZE)..];
+            var partitionId = BinaryPrimitives.ReadUInt32LittleEndian(header);
+            if (!seen.Add(partitionId))
+            {
+                throw new MalformedResponseException($"Fetch reply repeats partition {partitionId}.");
+            }
+            var status = BinaryPrimitives.ReadUInt32LittleEndian(header[4..]);
+            var recordsLength = BinaryPrimitives.ReadUInt32LittleEndian(header[52..]);
+            if (status != 0 && recordsLength != 0)
+            {
+                throw new MalformedResponseException($"Fetch section {index} has status {status} and records.");
+            }
+
+            if ((ulong)records + recordsLength > (ulong)span.Length)
+            {
+                throw new MalformedResponseException($"Fetch section {index} runs past the reply.");
+            }
+
+            sections[index] = (partitionId, status, records, (int)recordsLength);
+            records += (int)recordsLength;
+        }
+
+        if (records != span.Length)
+        {
+            throw new MalformedResponseException("Fetch reply holds bytes after its last section.");
+        }
+
+        return sections;
     }
 
     internal static PartitionRoute MapPartitionRoute(ReadOnlySpan<byte> payload)

@@ -20,9 +20,9 @@ use crate::http::http_transport::HttpTransport;
 use crate::http::path::encode_segment;
 use crate::prelude::{Identifier, IggyError};
 use async_trait::async_trait;
-use iggy_common::PartitionClient;
 use iggy_common::create_partitions::CreatePartitions;
 use iggy_common::delete_partitions::DeletePartitions;
+use iggy_common::{Page, PageQuery, Partition, PartitionClient};
 
 #[async_trait]
 impl PartitionClient for HttpClient {
@@ -62,6 +62,25 @@ impl PartitionClient for HttpClient {
         .await?;
         self.send_contexts.invalidate_topic_discovery();
         Ok(())
+    }
+
+    async fn get_partitions_page(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        query: &PageQuery,
+    ) -> Result<Page<Partition>, IggyError> {
+        query.validate()?;
+        let response = self
+            .get_with_query(
+                &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
+                &query.http_query_pairs(),
+            )
+            .await?;
+        response
+            .json()
+            .await
+            .map_err(|_| IggyError::InvalidJsonResponse)
     }
 }
 

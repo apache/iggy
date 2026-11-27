@@ -194,6 +194,7 @@ cc_binary(
     testonly = True,
     srcs = [
         "tests/bdd/background_steps.cpp",
+        "tests/bdd/deferred_polling_steps.cpp",
         "tests/bdd/messaging_steps.cpp",
         "tests/bdd/metadata_changes_steps.cpp",
         "tests/bdd/raw_command_steps.cpp",
@@ -242,6 +243,7 @@ cc_test(
         ],
     }),
     data = [
+        "tests/fixtures/list_pages.json",
         "tests/fixtures/metadata_changes.json",
         "tests/fixtures/resource_options.json",
     ],

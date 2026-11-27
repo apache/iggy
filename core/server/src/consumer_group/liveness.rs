@@ -19,38 +19,61 @@
 //! primary, which renews leases and commits a Logout for each expired member.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 use std::pin::pin;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
-use consensus::{Consensus, MetadataHandle};
+use consensus::{Consensus, MetadataHandle, VsrConsensus};
+use futures::StreamExt;
 use futures::future::{Either, select};
 use iggy_binary_protocol::requests::system::{
-    MAX_SESSIONS_PER_RETIREMENT, RetireSessionsRequest, SessionIdentity,
+    FinalizeSessionRequest, MAX_SESSIONS_PER_RETIREMENT, RetireSessionsRequest, RetirementDebt,
+    SessionIdentity,
 };
 use iggy_binary_protocol::{
-    Command, ConsensusHeader, ConsumerSession, ConsumerSessionHeartbeatHeader, HEADER_SIZE,
-    MAX_CONSUMER_SESSIONS_PER_HEARTBEAT, PrepareHeader, WireEncode,
+    Command, ConsensusHeader, ConsumerSession, ConsumerSessionHeartbeatHeader, GenericHeader,
+    HEADER_SIZE, MAX_CONSUMER_SESSIONS_PER_HEARTBEAT, Operation, PrepareHeader, ReplyHeader,
+    RoutedRequestHeader, WireEncode,
 };
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::SendError;
 use message_bus::lifecycle::ShutdownToken;
 use metadata::impls::metadata::StreamsFrontend;
+use metadata::stm::stream::Streams;
+use partitions::{BatchRetirement, RetirementDebtStatus};
 use server_common::Message;
-use server_common::sharding::CONSUMER_SESSION_REPORT_TIMEOUT;
+use server_common::sharding::{CONSUMER_SESSION_REPORT_TIMEOUT, IggyNamespace};
 use shard::Receiver;
-use tracing::{info, trace};
+use tracing::{debug, info, trace, warn};
 
-use crate::consumer_group::lease::ConsumerGroupLiveness;
+use crate::consumer_group::lease::{
+    ConsumerGroupLiveness, MemberSet, RetirementGroups, RetirementNamespaces, RetirementProgress,
+    RetirementReport, StoredPartition, Withheld, encode_retirement_progress,
+};
 use crate::shell::{ShellBus, ShellShard};
 
 const MAX_LOGOUTS_PER_PASS: usize = 256;
 const MAX_RETIREMENTS_PER_PASS: usize = 128;
 const HEARTBEAT_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 const RETIREMENT_SWEEP_INTERVAL: Duration = Duration::from_millis(100);
+/// Retirement reads and barriers one sweep keeps in flight. One shard's inbox
+/// serves every other request too.
+const RETIREMENT_ATTEMPTS_IN_FLIGHT: usize = 8;
+/// How long a walk may prove nothing before this node reports its retried
+/// namespaces unprovable.
+const UNPROVABLE_AFTER: Duration = Duration::from_secs(2);
+/// How often a suspect namespace gets a retirement barrier it does not wait
+/// for. Only a barrier moves a partition's metadata frontier past sessions
+/// that ended after its last debt payment.
+const SUSPECT_BARRIER_INTERVAL: Duration = Duration::from_secs(1);
+/// How long the metadata primary waits for an expected reporter before it
+/// finalizes with retirement debt.
+const RETIREMENT_DEBT_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, PartialEq, Eq)]
 enum Pass {
@@ -83,7 +106,8 @@ pub async fn run<B, MJ, S, SB>(
             .borrow()
             .ended_sessions()
             .next()
-            .is_some();
+            .is_some()
+            || !liveness.borrow().retirement_debts.unpaid.is_empty();
         let report_wait = next_report.saturating_duration_since(shard.bus.monotonic_now());
         let wait = if pending_retirement {
             report_wait.min(RETIREMENT_SWEEP_INTERVAL)
@@ -119,7 +143,245 @@ pub async fn run<B, MJ, S, SB>(
         } else {
             retire_sessions(&shard, &liveness, &stop, &shutdown, interval, &system_path).await;
         }
+        pay_retirement_debts(&shard, &liveness, &stop, &shutdown).await;
     }
+}
+
+/// Pay, for the partitions this node leads, the retirement debts committed
+/// finalizations recorded. Reading a debt also arms the session gate of every
+/// local replica, so a backup that becomes primary already refuses sessions.
+async fn pay_retirement_debts<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    liveness: &RefCell<ConsumerGroupLiveness>,
+    stop: &Receiver<()>,
+    shutdown: &ShutdownToken,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let metadata = shard.plane.metadata();
+    let Some(consensus) = metadata.consensus.as_ref() else {
+        return;
+    };
+    absorb_retirement_debts(
+        metadata.mux_stm.streams(),
+        liveness,
+        consensus.replica(),
+        consensus.replica_count(),
+    );
+    let batch: Vec<(IggyNamespace, u64, u64)> = {
+        let mut tracker = liveness.borrow_mut();
+        let debts = &mut tracker.retirement_debts;
+        let rotated: Box<dyn Iterator<Item = _>> = match debts.cursor {
+            Some(after) => Box::new(
+                debts
+                    .unpaid
+                    .range((Bound::Excluded(after), Bound::Unbounded))
+                    .chain(debts.unpaid.range(..=after)),
+            ),
+            None => Box::new(debts.unpaid.iter()),
+        };
+        let batch: Vec<_> = rotated
+            .take(MAX_RETIREMENTS_PER_PASS)
+            .map(|(namespace, (created_revision, debt_op))| {
+                (*namespace, *created_revision, *debt_op)
+            })
+            .collect();
+        debts.cursor = batch.last().map(|(namespace, _, _)| *namespace);
+        batch
+    };
+    if batch.is_empty() || stop.try_recv().is_ok() || shutdown.is_triggered() {
+        return;
+    }
+    let mut running = futures::stream::iter(batch.iter().map(
+        |&(namespace, created_revision, debt_op)| async move {
+            let settled = pay_retirement_debt(shard, namespace, created_revision, debt_op).await;
+            (namespace, created_revision, debt_op, settled)
+        },
+    ))
+    .buffer_unordered(RETIREMENT_ATTEMPTS_IN_FLIGHT);
+    let mut deadline = pin!(shard.bus.sleep(CONSUMER_SESSION_REPORT_TIMEOUT));
+    while let Either::Left((Some((namespace, created_revision, debt_op, settled)), _)) =
+        select(running.next(), deadline.as_mut()).await
+    {
+        let Some(settled) = settled else {
+            continue;
+        };
+        let mut tracker = liveness.borrow_mut();
+        let debts = &mut tracker.retirement_debts;
+        if debts.unpaid.get(&namespace) == Some(&(created_revision, debt_op)) {
+            debts.unpaid.remove(&namespace);
+            if settled == DebtSettlement::Paid {
+                debts.paid.insert(namespace, (created_revision, debt_op));
+            } else {
+                debts.paid.remove(&namespace);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DebtSettlement {
+    Paid,
+    Gone,
+}
+
+/// Merge the debts recorded since the last call into the unpaid set,
+/// rescanning committed metadata when the recent ones are no longer kept.
+fn absorb_retirement_debts(
+    streams: &Streams,
+    liveness: &RefCell<ConsumerGroupLiveness>,
+    node: u8,
+    nodes: u8,
+) {
+    let mut tracker = liveness.borrow_mut();
+    let debts = &mut tracker.retirement_debts;
+    let recent = debts
+        .seen_through
+        .and_then(|seen_through| streams.retirement_debts_since(seen_through, node, nodes));
+    let (entries, newest) = recent.unwrap_or_else(|| {
+        debts.unpaid.clear();
+        streams.retirement_debts_stored_by(node, nodes)
+    });
+    for (namespace, created_revision, debt_op) in entries {
+        if debts
+            .paid
+            .get(&namespace)
+            .is_some_and(|&(paid_revision, paid_op)| {
+                paid_revision == created_revision && paid_op >= debt_op
+            })
+        {
+            continue;
+        }
+        let entry = debts
+            .unpaid
+            .entry(namespace)
+            .or_insert((created_revision, debt_op));
+        if entry.0 < created_revision || (entry.0 == created_revision && entry.1 < debt_op) {
+            *entry = (created_revision, debt_op);
+        }
+    }
+    debts.seen_through = Some(newest);
+}
+
+/// `Some(Paid)` once a committed payment covers `debt_op`, `Some(Gone)` when
+/// the incarnation no longer exists, `None` while it is still owed. Only the
+/// node whose replica is a normal primary with an idle pipeline pays.
+async fn pay_retirement_debt<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    namespace: IggyNamespace,
+    created_revision: u64,
+    debt_op: u64,
+) -> Option<DebtSettlement>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let read = || {
+        shard.partition_read(
+            namespace,
+            shard::PartitionRead::RetirementDebt {
+                created_revision,
+                debt_op,
+            },
+        )
+    };
+    let metadata = shard.plane.metadata();
+    let sessions = match read().await {
+        Some(shard::PartitionReadReply::RetirementDebt(RetirementDebtStatus::Paid)) => {
+            return Some(DebtSettlement::Paid);
+        }
+        Some(shard::PartitionReadReply::RetirementDebt(RetirementDebtStatus::Unpaid(Some(
+            sessions,
+        )))) => sessions,
+        Some(shard::PartitionReadReply::NotFound) => {
+            return metadata
+                .mux_stm
+                .streams()
+                .retirement_debt_for(namespace, created_revision)
+                .is_none()
+                .then_some(DebtSettlement::Gone);
+        }
+        _ => return None,
+    };
+    let consensus = metadata.consensus.as_ref()?;
+    let applied = consensus.commit_min();
+    if applied < debt_op {
+        return None;
+    }
+    // A session absent from the table at `applied` but registered at or
+    // below it was finalized; newer ones are left alone.
+    let mut identities: Vec<SessionIdentity> = {
+        let table = metadata.client_table.borrow();
+        sessions
+            .into_iter()
+            .filter(|&(client_id, session)| {
+                session <= applied && table.session_epoch(client_id) != Some(session)
+            })
+            .map(|(client_id, session)| SessionIdentity {
+                client_id,
+                session,
+                metadata_watermark: debt_op.max(session),
+            })
+            .collect()
+    };
+    identities.sort_unstable_by_key(|identity| identity.client_id);
+    let batch_limit = MAX_SESSIONS_PER_RETIREMENT.min(
+        shard
+            .bus_max_message_size()
+            .saturating_sub(HEADER_SIZE + size_of::<u64>())
+            / SessionIdentity::ENCODED_SIZE,
+    );
+    if batch_limit == 0 {
+        return None;
+    }
+    let batches: Vec<&[SessionIdentity]> = if identities.is_empty() {
+        vec![&[]]
+    } else {
+        identities.chunks(batch_limit).collect()
+    };
+    let last = batches.len() - 1;
+    // Each batch must commit before the next: the last one's `paid_through`
+    // vouches for every earlier batch.
+    for (index, identities) in batches.into_iter().enumerate() {
+        let body = RetireSessionsRequest {
+            identities: identities.to_vec(),
+            paid_through: if index == last { debt_op } else { 0 },
+            retired_through: 0,
+        }
+        .to_bytes();
+        let request =
+            retire_sessions_frame(consensus.cluster(), namespace, debt_op, applied, &body);
+        let ticket = shard.partition_submit(namespace, request).ok()?;
+        let reply = shard.await_partition_submit(ticket).await?;
+        if !reply_committed(&reply) {
+            return None;
+        }
+    }
+    let paid = matches!(
+        read().await,
+        Some(shard::PartitionReadReply::RetirementDebt(
+            RetirementDebtStatus::Paid
+        ))
+    );
+    if paid {
+        shard.metrics().record_retirement_debt_paid();
+    }
+    paid.then_some(DebtSettlement::Paid)
+}
+
+fn reply_committed(reply: &Message<GenericHeader>) -> bool {
+    reply
+        .as_slice()
+        .get(..size_of::<ReplyHeader>())
+        .and_then(|bytes| bytemuck::checked::try_from_bytes::<ReplyHeader>(bytes).ok())
+        .is_some_and(|header| header.status == 0)
 }
 
 async fn report_and_expire<B, MJ, S, SB>(
@@ -154,7 +416,11 @@ where
 
     let incomplete = !clients.complete;
     let mut sessions = clients.clients;
-    sessions.extend(liveness.borrow_mut().local_activity(now, timeout));
+    sessions.extend(liveness.borrow_mut().local_activity(
+        now,
+        timeout,
+        shard.bus.realtime_micros(),
+    ));
 
     if primary_view.is_some() {
         let table = metadata.client_table.borrow();
@@ -306,7 +572,7 @@ async fn retire_sessions<B, MJ, S, SB>(
     let mut deadline = pin!(shard.bus.sleep(CONSUMER_SESSION_REPORT_TIMEOUT));
     for _ in 0..MAX_LOGOUTS_PER_PASS {
         let before = shard.plane.metadata().client_table.borrow().count();
-        let retirement = pin!(retire_session(
+        let retirement = pin!(retire_batch(
             shard,
             liveness,
             stop,
@@ -329,8 +595,10 @@ async fn retire_sessions<B, MJ, S, SB>(
     }
 }
 
+/// One step of this node's retirement walk. The metadata primary finalizes
+/// once the reports settle. Every other node reports its completed walk.
 #[allow(clippy::too_many_lines)]
-async fn retire_session<B, MJ, S, SB>(
+async fn retire_batch<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     liveness: &RefCell<ConsumerGroupLiveness>,
     stop: &Receiver<()>,
@@ -355,293 +623,817 @@ async fn retire_session<B, MJ, S, SB>(
         return;
     }
     let view = consensus.view();
-    liveness.borrow_mut().observe_view(Some(view));
-    let identity = metadata
+    let lowest_ended = metadata
         .client_table
         .borrow()
         .ended_sessions()
-        .min_by_key(|identity| (identity.metadata_watermark, identity.client_id));
-    let Some(identity) = identity else {
-        liveness.borrow_mut().reconcile_retirement(None, 0);
-        return;
-    };
-    let revision = metadata
-        .mux_stm
-        .streams()
-        .read(|inner| inner.namespace_revision);
-    liveness
-        .borrow_mut()
-        .reconcile_retirement(Some(identity), revision);
-    let remote_quorum = consensus.is_primary()
-        && liveness
-            .borrow()
-            .retirement
-            .as_ref()
-            .is_some_and(|progress| progress.reporters.len() >= consensus.quorum_replication());
-    if remote_quorum {
-        // The metadata primary need not belong to the common reporting quorum.
-        // Every reporter already proved retirement in every allocated group.
-        if let Err(error) = metadata
-            .submit_session_finalization(identity, revision)
-            .await
-        {
-            trace!(
-                ?error,
-                client_id = identity.client_id,
-                "session finalization deferred"
-            );
-        }
+        .map(|identity| identity.metadata_watermark)
+        .min();
+    {
+        let mut tracker = liveness.borrow_mut();
+        tracker.observe_view(Some(view));
+        tracker.reconcile_retirement(lowest_ended);
+    }
+    if lowest_ended.is_none() {
         return;
     }
-    let (cursor, reported) = {
+    // The metadata primary need not belong to the common reporting quorum.
+    if consensus.is_primary()
+        && let Some((settled_through, debt)) = settle_retirement(shard, liveness)
+    {
+        finalize_sessions(shard, liveness, settled_through, debt).await;
+        return;
+    }
+    if liveness.borrow().retirement.is_none() {
+        start_walk(shard, liveness);
+    }
+    let Some(reported) = liveness
+        .borrow()
+        .retirement
+        .as_ref()
+        .map(|progress| progress.reported)
+    else {
+        return;
+    };
+    if !reported && !sweep_retirement(shard, liveness, stop, shutdown, system_path).await {
+        return;
+    }
+    if consensus.view() != view || !consensus.is_normal() || consensus.is_transferring() {
+        return;
+    }
+    let groups = retirement_groups(shard, liveness);
+    let (retired_through, withheld) = {
         let tracker = liveness.borrow();
         let Some(progress) = &tracker.retirement else {
             return;
         };
-        (progress.cursor, progress.reported)
+        (
+            progress.retired_through,
+            withheld_vouches(&groups, &progress.unprovable),
+        )
     };
-    if !reported {
-        let mut identities: Vec<_> = metadata.client_table.borrow().ended_sessions().collect();
-        identities
-            .sort_unstable_by_key(|identity| (identity.metadata_watermark, identity.client_id));
-        let batch_limit = MAX_SESSIONS_PER_RETIREMENT.min(
-            shard.bus_max_message_size().saturating_sub(HEADER_SIZE)
-                / SessionIdentity::ENCODED_SIZE,
+    if consensus.is_primary() {
+        liveness.borrow_mut().retirement_reports.insert(
+            consensus.replica(),
+            (retired_through, Some(Rc::new(withheld))),
         );
-        if batch_limit == 0 {
-            return;
+        if let Some((settled_through, debt)) = settle_retirement(shard, liveness) {
+            finalize_sessions(shard, liveness, settled_through, debt).await;
         }
-        identities.truncate(batch_limit);
-        let body = RetireSessionsRequest { identities }.to_bytes();
-        let namespaces = {
-            let mut tracker = liveness.borrow_mut();
-            if tracker
-                .retirement_namespaces
-                .as_ref()
-                .is_none_or(|(cached_revision, _)| *cached_revision != revision)
-            {
-                tracker.retirement_fences.clear();
-                tracker.retirement_namespaces = Some((
-                    revision,
-                    metadata.mux_stm.streams().read(|inner| {
-                        let mut namespaces = Vec::new();
-                        for (_, stream) in &inner.items {
-                            for (topic_id, topic) in &stream.topics {
-                                for partition in &topic.partitions {
-                                    namespaces.push((
-                                        server_common::sharding::IggyNamespace::new(
-                                            stream.id,
-                                            topic_id,
-                                            partition.id,
-                                        ),
-                                        partition.created_revision,
-                                    ));
-                                }
-                            }
-                        }
-                        Rc::from(namespaces)
-                    }),
-                ));
-            }
-            let Some((_, namespaces)) = &tracker.retirement_namespaces else {
-                return;
-            };
-            Rc::clone(namespaces)
-        };
-        // Repeated barriers are idempotent, so an unfinished sweep can resume
-        // without delaying activity reports past their existing budget.
-        let completed = shard::bus_timeout(&shard.bus, CONSUMER_SESSION_REPORT_TIMEOUT, async {
-            for (namespace, created_revision) in namespaces
-                .iter()
-                .skip(cursor)
-                .take(MAX_RETIREMENTS_PER_PASS)
-            {
-                if stop.try_recv().is_ok() || shutdown.is_triggered() {
-                    return false;
-                }
-                if consensus.view() != view || !consensus.is_normal() {
-                    return false;
-                }
-                let status = shard
-                    .partition_read(
-                        *namespace,
-                        shard::PartitionRead::SessionRetired {
-                            identity,
-                            created_revision: *created_revision,
-                        },
-                    )
-                    .await;
-                let retired = match status {
-                    Some(shard::PartitionReadReply::SessionRetired(true)) => true,
-                    Some(shard::PartitionReadReply::SessionRetirementFailed {
-                        created_revision: failed_revision,
-                    }) if failed_revision == *created_revision => {
-                        if liveness.borrow().retirement_fences.get(namespace)
-                            == Some(created_revision)
-                        {
-                            true
-                        } else {
-                            match crate::partition_helpers::record_partition_retirement_fence(
-                                system_path,
-                                *namespace,
-                                *created_revision,
-                            )
-                            .await
-                            {
-                                Ok(()) => {
-                                    liveness
-                                        .borrow_mut()
-                                        .retirement_fences
-                                        .insert(*namespace, *created_revision);
-                                    true
-                                }
-                                Err(error) => {
-                                    tracing::warn!(%error, namespace_raw = namespace.inner(),
-                                    "retirement waits for durable partition fence");
-                                    false
-                                }
-                            }
-                        }
-                    }
-                    _ => false,
-                };
-                if !retired {
-                    let size = HEADER_SIZE + body.len();
-                    let mut request =
-                        Message::<iggy_binary_protocol::RoutedRequestHeader>::new(size)
-                            .transmute_header(
-                                |_, header: &mut iggy_binary_protocol::RoutedRequestHeader| {
-                                    header.command = Command::Request;
-                                    header.operation =
-                                        iggy_binary_protocol::Operation::RetireSession;
-                                    header.cluster = consensus.cluster();
-                                    header.client = message_bus::AUTO_COMMIT_CLIENT_ID;
-                                    header.session = 1;
-                                    header.request = identity.metadata_watermark;
-                                    header.metadata_watermark = consensus.commit_min();
-                                    header.group = namespace.inner();
-                                    header.size =
-                                        u32::try_from(size).expect("retirement frame fits u32");
-                                },
-                            );
-                    request.as_mut_slice()[HEADER_SIZE..].copy_from_slice(&body);
-                    if let Ok(ticket) = shard.partition_submit(*namespace, request) {
-                        let _ = shard.await_partition_submit(ticket).await;
-                    }
-                }
-                let retired = retired
-                    || matches!(
-                        shard
-                            .partition_read(
-                                *namespace,
-                                shard::PartitionRead::SessionRetired {
-                                    identity,
-                                    created_revision: *created_revision,
-                                }
-                            )
-                            .await,
-                        Some(shard::PartitionReadReply::SessionRetired(true))
-                    );
-                let mut tracker = liveness.borrow_mut();
-                let Some(progress) = &mut tracker.retirement else {
-                    return false;
-                };
-                if progress.identity != identity || progress.revision != revision {
-                    return false;
-                }
-                progress.complete &= retired;
-                progress.cursor += 1;
-            }
-            let mut tracker = liveness.borrow_mut();
-            let Some(progress) = &mut tracker.retirement else {
-                return false;
-            };
-            if progress.cursor < namespaces.len() {
-                return false;
-            }
-            if !progress.complete {
-                progress.cursor = 0;
-                progress.complete = true;
-                return false;
-            }
-            progress.reported = true;
-            true
-        })
-        .await
-        .unwrap_or(false);
-        if !completed {
-            return;
-        }
+        return;
     }
-    if consensus.view() != view
-        || !consensus.is_normal()
-        || consensus.is_transferring()
-        || metadata
-            .mux_stm
-            .streams()
-            .read(|inner| inner.namespace_revision)
-            != revision
+    if !liveness
+        .borrow_mut()
+        .retirement
+        .as_mut()
+        .is_some_and(|progress| {
+            // A report can be lost, and a new primary keeps none.
+            progress.report_due(
+                shard.bus.monotonic_now(),
+                report_interval.min(RETIREMENT_SWEEP_INTERVAL),
+            )
+        })
     {
         return;
     }
-    if consensus.is_primary() {
-        let ready = {
-            let mut tracker = liveness.borrow_mut();
-            let Some(progress) = &mut tracker.retirement else {
-                return;
-            };
-            progress.reporters.insert(consensus.replica());
-            progress.reporters.len() >= consensus.quorum_replication()
-        };
-        if ready
-            && let Err(error) = metadata
-                .submit_session_finalization(identity, revision)
-                .await
-        {
-            trace!(
-                ?error,
-                client_id = identity.client_id,
-                "session finalization deferred"
-            );
-        }
-    } else {
-        if !liveness
-            .borrow_mut()
-            .retirement
-            .as_mut()
-            .is_some_and(|progress| {
-                // The primary can receive this report before it starts the sweep.
-                progress.report_due(
-                    shard.bus.monotonic_now(),
-                    report_interval.min(RETIREMENT_SWEEP_INTERVAL),
-                )
-            })
-        {
-            return;
-        }
-        let message = heartbeat_message(
-            consensus.cluster(),
-            view,
-            consensus.replica(),
-            &[ConsumerSession {
-                client_id: identity.client_id,
-                session: identity.session,
-            }],
-            false,
-        )
+    let body = encode_retirement_progress(
+        Some(&withheld),
+        shard.bus_max_message_size().saturating_sub(HEADER_SIZE),
+    );
+    let message = heartbeat_frame(consensus.cluster(), view, consensus.replica(), &body, false)
         .transmute_header(|old, header| {
             *header = old;
             header.command = Command::SessionRetirementProgress;
-            header.namespace_revision = revision;
+            header.retired_through = retired_through;
             header.seal();
         });
-        if let Err(error) = shard
-            .bus
-            .send_to_replica(consensus.primary_index(view), message.into_frozen())
-            .await
-        {
-            trace!(?error, "session retirement report deferred");
+    if let Err(error) = shard
+        .bus
+        .send_to_replica(consensus.primary_index(view), message.into_frozen())
+        .await
+    {
+        trace!(?error, "session retirement report deferred");
+    }
+}
+
+/// Start a walk that proves retired every session ended so far, over the
+/// partitions this node stores now.
+fn start_walk<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    liveness: &RefCell<ConsumerGroupLiveness>,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let Some(retired_through) = shard
+        .plane
+        .metadata()
+        .client_table
+        .borrow()
+        .ended_sessions()
+        .map(|identity| identity.metadata_watermark)
+        .max()
+    else {
+        return;
+    };
+    // Listed with no await since the client table read, so a partition that
+    // the listing misses was created above `retired_through`.
+    let namespaces = stored_namespaces(shard, liveness);
+    liveness.borrow_mut().retirement = Some(RetirementProgress::new(
+        retired_through,
+        namespaces,
+        shard.bus.monotonic_now(),
+    ));
+}
+
+/// One bounded pass of this node's walk. Every namespace of the walk is tried
+/// once. Then the unproven ones are retried until each is proven, or until
+/// the walk proves nothing for [`UNPROVABLE_AFTER`]. Returns whether the walk
+/// is complete.
+#[allow(clippy::too_many_lines)]
+async fn sweep_retirement<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    liveness: &RefCell<ConsumerGroupLiveness>,
+    stop: &Receiver<()>,
+    shutdown: &ShutdownToken,
+    system_path: &str,
+) -> bool
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let metadata = shard.plane.metadata();
+    let Some(consensus) = metadata.consensus.as_ref() else {
+        return false;
+    };
+    let view = consensus.view();
+    let mut ended: Vec<SessionIdentity> = metadata.client_table.borrow().ended_sessions().collect();
+    ended.sort_unstable_by_key(|identity| identity.client_id);
+    let Some(ended_through) = ended
+        .iter()
+        .map(|identity| identity.metadata_watermark)
+        .max()
+    else {
+        return false;
+    };
+    let (batch, cursor, listed, attempts) = {
+        let tracker = liveness.borrow();
+        let Some(progress) = &tracker.retirement else {
+            return false;
+        };
+        let now = shard.bus.monotonic_now();
+        let barrier = |namespace: &IggyNamespace| {
+            if !tracker.retirement_suspects.contains(namespace) {
+                Barrier::Await
+            } else if tracker
+                .retirement_suspect_barriers
+                .get(namespace)
+                .is_none_or(|sent| now.saturating_duration_since(*sent) >= SUSPECT_BARRIER_INTERVAL)
+            {
+                Barrier::Send
+            } else {
+                Barrier::Skip
+            }
+        };
+        let cursor = progress.cursor;
+        let listed = progress
+            .namespaces
+            .len()
+            .saturating_sub(cursor)
+            .min(MAX_RETIREMENTS_PER_PASS);
+        let attempts: Vec<(IggyNamespace, u64, Barrier)> = if listed > 0 {
+            // Also before this node builds it, a partition created above the
+            // watermark refuses every request of the batch.
+            progress.namespaces[cursor..cursor + listed]
+                .iter()
+                .filter(|partition| partition.created_op <= progress.retired_through)
+                .map(|partition| {
+                    (
+                        partition.namespace,
+                        partition.created_revision,
+                        barrier(&partition.namespace),
+                    )
+                })
+                .collect()
+        } else {
+            progress
+                .pending
+                .iter()
+                .take(MAX_RETIREMENTS_PER_PASS)
+                .map(|(namespace, (created_revision, _))| {
+                    (*namespace, *created_revision, barrier(namespace))
+                })
+                .collect()
+        };
+        let batch = RetirementBatch {
+            ended: Arc::from(ended),
+            ended_through,
+            retired_through: progress.retired_through,
+        };
+        (batch, cursor, listed, attempts)
+    };
+    {
+        let now = shard.bus.monotonic_now();
+        let mut tracker = liveness.borrow_mut();
+        for (namespace, _, barrier) in &attempts {
+            if *barrier == Barrier::Send {
+                tracker.retirement_suspect_barriers.insert(*namespace, now);
+            }
         }
+    }
+    if stop.try_recv().is_ok()
+        || shutdown.is_triggered()
+        || consensus.view() != view
+        || !consensus.is_normal()
+    {
+        return false;
+    }
+    // A group without a live member quorum stalls only its own attempt: the
+    // pass deadline settles every attempt that answered in time. An attempt
+    // that never started within it is not a retry.
+    let started = RefCell::new(BTreeSet::new());
+    let mut running = futures::stream::iter(attempts.iter().map(
+        |&(namespace, created_revision, barrier)| {
+            let (batch, started) = (&batch, &started);
+            async move {
+                started.borrow_mut().insert(namespace);
+                let retired = prove_retired(
+                    shard,
+                    liveness,
+                    barrier,
+                    batch,
+                    namespace,
+                    created_revision,
+                    system_path,
+                )
+                .await;
+                (namespace, retired)
+            }
+        },
+    ))
+    .buffer_unordered(RETIREMENT_ATTEMPTS_IN_FLIGHT);
+    let mut proven = BTreeSet::new();
+    {
+        let mut deadline = pin!(shard.bus.sleep(CONSUMER_SESSION_REPORT_TIMEOUT));
+        while let Either::Left((Some((namespace, retired)), _)) =
+            select(running.next(), deadline.as_mut()).await
+        {
+            if retired {
+                proven.insert(namespace);
+            }
+        }
+    }
+    drop(running);
+    let started = started.into_inner();
+    if consensus.view() != view || !consensus.is_normal() {
+        return false;
+    }
+    let now = shard.bus.monotonic_now();
+    let mut tracker = liveness.borrow_mut();
+    let ConsumerGroupLiveness {
+        retirement,
+        retirement_suspects,
+        retirement_suspect_barriers,
+        ..
+    } = &mut *tracker;
+    let Some(progress) = retirement else {
+        return false;
+    };
+    let first_round = listed > 0;
+    for (namespace, created_revision, _) in &attempts {
+        if proven.contains(namespace) {
+            progress.pending.remove(namespace);
+        } else if first_round {
+            progress
+                .pending
+                .insert(*namespace, (*created_revision, false));
+        } else if started.contains(namespace)
+            && let Some((_, retried)) = progress.pending.get_mut(namespace)
+        {
+            *retried = true;
+        }
+    }
+    if first_round || !proven.is_empty() {
+        progress.last_progress = now;
+    }
+    if first_round {
+        progress.cursor = cursor + listed;
+    }
+    if progress.cursor < progress.namespaces.len() {
+        return false;
+    }
+    let stalled = now.saturating_duration_since(progress.last_progress) >= UNPROVABLE_AFTER;
+    let RetirementProgress {
+        pending,
+        unprovable,
+        ..
+    } = progress;
+    pending.retain(|namespace, (created_revision, retried)| {
+        let given_up = *retried && (retirement_suspects.contains(namespace) || stalled);
+        if given_up {
+            unprovable.insert(RetirementDebt {
+                namespace: namespace.inner(),
+                created_revision: *created_revision,
+            });
+        }
+        !given_up
+    });
+    if !pending.is_empty() {
+        return false;
+    }
+    progress.reported = true;
+    *retirement_suspects = progress
+        .unprovable
+        .iter()
+        .map(|debt| IggyNamespace::from_raw(debt.namespace))
+        .collect();
+    retirement_suspect_barriers.retain(|namespace, _| retirement_suspects.contains(namespace));
+    if !progress.unprovable.is_empty() {
+        debug!(
+            retired_through = progress.retired_through,
+            unprovable = progress.unprovable.len(),
+            "session retirement could not be proven on partitions without a live member quorum"
+        );
+    }
+    true
+}
+
+/// The namespaces this node stores, cached per namespace revision. Each node
+/// vouches only for the copies it stores.
+fn stored_namespaces<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    liveness: &RefCell<ConsumerGroupLiveness>,
+) -> RetirementNamespaces
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let metadata = shard.plane.metadata();
+    let streams = metadata.mux_stm.streams();
+    let revision = streams.read(|inner| inner.namespace_revision);
+    let mut tracker = liveness.borrow_mut();
+    if let Some((cached_revision, namespaces)) = &tracker.retirement_namespaces
+        && *cached_revision == revision
+    {
+        return Rc::clone(namespaces);
+    }
+    // Suspects outlive a revision change, because each walk ends by
+    // replacing them. A fence names its incarnation, so dropping the cache
+    // only costs a rewrite.
+    tracker.retirement_fences.clear();
+    let (node, nodes) = metadata.consensus.as_ref().map_or((0, 1), |consensus| {
+        (consensus.replica(), consensus.replica_count())
+    });
+    let namespaces: RetirementNamespaces = streams.read(|inner| {
+        let mut namespaces = Vec::new();
+        for (_, stream) in &inner.items {
+            for (topic_id, topic) in &stream.topics {
+                for partition in topic
+                    .partitions
+                    .iter()
+                    .filter(|partition| partition.replica_set(nodes).member(node).is_some())
+                {
+                    namespaces.push(StoredPartition {
+                        namespace: IggyNamespace::new(stream.id, topic_id, partition.id),
+                        created_revision: partition.created_revision,
+                        created_op: partition.created_op,
+                    });
+                }
+            }
+        }
+        Rc::from(namespaces)
+    });
+    tracker.retirement_namespaces = Some((revision, Rc::clone(&namespaces)));
+    namespaces
+}
+
+/// Whether this node's copy of `namespace` holds retired every session that
+/// ended at or below the walk watermark: by an applied barrier, or by a
+/// durable fence over a failed incarnation. Barriers name only the sessions
+/// that hold a slice entry. A suspect never waits on its barriers, so a group
+/// that cannot commit never holds a slot.
+async fn prove_retired<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    liveness: &RefCell<ConsumerGroupLiveness>,
+    barrier: Barrier,
+    batch: &RetirementBatch,
+    namespace: IggyNamespace,
+    created_revision: u64,
+    system_path: &str,
+) -> bool
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let read = || {
+        shard.partition_read(
+            namespace,
+            shard::PartitionRead::SessionsRetired {
+                ended: Arc::clone(&batch.ended),
+                retired_through: batch.retired_through,
+                created_revision,
+            },
+        )
+    };
+    let owed = match read().await {
+        Some(shard::PartitionReadReply::SessionsRetired(BatchRetirement::Retired)) => return true,
+        Some(shard::PartitionReadReply::SessionsRetired(BatchRetirement::Owed(owed))) => owed,
+        Some(shard::PartitionReadReply::SessionRetirementFailed {
+            created_revision: failed_revision,
+        }) if failed_revision == created_revision => {
+            if liveness.borrow().retirement_fences.get(&namespace) == Some(&created_revision) {
+                return true;
+            }
+            return match crate::partition_helpers::record_partition_retirement_fence(
+                system_path,
+                namespace,
+                created_revision,
+            )
+            .await
+            {
+                Ok(()) => {
+                    liveness
+                        .borrow_mut()
+                        .retirement_fences
+                        .insert(namespace, created_revision);
+                    true
+                }
+                Err(error) => {
+                    tracing::warn!(%error, namespace_raw = namespace.inner(),
+                        "retirement waits for durable partition fence");
+                    false
+                }
+            };
+        }
+        // Not served here now, so a barrier cannot prove it either.
+        _ => return false,
+    };
+    if barrier == Barrier::Skip {
+        return false;
+    }
+    let Some(consensus) = shard.plane.metadata().consensus.as_ref() else {
+        return false;
+    };
+    let batch_limit = MAX_SESSIONS_PER_RETIREMENT.min(
+        shard
+            .bus_max_message_size()
+            .saturating_sub(HEADER_SIZE + 2 * size_of::<u64>())
+            / SessionIdentity::ENCODED_SIZE,
+    );
+    if batch_limit == 0 {
+        return false;
+    }
+    let mut chunks = owed.chunks(batch_limit);
+    let first = chunks.next().unwrap_or_default();
+    // Each chunk raises the frontier to the newest end op, so one barrier
+    // also serves the walk of a node that started after this one.
+    for identities in std::iter::once(first).chain(chunks) {
+        let body = RetireSessionsRequest {
+            identities: identities.to_vec(),
+            paid_through: 0,
+            retired_through: batch.ended_through,
+        }
+        .to_bytes();
+        let request = retire_sessions_frame(
+            consensus.cluster(),
+            namespace,
+            batch.ended_through,
+            consensus.commit_min(),
+            &body,
+        );
+        let Ok(ticket) = shard.partition_submit(namespace, request) else {
+            return false;
+        };
+        if barrier == Barrier::Await
+            && !shard
+                .await_partition_submit(ticket)
+                .await
+                .is_some_and(|reply| reply_committed(&reply))
+        {
+            return false;
+        }
+    }
+    if barrier == Barrier::Send {
+        // The retry's read proves it once the barriers commit.
+        return false;
+    }
+    matches!(
+        read().await,
+        Some(shard::PartitionReadReply::SessionsRetired(
+            BatchRetirement::Retired
+        ))
+    )
+}
+
+/// How a sweep attempt treats a namespace the plain read cannot prove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Barrier {
+    /// Submit a retirement and wait for it before reading again.
+    Await,
+    /// A suspect due for a retirement it does not wait for.
+    Send,
+    /// A suspect that got one recently: read only.
+    Skip,
+}
+
+/// What one pass of a walk proves on each partition, and what its barriers
+/// carry.
+struct RetirementBatch {
+    /// Every session ended now, sorted by client id.
+    ended: Arc<[SessionIdentity]>,
+    /// The newest end op of `ended`, which a barrier raises the frontier to.
+    ended_through: u64,
+    /// The walk watermark that a proof must reach.
+    retired_through: u64,
+}
+
+/// A server-originated `RetireSession` request for `namespace`.
+fn retire_sessions_frame(
+    cluster: u128,
+    namespace: IggyNamespace,
+    request: u64,
+    metadata_watermark: u64,
+    body: &[u8],
+) -> Message<RoutedRequestHeader> {
+    let size = HEADER_SIZE + body.len();
+    let mut message = Message::<RoutedRequestHeader>::new(size).transmute_header(
+        |_, header: &mut RoutedRequestHeader| {
+            header.command = Command::Request;
+            header.operation = Operation::RetireSession;
+            header.cluster = cluster;
+            header.client = message_bus::AUTO_COMMIT_CLIENT_ID;
+            header.session = 1;
+            header.request = request;
+            header.metadata_watermark = metadata_watermark;
+            header.group = namespace.inner();
+            header.size = u32::try_from(size).expect("retirement frame fits u32");
+        },
+    );
+    message.as_mut_slice()[HEADER_SIZE..].copy_from_slice(body);
+    message
+}
+
+/// Settle the reports so far: the lowest watermark among them, and the debt
+/// of every partition whose members did not vouch for it. `None` keeps
+/// waiting. A partition goes into debt only once every node expected to
+/// report has, or after [`RETIREMENT_DEBT_GRACE`].
+fn settle_retirement<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    liveness: &RefCell<ConsumerGroupLiveness>,
+) -> Option<(u64, Vec<RetirementDebt>)>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let nodes = shard.plane.metadata().consensus.as_ref()?.replica_count();
+    let groups = retirement_groups(shard, liveness);
+    let now = shard.bus.monotonic_now();
+    let mut tracker = liveness.borrow_mut();
+    let ConsumerGroupLiveness {
+        retirement_reports,
+        retirement_settleable_since,
+        retirement_absent,
+        ..
+    } = &mut *tracker;
+    // Each report covers every session that ended at or below its own
+    // watermark, so all of them cover the lowest one.
+    let retired_through = retirement_reports
+        .values()
+        .map(|(retired_through, _)| *retired_through)
+        .min()?;
+    let debt = retirement_settlement(&groups, retirement_reports, nodes)?;
+    let reported = retirement_reports
+        .keys()
+        .fold(0, |mask, &node| mask | node_bit(node));
+    let expected = all_nodes(nodes) & !*retirement_absent;
+    if !debt.is_empty() && reported & expected != expected {
+        let since = *retirement_settleable_since.get_or_insert(now);
+        if now.saturating_duration_since(since) < RETIREMENT_DEBT_GRACE {
+            return None;
+        }
+    }
+    *retirement_absent = all_nodes(nodes) & !reported;
+    Some((retired_through, debt))
+}
+
+fn retirement_groups<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    liveness: &RefCell<ConsumerGroupLiveness>,
+) -> Rc<RetirementGroups>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let metadata = shard.plane.metadata();
+    let streams = metadata.mux_stm.streams();
+    let revision = streams.read(|inner| inner.namespace_revision);
+    let mut tracker = liveness.borrow_mut();
+    if let Some((cached_revision, groups)) = &tracker.retirement_groups
+        && *cached_revision == revision
+    {
+        return Rc::clone(groups);
+    }
+    let nodes = metadata
+        .consensus
+        .as_ref()
+        .map_or(1, VsrConsensus::replica_count);
+    let groups = Rc::new(build_retirement_groups(streams, nodes));
+    tracker.retirement_groups = Some((revision, Rc::clone(&groups)));
+    groups
+}
+
+fn build_retirement_groups(streams: &Streams, nodes: u8) -> RetirementGroups {
+    streams.read(|inner| {
+        let mut groups = RetirementGroups::default();
+        let mut by_mask = BTreeMap::new();
+        for (stream_id, stream) in &inner.items {
+            for (topic_id, topic) in &stream.topics {
+                for partition in &topic.partitions {
+                    let members = partition.replica_set(nodes);
+                    let mask = members
+                        .nodes()
+                        .iter()
+                        .fold(0, |mask, &node| mask | node_bit(node));
+                    let index = *by_mask.entry(mask).or_insert_with(|| {
+                        groups.sets.push(MemberSet {
+                            mask,
+                            quorum: u32::try_from(consensus::quorum_replication(members.len()))
+                                .unwrap_or(u32::MAX),
+                            partitions: Vec::new(),
+                        });
+                        groups.sets.len() - 1
+                    });
+                    let debt = RetirementDebt {
+                        namespace: IggyNamespace::new(stream_id, topic_id, partition.id).inner(),
+                        created_revision: partition.created_revision,
+                    };
+                    groups.sets[index].partitions.push(debt);
+                    groups.by_partition.insert(debt, index);
+                }
+            }
+        }
+        groups
+    })
+}
+
+/// `None` without a replication quorum of the cluster. Otherwise every
+/// partition whose vouching members fall short of a replication quorum of its
+/// member set: those were not proven retired and owe a retirement.
+fn retirement_settlement(
+    groups: &RetirementGroups,
+    reports: &BTreeMap<u8, RetirementReport>,
+    nodes: u8,
+) -> Option<Vec<RetirementDebt>> {
+    if reports.len() < consensus::quorum_replication(nodes) {
+        return None;
+    }
+    let vouching = reports
+        .iter()
+        .filter(|(_, (_, withheld))| withheld.is_some())
+        .fold(0, |mask, (&node, _)| mask | node_bit(node));
+    let vouchers: Vec<u32> = groups
+        .sets
+        .iter()
+        .map(|set| {
+            let withheld_sets = reports
+                .iter()
+                .filter(|(node, (_, withheld))| {
+                    set.mask & node_bit(**node) != 0
+                        && withheld
+                            .as_ref()
+                            .is_some_and(|withheld| withheld.masks.contains(&set.mask))
+                })
+                .count();
+            (vouching & set.mask)
+                .count_ones()
+                .saturating_sub(u32::try_from(withheld_sets).unwrap_or(u32::MAX))
+        })
+        .collect();
+    let mut debt = Vec::new();
+    for (set, &vouchers) in groups.sets.iter().zip(&vouchers) {
+        if vouchers < set.quorum {
+            debt.extend_from_slice(&set.partitions);
+        }
+    }
+    let mut withheld: BTreeMap<RetirementDebt, (usize, u32)> = BTreeMap::new();
+    for (&node, (_, entries)) in reports {
+        for entry in entries
+            .iter()
+            .flat_map(|withheld| withheld.partitions.iter())
+        {
+            if let Some(&index) = groups.by_partition.get(entry)
+                && vouchers[index] >= groups.sets[index].quorum
+                && groups.sets[index].mask & node_bit(node) != 0
+            {
+                withheld.entry(*entry).or_insert((index, 0)).1 += 1;
+            }
+        }
+    }
+    for (entry, (index, count)) in withheld {
+        if vouchers[index].saturating_sub(count) < groups.sets[index].quorum {
+            debt.push(entry);
+        }
+    }
+    Some(debt)
+}
+
+/// The vouches a node withholds for `unprovable`, as whole member sets where
+/// it could prove none of a set's partitions.
+fn withheld_vouches(groups: &RetirementGroups, unprovable: &BTreeSet<RetirementDebt>) -> Withheld {
+    let mut by_set: BTreeMap<usize, Vec<RetirementDebt>> = BTreeMap::new();
+    let mut withheld = Withheld::default();
+    for entry in unprovable {
+        match groups.by_partition.get(entry) {
+            Some(&index) => by_set.entry(index).or_default().push(*entry),
+            None => withheld.partitions.push(*entry),
+        }
+    }
+    for (index, entries) in by_set {
+        let set = &groups.sets[index];
+        if entries.len() == set.partitions.len() {
+            withheld.masks.push(set.mask);
+        } else {
+            withheld.partitions.extend(entries);
+        }
+    }
+    withheld
+}
+
+const fn node_bit(node: u8) -> u32 {
+    match 1_u32.checked_shl(node as u32) {
+        Some(bit) => bit,
+        None => 0,
+    }
+}
+
+const fn all_nodes(nodes: u8) -> u32 {
+    match 1_u32.checked_shl(nodes as u32) {
+        Some(bit) => bit - 1,
+        None => u32::MAX,
+    }
+}
+
+async fn finalize_sessions<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    liveness: &RefCell<ConsumerGroupLiveness>,
+    retired_through: u64,
+    debt: Vec<RetirementDebt>,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let encoded = FinalizeSessionRequest {
+        retired_through,
+        debt: Vec::new(),
+    }
+    .encoded_size()
+        + size_of::<u32>()
+        + debt.len() * RetirementDebt::ENCODED_SIZE;
+    if HEADER_SIZE + encoded > shard.bus_max_message_size() {
+        warn!(
+            retired_through,
+            debt = debt.len(),
+            "session finalization deferred: its retirement debt exceeds one message"
+        );
+        return;
+    }
+    if !debt.is_empty() {
+        debug!(
+            retired_through,
+            debt = debt.len(),
+            "finalizing sessions with partition retirement debt"
+        );
+    }
+    match shard
+        .plane
+        .metadata()
+        .submit_session_finalization(retired_through, debt)
+        .await
+    {
+        Ok(Some(_)) => liveness.borrow_mut().retirement_settleable_since = None,
+        Ok(None) => {}
+        Err(error) => trace!(?error, retired_through, "session finalization deferred"),
     }
 }
 
@@ -723,7 +1515,6 @@ where
     }
 }
 
-#[allow(clippy::cast_possible_truncation)]
 fn heartbeat_message(
     cluster: u128,
     view: u32,
@@ -735,6 +1526,17 @@ fn heartbeat_message(
     for session in sessions {
         session.encode(&mut body);
     }
+    heartbeat_frame(cluster, view, replica, &body, incomplete)
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn heartbeat_frame(
+    cluster: u128,
+    view: u32,
+    replica: u8,
+    body: &[u8],
+    incomplete: bool,
+) -> Message<ConsumerSessionHeartbeatHeader> {
     let size = HEADER_SIZE + body.len();
     let mut message = Message::<ConsumerSessionHeartbeatHeader>::new(size).transmute_header(
         |_, header: &mut ConsumerSessionHeartbeatHeader| {
@@ -744,17 +1546,18 @@ fn heartbeat_message(
             header.replica = replica;
             header.incomplete = u8::from(incomplete);
             header.size = size as u32;
-            header.checksum_body = u128::from(iggy_common::calculate_checksum(&body));
+            header.checksum_body = u128::from(iggy_common::calculate_checksum(body));
             header.seal();
         },
     );
-    message.as_mut_slice()[HEADER_SIZE..size].copy_from_slice(&body);
+    message.as_mut_slice()[HEADER_SIZE..size].copy_from_slice(body);
     message
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consumer_group::lease::Unprovable;
     use crate::dispatch::test_support::{
         SpyBus, TestShard, prepare_message, register_reply, test_shard,
     };
@@ -771,7 +1574,6 @@ mod tests {
     use message_bus::lifecycle::Shutdown;
     use metadata::stm::StateMachine;
     use metadata::stm::consumer_group::JoinConsumerGroupRequest;
-    use metadata::stm::stream::TruncatePartitionRequest;
     use server_common::MessageBag;
     use server_common::sharding::METADATA_GROUP;
 
@@ -932,6 +1734,7 @@ mod tests {
                 initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 2,
+                members: Vec::new(),
             }],
         };
         let group = CreateConsumerGroupRequest {
@@ -1208,6 +2011,7 @@ mod tests {
                     initial_view: 0,
                     partition_id,
                     consensus_group_id: u64::from(partition_id) + 1,
+                    members: Vec::new(),
                 })
                 .collect(),
         };
@@ -1498,18 +2302,17 @@ mod tests {
             .ended_sessions()
             .next()
             .unwrap();
-        let revision = metadata
-            .mux_stm
-            .streams()
-            .read(|inner| inner.namespace_revision);
         let tracker = RefCell::new(ConsumerGroupLiveness::default());
         {
             let mut tracker = tracker.borrow_mut();
             tracker.observe_view(Some(VIEW - 1));
-            tracker.reconcile_retirement(Some(identity), revision);
-            let progress = tracker.retirement.as_mut().unwrap();
+            let mut progress = RetirementProgress::new(END_OP, Rc::from([]), Instant::now());
             progress.reported = true;
-            progress.reporters.extend([0, 1]);
+            tracker.retirement = Some(progress);
+            tracker.retirement_reports.extend([
+                (0, (END_OP, Some(Rc::default()))),
+                (1, (END_OP, Some(Rc::default()))),
+            ]);
         }
         let (stop, receiver) = shard::channel(1);
         stop.try_send(()).unwrap();
@@ -1522,9 +2325,9 @@ mod tests {
             "old-view quorum must not start a session finalization"
         );
         let tracker = tracker.borrow();
+        assert!(tracker.retirement_reports.is_empty());
         let progress = tracker.retirement.as_ref().unwrap();
         assert!(!progress.reported);
-        assert!(progress.reporters.is_empty());
         assert_eq!(progress.cursor, 0);
         assert_eq!(
             metadata
@@ -1542,42 +2345,176 @@ mod tests {
     }
 
     #[test]
-    fn retirement_quorum_discards_reports_from_an_older_namespace_revision() {
-        let identity = iggy_binary_protocol::requests::system::SessionIdentity {
-            client_id: CLIENT,
-            session: SESSION,
-            metadata_watermark: 3,
+    fn given_a_partition_without_member_reports_when_finalizing_should_owe_debt_not_block() {
+        let streams = Streams::default();
+        let stored = server_common::sharding::IggyNamespace::new(0, 0, 0);
+        let sibling = server_common::sharding::IggyNamespace::new(0, 0, 1);
+        let everywhere = server_common::sharding::IggyNamespace::new(1, 0, 0);
+        for (namespace, group) in [(stored, 1), (sibling, 2)] {
+            streams.seed_namespace_on(
+                namespace,
+                group,
+                0,
+                iggy_common::Durability::Persisted,
+                &[1, 3, 4],
+            );
+        }
+        streams.seed_namespace_on(
+            everywhere,
+            3,
+            0,
+            iggy_common::Durability::Persisted,
+            &[0, 1, 2, 3, 4],
+        );
+        let debt = |namespace: server_common::sharding::IggyNamespace| RetirementDebt {
+            namespace: namespace.inner(),
+            created_revision: streams.created_revision_for_namespace(namespace).unwrap(),
         };
-        let report = |revision| {
-            heartbeat_message(
-                CLUSTER,
-                VIEW,
-                1,
-                &[ConsumerSession {
-                    client_id: CLIENT,
-                    session: SESSION,
-                }],
-                false,
+        let groups = build_retirement_groups(&streams, 5);
+        let settle = |reports: &[(u8, Unprovable)]| {
+            let reports = reports
+                .iter()
+                .map(|(node, unprovable)| (*node, (SESSION, unprovable.clone())))
+                .collect();
+            retirement_settlement(&groups, &reports, 5).map(|mut debt| {
+                debt.sort_unstable();
+                debt
+            })
+        };
+        let vouches = |node: u8| (node, Some(Rc::<Withheld>::default()));
+        let withholds = |node: u8, unprovable: &[RetirementDebt]| {
+            (
+                node,
+                Some(Rc::new(withheld_vouches(
+                    &groups,
+                    &unprovable.iter().copied().collect(),
+                ))),
             )
-            .transmute_header(|old, header| {
+        };
+        let mut both = vec![debt(stored), debt(sibling)];
+        both.sort_unstable();
+        assert_eq!(
+            settle(&[vouches(0), vouches(1), vouches(2)]),
+            Some(both.clone()),
+            "a cluster quorum holding one member finalizes and leaves the partitions owing"
+        );
+        assert_eq!(
+            settle(&[vouches(0), vouches(1), vouches(3)]),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            settle(&[vouches(1), vouches(3)]),
+            None,
+            "the cluster-wide quorum still applies"
+        );
+        assert_eq!(
+            settle(&[
+                vouches(0),
+                withholds(1, &[debt(stored)]),
+                vouches(3),
+                (4, None)
+            ]),
+            Some(vec![debt(stored)]),
+            "an unprovable or withheld report is not a vouch"
+        );
+        assert_eq!(
+            settle(&[
+                vouches(0),
+                withholds(1, &[debt(stored), debt(sibling)]),
+                vouches(3),
+            ]),
+            Some(both),
+            "a withheld member set counts against every partition in it"
+        );
+        assert_eq!(
+            settle(&[
+                vouches(0),
+                vouches(1),
+                vouches(3),
+                withholds(4, &[debt(stored)]),
+            ]),
+            Some(Vec::new()),
+            "two of three members still vouch"
+        );
+    }
+
+    #[test]
+    fn given_withheld_vouches_when_reporting_progress_should_round_trip_or_withhold_all() {
+        const RETIRED_THROUGH: u64 = 3;
+        let withheld = Withheld {
+            masks: vec![0b1010],
+            partitions: vec![RetirementDebt {
+                namespace: 5,
+                created_revision: 6,
+            }],
+        };
+        let report = |body: &[u8]| {
+            heartbeat_frame(CLUSTER, VIEW, 1, body, false).transmute_header(|old, header| {
                 *header = old;
                 header.command = Command::SessionRetirementProgress;
-                header.namespace_revision = revision;
+                header.retired_through = RETIRED_THROUGH;
                 header.seal();
             })
         };
-        let mut tracker = ConsumerGroupLiveness::default();
-        tracker.observe_view(Some(VIEW));
-        tracker.reconcile_retirement(Some(identity), 1);
-        tracker.receive(CLUSTER, Some(VIEW), &report(1), Instant::now(), TIMEOUT);
-        assert_eq!(tracker.retirement.as_ref().unwrap().reporters.len(), 1);
+        for (sent, body_max, expected) in [
+            (Some(&withheld), 1024, Some(Rc::new(withheld.clone()))),
+            (Some(&Withheld::default()), 1024, Some(Rc::default())),
+            (Some(&withheld), ConsumerSession::ENCODED_SIZE, None),
+            (None, 1024, None),
+        ] {
+            let mut tracker = ConsumerGroupLiveness::default();
+            tracker.observe_view(Some(VIEW));
+            let body = encode_retirement_progress(sent, body_max);
+            tracker.receive(CLUSTER, Some(VIEW), &report(&body), Instant::now(), TIMEOUT);
+            assert_eq!(
+                tracker.retirement_reports.get(&1),
+                Some(&(RETIRED_THROUGH, expected))
+            );
+        }
+    }
 
-        tracker.reconcile_retirement(Some(identity), 2);
-        assert!(tracker.retirement.as_ref().unwrap().reporters.is_empty());
-        tracker.receive(CLUSTER, Some(VIEW), &report(1), Instant::now(), TIMEOUT);
-        assert!(tracker.retirement.as_ref().unwrap().reporters.is_empty());
-        tracker.receive(CLUSTER, Some(VIEW), &report(2), Instant::now(), TIMEOUT);
-        assert_eq!(tracker.retirement.as_ref().unwrap().reporters.len(), 1);
+    /// Nodes start their walks at different ops, so each report covers the
+    /// sessions at or below its own watermark, and the primary finalizes
+    /// through the lowest one.
+    #[compio::test]
+    async fn given_reports_of_walks_with_different_watermarks_when_settling_should_finalize_through_the_lowest()
+     {
+        const LOWER: u64 = SESSION;
+        const HIGHER: u64 = SESSION + 2;
+        let (_directory, mut shard) = shard_with_members(1).await;
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            3,
+            METADATA_GROUP,
+            shard.bus.clone(),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        Rc::get_mut(&mut shard)
+            .unwrap()
+            .plane
+            .metadata_mut()
+            .consensus = Some(consensus);
+        let tracker = RefCell::new(ConsumerGroupLiveness::default());
+        let vouch = |retired_through| (retired_through, Some(Rc::<Withheld>::default()));
+        tracker
+            .borrow_mut()
+            .retirement_reports
+            .insert(1, vouch(HIGHER));
+        assert_eq!(
+            settle_retirement(&shard, &tracker),
+            None,
+            "one report of three nodes is no quorum"
+        );
+        tracker
+            .borrow_mut()
+            .retirement_reports
+            .insert(2, vouch(LOWER));
+        assert_eq!(
+            settle_retirement(&shard, &tracker),
+            Some((LOWER, Vec::new()))
+        );
     }
 
     #[compio::test]
@@ -1592,33 +2529,23 @@ mod tests {
             .borrow_mut()
             .commit_capacity(3)
             .unwrap();
-        for client_id in [CLIENT, CLIENT + 1] {
+        // The report below covers only the first session.
+        for (client_id, end_op) in [(CLIENT, SESSION), (CLIENT + 1, SESSION + 1)] {
             assert!(
                 metadata
                     .client_table
                     .borrow_mut()
-                    .end_session(client_id, 0, SESSION, SESSION)
+                    .end_session(client_id, 0, SESSION, end_op)
             );
         }
-        let identity = metadata
-            .client_table
-            .borrow()
-            .ended_sessions()
-            .find(|identity| identity.client_id == CLIENT)
-            .unwrap();
         let consensus = metadata.consensus.as_ref().unwrap();
-        let revision = metadata
-            .mux_stm
-            .streams()
-            .read(|inner| inner.namespace_revision);
         let tracker = RefCell::new(ConsumerGroupLiveness::default());
         {
             let mut tracker = tracker.borrow_mut();
             tracker.observe_view(Some(consensus.view()));
-            tracker.reconcile_retirement(Some(identity), revision);
-            let progress = tracker.retirement.as_mut().unwrap();
-            progress.reported = true;
-            progress.reporters.insert(consensus.replica());
+            tracker
+                .retirement_reports
+                .insert(consensus.replica(), (SESSION, Some(Rc::default())));
         }
         let (_stop, receiver) = shard::channel(1);
         let (_signal, shutdown) = Shutdown::new();
@@ -1634,7 +2561,10 @@ mod tests {
                 CLIENT + 2,
                 0,
                 iggy_binary_protocol::requests::users::login_register::RegisterRequest {
-                    user_created_at: 1,
+                    credential:
+                        iggy_binary_protocol::requests::users::login_register::CredentialProof::account(
+                            1, 1,
+                        ),
                     bind_verifier: [0x6b; 32],
                 },
             ),
@@ -1806,79 +2736,15 @@ mod tests {
         }
     }
 
+    /// Pins the release pace of the registry capacity of ended sessions. One
+    /// walk covers every session that ended before it started, at most
+    /// `MAX_RETIREMENTS_PER_PASS` partitions per pass, so all of them are
+    /// released in pass `ceil(P / MAX_RETIREMENTS_PER_PASS)`. Failed partitions
+    /// report through their fence and need no barrier, so the count covers
+    /// only the walk and the finalization.
     #[compio::test]
-    async fn given_segment_deletion_when_retiring_should_keep_sweep_progress() {
-        let (_directory, shard) = shard_with_members(1).await;
-        let metadata = shard.plane.metadata();
-        assert!(
-            metadata
-                .client_table
-                .borrow_mut()
-                .end_session(CLIENT, 0, SESSION, SESSION)
-        );
-        let identity = metadata
-            .client_table
-            .borrow()
-            .ended_sessions()
-            .next()
-            .unwrap();
-        let mut tracker = ConsumerGroupLiveness::default();
-        tracker.reconcile_retirement(
-            Some(identity),
-            metadata
-                .mux_stm
-                .streams()
-                .read(|inner| inner.namespace_revision),
-        );
-        let progress = tracker.retirement.as_mut().unwrap();
-        progress.cursor = 1;
-        progress.reporters.insert(1);
-        let truncate = TruncatePartitionRequest {
-            stream_id: WireIdentifier::numeric(0),
-            topic_id: WireIdentifier::numeric(0),
-            partition_id: 0,
-            up_to_offset: 0,
-            expected_history: None,
-        };
-        for _ in 0..3 {
-            assert_eq!(
-                metadata
-                    .mux_stm
-                    .update(prepare_message(
-                        Operation::TruncatePartition,
-                        CLIENT,
-                        1,
-                        &truncate.to_bytes()
-                    ))
-                    .unwrap()
-                    .code,
-                0
-            );
-            tracker.reconcile_retirement(
-                Some(identity),
-                metadata
-                    .mux_stm
-                    .streams()
-                    .read(|inner| inner.namespace_revision),
-            );
-            let progress = tracker.retirement.as_ref().unwrap();
-            assert_eq!(
-                progress.cursor, 1,
-                "segment deletion must not restart session retirement"
-            );
-            assert!(progress.reporters.contains(&1));
-        }
-    }
-
-    /// Pins the release pace of the registry capacity of ended sessions. Every
-    /// session takes its own sweep over all allocated partitions, at most
-    /// `MAX_RETIREMENTS_PER_PASS` per pass, so above that many partitions each
-    /// further session costs `ceil(P / MAX_RETIREMENTS_PER_PASS) - 1` passes.
-    /// Failed partitions report through their fence and need no barrier, so the
-    /// count covers only the sweep and the finalization.
-    #[compio::test]
-    async fn given_ended_sessions_across_partitions_when_sweeping_should_release_one_session_per_sweep()
-     {
+    async fn given_ended_sessions_across_partitions_when_sweeping_should_release_them_in_one_walk()
+    {
         const SESSIONS: usize = 3;
         const MANY_PARTITIONS: u32 = 1000;
         const PASSES_MAX: usize = 64;
@@ -1935,16 +2801,449 @@ mod tests {
                     break;
                 }
             }
-            // A sweep starts in the pass that released the session before it.
-            let expected: Vec<usize> = (0..SESSIONS)
-                .map(|released| sweep_passes + released * (sweep_passes - 1))
-                .collect();
             assert_eq!(
-                release_passes, expected,
-                "P={partitions_count}: each slot must be released in the pass where its sweep \
+                release_passes,
+                vec![sweep_passes; SESSIONS],
+                "P={partitions_count}: every slot must be released in the pass where the walk \
                  covers every partition"
             );
         }
+    }
+
+    #[compio::test]
+    async fn given_a_recorded_debt_when_paying_should_retire_the_finalized_session_and_open_the_gate()
+     {
+        const STRANDED: u128 = CLIENT + 7;
+        const STRANDED_SESSION: u64 = 5;
+        const DEBT_OP: u64 = 9;
+        let (_directory, shard) = shard_with_members(1).await;
+        let metadata = shard.plane.metadata();
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let created_revision = insert_in_memory_partition(&shard, namespace);
+        let mut messages = server_common::send_messages::IggyMessages::with_capacity(1);
+        messages.push(server_common::send_messages::IggyMessage {
+            header: server_common::send_messages::IggyMessageHeader::default(),
+            payload: bytes::Bytes::from_static(b"stranded"),
+            user_headers: None,
+        });
+        let batch =
+            server_common::send_messages::SendMessagesOwned::from_messages(namespace, &messages)
+                .unwrap();
+        let mut body = vec![0; batch.header.total_size()];
+        batch.header.encode_into(&mut body);
+        body[iggy_binary_protocol::batch::BATCH_HEADER_SIZE..].copy_from_slice(&batch.blob);
+        let send = crate::dispatch::test_support::request_message(
+            Operation::SendMessages,
+            STRANDED,
+            STRANDED_SESSION,
+            1,
+            &body,
+        )
+        .transmute_header(|original, header: &mut RoutedRequestHeader| {
+            *header = original;
+            header.cluster = 1;
+            header.group = namespace.inner();
+            header.partition_incarnation = created_revision;
+        });
+        super::super::tests::run_with_partition_message_pump(&shard, async {
+            let ticket = shard.partition_submit(namespace, send).unwrap();
+            let reply = shard.await_partition_submit(ticket).await.unwrap();
+            assert!(reply_committed(&reply), "the stranded session writes once");
+        })
+        .await;
+        let slice_holds = |shard: &TestShard| {
+            shard
+                .plane
+                .partitions()
+                .get_by_ns(&namespace)
+                .unwrap()
+                .observe_retirement_debt(0)
+        };
+        assert_eq!(
+            slice_holds(&shard),
+            RetirementDebtStatus::Paid,
+            "no debt is owed before one is recorded"
+        );
+        assert_eq!(
+            shard
+                .plane
+                .partitions()
+                .get_by_ns(&namespace)
+                .unwrap()
+                .observe_retirement_debt(1),
+            RetirementDebtStatus::Unpaid(Some(vec![(STRANDED, STRANDED_SESSION)]))
+        );
+        metadata.mux_stm.streams().record_retirement_debt(
+            &[RetirementDebt {
+                namespace: namespace.inner(),
+                created_revision,
+            }],
+            DEBT_OP,
+        );
+
+        let tracker = RefCell::new(ConsumerGroupLiveness::default());
+        let (_stop, receiver) = shard::channel(1);
+        let (_signal, shutdown) = Shutdown::new();
+        super::super::tests::run_with_partition_message_pump(
+            &shard,
+            pay_retirement_debts(&shard, &tracker, &receiver, &shutdown),
+        )
+        .await;
+
+        let partitions = shard.plane.partitions();
+        let partition = partitions.get_by_ns(&namespace).unwrap();
+        assert!(
+            !partition.owes_session_retirement(),
+            "the payment committed and opened the gate"
+        );
+        assert_eq!(
+            partition.observe_retirement_debt(DEBT_OP),
+            RetirementDebtStatus::Paid
+        );
+        assert_eq!(
+            partition.observe_retirement_debt(DEBT_OP + 1),
+            RetirementDebtStatus::Unpaid(Some(Vec::new())),
+            "the finalized session left the retry slice"
+        );
+        let tracker = tracker.borrow();
+        assert!(tracker.retirement_debts.unpaid.is_empty());
+        assert_eq!(
+            tracker.retirement_debts.paid.get(&namespace),
+            Some(&(created_revision, DEBT_OP))
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_suspect_partition_that_commits_when_sweeping_should_prove_without_debt() {
+        const PASSES_MAX: usize = 16;
+        let (directory, shard) = shard_with_members(1).await;
+        let metadata = shard.plane.metadata();
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let created_revision = insert_in_memory_partition(&shard, namespace);
+        assert!(
+            metadata
+                .client_table
+                .borrow_mut()
+                .end_session(CLIENT, 0, SESSION, SESSION)
+        );
+        let tracker = RefCell::new(ConsumerGroupLiveness::default());
+        // An earlier walk found the partition without its member quorum.
+        tracker.borrow_mut().retirement_suspects.insert(namespace);
+        let (_stop, receiver) = shard::channel(1);
+        let (_signal, shutdown) = Shutdown::new();
+        let system_path = directory.path().to_str().unwrap();
+        for _ in 0..PASSES_MAX {
+            if metadata.client_table.borrow().count() == 0 {
+                break;
+            }
+            super::super::tests::run_with_partition_message_pump(
+                &shard,
+                retire_sessions(&shard, &tracker, &receiver, &shutdown, TIMEOUT, system_path),
+            )
+            .await;
+        }
+
+        assert_eq!(metadata.client_table.borrow().count(), 0);
+        assert_eq!(
+            metadata
+                .mux_stm
+                .streams()
+                .retirement_debt_for(namespace, created_revision),
+            Some(0),
+            "a suspect that commits again proves the session instead of owing it"
+        );
+        assert!(!tracker.borrow().retirement_suspects.contains(&namespace));
+    }
+
+    /// A backup proves its copy only after the node of the partition primary
+    /// commits a barrier. So a retried namespace stays pending while the walk
+    /// is young, and becomes unprovable once the walk proves nothing for
+    /// `UNPROVABLE_AFTER`.
+    #[compio::test]
+    async fn given_an_unprovable_partition_when_the_walk_stalls_should_owe_it_and_not_before() {
+        let (directory, shard) = shard_with_members(1).await;
+        let system_path = directory.path().to_str().unwrap();
+        let metadata = shard.plane.metadata();
+        // In metadata but not served here, so no read proves it.
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let created_revision = metadata
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(namespace)
+            .unwrap();
+        assert!(
+            metadata
+                .client_table
+                .borrow_mut()
+                .end_session(CLIENT, 0, SESSION, SESSION)
+        );
+        let tracker = RefCell::new(ConsumerGroupLiveness::default());
+        let (_stop, receiver) = shard::channel(1);
+        let (_signal, shutdown) = Shutdown::new();
+        let pass = || {
+            super::super::tests::run_with_partition_message_pump(
+                &shard,
+                retire_sessions(&shard, &tracker, &receiver, &shutdown, TIMEOUT, system_path),
+            )
+        };
+        // The first round, then a retry right after it.
+        for _ in 0..2 {
+            pass().await;
+        }
+        {
+            let tracker = tracker.borrow();
+            let progress = tracker.retirement.as_ref().unwrap();
+            assert_eq!(
+                progress.pending.get(&namespace),
+                Some(&(created_revision, true))
+            );
+            assert!(
+                progress.unprovable.is_empty(),
+                "a walk that is not stalled waits for the barrier of another node"
+            );
+        }
+        assert_eq!(metadata.client_table.borrow().count(), 1);
+
+        {
+            let mut tracker = tracker.borrow_mut();
+            let progress = tracker.retirement.as_mut().unwrap();
+            progress.last_progress = progress
+                .last_progress
+                .checked_sub(UNPROVABLE_AFTER)
+                .unwrap();
+        }
+        pass().await;
+        assert_eq!(metadata.client_table.borrow().count(), 0);
+        assert!(
+            metadata
+                .mux_stm
+                .streams()
+                .retirement_debt_for(namespace, created_revision)
+                .is_some_and(|debt_op| debt_op > SESSION),
+            "a stalled walk reports the partition, which then owes the retirement"
+        );
+    }
+
+    /// A proof in a retry pass is progress, so the walk keeps waiting for the
+    /// barriers of other nodes while it still proves namespaces.
+    #[compio::test]
+    async fn given_a_retry_pass_that_proves_a_namespace_when_the_clock_passes_the_stall_limit_should_keep_the_rest_pending()
+     {
+        let (directory, shard) = shard_with_members_on_partitions(1, 2).await;
+        let system_path = directory.path().to_str().unwrap();
+        let metadata = shard.plane.metadata();
+        assert!(
+            metadata
+                .client_table
+                .borrow_mut()
+                .end_session(CLIENT, 0, SESSION, SESSION)
+        );
+        // Not served here, so no read proves it.
+        let unprovable = IggyNamespace::new(0, 0, 0);
+        let unprovable_revision = metadata
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(unprovable)
+            .unwrap();
+        let provable = IggyNamespace::new(0, 0, 1);
+        let provable_revision = insert_in_memory_partition(&shard, provable);
+        let tracker = RefCell::new(ConsumerGroupLiveness::default());
+        {
+            let mut tracker = tracker.borrow_mut();
+            tracker.observe_view(Some(metadata.consensus.as_ref().unwrap().view()));
+            let mut progress = RetirementProgress::new(
+                SESSION,
+                Rc::from([
+                    stored_partition(&shard, unprovable),
+                    stored_partition(&shard, provable),
+                ]),
+                Instant::now().checked_sub(UNPROVABLE_AFTER).unwrap(),
+            );
+            progress.cursor = progress.namespaces.len();
+            progress.pending = BTreeMap::from([
+                (unprovable, (unprovable_revision, true)),
+                (provable, (provable_revision, false)),
+            ]);
+            tracker.retirement = Some(progress);
+        }
+        let (_stop, receiver) = shard::channel(1);
+        let (_signal, shutdown) = Shutdown::new();
+        super::super::tests::run_with_partition_message_pump(
+            &shard,
+            retire_sessions(&shard, &tracker, &receiver, &shutdown, TIMEOUT, system_path),
+        )
+        .await;
+
+        let tracker = tracker.borrow();
+        let progress = tracker.retirement.as_ref().unwrap();
+        assert_eq!(
+            progress.pending,
+            BTreeMap::from([(unprovable, (unprovable_revision, true))])
+        );
+        assert!(
+            progress.unprovable.is_empty(),
+            "the proof restarted the stall clock"
+        );
+        assert_eq!(metadata.client_table.borrow().count(), 1);
+    }
+
+    /// A pass ends at its deadline, so an attempt that did not start in it is
+    /// no retry and cannot make its namespace unprovable.
+    #[compio::test]
+    async fn given_a_retry_pass_cut_by_its_deadline_when_marking_retries_should_count_only_started_attempts()
+     {
+        const PARTITIONS: usize = RETIREMENT_ATTEMPTS_IN_FLIGHT + 1;
+        let (directory, shard) =
+            shard_with_members_on_partitions(1, u32::try_from(PARTITIONS).unwrap()).await;
+        let system_path = directory.path().to_str().unwrap();
+        let metadata = shard.plane.metadata();
+        assert!(
+            metadata
+                .client_table
+                .borrow_mut()
+                .end_session(CLIENT, 0, SESSION, SESSION)
+        );
+        let namespaces: Vec<StoredPartition> = (0..PARTITIONS)
+            .map(|partition_id| {
+                let namespace = IggyNamespace::new(0, 0, partition_id);
+                insert_in_memory_partition(&shard, namespace);
+                stored_partition(&shard, namespace)
+            })
+            .collect();
+        let tracker = RefCell::new(ConsumerGroupLiveness::default());
+        {
+            let mut tracker = tracker.borrow_mut();
+            tracker.observe_view(Some(metadata.consensus.as_ref().unwrap().view()));
+            let mut progress =
+                RetirementProgress::new(SESSION, Rc::from(namespaces.clone()), Instant::now());
+            // The first round ended and proved nothing.
+            progress.cursor = PARTITIONS;
+            progress.pending = namespaces
+                .iter()
+                .map(|partition| (partition.namespace, (partition.created_revision, false)))
+                .collect();
+            tracker.retirement = Some(progress);
+        }
+        let (_stop, receiver) = shard::channel(1);
+        let (_signal, shutdown) = Shutdown::new();
+        // With no message pump, no read answers before the pass deadline.
+        retire_sessions(&shard, &tracker, &receiver, &shutdown, TIMEOUT, system_path).await;
+
+        let tracker = tracker.borrow();
+        let pending = &tracker.retirement.as_ref().unwrap().pending;
+        assert_eq!(pending.len(), PARTITIONS);
+        assert_eq!(
+            pending.values().filter(|(_, retried)| *retried).count(),
+            RETIREMENT_ATTEMPTS_IN_FLIGHT,
+            "only the attempts in flight ran"
+        );
+    }
+
+    /// A barrier raises the frontier to the newest end op. So the walk that
+    /// starts after the next finalization proves the partition with a read.
+    #[compio::test]
+    async fn given_a_session_that_ended_during_a_walk_when_proving_should_cover_it_with_the_same_barrier()
+     {
+        const PASSES_MAX: usize = 16;
+        let (directory, shard) = shard_with_members(2).await;
+        let system_path = directory.path().to_str().unwrap();
+        let metadata = shard.plane.metadata();
+        let namespace = IggyNamespace::new(0, 0, 0);
+        insert_in_memory_partition(&shard, namespace);
+        for (client_id, end_op) in [(CLIENT, SESSION), (CLIENT + 1, SESSION + 1)] {
+            assert!(
+                metadata
+                    .client_table
+                    .borrow_mut()
+                    .end_session(client_id, 0, SESSION, end_op)
+            );
+        }
+        let tracker = RefCell::new(ConsumerGroupLiveness::default());
+        {
+            let mut tracker = tracker.borrow_mut();
+            tracker.observe_view(Some(metadata.consensus.as_ref().unwrap().view()));
+            // The walk started before the second session ended.
+            tracker.retirement = Some(RetirementProgress::new(
+                SESSION,
+                Rc::from([stored_partition(&shard, namespace)]),
+                Instant::now(),
+            ));
+        }
+        let (_stop, receiver) = shard::channel(1);
+        let (_signal, shutdown) = Shutdown::new();
+        for _ in 0..PASSES_MAX {
+            if metadata.client_table.borrow().count() == 0 {
+                break;
+            }
+            super::super::tests::run_with_partition_message_pump(
+                &shard,
+                retire_sessions(&shard, &tracker, &receiver, &shutdown, TIMEOUT, system_path),
+            )
+            .await;
+        }
+        assert_eq!(metadata.client_table.borrow().count(), 0);
+        assert_eq!(
+            shard
+                .plane
+                .partitions()
+                .get_by_ns(&namespace)
+                .unwrap()
+                .consensus()
+                .commit_min(),
+            1,
+            "two walks need one barrier"
+        );
+    }
+
+    /// The listing entry of the committed partition at `namespace`.
+    fn stored_partition(shard: &TestShard, namespace: IggyNamespace) -> StoredPartition {
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .with_committed_partition(namespace, |partition| StoredPartition {
+                namespace,
+                created_revision: partition.created_revision,
+                created_op: partition.created_op,
+            })
+            .unwrap()
+    }
+
+    /// A single-replica in-memory partition at `namespace`, routed to shard 0.
+    fn insert_in_memory_partition(shard: &TestShard, namespace: IggyNamespace) -> u64 {
+        let created_revision = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(namespace)
+            .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            namespace.inner(),
+            shard.bus.clone(),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let mut partition = partitions::IggyPartition::with_in_memory_storage(
+            std::sync::Arc::new(iggy_common::PartitionStats::default()),
+            consensus,
+            shard.plane.partitions().config().segment_size,
+        );
+        partition.set_created_revision(created_revision);
+        shard.plane.partitions().insert(namespace, partition);
+        shard::shards_table::ShardsTable::insert(
+            shard.shards_table(),
+            namespace,
+            server_common::sharding::PartitionLocation::new(
+                server_common::sharding::ShardId::new(0),
+                created_revision,
+            ),
+        );
+        created_revision
     }
 
     #[test]
@@ -1956,14 +3255,15 @@ mod tests {
             };
             MAX_CONSUMER_SESSIONS_PER_HEARTBEAT
         ];
-        for command in [
-            Command::ConsumerSessionHeartbeat,
-            Command::SessionRetirementProgress,
+        for (command, retired_through) in [
+            (Command::ConsumerSessionHeartbeat, 0),
+            (Command::SessionRetirementProgress, SESSION),
         ] {
             let message = heartbeat_message(CLUSTER, VIEW, 2, &sessions, false).transmute_header(
                 |old, header| {
                     *header = old;
                     header.command = command;
+                    header.retired_through = retired_through;
                     header.seal();
                 },
             );

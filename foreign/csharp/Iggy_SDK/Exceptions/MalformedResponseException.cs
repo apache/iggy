@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Contracts;
+
 namespace Apache.Iggy.Exceptions;
 
 /// <summary>
@@ -28,4 +30,18 @@ public sealed class MalformedResponseException : InvalidResponseException
     internal MalformedResponseException(string message) : base(message)
     {
     }
+
+    internal MalformedResponseException(string message, ReadOnlySpan<byte> record) : base(message)
+    {
+        Record = record.ToArray();
+    }
+
+    /// <summary>
+    ///     For reply records that do not decode: the remaining bytes of the records from where decoding stopped,
+    ///     as received. Null for a malformed reply that is not records.
+    /// </summary>
+    public byte[]? Record { get; }
+
+    /// <summary>The context of a poll reply over TCP whose records do not decode. Null for any other reply.</summary>
+    internal PartitionContext? Context { get; set; }
 }

@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::change_log::store::{ChangeEntry, ChangeLog, ChangeLogCapacities, MAX_CAPACITY, Ring};
-use crate::stm::snapshot::SnapshotError;
+use crate::stm::snapshot::{SnapshotError, encode_array_len, encode_value};
 use bytes::Bytes;
 use iggy_binary_protocol::primitives::metadata_changes::WireMetadataChangeKind;
 use iggy_common::{MetadataChangeClass, MetadataChangeGroup};
@@ -55,6 +55,59 @@ pub struct ChangeEntrySnapshot {
     /// byte at or above 0x80.
     #[serde(with = "body_bytes")]
     pub body: Bytes,
+}
+
+/// The length of the msgpack array a [`ChangeLogSnapshot`] encodes as.
+const CHANGE_LOG_SNAPSHOT_FIELDS: usize = 4;
+/// The length of the msgpack array a [`RingSnapshot`] encodes as.
+const RING_SNAPSHOT_FIELDS: usize = 4;
+
+/// Writes what the derived `Serialize` of [`ChangeLogSnapshot`] writes, one
+/// step at a time: the fields ahead of the entries of a ring, then one
+/// [`ChangeEntrySnapshot`] per step. A ring at its largest capacity is far
+/// too much to encode between two yields of the snapshot writer.
+#[derive(Debug)]
+pub struct ChangeLogEncoder {
+    /// `log_id` and `last_record_op`, until the first step wrote them.
+    head: Option<(Option<u128>, u64)>,
+    rings: std::array::IntoIter<RingSnapshot, 2>,
+    entries: std::vec::IntoIter<ChangeEntrySnapshot>,
+}
+
+impl From<ChangeLogSnapshot> for ChangeLogEncoder {
+    fn from(snapshot: ChangeLogSnapshot) -> Self {
+        Self {
+            head: Some((snapshot.log_id, snapshot.last_record_op)),
+            rings: [snapshot.resource, snapshot.activity].into_iter(),
+            entries: Vec::new().into_iter(),
+        }
+    }
+}
+
+impl ChangeLogEncoder {
+    /// Append the next step to `out` and return whether steps remain.
+    ///
+    /// # Errors
+    /// [`SnapshotError::Serialize`] when an entry does not encode, and
+    /// [`SnapshotError::InvalidState`] for a ring that outgrows msgpack.
+    pub fn encode_next(&mut self, out: &mut Vec<u8>) -> Result<bool, SnapshotError> {
+        if let Some(entry) = self.entries.next() {
+            encode_value(out, &entry)?;
+        } else if let Some(ring) = self.rings.next() {
+            if let Some((log_id, last_record_op)) = self.head.take() {
+                encode_array_len(out, CHANGE_LOG_SNAPSHOT_FIELDS)?;
+                encode_value(out, &log_id)?;
+                encode_value(out, &last_record_op)?;
+            }
+            encode_array_len(out, RING_SNAPSHOT_FIELDS)?;
+            encode_value(out, &ring.evicted_through_op)?;
+            encode_value(out, &ring.evicted_through_ordinal)?;
+            encode_value(out, &ring.evicted_through_timestamp)?;
+            encode_array_len(out, ring.entries.len())?;
+            self.entries = ring.entries.into_iter();
+        }
+        Ok(self.entries.len() > 0 || self.rings.len() > 0)
+    }
 }
 
 impl ChangeLogSnapshot {
@@ -282,6 +335,32 @@ mod tests {
             .expect("readable");
         assert_eq!(decoded, snapshot);
         assert_eq!(reencoded, encoded, "identical logs must encode identically");
+    }
+
+    #[test]
+    fn given_log_when_encoding_in_steps_should_write_the_snapshot_bytes_one_entry_a_step() {
+        let populated = populated_log()
+            .read(|log| ChangeLogSnapshot::from(log))
+            .expect("readable");
+        assert!(populated.resource.entries.len() > 1 && !populated.activity.entries.is_empty());
+        for snapshot in [populated, ChangeLogSnapshot::default()] {
+            let entries = snapshot.resource.entries.len() + snapshot.activity.entries.len();
+            let expected = rmp_serde::to_vec(&snapshot).expect("encode");
+
+            let mut encoder = ChangeLogEncoder::from(snapshot);
+            let mut bytes = Vec::new();
+            let mut steps = 1;
+            while encoder.encode_next(&mut bytes).expect("encode") {
+                steps += 1;
+            }
+
+            assert_eq!(bytes, expected, "steps must not change a byte");
+            assert_eq!(steps, entries + 2, "one step for each ring and each entry");
+            assert!(
+                !encoder.encode_next(&mut bytes).expect("encode") && bytes == expected,
+                "a finished encoder writes nothing"
+            );
+        }
     }
 
     #[test]

@@ -35,15 +35,18 @@ use crate::dispatch::failure::{
     ClientOrigin, FrameChannel, send_host_frame, send_non_replicated_bytes,
     send_non_replicated_deny,
 };
+use crate::dispatch::fetch::fetch_messages;
 use crate::dispatch::metadata_changes::metadata_changes_reply;
-use crate::dispatch::partition::{handle_get_consumer_offset, handle_poll_messages};
-use crate::namespace::resolve_partition_namespace;
+use crate::dispatch::partition::{
+    handle_get_consumer_offset, handle_poll_messages, read_deferred_poll, resolve_deferred_poll,
+};
+use crate::namespace::{PrimaryLookup, resolve_partition_namespace};
 use crate::reply_frame::{build_empty_reply, current_metadata_commit};
 use crate::responses::{
     build_get_me_response, build_get_personal_access_tokens_response,
     build_non_replicated_response, connected_client_to_response,
 };
-use crate::session_manager::{ConnectionContext, SessionManager};
+use crate::session_manager::{ConnectionContext, FetchReadGuard, SessionManager};
 use crate::shell::{ShellBus, ShellShard};
 use crate::snapshot;
 use crate::wire::request_body;
@@ -51,17 +54,22 @@ use bytes::Bytes;
 use configs::server::ServerConfig;
 use consensus::MetadataHandle;
 use consensus::client_table::SessionAttachment;
-use futures::future::{Either, select};
+use futures::future::{Abortable, Either, select};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
-    BIND_SESSION_CODE, DESCRIBE_OPTIONS_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE,
-    GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE, GET_METADATA_CHANGES_CODE,
-    GET_PARTITION_ROUTE_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_SNAPSHOT_FILE_CODE,
-    GET_STATS_CODE, PING_CODE, POLL_MESSAGES_CODE, SYNC_CONSUMER_GROUP_CODE,
+    BIND_SESSION_CODE, CANCEL_DEFERRED_REQUEST_CODE, DESCRIBE_OPTIONS_CODE, FETCH_MESSAGES_CODE,
+    GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE,
+    GET_ME_CODE, GET_METADATA_CHANGES_CODE, GET_PARTITION_ROUTE_CODE,
+    GET_PERSONAL_ACCESS_TOKENS_CODE, GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE, GET_STREAMS_CODE,
+    GET_TOPICS_CODE, PING_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE,
+    SYNC_CONSUMER_GROUP_CODE,
 };
 use iggy_binary_protocol::dispatch::lookup_command;
 use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
-use iggy_binary_protocol::requests::messages::GetPartitionRouteRequest;
+use iggy_binary_protocol::requests::messages::{
+    DeferredPollMessagesRequest, FetchMessagesRequest, GetPartitionRouteRequest,
+    MIN_DEFERRED_POLL_REPLY_MARGIN_US,
+};
 use iggy_binary_protocol::requests::system::BindSessionRequest;
 use iggy_binary_protocol::requests::system::get_client::GetClientRequest;
 use iggy_binary_protocol::requests::system::get_snapshot::GetSnapshotRequest;
@@ -73,16 +81,17 @@ use iggy_binary_protocol::responses::messages::PartitionRouteResponse;
 use iggy_binary_protocol::responses::system::get_snapshot::GetSnapshotResponse;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{HEADER_SIZE, RoutedRequestHeader, WireDecode, WireEncode};
-use iggy_common::{IggyError, SnapshotCompression, SystemSnapshotType};
+use iggy_common::{BINARY_OPERATION_TIMEOUT, IggyError, SnapshotCompression, SystemSnapshotType};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
+use message_bus::BusMessage;
 use message_bus::framing::MAX_MESSAGE_SIZE;
 use metadata::AppliedFrontier;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
 use server_common::Message;
-use shard::{PartitionRead, PartitionReadReply};
-use std::cell::RefCell;
+use shard::{CommitGate, PARTITION_SUBMIT_TIMEOUT, PartitionReadReply};
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::pin;
@@ -152,14 +161,31 @@ async fn handle_get_me<B, MJ, S, SB>(
 /// Commit broadcasts a held read waits out before it fails retryable.
 ///
 /// Sized for a node merely behind on its commit walk, NOT for a view change --
-/// detecting one costs `heartbeat_timeout` and escalating it another
+/// detecting one costs `commit_busy_heartbeat_timeout` and escalating it another
 /// `view_change_status_timeout`, and `recovery_barrier_deadline` budgets at
 /// least 15s for the same event, so a read that waits out an election is a read
 /// the caller should retry elsewhere.
 const READ_FRONTIER_BROADCASTS: u32 = 6;
 
+/// Commit broadcasts a partition request ahead of the applied frontier waits
+/// out before it fails retryable. Fewer than a held read gets: the wait runs
+/// on the drain of its connection, and the frames behind it wait with it.
+const PARTITION_FRONTIER_BROADCASTS: u32 = 2;
+
+/// Longest wait of a partition request for the applied frontier. The
+/// heartbeat interval has no configured ceiling, and after the wait a write
+/// still gets [`PARTITION_SUBMIT_TIMEOUT`] for its committed reply. Both must
+/// end inside the operation deadline of the client. A refusal that comes
+/// later finds a client that reported an unknown outcome for a write that
+/// this node never submitted.
+const PARTITION_FRONTIER_WAIT_MAX: Duration = Duration::from_secs(5);
+const _: () = assert!(
+    PARTITION_FRONTIER_WAIT_MAX.as_nanos() + PARTITION_SUBMIT_TIMEOUT.as_nanos()
+        < BINARY_OPERATION_TIMEOUT.as_nanos()
+);
+
 /// How long a held metadata read may wait for this node's applied frontier,
-/// sized from `[cluster] commit_broadcast_interval`: the thing the read is
+/// sized from `[cluster] commit_busy_heartbeat_interval`: the thing the read is
 /// short of is a commit broadcast, so the budget has to move with the
 /// configured cadence rather than with the compile-time default that
 /// `TimeoutManager::COMMIT_MESSAGE_TICKS` names (the runtime overrides it
@@ -169,12 +195,24 @@ const READ_FRONTIER_BROADCASTS: u32 = 6;
 /// shard's read gate has neither consensus nor the cluster config.
 #[must_use]
 pub fn read_frontier_budget(config: &ServerConfig) -> Duration {
+    commit_broadcasts(config, READ_FRONTIER_BROADCASTS)
+}
+
+/// How long a partition request ahead of this node's applied frontier may
+/// wait for it. Sized and minted as [`read_frontier_budget`] is, up to
+/// [`PARTITION_FRONTIER_WAIT_MAX`].
+#[must_use]
+pub fn partition_frontier_budget(config: &ServerConfig) -> Duration {
+    commit_broadcasts(config, PARTITION_FRONTIER_BROADCASTS).min(PARTITION_FRONTIER_WAIT_MAX)
+}
+
+fn commit_broadcasts(config: &ServerConfig, count: u32) -> Duration {
     config
         .cluster
-        .commit_broadcast_interval
+        .commit_busy_heartbeat_interval
         .get_duration()
         // No config ceiling on the interval, so plain `*` can overflow.
-        .saturating_mul(READ_FRONTIER_BROADCASTS)
+        .saturating_mul(count)
 }
 
 /// Whether `code`'s answer comes from the metadata state machine, and so must
@@ -191,9 +229,11 @@ pub fn read_frontier_budget(config: &ServerConfig) -> Duration {
 /// - `GetClusterMetadata` answers from the configured roster plus the
 ///   consensus view, and sits on the SDK's leader-discovery path, where the
 ///   wait would be real.
-/// - `PollMessages` and `GetConsumerOffset` are partition-plane reads: their
-///   answer comes from a partition group's own log, not the metadata STM, and
-///   holding them would put metadata lag on the data path.
+/// - `PollMessages`, `PollMessagesDeferred`,
+///   `FetchMessages` and `GetConsumerOffset` are partition-plane reads: their answer comes from a
+///   partition group's own log, not the metadata STM, and holding them would
+///   put metadata lag on the data path.
+/// - `CancelDeferredRequest` reads nothing and gets no reply.
 /// - `GetSnapshotFile` shells out to system tools off-thread; there is no
 ///   metadata answer to hold.
 /// - A code this build does not know: its only outcome is `InvalidCommand`,
@@ -209,6 +249,9 @@ pub const fn read_needs_metadata_frontier(code: u32) -> bool {
             | DESCRIBE_OPTIONS_CODE
             | GET_CLUSTER_METADATA_CODE
             | POLL_MESSAGES_CODE
+            | POLL_MESSAGES_DEFERRED_CODE
+            | FETCH_MESSAGES_CODE
+            | CANCEL_DEFERRED_REQUEST_CODE
             | GET_CONSUMER_OFFSET_CODE
             | GET_SNAPSHOT_FILE_CODE
     ) && lookup_command(code).is_some()
@@ -345,16 +388,19 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    authorize_attached(attachment, &authorize)?;
+    authorize_attached(attachment, shard.bus.realtime_micros(), &authorize)?;
     if !read_needs_metadata_frontier(code) {
         return Ok(());
     }
     if await_metadata_read_frontier(shard, watermark).await? == FrontierWait::CaughtUp {
-        authorize_attached(attachment, &authorize)?;
+        authorize_attached(attachment, shard.bus.realtime_micros(), &authorize)?;
     }
     Ok(())
 }
 
+/// `reply_cap` is the largest reply frame a client accepts, see
+/// [`deny_oversized_reply`]. Outside tests it is
+/// [`MAX_RECORD_REPLY_SIZE`](iggy_binary_protocol::MAX_RECORD_REPLY_SIZE).
 #[allow(clippy::future_not_send, clippy::too_many_lines)]
 pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
@@ -375,6 +421,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
         address: client_address,
         metadata_watermark: watermark,
     }: ConnectionContext,
+    reply_cap: usize,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -391,6 +438,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
     let watermark = watermark.max(request.header().minimum_metadata_op);
     let code = u32::from_le_bytes(request.header().reserved[CODE_RANGE].try_into().unwrap());
     match code {
+        CANCEL_DEFERRED_REQUEST_CODE => {}
         PING_CODE => {
             // No `record_heartbeat` here: the funnel records one for EVERY
             // frame before classification, so a ping is already covered.
@@ -442,21 +490,27 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             // Shared-nothing: each shard knows only its own connections, so
             // gather across all shards (scatter-gather over the mesh).
             let infos = shard.list_all_clients().await;
-            if let Err(error) = authorize_attached(attachment, authorize) {
+            if let Err(error) =
+                authorize_attached(attachment, shard.bus.realtime_micros(), authorize)
+            {
                 send_non_replicated_deny(shard, &request, origin, error.as_code()).await;
                 return;
             }
-            let response = GetClientsResponse {
+            let body = GetClientsResponse {
                 clients: infos
                     .iter()
                     .map(|info| connected_client_to_response(shard, info))
                     .collect(),
-            };
+            }
+            .to_bytes();
+            if deny_oversized_reply(shard, &request, origin, code, body.len(), reply_cap).await {
+                return;
+            }
             send_non_replicated_bytes(
                 shard,
                 &request,
                 origin,
-                response.to_bytes(),
+                body,
                 FrameChannel::Reply,
                 "get_clients",
             )
@@ -477,7 +531,9 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                 .ok()
                 .map(|req| req.client_id);
             let infos = shard.list_all_clients().await;
-            if let Err(error) = authorize_attached(attachment, authorize) {
+            if let Err(error) =
+                authorize_attached(attachment, shard.bus.realtime_micros(), authorize)
+            {
                 send_non_replicated_deny(shard, &request, origin, error.as_code()).await;
                 return;
             }
@@ -533,7 +589,10 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             // during the hop.
             let reply = metadata_changes_reply(shard, request_body(&request), user_id)
                 .await
-                .and_then(|bytes| authorize_attached(attachment, authorize).map(|()| bytes));
+                .and_then(|bytes| {
+                    authorize_attached(attachment, shard.bus.realtime_micros(), authorize)
+                        .map(|()| bytes)
+                });
             match reply {
                 Ok(bytes) => {
                     send_non_replicated_bytes(
@@ -574,13 +633,27 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                 }
             }
         }
-        POLL_MESSAGES_CODE => {
+        POLL_MESSAGES_CODE | POLL_MESSAGES_DEFERRED_CODE | FETCH_MESSAGES_CODE => {
             let consumer_client = bound
                 .zip(attachment)
                 .map(|((client_id, _), attachment)| (client_id, attachment))
                 .ok_or(IggyError::Unauthenticated);
             match consumer_client {
                 Ok((consumer_client_id, attachment)) => {
+                    if code != POLL_MESSAGES_CODE {
+                        handle_deferred_request(
+                            shard,
+                            sessions,
+                            origin,
+                            &request,
+                            code,
+                            user_id,
+                            consumer_client_id,
+                            attachment,
+                        )
+                        .await;
+                        return;
+                    }
                     handle_poll_messages(
                         shard,
                         origin,
@@ -623,9 +696,216 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             }
             handle_default_non_replicated(
                 shard, origin, code, &request, user_id, attachment, watermark, &roster, client_ip,
+                reply_cap,
             )
             .await;
         }
+    }
+}
+
+enum DeferredRequest {
+    Poll(DeferredPollMessagesRequest),
+    Fetch(FetchMessagesRequest),
+}
+
+#[allow(
+    clippy::future_not_send,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
+async fn handle_deferred_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    origin: ClientOrigin,
+    request: &Message<RoutedRequestHeader>,
+    code: u32,
+    user_id: Option<u32>,
+    consumer_client_id: u128,
+    attachment: &SessionAttachment,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let body = request_body(request);
+    let decoded = match code {
+        POLL_MESSAGES_DEFERRED_CODE => {
+            DeferredPollMessagesRequest::decode_from(body).map(DeferredRequest::Poll)
+        }
+        _ => FetchMessagesRequest::decode_from(body).map(DeferredRequest::Fetch),
+    };
+    let Ok(mut wire) = decoded else {
+        send_non_replicated_deny(shard, request, origin, IggyError::InvalidCommand.as_code()).await;
+        return;
+    };
+    let (wait_us, timeout_us) = match &mut wire {
+        DeferredRequest::Poll(poll) => (&mut poll.wait_us, &mut poll.request_timeout_us),
+        DeferredRequest::Fetch(fetch) => (&mut fetch.wait_us, &mut fetch.request_timeout_us),
+    };
+    let elapsed_us = shard
+        .bus
+        .monotonic_micros()
+        .saturating_sub(origin.arrived_us());
+    // A frame that waited in the drain gets only the time its client still waits for it, so a
+    // request that its client gave up on stores nothing.
+    let Some((remaining_wait_us, remaining_timeout_us)) =
+        remaining_timers(*wait_us, *timeout_us, elapsed_us)
+    else {
+        send_non_replicated_deny(
+            shard,
+            request,
+            origin,
+            IggyError::TransientNotAccepted.as_code(),
+        )
+        .await;
+        return;
+    };
+    *wait_us = remaining_wait_us;
+    *timeout_us = remaining_timeout_us;
+    let timeout_us = remaining_timeout_us;
+    let committing = match &wire {
+        DeferredRequest::Poll(poll) => poll.poll.auto_commit,
+        DeferredRequest::Fetch(fetch) => fetch.auto_commit,
+    };
+    let commit_gate = committing.then(CommitGate::default);
+    serve_deferred_request(
+        shard,
+        sessions,
+        (origin, request),
+        (Duration::from_micros(timeout_us), commit_gate.clone()),
+        async {
+            let user_id = user_id.ok_or(IggyError::Unauthenticated)?;
+            if !attachment.is_valid_at(shard.bus.realtime_micros()) {
+                return Err(IggyError::StaleClient);
+            }
+            if !shard
+                .plane
+                .metadata()
+                .applied_frontier()
+                .partition_requests_allowed(shard.bus.monotonic_now())
+                || request.header().minimum_metadata_op > current_metadata_commit(shard)
+            {
+                return Err(IggyError::TransientNotAccepted);
+            }
+            match wire {
+                DeferredRequest::Poll(poll) => {
+                    let (namespace, partition_id, mut resolved) = resolve_deferred_poll(
+                        shard,
+                        &poll,
+                        request.header(),
+                        (consumer_client_id, attachment.clone(), user_id),
+                    )?;
+                    resolved.commit_gate = commit_gate;
+                    read_deferred_poll(
+                        shard,
+                        request,
+                        (namespace, partition_id, resolved),
+                        attachment,
+                    )
+                    .await
+                    .map(|reply| (reply, Vec::new()))
+                }
+                DeferredRequest::Fetch(fetch) => {
+                    Box::pin(fetch_messages(
+                        shard,
+                        sessions,
+                        request,
+                        (&fetch, commit_gate),
+                        (consumer_client_id, attachment, user_id),
+                    ))
+                    .await
+                }
+            }
+        },
+    )
+    .await;
+}
+
+#[allow(clippy::future_not_send)]
+async fn serve_deferred_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    (origin, request): (ClientOrigin, &Message<RoutedRequestHeader>),
+    (watchdog, commit_gate): (Duration, Option<CommitGate>),
+    reply: impl Future<Output = Result<(BusMessage, Vec<FetchReadGuard>), IggyError>>,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let (guard, cancellation) = match SessionManager::begin_deferred_request(
+        sessions,
+        origin.id,
+        (request.header().request, commit_gate.clone()),
+        watchdog,
+        shard.bus.monotonic_now(),
+    ) {
+        Ok(active) => active,
+        Err(error) => {
+            send_non_replicated_deny(shard, request, origin, error.as_code()).await;
+            return;
+        }
+    };
+    let response_queued = Cell::new(false);
+    let outcome = {
+        let operation = Abortable::new(
+            async {
+                // The session room of the reads stays held until the reply is written.
+                let (mut reply, _held_reads) = reply.await?;
+                let written = reply.track_write();
+                // A watchdog expiry while the send waits for room drops the reply
+                // unsent, so only a returned send counts as queued.
+                send_host_frame(shard, origin, reply, FrameChannel::Reply, "deferred_reply").await;
+                response_queued.set(true);
+                written
+                    .await
+                    .map_err(|_| IggyError::ShardCommunicationError)
+            },
+            cancellation,
+        );
+        let operation = pin!(operation);
+        let timeout = pin!(shard.bus.sleep(watchdog));
+        match select(operation, timeout).await {
+            Either::Left((Ok(result), _)) => Some(result),
+            // A committing request that its client cancelled before any read
+            // committed answers once, so the client knows nothing was stored.
+            Either::Left((Err(_), _))
+                if commit_gate.as_ref().is_some_and(CommitGate::is_cancelled) =>
+            {
+                Some(Err(IggyError::TransientNotAccepted))
+            }
+            Either::Left((Err(_), _)) => None,
+            Either::Right(_) => Some(Err(IggyError::ShardCommunicationError)),
+        }
+    };
+    if matches!(outcome, Some(Ok(()))) {
+        guard.written(shard.bus.monotonic_now());
+    }
+    drop(guard);
+    // A queued reply can still reach the peer after the write watchdog expires.
+    if let Some(Err(error)) = outcome
+        && !response_queued.get()
+    {
+        send_non_replicated_deny(shard, request, origin, error.as_code()).await;
+    }
+}
+
+/// The wait and the request timeout of a deferred request whose frame arrived
+/// `elapsed_us` ago, or `None` once its timeout passed. The wait keeps the reply
+/// margin before the shortened timeout.
+const fn remaining_timers(wait_us: u64, timeout_us: u64, elapsed_us: u64) -> Option<(u64, u64)> {
+    match timeout_us.checked_sub(elapsed_us) {
+        Some(remaining) if remaining > 0 => {
+            let wait_us = wait_us.saturating_sub(elapsed_us);
+            let room = remaining.saturating_sub(MIN_DEFERRED_POLL_REPLY_MARGIN_US);
+            let wait = if wait_us < room { wait_us } else { room };
+            Some((wait, remaining))
+        }
+        _ => None,
     }
 }
 
@@ -737,9 +1017,8 @@ where
         .ok_or(IggyError::TransientNotAccepted)?;
     let partitions_count =
         u32::try_from(partitions_count).map_err(|_| IggyError::TransientNotAccepted)?;
-    let Some(PartitionReadReply::Primary { view, primary }) = shard
-        .partition_read(namespace, PartitionRead::Primary)
-        .await
+    let Some(PartitionReadReply::Primary { view, primary }) =
+        crate::namespace::partition_primary(shard, namespace, PrimaryLookup::Hold).await
     else {
         return Err(IggyError::TransientNotAccepted);
     };
@@ -785,6 +1064,7 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
     watermark: u64,
     roster: &ClusterRoster,
     client_ip: Option<IpAddr>,
+    reply_cap: usize,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -793,9 +1073,10 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
     SB: SuperblockStore + 'static,
 {
     let transport_client_id = origin.id;
-    // Gate by command code before the shared builder runs. The builder stays
-    // authz-free (it is byte-shared with the HTTP read path, which gates
-    // separately); a denial replies status!=0 with an empty body. The
+    // Gate by command code before the shared builder runs. The builder checks
+    // no grant itself, except that the stream and topic lists return only what
+    // the caller may read (it is byte-shared with the HTTP read path, which
+    // gates separately); a denial replies status!=0 with an empty body. The
     // read-your-writes hold sits INSIDE the same call, behind that denial: an
     // unauthorized read must fail now, not after the whole poll budget.
     let authorize = || authorize_default_read(shard, code, request_body(request), user_id);
@@ -833,13 +1114,13 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
         let clients_count = shard.count_all_clients().await;
         (
             u32::try_from(clients_count).unwrap_or(u32::MAX),
-            authorize_attached(attachment, authorize),
+            authorize_attached(attachment, shard.bus.realtime_micros(), authorize),
         )
     } else {
         (0, Ok(()))
     };
     match gate.and_then(|()| {
-        build_non_replicated_response(
+        let response = build_non_replicated_response(
             shard,
             code,
             request_body(request),
@@ -847,9 +1128,20 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
             roster,
             client_ip,
             clients_count,
-        )
+        )?;
+        // A list is projected with the grants of whoever holds the caller's id
+        // now, and shard 0 can delete the caller and reuse its id meanwhile.
+        if matches!(code, GET_STREAMS_CODE | GET_TOPICS_CODE) {
+            authorize_attached(attachment, shard.bus.realtime_micros(), || Ok(()))?;
+        }
+        Ok(response)
     }) {
         Ok(response) => {
+            if deny_oversized_reply(shard, request, origin, code, response.body_len(), reply_cap)
+                .await
+            {
+                return;
+            }
             let commit = current_metadata_commit(shard);
             let reply = response.into_reply(
                 request.header(),
@@ -882,6 +1174,50 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
     }
 }
 
+/// Sends `ReplyTooLarge` in place of a reply whose frame passes `reply_cap`
+/// and returns `true`. The QUIC and WebSocket links of the Rust SDK refuse a
+/// frame above [`MAX_RECORD_REPLY_SIZE`](iggy_binary_protocol::MAX_RECORD_REPLY_SIZE)
+/// by default and drop the connection, so the typed error keeps the link of
+/// every client.
+///
+/// Only `GetClients` and the reads of `build_non_replicated_response` pass
+/// this check. `GetSnapshot` checks a cap of its own, and `GetMetadataChanges`
+/// pages under a budget of its own. HTTP replies do not pass this check,
+/// because HTTP has no such cap.
+#[allow(clippy::future_not_send)]
+async fn deny_oversized_reply<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    request: &Message<RoutedRequestHeader>,
+    origin: ClientOrigin,
+    code: u32,
+    body_len: usize,
+    reply_cap: usize,
+) -> bool
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    if reply_frame_fits(body_len, reply_cap) {
+        return false;
+    }
+    warn!(
+        transport_client_id = origin.id,
+        code,
+        frame_size = HEADER_SIZE.saturating_add(body_len),
+        max = reply_cap,
+        "reply exceeds the client reply limit; refusing to send"
+    );
+    send_non_replicated_deny(shard, request, origin, IggyError::ReplyTooLarge.as_code()).await;
+    true
+}
+
+const fn reply_frame_fits(body_len: usize, cap: usize) -> bool {
+    HEADER_SIZE.saturating_add(body_len) <= cap
+}
+
 /// Serve `GET_SNAPSHOT_FILE`: gate on the snapshot rule (`manage_servers`,
 /// since the archive dumps server logs and host diagnostics), then await the
 /// off-thread collection (see `snapshot::collect`), gate again, and reply
@@ -903,7 +1239,7 @@ async fn handle_get_snapshot<B, MJ, S, SB>(
 {
     let transport_client_id = origin.id;
     let authorize = || {
-        authorize_attached(attachment, || {
+        authorize_attached(attachment, shard.bus.realtime_micros(), || {
             authorize_uid(shard, user_id, Permissioner::get_snapshot)
         })
     };
@@ -1034,13 +1370,16 @@ async fn handle_sync_consumer_group<B, MJ, S, SB>(
 #[cfg(test)]
 mod tests {
     use super::{
-        FrontierUnreached, FrontierWait, hold_for_frontier, read_frontier_budget,
-        read_needs_metadata_frontier,
+        FrontierUnreached, FrontierWait, MIN_DEFERRED_POLL_REPLY_MARGIN_US,
+        PARTITION_FRONTIER_WAIT_MAX, hold_for_frontier, partition_frontier_budget,
+        read_frontier_budget, read_needs_metadata_frontier, remaining_timers, reply_frame_fits,
     };
     use configs::server::ServerConfig;
+    use iggy_binary_protocol::HEADER_SIZE;
     use iggy_binary_protocol::codes::{
-        DESCRIBE_OPTIONS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE,
-        GET_SNAPSHOT_FILE_CODE, GET_STREAM_CODE, PING_CODE, POLL_MESSAGES_CODE,
+        CANCEL_DEFERRED_REQUEST_CODE, DESCRIBE_OPTIONS_CODE, FETCH_MESSAGES_CODE,
+        GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE, GET_SNAPSHOT_FILE_CODE,
+        GET_STREAM_CODE, PING_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE,
         SYNC_CONSUMER_GROUP_CODE,
     };
     use iggy_common::IggyDuration;
@@ -1050,7 +1389,7 @@ mod tests {
     use std::time::Duration;
 
     /// The budget has to move with the CONFIGURED commit cadence, not with the
-    /// compile-time default: `[cluster] commit_broadcast_interval` is what
+    /// compile-time default: `[cluster] commit_busy_heartbeat_interval` is what
     /// sizes the timer the read is waiting on, and a cluster that widens it to
     /// 2s would otherwise get a budget of one and a half broadcasts and refuse
     /// reads on a backup that is merely a commit behind.
@@ -1065,12 +1404,29 @@ mod tests {
             AppliedFrontier::DEFAULT_READ_BUDGET,
             "the config default must agree with the frontier's built-in fallback"
         );
+        assert_eq!(
+            partition_frontier_budget(&config),
+            AppliedFrontier::DEFAULT_PARTITION_REQUEST_BUDGET,
+            "the config default must agree with the frontier's built-in fallback"
+        );
 
-        config.cluster.commit_broadcast_interval = IggyDuration::from(Duration::from_secs(2));
+        config.cluster.commit_busy_heartbeat_interval = IggyDuration::from(Duration::from_secs(2));
         assert_eq!(
             read_frontier_budget(&config),
             Duration::from_secs(12),
             "six broadcasts of the configured interval"
+        );
+        assert_eq!(
+            partition_frontier_budget(&config),
+            Duration::from_secs(4),
+            "two broadcasts of the configured interval"
+        );
+
+        config.cluster.commit_busy_heartbeat_interval = IggyDuration::from(Duration::from_secs(20));
+        assert_eq!(
+            partition_frontier_budget(&config),
+            PARTITION_FRONTIER_WAIT_MAX,
+            "a write must get its refusal while its client still waits for it"
         );
     }
 
@@ -1161,6 +1517,9 @@ mod tests {
             DESCRIBE_OPTIONS_CODE,
             GET_CLUSTER_METADATA_CODE,
             POLL_MESSAGES_CODE,
+            POLL_MESSAGES_DEFERRED_CODE,
+            FETCH_MESSAGES_CODE,
+            CANCEL_DEFERRED_REQUEST_CODE,
             GET_CONSUMER_OFFSET_CODE,
             GET_SNAPSHOT_FILE_CODE,
         ] {
@@ -1174,5 +1533,53 @@ mod tests {
             !read_needs_metadata_frontier(u32::MAX),
             "an unknown code has no answer to hold, so it must not park"
         );
+    }
+
+    #[test]
+    fn given_a_queued_deferred_frame_when_timeout_has_room_should_subtract_queue_time_from_wait() {
+        const SECOND: u64 = 1_000_000;
+        assert_eq!(
+            remaining_timers(5 * SECOND, 10 * SECOND, 2 * SECOND),
+            Some((3 * SECOND, 8 * SECOND))
+        );
+        assert_eq!(
+            remaining_timers(5 * SECOND, 10 * SECOND, 6 * SECOND),
+            Some((0, 4 * SECOND))
+        );
+    }
+
+    #[test]
+    fn given_a_queued_deferred_frame_when_timed_should_keep_only_what_its_client_still_waits() {
+        const SECOND: u64 = 1_000_000;
+        let margin = MIN_DEFERRED_POLL_REPLY_MARGIN_US;
+        assert_eq!(
+            remaining_timers(5 * SECOND, 5 * SECOND + margin, 0),
+            Some((5 * SECOND, 5 * SECOND + margin)),
+            "a frame served on arrival keeps its timers"
+        );
+        assert_eq!(
+            remaining_timers(5 * SECOND, 5 * SECOND + margin, 2 * SECOND),
+            Some((3 * SECOND, 3 * SECOND + margin)),
+            "the wait keeps the reply margin before the shortened timeout"
+        );
+        assert_eq!(
+            remaining_timers(0, 10 * SECOND, 4 * SECOND),
+            Some((0, 6 * SECOND)),
+            "a zero wait stays zero"
+        );
+        assert_eq!(
+            remaining_timers(5 * SECOND, 5 * SECOND + margin, 5 * SECOND + margin),
+            None,
+            "a frame that outlived its timeout is not served"
+        );
+    }
+
+    #[test]
+    fn given_a_reply_frame_at_the_cap_when_sized_should_fit_and_one_byte_more_should_not() {
+        let cap = HEADER_SIZE + 10;
+        assert!(reply_frame_fits(10, cap));
+        assert!(!reply_frame_fits(11, cap));
+        assert!(reply_frame_fits(0, HEADER_SIZE));
+        assert!(!reply_frame_fits(0, HEADER_SIZE - 1));
     }
 }

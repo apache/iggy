@@ -198,7 +198,8 @@ fn create_algorithm_confusion_jwt() -> String {
 
     let mut header = Header::new(Algorithm::HS256);
     header.kid = Some(TEST_KEY_ID.to_string());
-    let encoding_key = EncodingKey::from_secret(b"attacker-controlled-hmac-secret");
+    let encoding_key = EncodingKey::from_secret(b"attacker-controlled-hmac-secret")
+        .expect("create a key from the non-empty test secret");
 
     encode(&header, &claims, &encoding_key).unwrap()
 }

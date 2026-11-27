@@ -22,6 +22,8 @@ package org.apache.iggy.client.blocking;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.HeaderValue;
+import org.apache.iggy.system.NamedPageQuery;
+import org.apache.iggy.system.Page;
 import org.apache.iggy.topic.Topic;
 import org.apache.iggy.topic.TopicDetails;
 import org.apache.iggy.topic.TopicOptions;
@@ -43,7 +45,24 @@ public interface TopicsClient {
         return getTopics(StreamId.of(streamId));
     }
 
+    /**
+     * Gets the topics the caller may read within a stream. Over TCP, reads the list in pages of up to 1000 topics, so
+     * the list is not one consistent read. All pages share the sign-in and the request timeout of the call, so a new
+     * sign-in during the read fails it. If the stream goes missing after the first page, the call fails as
+     * {@link #getTopicsPage} does for a caller with a global read grant, and ends there for any other caller. Over
+     * TCP, the call fails with {@link org.apache.iggy.exception.IggyMalformedResponseException} when the server
+     * answers the page cursor it was sent. Over HTTP, reads the whole list in one reply, which the server builds from
+     * pages of 1000, so it is not one consistent read either.
+     */
     List<Topic> getTopics(StreamId streamId);
+
+    /**
+     * Gets one page of the topics the caller may read within a stream. For a stream that does not exist, or one the
+     * caller may read no topic of, the first page is empty and has no next cursor. For a caller with a global read
+     * grant, a page read with a cursor fails with a stream not found error instead, because the stream was deleted
+     * during the walk. A query that breaks the page rules fails with an invalid command error.
+     */
+    Page<Topic> getTopicsPage(StreamId streamId, NamedPageQuery query);
 
     default TopicDetails createTopic(Long streamId, String name, long partitionsCount) {
         return createTopic(StreamId.of(streamId), name, partitionsCount);

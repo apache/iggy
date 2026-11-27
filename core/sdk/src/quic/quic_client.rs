@@ -177,6 +177,7 @@ fn configure(config: &QuicClientConfig) -> Result<ClientConfig, IggyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iggy_binary_protocol::MAX_RECORD_REPLY_SIZE;
     use iggy_common::{
         BinaryTransport, Client, ClientState, Credentials, DiagnosticEvent, IggyDuration,
         NonZeroIggyDuration,
@@ -399,7 +400,10 @@ mod tests {
             other => panic!("expected UsernamePassword auto_login, got {other:?}"),
         }
 
-        assert_eq!(quic_client_config.response_buffer_size, 10_000_000);
+        assert_eq!(
+            quic_client_config.response_buffer_size,
+            MAX_RECORD_REPLY_SIZE as u64
+        );
         assert_eq!(quic_client_config.max_concurrent_bidi_streams, 10_000);
         assert_eq!(quic_client_config.datagram_send_buffer_size, 100_000);
         assert_eq!(quic_client_config.initial_mtu, 1200);
@@ -454,7 +458,10 @@ mod tests {
             other => panic!("expected UsernamePassword auto_login, got {other:?}"),
         }
 
-        assert_eq!(quic_client_config.response_buffer_size, 10_000_000);
+        assert_eq!(
+            quic_client_config.response_buffer_size,
+            MAX_RECORD_REPLY_SIZE as u64
+        );
         assert_eq!(quic_client_config.max_concurrent_bidi_streams, 10_000);
         assert_eq!(quic_client_config.datagram_send_buffer_size, 100_000);
         assert_eq!(
@@ -506,7 +513,10 @@ mod tests {
             other => panic!("expected PersonalAccessToken auto_login, got {other:?}"),
         }
 
-        assert_eq!(quic_client_config.response_buffer_size, 10_000_000);
+        assert_eq!(
+            quic_client_config.response_buffer_size,
+            MAX_RECORD_REPLY_SIZE as u64
+        );
         assert_eq!(quic_client_config.max_concurrent_bidi_streams, 10_000);
         assert_eq!(quic_client_config.datagram_send_buffer_size, 100_000);
         assert_eq!(quic_client_config.initial_mtu, 1200);

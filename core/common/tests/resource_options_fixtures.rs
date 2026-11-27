@@ -24,7 +24,7 @@ use iggy_binary_protocol::requests::streams::CreateStreamRequest;
 use iggy_binary_protocol::requests::system::{DescribeOptionsRequest, UpdateResourceRequest};
 use iggy_binary_protocol::requests::topics::CreateTopicRequest;
 use iggy_binary_protocol::requests::users::CreateUserRequest;
-use iggy_binary_protocol::responses::streams::{GetStreamResponse, StreamResponse, TopicHeader};
+use iggy_binary_protocol::responses::streams::{GetStreamResponse, StreamResponse, TopicResponse};
 use iggy_binary_protocol::responses::system::DescribeOptionsResponse;
 use iggy_binary_protocol::responses::topics::GetTopicResponse;
 use iggy_binary_protocol::responses::users::{UserDetailsResponse, UserResponse};
@@ -65,9 +65,9 @@ fn given_live_wire_constants_when_comparing_fixture_should_match_codes_and_versi
     );
     assert_eq!(
         constants.protocol_version.packed,
-        pack_protocol_version(0, 12, 0)
+        pack_protocol_version(0, 12, 3)
     );
-    assert_eq!(constants.protocol_version.text, "0.12.0");
+    assert_eq!(constants.protocol_version.text, "0.12.3");
     assert_eq!(
         constants.command_codes["update_resource"],
         CommandCode {
@@ -189,7 +189,7 @@ fn given_describe_options_vectors_when_decoding_should_match_catalog_flags() {
             .expect("entries decode");
         assert_eq!(entries, vector.entries, "{}", vector.scope);
 
-        let rebuilt = describe_options_response(vector.scope).expect("server response builds");
+        let rebuilt = describe_options_response(vector.scope, &[]).expect("server response builds");
         assert_eq!(
             rebuilt.to_bytes().as_ref(),
             bytes.as_slice(),
@@ -534,7 +534,12 @@ fn given_response_vectors_when_decoding_should_match_typed_projection() {
         );
 
         let stored = vector.state.stored_options().expect("stored state builds");
-        let public = public_options(OptionsScope::Stream, &stored).expect("stream projects");
+        let public = vector.state.public_options().expect("stream projects");
+        assert_eq!(
+            vector.expected.shadow_origin, vector.state.shadow_origin,
+            "{}",
+            vector.case
+        );
         let (options, derived_options) =
             resource_options_to_wire_split(&public).expect("blocks encode");
         let rebuilt = GetStreamResponse {
@@ -660,7 +665,7 @@ fn given_response_vectors_when_decoding_should_match_typed_projection() {
             vector.case
         );
         let rebuilt = GetTopicResponse {
-            topic: TopicHeader {
+            topic: TopicResponse {
                 id: vector.expected.id,
                 created_at: vector.expected.created_at,
                 partitions_count: vector.expected.partitions_count,

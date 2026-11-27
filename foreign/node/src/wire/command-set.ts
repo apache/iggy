@@ -31,7 +31,7 @@ import { getClient } from './client/get-client.command.js';
 import { createGroup } from './consumer-group/create-group.command.js';
 import { joinGroup } from './consumer-group/join-group.command.js';
 import { getGroup } from './consumer-group/get-group.command.js';
-import { getGroups } from './consumer-group/get-groups.command.js';
+import { getGroups, getGroupsPage } from './consumer-group/get-groups.command.js';
 import { leaveGroup } from './consumer-group/leave-group.command.js';
 import { deleteGroup } from './consumer-group/delete-group.command.js';
 import {
@@ -41,13 +41,16 @@ import {
 import { createTopic } from './topic/create-topic.command.js';
 import { updateTopic } from './topic/update-topic.command.js';
 import { getTopic } from './topic/get-topic.command.js';
-import { getTopics } from './topic/get-topics.command.js';
+import { getTopics, getTopicsPage } from './topic/get-topics.command.js';
 import { deleteTopic } from './topic/delete-topic.command.js';
 import { ensureTopic } from './topic/ensure-topic.virtual.command.js';
 
 import { getOffset } from './offset/get-offset.command.js';
 import { storeOffset } from './offset/store-offset.command.js';
 import { deleteOffset } from './offset/delete-offset.command.js';
+import { storePosition, deletePosition } from './offset/position.command.js';
+import { openReader } from '../stream/partition-reader.js';
+import { openConsumer, openConsumerGroup } from '../stream/iggy-consumer.js';
 
 import { sendMessages } from './message/send-messages.command.js';
 import { pollMessages } from './message/poll-messages.command.js';
@@ -55,12 +58,13 @@ import { pollMessages } from './message/poll-messages.command.js';
 import { createStream } from './stream/create-stream.command.js';
 import { updateStream } from './stream/update-stream.command.js';
 import { getStream } from './stream/get-stream.command.js';
-import { getStreams } from './stream/get-streams.command.js';
+import { getStreams, getStreamsPage } from './stream/get-streams.command.js';
 import { deleteStream } from './stream/delete-stream.command.js';
 import { ensureStream } from './stream/ensure-stream.virtual.command.js';
 
 import { createPartition } from './partition/create-partition.command.js';
 import { deletePartition } from './partition/delete-partition.command.js';
+import { getPartitionsPage } from './partition/get-partitions.command.js';
 
 import { deleteSegments } from './segment/delete-segments.command.js';
 
@@ -71,6 +75,7 @@ import { snapshot } from './system/snapshot.command.js';
 import { ping } from './system/ping.command.js';
 
 import { getClusterMetadata } from './cluster/get-cluster-metadata.command.js';
+import { retireGeoOrigin } from './cluster/retire-geo-origin.command.js';
 
 import { getTokens } from './token/get-tokens.command.js';
 import { createToken } from './token/create-token.command.js';
@@ -82,12 +87,13 @@ import { changePassword } from './user/change-password.command.js';
 import { updateUser } from './user/update-user.command.js';
 import { updatePermissions } from './user/update-permissions.command.js';
 import { deleteUser } from './user/delete-user.command.js';
-import { getUsers } from './user/get-users.command.js';
+import { getUsers, getUsersPage } from './user/get-users.command.js';
 
 
 const userAPI = (c: ClientProvider) => ({
   get: getUser(c),
   list: getUsers(c),
+  listPage: getUsersPage(c),
   create: createUser(c),
   update: updateUser(c),
   updatePermissions: updatePermissions(c),
@@ -124,6 +130,7 @@ type TokenAPI = ReturnType<typeof tokenAPI>;
 const streamAPI = (c: ClientProvider) => ({
   get: getStream(c),
   list: getStreams(c),
+  listPage: getStreamsPage(c),
   create: createStream(c),
   update: updateStream(c),
   delete: deleteStream(c),
@@ -135,6 +142,7 @@ type StreamAPI = ReturnType<typeof streamAPI>;
 const topicAPI = (c: ClientProvider) => ({
   get: getTopic(c),
   list: getTopics(c),
+  listPage: getTopicsPage(c),
   create: createTopic(c),
   update: updateTopic(c),
   delete: deleteTopic(c),
@@ -144,6 +152,7 @@ const topicAPI = (c: ClientProvider) => ({
 type TopicAPI = ReturnType<typeof topicAPI>;
 
 const partitionAPI = (c: ClientProvider) => ({
+  listPage: getPartitionsPage(c),
   create: createPartition(c),
   delete: deletePartition(c),
 });
@@ -159,6 +168,7 @@ type SegmentAPI = ReturnType<typeof segmentAPI>;
 const groupAPI = (c: ClientProvider) => ({
   get: getGroup(c),
   list: getGroups(c),
+  listPage: getGroupsPage(c),
   create: createGroup(c),
   join: joinGroup(c),
   leave: leaveGroup(c),
@@ -172,13 +182,16 @@ type GroupAPI = ReturnType<typeof groupAPI>;
 const offsetAPI = (c: ClientProvider) => ({
   get: getOffset(c),
   store: storeOffset(c),
-  delete: deleteOffset(c)
+  delete: deleteOffset(c),
+  storePosition: storePosition(c),
+  deletePosition: deletePosition(c)
 });
 
 type OffsetAPI = ReturnType<typeof offsetAPI>;
 
 const messageAPI = (c: ClientProvider) => ({
   poll: pollMessages(c),
+  reader: openReader(c),
   send: sendMessages(c)
 });
 
@@ -195,7 +208,8 @@ const systemAPI = (c: ClientProvider) => ({
 type SystemAPI = ReturnType<typeof systemAPI>;
 
 const clusterAPI = (c: ClientProvider) => ({
-  getClusterMetadata: getClusterMetadata(c)
+  getClusterMetadata: getClusterMetadata(c),
+  retireGeoOrigin: retireGeoOrigin(c)
 });
 
 type ClusterAPI = ReturnType<typeof clusterAPI>;
@@ -231,6 +245,10 @@ export abstract class CommandAPI extends AbstractAPI {
   group: GroupAPI = groupAPI(this.clientProvider);
   offset: OffsetAPI = offsetAPI(this.clientProvider);
   message: MessageAPI = messageAPI(this.clientProvider);
+  /** A standalone consumer of some partitions, one message at a time, on this client. */
+  consumer = openConsumer(this.clientProvider);
+  /** A member of a consumer group, created when it is missing, one message at a time, on this client. */
+  consumerGroup = openConsumerGroup(this.clientProvider);
   system: SystemAPI = systemAPI(this.clientProvider);
   cluster: ClusterAPI = clusterAPI(this.clientProvider);
 
@@ -254,7 +272,9 @@ export abstract class CommandAPI extends AbstractAPI {
 
   /**
    * Sends a command code with a payload and returns the raw response payload.
-   * Session-control codes are rejected with an invalid-command error.
+   * Session-control codes and the cancellation of a deferred request (108),
+   * which only the client sends for its own requests, are rejected with an
+   * invalid-command error.
    *
    * @param code - Command code to send
    * @param payload - Raw command payload
@@ -271,8 +291,8 @@ export abstract class CommandAPI extends AbstractAPI {
    * Sends a command code with a payload to the replica with the given id, as
    * the cluster metadata names it, and returns the raw response payload. Every
    * node answers non-replicated commands such as GetStats from its own state.
-   * Replicated commands, polls, consumer-offset reads and session-control codes
-   * are rejected with an invalid-command error, and a replica id the cluster
+   * Replicated commands, polls, fetches, consumer-offset reads
+   * and session-control codes are rejected with an invalid-command error, and a replica id the cluster
    * metadata does not name with an invalid-identifier error. A `NotPrimary`
    * refusal is returned and not retried on another replica.
    *
@@ -294,7 +314,8 @@ export abstract class CommandAPI extends AbstractAPI {
     payload: Buffer,
     options?: SendCommandOptions
   ): Promise<Buffer> {
-    if (SESSION_CONTROL_CODES.has(code))
+    // Only a link cancels a deferred request, the one that it sent.
+    if (SESSION_CONTROL_CODES.has(code) || code === COMMAND_CODE.CancelDeferredRequest)
       throw responseError(code, INVALID_COMMAND_ERROR_CODE);
 
     const snapshot = Buffer.from(payload);

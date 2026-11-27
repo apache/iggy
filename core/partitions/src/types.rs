@@ -16,10 +16,20 @@
 // under the License.
 
 use iggy_binary_protocol::Operation;
-use iggy_common::{IggyByteSize, PollingKind, PollingStrategy, ServerKeyContext};
+use iggy_common::{
+    ConsumerGroupId, ConsumerOffset, IggyByteSize, PollingKind, PollingStrategy, ServerKeyContext,
+};
 use server_common::iobuf::Frozen;
 use smallvec::SmallVec;
+use std::collections::BTreeMap;
 use std::sync::Arc;
+
+/// Offset cursors of one partition, keyed by consumer id. Only the owner shard
+/// reads them, and a `BTreeMap` keeps the iteration order the same in every run.
+pub type ConsumerOffsets = BTreeMap<usize, ConsumerOffset>;
+
+/// Offset cursors of one partition, keyed by consumer group.
+pub type ConsumerGroupOffsets = BTreeMap<ConsumerGroupId, ConsumerOffset>;
 
 /// A local commit that failed for an op the cluster had already committed.
 ///
@@ -48,6 +58,11 @@ pub struct Fragment<const ALIGN: usize = 4096> {
 }
 
 impl<const ALIGN: usize> Fragment<ALIGN> {
+    #[must_use]
+    pub fn allocation_bytes(&self) -> usize {
+        self.source.allocation_bytes()
+    }
+
     #[must_use]
     pub fn whole(source: Frozen<ALIGN>) -> Self {
         let end = source.len();
@@ -98,6 +113,13 @@ impl<const ALIGN: usize> Fragment<ALIGN> {
     pub fn borrows_from(&self, source: &Frozen<ALIGN>) -> bool {
         self.source.shares_allocation(source)
     }
+
+    /// Identity of the allocation this fragment keeps alive, so a byte charge
+    /// counts a shared allocation once instead of once per slice.
+    #[must_use]
+    pub fn allocation_id(&self) -> usize {
+        self.source.allocation_id()
+    }
 }
 
 /// Arguments for polling messages from a partition.
@@ -110,7 +132,7 @@ pub struct PollingArgs {
 }
 
 pub type PollFragments<const ALIGN: usize = 4096> = SmallVec<[Fragment<ALIGN>; 4]>;
-pub type PollQueryResult<const ALIGN: usize = 4096> = (PollFragments<ALIGN>, Option<u64>);
+pub type PollQueryResult<const ALIGN: usize = 4096> = (PollFragments<ALIGN>, Option<u64>, u32);
 
 impl PollingArgs {
     #[must_use]
@@ -344,8 +366,10 @@ pub enum RepairConclusion {
     /// The walk reached the requested frontier; the session was dropped.
     Done,
     /// The floor's continuity check failed: ops below it are neither locally
-    /// durable nor repaired. The session was dropped here -- state transfer
-    /// supersedes repair -- and the caller arms the transfer.
+    /// durable nor repaired. The repair walk of an unproven view log that
+    /// outgrew its byte budget also ends here, with `floor` at `commit_min`.
+    /// The session was dropped here -- state transfer supersedes repair -- and
+    /// the caller arms the transfer.
     FloorRefused { floor: u64, to_op: u64 },
 }
 

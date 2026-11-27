@@ -96,6 +96,8 @@ pub enum Command {
     // Fresh metadata and partition readiness for primary rebalancing.
     PrimaryRebalance = 33,
     SegmentDelete = 34,
+    CommitReply = 35,
+    PrepareProgress = 36,
 }
 
 // SAFETY: Command is #[repr(u8)] with no padding bytes.
@@ -106,7 +108,7 @@ unsafe impl CheckedBitPattern for Command {
     type Bits = u8;
 
     fn is_valid_bit_pattern(bits: &u8) -> bool {
-        *bits <= Self::SegmentDelete as u8
+        *bits <= Self::PrepareProgress as u8
     }
 }
 
@@ -127,7 +129,7 @@ mod tests {
 
     #[test]
     fn replica_auth_commands_are_valid_bit_patterns() {
-        for command in 14u8..=34 {
+        for command in 14u8..=36 {
             let mut buf: AVec<u8, ConstAlign<16>> = AVec::new(16);
             buf.resize(256, 0);
             buf[60] = command;
@@ -135,7 +137,7 @@ mod tests {
         }
         let mut buf: AVec<u8, ConstAlign<16>> = AVec::new(16);
         buf.resize(256, 0);
-        buf[60] = 35;
+        buf[60] = 37;
         assert!(bytemuck::checked::try_from_bytes::<GenericHeader>(&buf).is_err());
     }
 }

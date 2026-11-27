@@ -19,7 +19,7 @@ use crate::shard_allocator::ShardingError;
 use consensus::VsrStateError;
 use iggy_binary_protocol::Operation;
 use metadata::impls::recovery::RecoveryError;
-use partitions::PartitionRecoveryError;
+use partitions::{PartitionRecoveryError, StoreViewRequest};
 use server_common::log::LogError;
 use shard::ShardCtorError;
 use std::error::Error as _;
@@ -62,10 +62,14 @@ pub enum ServerError {
         #[source]
         source: Box<iggy_common::IggyError>,
     },
+    #[error("cannot register the partition state machines")]
+    PartitionStateMachines(#[source] partitions::state_machine::RegistrationError),
     #[error("failed to load server config")]
     Config(#[source] configs::ConfigurationError),
     #[error("failed to allocate shards from sharding.cpu_allocation")]
     ShardAllocator(#[source] ShardingError),
+    #[error("cluster.coordinator.replica_connections_per_peer cannot run on this node")]
+    ReplicaLinkLayout(#[source] message_bus::LinkLayoutError),
     #[error("failed to bind shard {shard_id} to its CPU set")]
     CpuAffinityFailed {
         shard_id: u16,
@@ -165,6 +169,11 @@ pub enum ServerError {
         poll: std::time::Duration,
         drain: std::time::Duration,
     },
+    #[error("sharding.shutdown_primary_handoff_timeout must be <= {max:?}; got {value:?}")]
+    InvalidShutdownPrimaryHandoffTimeout {
+        value: std::time::Duration,
+        max: std::time::Duration,
+    },
     #[error("sharding.shutdown_join_timeout must be <= {max:?}; got {value:?}")]
     InvalidShutdownJoinTimeout {
         value: std::time::Duration,
@@ -226,6 +235,15 @@ pub enum ServerError {
         "partition {namespace_raw} incarnation {created_revision} is durably fenced for session retirement"
     )]
     PartitionRetirementFenced {
+        namespace_raw: u64,
+        created_revision: u64,
+    },
+    #[error(
+        "partition {namespace_raw} incarnation {created_revision} is stored only on this node, \
+         and this node's storage began after it was created without any record of it: \
+         refusing to serve it from offset 0; delete and recreate the topic to accept the loss"
+    )]
+    PartitionLostWithStorage {
         namespace_raw: u64,
         created_revision: u64,
     },
@@ -306,6 +324,42 @@ pub enum ServerError {
         partition_id: usize,
         namespace_raw: u64,
     },
+    /// The partition of a tiered topic found no chain file, and something
+    /// below its local front may have left the disk. Boot leaves it unbuilt,
+    /// and the reconciler loads it again with what `request` reads from the
+    /// store.
+    #[error(
+        "partition {stream_id}/{topic_id}/{partition_id} found no segment chain, and the offsets \
+         {} to {} below its local log wait for the object store",
+        request.from,
+        request.front.saturating_sub(1)
+    )]
+    PartitionChainMissing {
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        request: Box<StoreViewRequest>,
+    },
+    /// The loader wrote the chain it rebuilt from the store. Its caller loads
+    /// the partition once more over that chain, so recovery checks it by the
+    /// rules of any other chain.
+    #[error(
+        "partition {stream_id}/{topic_id}/{partition_id} rebuilt its segment chain from the \
+         object store"
+    )]
+    PartitionChainRebuilt {
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    },
+    #[error(
+        "the rebuild of the segment chain at {dir} could not read an anchor or write the chain"
+    )]
+    PartitionChainRebuildIo {
+        dir: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error(
         "shard {shard_id} aborted while waiting for shard-0 to broadcast the metadata \
          factory bundle; shard 0 dropped its sender (most likely it failed to recover)"
@@ -331,6 +385,15 @@ pub enum ServerError {
     ClusterReplicaCountTooLarge { count: usize },
     #[error("cluster mode requires --replica-id to identify the current node")]
     MissingReplicaId,
+    #[error(
+        "committed metadata places partition {namespace_raw} on node {node}, but the cluster \
+         has {nodes} nodes; adding or removing nodes is not supported"
+    )]
+    PartitionMemberOutsideCluster {
+        namespace_raw: u64,
+        node: u8,
+        nodes: u8,
+    },
     #[error(
         "--replica-id {supplied} was passed with cluster.enabled=false; the WAL would commit \
          under replica {default} which permanently fixes this node's identity. Either set \
@@ -412,6 +475,69 @@ pub enum ServerError {
     Panicked { description: String },
     #[error("Failed to list config environment variables")]
     ListConfigEnvVars(#[source] std::io::Error),
+    #[error("failed to build the external auth HTTP client: {reason}")]
+    ExternalAuthClient { reason: String },
+    #[error("tiered storage cannot start: {reason}")]
+    TieredStorage { reason: String },
+    #[error("tiered storage cannot start: tiered_storage.path {path:?} cannot be read")]
+    TieredStoragePath {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "tiered storage cannot start: tiered_storage.prefix {prefix:?} is not a usable key prefix"
+    )]
+    TieredStoragePrefix {
+        prefix: String,
+        #[source]
+        source: iggy_object_store::ObjectStoreError,
+    },
+    #[error("tiered storage cannot start: the object store refused the boot probe of {key:?}")]
+    TieredStorageProbe {
+        key: String,
+        #[source]
+        source: iggy_object_store::ObjectStoreError,
+    },
+    #[error(
+        "tiered storage cannot start: the object store took a create-only put over the \
+         existing store identity object {key:?}, so it ignores conditional creates, which \
+         uploads rely on. Point tiered_storage.backend ({backend}) and tiered_storage.endpoint \
+         at a store that refuses a create over an existing object"
+    )]
+    TieredStorageConditionalCreate {
+        key: String,
+        backend: configs::tiered_storage::TieredStorageBackend,
+        #[source]
+        source: iggy_object_store::ObjectStoreError,
+    },
+    #[error("tiered storage cannot start: no runtime for the boot probe")]
+    TieredStorageProbeRuntime {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "tiered storage cannot start: the {source_name} of {subject} handed out no credentials"
+    )]
+    TieredStorageCredentials {
+        subject: String,
+        source_name: &'static str,
+        #[source]
+        source: iggy_object_store::credentials::CredentialError,
+    },
+    #[error("tiered storage cannot start: the credentials refresher of {subject}")]
+    TieredStorageCredentialsThread {
+        subject: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("tiered storage cannot start: the gcs backend has no access token")]
+    TieredStorageGcsKeyFile {
+        #[source]
+        source: iggy_object_store::gcs::credentials::KeyFileError,
+    },
+    #[error("geo peer {origin:?} can never be read: {reason}")]
+    GeoPeer { origin: String, reason: String },
 }
 
 /// Per-shard outcome captured by [`crate::boot::ShardHandles::join_all`]

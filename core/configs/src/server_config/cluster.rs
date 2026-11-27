@@ -20,29 +20,34 @@
 use super::defaults::SERVER_CONFIG;
 use crate::ConfigurationError;
 use crate::http::HttpJwtConfig;
-use configs::ConfigEnv;
+use configs::{ConfigEnv, DisplayFromStrOrNumber};
 use iggy_common::{IggyDuration, Validatable};
 use ipnet::{IpNet, Ipv4Net};
 use serde::{Deserialize, Serialize};
-use serde_with::{DisplayFromStr, serde_as};
+use serde_with::serde_as;
 use std::cmp::Reverse;
 use std::fmt;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::time::Duration;
 
-/// Absolute floor for the backup liveness window, independent of the
-/// commit-broadcast rate. The primary signals liveness through its commit
-/// broadcast (`commit_broadcast_interval`, 500ms by default); 2s spans several
-/// broadcasts, so a single delayed one never elects. The per-config
-/// `MIN_HEARTBEAT_TO_COMMIT_BROADCAST_RATIO` check scales the same headroom
-/// when the broadcast interval is retuned.
+/// Shard tick of the consensus timers, `CONSENSUS_TICK_INTERVAL` in
+/// `core/shard`. It is a copy, so that `core/configs` does not depend on
+/// `core/shard`. A static assert in `core/server` keeps the two equal.
+pub const CONSENSUS_TICK: Duration = Duration::from_millis(10);
+
+/// Floor for `commit_busy_heartbeat_timeout`, independent of the heartbeat rate.
 pub const MIN_CLUSTER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The backup liveness window (`heartbeat_timeout`) must span at least this
-/// many commit broadcasts (`commit_broadcast_interval`), so one dropped or
-/// delayed broadcast never trips a view change on a healthy primary.
-const MIN_HEARTBEAT_TO_COMMIT_BROADCAST_RATIO: u32 = 4;
+/// Ceiling for both Commit heartbeat timeouts. The replica handshake sends
+/// them as `u32` milliseconds, and a larger value would saturate, so two
+/// nodes with different values would accept each other. A static assert in
+/// `core/server` keeps the two equal.
+pub const MAX_CLUSTER_HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(u32::MAX as u64);
+
+/// Each heartbeat timeout must span at least this many heartbeats, so one
+/// late heartbeat never starts an election.
+const HEARTBEATS_PER_TIMEOUT_MIN: u32 = 4;
 
 /// The view-change status backstop (`view_change_status_timeout`) must span at
 /// least this many retransmit intervals (`view_change_retransmit_interval`), so
@@ -71,6 +76,12 @@ const MAX_VIEW_PROBE_ATTEMPTS: u32 = 100;
 /// [`DEFAULT_VIEW_PROBE_ATTEMPTS_MAX`]); `core/server`'s bootstrap
 /// static-asserts it equal to `shard::REPAIR_CHUNK_MAX`.
 pub const DEFAULT_REPAIR_CHUNK_MAX: usize = 128;
+
+/// Maximum number of replicas supported by the VSR implementation.
+///
+/// Duplicated here so `core/configs` does not depend on `core/consensus`;
+/// `core/server` pins the values together at compile time.
+pub const MAX_CLUSTER_REPLICAS: usize = 32;
 
 /// `size_of::<StateChunkHeader>()`. Duplicated here for the same reason as
 /// [`DEFAULT_REPAIR_CHUNK_MAX`]; `core/server`'s bootstrap static-asserts it
@@ -102,20 +113,28 @@ const MAX_HOSTNAME_LEN: usize = 253;
 /// Per-label limit from RFC 1035.
 const MAX_HOSTNAME_LABEL_LEN: usize = 63;
 
-/// serde fallback for configs written before the field existed; the value
-/// itself lives in `core/server/config.toml` like every other default.
-fn default_heartbeat_timeout() -> IggyDuration {
-    SERVER_CONFIG.cluster.heartbeat_timeout.parse().unwrap()
+fn parse_default(value: &str) -> IggyDuration {
+    value.parse().unwrap()
 }
 
-/// serde fallback for configs written before the field existed; the value
-/// itself lives in `core/server/config.toml` like every other default.
-fn default_commit_broadcast_interval() -> IggyDuration {
-    SERVER_CONFIG
-        .cluster
-        .commit_broadcast_interval
-        .parse()
-        .unwrap()
+fn default_commit_heartbeat_grid() -> IggyDuration {
+    parse_default(SERVER_CONFIG.cluster.commit_heartbeat_grid)
+}
+
+fn default_commit_busy_heartbeat_interval() -> IggyDuration {
+    parse_default(SERVER_CONFIG.cluster.commit_busy_heartbeat_interval)
+}
+
+fn default_commit_busy_heartbeat_timeout() -> IggyDuration {
+    parse_default(SERVER_CONFIG.cluster.commit_busy_heartbeat_timeout)
+}
+
+fn default_commit_idle_heartbeat_interval() -> IggyDuration {
+    parse_default(SERVER_CONFIG.cluster.commit_idle_heartbeat_interval)
+}
+
+fn default_commit_idle_heartbeat_timeout() -> IggyDuration {
+    parse_default(SERVER_CONFIG.cluster.commit_idle_heartbeat_timeout)
 }
 
 /// serde fallback for configs written before the field existed; the value
@@ -170,6 +189,16 @@ fn default_repair_retry_interval() -> IggyDuration {
     SERVER_CONFIG.cluster.repair_retry_interval.parse().unwrap()
 }
 
+/// serde fallback for configs written before the field existed; the value
+/// itself lives in `core/server/config.toml` like every other default.
+fn default_replication_factor() -> ReplicationFactorDefault {
+    SERVER_CONFIG
+        .cluster
+        .default_replication_factor
+        .parse()
+        .unwrap()
+}
+
 fn default_repair_gap_debounce_interval() -> IggyDuration {
     SERVER_CONFIG
         .cluster
@@ -200,34 +229,45 @@ fn default_superblock_wedged_fatal_timeout() -> IggyDuration {
 pub struct ClusterConfig {
     pub enabled: bool,
     pub name: String,
-    /// Backup-side liveness window for a plane's primary. A replica that
-    /// sees no primary traffic for this long starts a view change
-    /// (`normal_heartbeat_timeout`). Raise it on oversubscribed hosts where
-    /// scheduling stalls fake primary death; sub-`MIN_CLUSTER_HEARTBEAT_TIMEOUT`
-    /// values (including the `0` / `disabled` / `unlimited` sentinels, which
-    /// all parse to zero) are rejected at boot.
-    #[serde(default = "default_heartbeat_timeout")]
-    #[serde_as(as = "DisplayFromStr")]
+    /// Interval between grid ticks, the only shard ticks on which heartbeats
+    /// join a Commit batch. Must be a whole multiple of the 10 ms shard tick.
+    #[serde(default = "default_commit_heartbeat_grid")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
-    pub heartbeat_timeout: IggyDuration,
-    /// How often the primary broadcasts its commit point to every backup, the
-    /// cluster's primary-liveness signal. Each broadcast resets the backups'
-    /// `heartbeat_timeout` window, so that window must span several broadcasts:
-    /// boot rejects `heartbeat_timeout < MIN_HEARTBEAT_TO_COMMIT_BROADCAST_RATIO
-    /// * commit_broadcast_interval`. Sizes the consensus `CommitMessage` timer.
-    /// Zero (and the `0` / `disabled` / `unlimited` sentinels, which all parse
-    /// to zero) is rejected at boot.
-    #[serde(default = "default_commit_broadcast_interval")]
-    #[serde_as(as = "DisplayFromStr")]
+    pub commit_heartbeat_grid: IggyDuration,
+    /// Interval between the heartbeats of a busy group, a whole multiple of
+    /// `commit_heartbeat_grid`.
+    #[serde(default = "default_commit_busy_heartbeat_interval")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
-    pub commit_broadcast_interval: IggyDuration,
+    pub commit_busy_heartbeat_interval: IggyDuration,
+    /// How long the backups of a busy group wait for a heartbeat before they
+    /// vote, and the quiet time before a group turns idle. It is also the quorum
+    /// window of a busy primary and, on Linux, the `TCP_USER_TIMEOUT` of every
+    /// replica link.
+    #[serde(default = "default_commit_busy_heartbeat_timeout")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
+    #[config_env(leaf)]
+    pub commit_busy_heartbeat_timeout: IggyDuration,
+    /// Interval between the heartbeats of an idle group, a whole multiple of
+    /// `commit_busy_heartbeat_interval`.
+    #[serde(default = "default_commit_idle_heartbeat_interval")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
+    #[config_env(leaf)]
+    pub commit_idle_heartbeat_interval: IggyDuration,
+    /// How long the backups of an idle group wait for a heartbeat. The backups
+    /// wait the larger of this value and `commit_busy_heartbeat_timeout`.
+    #[serde(default = "default_commit_idle_heartbeat_timeout")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
+    #[config_env(leaf)]
+    pub commit_idle_heartbeat_timeout: IggyDuration,
     /// How often the primary retransmits prepares a backup has not yet acked.
     /// Lower recovers faster from a dropped prepare at the cost of replica
     /// traffic. Sizes the consensus `Prepare` timer. Zero (and the `0` /
     /// `disabled` / `unlimited` sentinels, which all parse to zero) is rejected
     /// at boot.
     #[serde(default = "default_prepare_retransmit_interval")]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
     pub prepare_retransmit_interval: IggyDuration,
     /// How often a plane retransmits its `StartViewChange` / `DoViewChange`
@@ -237,18 +277,20 @@ pub struct ClusterConfig {
     /// `disabled` / `unlimited` sentinels, which all parse to zero) is rejected
     /// at boot.
     #[serde(default = "default_view_change_retransmit_interval")]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
     pub view_change_retransmit_interval: IggyDuration,
     /// Backstop for a stalled view change: one that does not conclude within
-    /// this window escalates to a fresh cluster-wide election. Must span
+    /// this window escalates to a fresh cluster-wide election. The window
+    /// starts once the replica wrote the new view to disk, and each view
+    /// change in a row doubles it, up to 16 times. Must span
     /// several `view_change_retransmit_interval`s so a few dropped view-change
     /// messages retransmit rather than escalate: boot rejects
     /// `view_change_status_timeout < MIN_STATUS_TO_RETRANSMIT_RATIO *
     /// view_change_retransmit_interval`. Zero (and the `0` / `disabled` /
     /// `unlimited` sentinels, which all parse to zero) is rejected at boot.
     #[serde(default = "default_view_change_status_timeout")]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
     pub view_change_status_timeout: IggyDuration,
     /// How often a recovering or view-change backup re-requests the current
@@ -256,7 +298,7 @@ pub struct ClusterConfig {
     /// consensus `RequestStartView` timer. Zero (and the `0` / `disabled` /
     /// `unlimited` sentinels, which all parse to zero) is rejected at boot.
     #[serde(default = "default_request_start_view_retransmit_interval")]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
     pub request_start_view_retransmit_interval: IggyDuration,
     /// How many consecutive unanswered `RequestStartView` probes a recovering
@@ -276,7 +318,7 @@ pub struct ClusterConfig {
     /// Paces streams that are already open only. How long a hole waits before a
     /// stream is opened for it is `repair_gap_debounce_interval`.
     #[serde(default = "default_repair_retry_interval")]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
     pub repair_retry_interval: IggyDuration,
     /// How long a backup must hold committed ops it cannot walk to before the
@@ -293,7 +335,7 @@ pub struct ClusterConfig {
     /// its value. Zero (and the `0` / `disabled` / `unlimited` sentinels, which
     /// all parse to zero) is rejected at boot.
     #[serde(default = "default_repair_gap_debounce_interval")]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
     pub repair_gap_debounce_interval: IggyDuration,
     /// Prepares a peer serves per repair round before the requester asks for
@@ -317,9 +359,16 @@ pub struct ClusterConfig {
     /// deadline; nonzero values below `MIN_SUPERBLOCK_WEDGED_FATAL_TIMEOUT` are
     /// rejected at boot.
     #[serde(default = "default_superblock_wedged_fatal_timeout")]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
     pub superblock_wedged_fatal_timeout: IggyDuration,
+    /// Replication factor of a topic created without one. The metadata primary
+    /// resolves it at admission and the topic stores the result, so nodes
+    /// configured differently only differ in what a create admitted through
+    /// them gets.
+    #[serde(default = "default_replication_factor")]
+    #[config_env(leaf)]
+    pub default_replication_factor: ReplicationFactorDefault,
     /// Full roster of cluster members. Intended to be byte-identical across
     /// every node so operators ship one config. The running node's identity
     /// is supplied out-of-band via the `--replica-id` CLI flag, which
@@ -343,28 +392,61 @@ pub struct ClusterConfig {
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 #[serde(deny_unknown_fields)]
 pub struct ClusterCoordinatorConfig {
-    /// When `total_shards > 1`, exclude shard 0 from replica placement.
-    /// Shard 0 already hosts the coordinator, the metadata writer, and both
-    /// listeners; replicas are long-lived steady flows, so offload them to
-    /// peer shards by default.
+    /// Keep replica links off shard 0 while the shard range of link 0 has
+    /// another shard. Shard 0 already hosts the coordinator, the metadata
+    /// writer, and both listeners; replica links are long-lived steady
+    /// flows, so offload them to peer shards by default.
     #[serde(default = "default_skip_shard_zero_for_replicas")]
     pub skip_shard_zero_for_replicas: bool,
+    /// TCP links to each peer replica, at most the shard count. Link `j`
+    /// carries the frames of the shards in range `j`, so more links spread
+    /// replication over more shards. Every node must run the same value:
+    /// the replica handshake refuses a peer that differs. Shard counts may
+    /// differ between nodes. A range with fewer shards than there are peers
+    /// puts links to two peers on one shard. With
+    /// `skip_shard_zero_for_replicas` on, range 0 keeps its links off shard
+    /// 0, so it needs one shard more than there are peers.
+    #[serde(default = "default_replica_connections_per_peer")]
+    pub replica_connections_per_peer: u16,
     /// When `total_shards > 1`, exclude shard 0 from client placement.
     /// Default false: client connections are short-lived and benefit from
     /// shard-0 parallelism more than replicas do.
     #[serde(default)]
     pub skip_shard_zero_for_clients: bool,
+    /// Place no partition on shard 0, so a stall of the metadata plane there
+    /// cannot stop the heartbeats of partition groups. Keep
+    /// `skip_shard_zero_for_replicas` on with it, or a replica link can still
+    /// sit on shard 0. With two shards every partition lands on shard 1. A
+    /// node with one shard refuses to start with this on, because no shard
+    /// would own a partition. Placement is recomputed at every boot and no
+    /// shard id is stored, so a restart may change this freely. Run the same
+    /// value on every node: a node that differs still routes correctly, but
+    /// frames between it and its peers can take an extra hop between shards,
+    /// as with differing shard counts. In both cases a peer can send
+    /// partition frames over link 0, and a node keeps that link on shard 0
+    /// when the shard range of the link holds only shard 0. Nodes with the
+    /// same shard count and the same value never do that. Older server
+    /// binaries reject a TOML config containing this key. Remove the key
+    /// before a rollback to one.
+    #[serde(default)]
+    pub skip_shard_zero_for_partitions: bool,
 }
 
 fn default_skip_shard_zero_for_replicas() -> bool {
     true
 }
 
+fn default_replica_connections_per_peer() -> u16 {
+    1
+}
+
 impl Default for ClusterCoordinatorConfig {
     fn default() -> Self {
         Self {
             skip_shard_zero_for_replicas: default_skip_shard_zero_for_replicas(),
+            replica_connections_per_peer: default_replica_connections_per_peer(),
             skip_shard_zero_for_clients: false,
+            skip_shard_zero_for_partitions: false,
         }
     }
 }
@@ -475,6 +557,11 @@ pub struct ClusterNodeConfig {
     /// `nodes.len()`. Validated by [`ClusterConfig::validate`].
     pub replica_id: u8,
     pub ports: TransportPorts,
+    /// Failure domain, such as a rack or an availability zone. Placement puts
+    /// a partition's copies in as many as it can. A node without one shares a
+    /// domain with no other node.
+    #[serde(default)]
+    pub rack: Option<String>,
 }
 
 /// One client-network-scoped advertised address: clients whose IP falls
@@ -790,6 +877,128 @@ impl fmt::Display for AdvertisedAddress {
     }
 }
 
+/// What a topic created without a replication factor gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicationFactorDefault {
+    /// Every node, the layout from before per-topic replication factors.
+    AllNodes,
+    /// This many nodes, lowered to the node count when larger.
+    Nodes(u8),
+}
+
+impl ReplicationFactorDefault {
+    /// Upper bound of [`Self::Nodes`], the most members a partition can have.
+    pub const MAX: u8 = 32;
+    const ALL_NODES: &'static str = "all";
+
+    /// The configured number of nodes, `None` for every node.
+    #[must_use]
+    pub const fn factor(self) -> Option<u8> {
+        match self {
+            Self::AllNodes => None,
+            Self::Nodes(factor) => Some(factor),
+        }
+    }
+
+    fn from_number(value: u64) -> Result<Self, ReplicationFactorDefaultError> {
+        u8::try_from(value)
+            .ok()
+            .filter(|factor| (1..=Self::MAX).contains(factor))
+            .map(Self::Nodes)
+            .ok_or_else(|| ReplicationFactorDefaultError {
+                value: value.to_string(),
+            })
+    }
+}
+
+impl FromStr for ReplicationFactorDefault {
+    type Err = ReplicationFactorDefaultError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.eq_ignore_ascii_case(Self::ALL_NODES) {
+            return Ok(Self::AllNodes);
+        }
+        value
+            .parse::<u64>()
+            .map_err(|_| ReplicationFactorDefaultError {
+                value: value.to_owned(),
+            })
+            .and_then(Self::from_number)
+    }
+}
+
+impl Serialize for ReplicationFactorDefault {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+/// Accepts a TOML integer as well as a string, because the environment
+/// provider turns a numeric `IGGY_CLUSTER_DEFAULT_REPLICATION_FACTOR` into one.
+impl<'de> Deserialize<'de> for ReplicationFactorDefault {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(ReplicationFactorDefaultVisitor)
+    }
+}
+
+struct ReplicationFactorDefaultVisitor;
+
+impl serde::de::Visitor<'_> for ReplicationFactorDefaultVisitor {
+    type Value = ReplicationFactorDefault;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "\"{}\" or an integer from 1 to {}",
+            ReplicationFactorDefault::ALL_NODES,
+            ReplicationFactorDefault::MAX
+        )
+    }
+
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        value.parse().map_err(E::custom)
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+        ReplicationFactorDefault::from_number(value).map_err(E::custom)
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+        u64::try_from(value)
+            .map_err(|_| E::custom(format!("invalid default_replication_factor {value}")))
+            .and_then(|value| self.visit_u64(value))
+    }
+}
+
+impl fmt::Display for ReplicationFactorDefault {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AllNodes => formatter.write_str(Self::ALL_NODES),
+            Self::Nodes(factor) => write!(formatter, "{factor}"),
+        }
+    }
+}
+
+/// A `default_replication_factor` that is neither `all` nor 1 to 32.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicationFactorDefaultError {
+    value: String,
+}
+
+impl fmt::Display for ReplicationFactorDefaultError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "invalid default_replication_factor {:?}: expected \"{}\" or 1 to {}",
+            self.value,
+            ReplicationFactorDefault::ALL_NODES,
+            ReplicationFactorDefault::MAX
+        )
+    }
+}
+
+impl std::error::Error for ReplicationFactorDefaultError {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdvertisedAddressError {
     Empty,
@@ -879,6 +1088,108 @@ pub fn http_forwarding_key_material<'a>(
         .map(String::as_str)
 }
 
+/// A broken rule of the Commit heartbeat schedule. `G`, `H_B`, `T_B`, `H_I` and
+/// `T_I` are `commit_heartbeat_grid`, `commit_busy_heartbeat_interval`,
+/// `commit_busy_heartbeat_timeout`, `commit_idle_heartbeat_interval` and
+/// `commit_idle_heartbeat_timeout`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeartbeatRule {
+    /// `G` is a whole multiple of the 10 ms shard tick.
+    GridIsTickMultiple,
+    /// `H_B = m * G` with a natural `m >= 1`.
+    BusyIntervalIsGridMultiple,
+    /// `T_B >= max(2s, 4 * H_B)`.
+    BusyTimeoutSpansBusyHeartbeats,
+    /// `H_I = k * H_B` with a natural `k >= 1`.
+    IdleIntervalIsBusyMultiple,
+    /// `max(T_I, T_B) >= 4 * H_I`.
+    IdleWaitSpansIdleHeartbeats,
+    /// `T_B >= 4 * H_I`.
+    QuorumWindowSpansIdleHeartbeats,
+    /// `max(T_B, T_I) <= u32::MAX` ms. The rules above make `T_B` the largest
+    /// of `G`, `H_B`, `H_I` and `T_B`, so all five fit the handshake.
+    TimeoutsFitHandshake,
+}
+
+impl fmt::Display for HeartbeatRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let rule = match self {
+            Self::GridIsTickMultiple => {
+                "rule grid_is_tick_multiple: cluster.commit_heartbeat_grid must be a nonzero \
+                 whole multiple of the 10ms shard tick"
+            }
+            Self::BusyIntervalIsGridMultiple => {
+                "rule busy_interval_is_grid_multiple: cluster.commit_busy_heartbeat_interval \
+                 must be a nonzero whole multiple of cluster.commit_heartbeat_grid"
+            }
+            Self::BusyTimeoutSpansBusyHeartbeats => {
+                "rule busy_timeout_spans_busy_heartbeats: cluster.commit_busy_heartbeat_timeout \
+                 must be at least 2s and at least 4x cluster.commit_busy_heartbeat_interval"
+            }
+            Self::IdleIntervalIsBusyMultiple => {
+                "rule idle_interval_is_busy_multiple: cluster.commit_idle_heartbeat_interval \
+                 must be a nonzero whole multiple of cluster.commit_busy_heartbeat_interval"
+            }
+            Self::IdleWaitSpansIdleHeartbeats => {
+                "rule idle_wait_spans_idle_heartbeats: the larger of \
+                 cluster.commit_idle_heartbeat_timeout and cluster.commit_busy_heartbeat_timeout \
+                 must be at least 4x cluster.commit_idle_heartbeat_interval"
+            }
+            Self::QuorumWindowSpansIdleHeartbeats => {
+                "rule quorum_window_spans_idle_heartbeats: \
+                 cluster.commit_busy_heartbeat_timeout must be at least 4x \
+                 cluster.commit_idle_heartbeat_interval"
+            }
+            Self::TimeoutsFitHandshake => {
+                "rule timeouts_fit_handshake: cluster.commit_busy_heartbeat_timeout and \
+                 cluster.commit_idle_heartbeat_timeout must be at most 4294967295ms (about 49.7 \
+                 days), the largest value the replica handshake carries"
+            }
+        };
+        f.write_str(rule)
+    }
+}
+
+/// Whether `value` is a nonzero whole multiple of `unit`.
+fn is_whole_multiple(value: Duration, unit: Duration) -> bool {
+    !value.is_zero() && !unit.is_zero() && value.as_nanos().is_multiple_of(unit.as_nanos())
+}
+
+impl ClusterConfig {
+    /// The first rule of the Commit heartbeat schedule these values break.
+    #[must_use]
+    pub fn heartbeat_schedule_violation(&self) -> Option<HeartbeatRule> {
+        let grid = self.commit_heartbeat_grid.get_duration();
+        let busy_interval = self.commit_busy_heartbeat_interval.get_duration();
+        let busy_timeout = self.commit_busy_heartbeat_timeout.get_duration();
+        let idle_interval = self.commit_idle_heartbeat_interval.get_duration();
+        let idle_timeout = self.commit_idle_heartbeat_timeout.get_duration();
+        let four = |interval: Duration| interval.saturating_mul(HEARTBEATS_PER_TIMEOUT_MIN);
+        if !is_whole_multiple(grid, CONSENSUS_TICK) {
+            return Some(HeartbeatRule::GridIsTickMultiple);
+        }
+        if !is_whole_multiple(busy_interval, grid) {
+            return Some(HeartbeatRule::BusyIntervalIsGridMultiple);
+        }
+        if busy_timeout < MIN_CLUSTER_HEARTBEAT_TIMEOUT.max(four(busy_interval)) {
+            return Some(HeartbeatRule::BusyTimeoutSpansBusyHeartbeats);
+        }
+        if !is_whole_multiple(idle_interval, busy_interval) {
+            return Some(HeartbeatRule::IdleIntervalIsBusyMultiple);
+        }
+        if idle_timeout.max(busy_timeout) < four(idle_interval) {
+            return Some(HeartbeatRule::IdleWaitSpansIdleHeartbeats);
+        }
+        if busy_timeout < four(idle_interval) {
+            return Some(HeartbeatRule::QuorumWindowSpansIdleHeartbeats);
+        }
+        if busy_timeout.max(idle_timeout) > MAX_CLUSTER_HEARTBEAT_TIMEOUT {
+            return Some(HeartbeatRule::TimeoutsFitHandshake);
+        }
+        None
+    }
+}
+
 impl Validatable<ConfigurationError> for ClusterConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
         // Ahead of the enabled gate: the top-level rule against
@@ -923,52 +1234,16 @@ impl Validatable<ConfigurationError> for ClusterConfig {
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
-        // `0` / `disabled` / `unlimited` all parse to a zero duration and
-        // land here too: there is no way to switch the liveness window off.
-        if self.heartbeat_timeout.get_duration() < MIN_CLUSTER_HEARTBEAT_TIMEOUT {
-            eprintln!(
-                "Invalid cluster configuration: cluster.heartbeat_timeout '{}' must be at least {}s \
-                 (the primary signals liveness through its commit broadcast; a shorter window \
-                 elects on every scheduling hiccup)",
-                self.heartbeat_timeout,
-                MIN_CLUSTER_HEARTBEAT_TIMEOUT.as_secs()
-            );
+        if let Some(rule) = self.heartbeat_schedule_violation() {
+            eprintln!("Invalid cluster configuration: {rule}");
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
-
-        // The commit broadcast is the cluster's liveness feed and the prepare
-        // retransmit its recovery timer; both size consensus timers that have
-        // to advance. `0` / `disabled` / `unlimited` all collapse to a zero
-        // duration, which would stall the timer - reject them.
-        if self.commit_broadcast_interval.get_duration().is_zero() {
-            eprintln!(
-                "Invalid cluster configuration: cluster.commit_broadcast_interval must be nonzero \
-                 (it drives the primary's liveness broadcast)"
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
+        // `0`, `disabled` and `unlimited` all parse to zero. A zero interval
+        // stops the prepare retransmit timer.
         if self.prepare_retransmit_interval.get_duration().is_zero() {
             eprintln!(
                 "Invalid cluster configuration: cluster.prepare_retransmit_interval must be \
                  nonzero (it drives prepare retransmission)"
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        // The liveness window must span several commit broadcasts so a single
-        // delayed broadcast never trips a view change on a healthy primary.
-        let min_heartbeat = self
-            .commit_broadcast_interval
-            .get_duration()
-            .saturating_mul(MIN_HEARTBEAT_TO_COMMIT_BROADCAST_RATIO);
-        if self.heartbeat_timeout.get_duration() < min_heartbeat {
-            eprintln!(
-                "Invalid cluster configuration: cluster.heartbeat_timeout '{}' must be at least \
-                 {}x cluster.commit_broadcast_interval '{}' so the liveness window spans several \
-                 broadcasts",
-                self.heartbeat_timeout,
-                MIN_HEARTBEAT_TO_COMMIT_BROADCAST_RATIO,
-                self.commit_broadcast_interval
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
@@ -1067,6 +1342,14 @@ impl Validatable<ConfigurationError> for ClusterConfig {
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
+        if self.nodes.len() > MAX_CLUSTER_REPLICAS {
+            eprintln!(
+                "Invalid cluster configuration: cluster.nodes contains {} replicas, but the VSR implementation supports at most {MAX_CLUSTER_REPLICAS}",
+                self.nodes.len()
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
         // VSR needs every replica to have a stable, unique id strictly
         // less than the total replica count. Duplicate ids would split the
         // cluster into two replicas claiming the same slot; out-of-range
@@ -1076,6 +1359,28 @@ impl Validatable<ConfigurationError> for ClusterConfig {
             eprintln!("Invalid cluster configuration: more than 255 replicas is unsupported");
             ConfigurationError::InvalidConfigurationValue
         })?;
+
+        // Placement treats a node without a rack as alone in one, so a single
+        // unlabeled node would take a copy of nearly every partition. Kafka
+        // likewise refuses a rack-aware assignment when only some brokers set
+        // `broker.rack`.
+        let racked = self.nodes.iter().filter(|node| node.rack.is_some()).count();
+        if racked != 0 && racked != self.nodes.len() {
+            eprintln!(
+                "Invalid cluster configuration: {racked} of {} nodes set 'rack'; set it on every \
+                 node or on none",
+                self.nodes.len()
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.nodes.iter().any(|node| {
+            node.rack
+                .as_deref()
+                .is_some_and(|rack| rack.trim().is_empty())
+        }) {
+            eprintln!("Invalid cluster configuration: a node's 'rack' cannot be empty");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
 
         let mut seen_ids = std::collections::HashSet::new();
         let mut seen_names = std::collections::HashSet::new();
@@ -1512,14 +1817,18 @@ mod tests {
         let config = ClusterConfig {
             enabled: true,
             name: "iggy-cluster".to_owned(),
-            heartbeat_timeout: default_heartbeat_timeout(),
-            commit_broadcast_interval: default_commit_broadcast_interval(),
+            commit_heartbeat_grid: default_commit_heartbeat_grid(),
+            commit_busy_heartbeat_interval: default_commit_busy_heartbeat_interval(),
+            commit_busy_heartbeat_timeout: default_commit_busy_heartbeat_timeout(),
+            commit_idle_heartbeat_interval: default_commit_idle_heartbeat_interval(),
+            commit_idle_heartbeat_timeout: default_commit_idle_heartbeat_timeout(),
             prepare_retransmit_interval: default_prepare_retransmit_interval(),
             view_change_retransmit_interval: default_view_change_retransmit_interval(),
             view_change_status_timeout: default_view_change_status_timeout(),
             request_start_view_retransmit_interval: default_request_start_view_retransmit_interval(
             ),
             view_probe_attempts_max: default_view_probe_attempts_max(),
+            default_replication_factor: default_replication_factor(),
             repair_retry_interval: default_repair_retry_interval(),
             repair_gap_debounce_interval: default_repair_gap_debounce_interval(),
             repair_chunk_max: default_repair_chunk_max(),
@@ -1729,6 +2038,7 @@ mod advertised_for_tests {
 
     fn node_with_selectors(selectors: Vec<AdvertisedAddressSelector>) -> ClusterNodeConfig {
         ClusterNodeConfig {
+            rack: None,
             name: "node-0".to_owned(),
             ip: "10.0.1.5".to_owned(),
             advertised_address: Some("203.0.113.10".to_owned()),
@@ -1919,6 +2229,7 @@ mod cluster_validate_tests {
 
     fn node(name: &str, id: u8) -> ClusterNodeConfig {
         ClusterNodeConfig {
+            rack: None,
             name: name.to_string(),
             ip: "127.0.0.1".to_string(),
             advertised_address: None,
@@ -1939,14 +2250,18 @@ mod cluster_validate_tests {
         ClusterConfig {
             enabled: true,
             name: "iggy-cluster".to_string(),
-            heartbeat_timeout: default_heartbeat_timeout(),
-            commit_broadcast_interval: default_commit_broadcast_interval(),
+            commit_heartbeat_grid: default_commit_heartbeat_grid(),
+            commit_busy_heartbeat_interval: default_commit_busy_heartbeat_interval(),
+            commit_busy_heartbeat_timeout: default_commit_busy_heartbeat_timeout(),
+            commit_idle_heartbeat_interval: default_commit_idle_heartbeat_interval(),
+            commit_idle_heartbeat_timeout: default_commit_idle_heartbeat_timeout(),
             prepare_retransmit_interval: default_prepare_retransmit_interval(),
             view_change_retransmit_interval: default_view_change_retransmit_interval(),
             view_change_status_timeout: default_view_change_status_timeout(),
             request_start_view_retransmit_interval: default_request_start_view_retransmit_interval(
             ),
             view_probe_attempts_max: default_view_probe_attempts_max(),
+            default_replication_factor: default_replication_factor(),
             repair_retry_interval: default_repair_retry_interval(),
             repair_gap_debounce_interval: default_repair_gap_debounce_interval(),
             repair_chunk_max: default_repair_chunk_max(),
@@ -1992,24 +2307,115 @@ mod cluster_validate_tests {
         assert_eq!(material(&jwt("enc", "dec"), &cluster), None);
     }
 
-    #[test]
-    fn validate_rejects_sub_minimum_heartbeat_timeout() {
+    fn schedule(
+        grid_ms: u64,
+        busy_interval_ms: u64,
+        busy_timeout_ms: u64,
+        idle_interval_ms: u64,
+        idle_timeout_ms: u64,
+    ) -> ClusterConfig {
+        let ms = |value| IggyDuration::new(Duration::from_millis(value));
         let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
-        c.heartbeat_timeout = IggyDuration::new(Duration::from_millis(500));
-        assert!(c.validate().is_err());
-        // The "disabled" / "unlimited" sentinels collapse to zero and must
-        // be rejected the same way.
-        c.heartbeat_timeout = IggyDuration::new(Duration::ZERO);
-        assert!(c.validate().is_err());
+        c.commit_heartbeat_grid = ms(grid_ms);
+        c.commit_busy_heartbeat_interval = ms(busy_interval_ms);
+        c.commit_busy_heartbeat_timeout = ms(busy_timeout_ms);
+        c.commit_idle_heartbeat_interval = ms(idle_interval_ms);
+        c.commit_idle_heartbeat_timeout = ms(idle_timeout_ms);
+        c
     }
 
     #[test]
-    fn validate_rejects_zero_commit_broadcast_interval() {
-        // `0` / `disabled` / `unlimited` all collapse to zero and stall the
-        // liveness broadcast.
-        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
-        c.commit_broadcast_interval = IggyDuration::new(Duration::ZERO);
-        assert!(c.validate().is_err());
+    fn given_default_heartbeat_schedule_when_validating_should_pass_every_rule() {
+        let c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        assert_eq!(c.heartbeat_schedule_violation(), None);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn given_nearest_heartbeat_values_when_validating_should_accept_passing_and_name_failing_rule()
+    {
+        use HeartbeatRule::{
+            BusyIntervalIsGridMultiple, BusyTimeoutSpansBusyHeartbeats, GridIsTickMultiple,
+            IdleIntervalIsBusyMultiple, IdleWaitSpansIdleHeartbeats,
+            QuorumWindowSpansIdleHeartbeats, TimeoutsFitHandshake,
+        };
+        // (passing values, failing values, rule the failing values break)
+        let cases = [
+            (
+                schedule(10, 500, 5000, 1000, 12000),
+                schedule(15, 500, 5000, 1000, 12000),
+                GridIsTickMultiple,
+            ),
+            (
+                schedule(10, 500, 5000, 1000, 12000),
+                schedule(0, 500, 5000, 1000, 12000),
+                GridIsTickMultiple,
+            ),
+            // m = 1 passes, m = 0 and m = 1.5 fail.
+            (
+                schedule(100, 100, 2000, 500, 12000),
+                schedule(100, 0, 2000, 500, 12000),
+                BusyIntervalIsGridMultiple,
+            ),
+            (
+                schedule(100, 100, 2000, 500, 12000),
+                schedule(100, 150, 2000, 450, 12000),
+                BusyIntervalIsGridMultiple,
+            ),
+            // T_B = max(2s, 4 H_B) passes, one tick less fails.
+            (
+                schedule(100, 500, 2000, 500, 2000),
+                schedule(100, 500, 1990, 500, 2000),
+                BusyTimeoutSpansBusyHeartbeats,
+            ),
+            (
+                schedule(100, 1000, 4000, 1000, 4000),
+                schedule(100, 1000, 3990, 1000, 4000),
+                BusyTimeoutSpansBusyHeartbeats,
+            ),
+            // k = 1 passes, k = 0 and k = 1.5 fail.
+            (
+                schedule(100, 500, 5000, 500, 12000),
+                schedule(100, 500, 5000, 0, 12000),
+                IdleIntervalIsBusyMultiple,
+            ),
+            (
+                schedule(100, 500, 5000, 1000, 12000),
+                schedule(100, 500, 5000, 750, 12000),
+                IdleIntervalIsBusyMultiple,
+            ),
+            // max(T_I, T_B) = 4 H_I passes, one tick less fails.
+            (
+                schedule(100, 500, 2000, 500, 2000),
+                schedule(100, 500, 2000, 1000, 3990),
+                IdleWaitSpansIdleHeartbeats,
+            ),
+            // T_B = 4 H_I passes, one tick less fails, with T_I large enough.
+            (
+                schedule(100, 500, 4000, 1000, 12000),
+                schedule(100, 500, 3990, 1000, 12000),
+                QuorumWindowSpansIdleHeartbeats,
+            ),
+            // u32::MAX ms passes, one millisecond more fails, for T_B and T_I.
+            (
+                schedule(100, 500, 4_294_967_295, 1000, 12000),
+                schedule(100, 500, 4_294_967_296, 1000, 12000),
+                TimeoutsFitHandshake,
+            ),
+            (
+                schedule(100, 500, 5000, 1000, 4_294_967_295),
+                schedule(100, 500, 5000, 1000, 4_294_967_296),
+                TimeoutsFitHandshake,
+            ),
+        ];
+        for (passing, failing, rule) in cases {
+            assert_eq!(passing.heartbeat_schedule_violation(), None, "{rule:?}");
+            assert!(passing.validate().is_ok(), "{rule:?}");
+            assert_eq!(failing.heartbeat_schedule_violation(), Some(rule));
+            assert!(failing.validate().is_err(), "{rule:?}");
+            let message = rule.to_string();
+            assert!(message.starts_with("rule "), "{message}");
+        }
     }
 
     #[test]
@@ -2017,25 +2423,6 @@ mod cluster_validate_tests {
         let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
         c.prepare_retransmit_interval = IggyDuration::new(Duration::ZERO);
         assert!(c.validate().is_err());
-    }
-
-    #[test]
-    fn validate_rejects_heartbeat_below_commit_broadcast_ratio() {
-        // 3s clears the absolute 2s floor but is still < 4x the 1s broadcast,
-        // so the ratio rule is what rejects here, not the floor.
-        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
-        c.heartbeat_timeout = IggyDuration::new(Duration::from_secs(3));
-        c.commit_broadcast_interval = IggyDuration::new(Duration::from_secs(1));
-        assert!(c.validate().is_err());
-    }
-
-    #[test]
-    fn validate_accepts_heartbeat_at_commit_broadcast_ratio() {
-        // Exactly 4x the broadcast (and above the 2s floor) must pass.
-        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
-        c.heartbeat_timeout = IggyDuration::new(Duration::from_secs(4));
-        c.commit_broadcast_interval = IggyDuration::new(Duration::from_secs(1));
-        assert!(c.validate().is_ok());
     }
 
     #[test]
@@ -2078,6 +2465,50 @@ mod cluster_validate_tests {
         c.view_change_retransmit_interval = IggyDuration::new(Duration::from_secs(1));
         c.view_change_status_timeout = IggyDuration::new(Duration::from_secs(4));
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn given_default_replication_factor_text_when_parsing_should_accept_all_or_one_to_thirty_two() {
+        assert_eq!("all".parse(), Ok(ReplicationFactorDefault::AllNodes));
+        assert_eq!("ALL".parse(), Ok(ReplicationFactorDefault::AllNodes));
+        assert_eq!("3".parse(), Ok(ReplicationFactorDefault::Nodes(3)));
+        assert_eq!("32".parse(), Ok(ReplicationFactorDefault::Nodes(32)));
+        for invalid in ["0", "33", "-1", "three", ""] {
+            assert!(
+                invalid.parse::<ReplicationFactorDefault>().is_err(),
+                "{invalid:?}"
+            );
+        }
+        for value in [
+            ReplicationFactorDefault::AllNodes,
+            ReplicationFactorDefault::Nodes(7),
+        ] {
+            assert_eq!(value.to_string().parse(), Ok(value));
+        }
+        assert_eq!(
+            ClusterConfig::default().default_replication_factor,
+            ReplicationFactorDefault::AllNodes,
+            "the shipped default keeps every partition on every node"
+        );
+    }
+
+    #[test]
+    fn given_default_replication_factor_as_integer_or_string_when_deserializing_should_accept_both()
+    {
+        let parse = |text: &str| serde_json::from_str::<ReplicationFactorDefault>(text);
+        assert_eq!(parse("2").unwrap(), ReplicationFactorDefault::Nodes(2));
+        assert_eq!(parse("\"2\"").unwrap(), ReplicationFactorDefault::Nodes(2));
+        assert_eq!(
+            parse("\"all\"").unwrap(),
+            ReplicationFactorDefault::AllNodes
+        );
+        for invalid in ["0", "-1", "33", "\"none\""] {
+            assert!(parse(invalid).is_err(), "{invalid}");
+        }
+        assert_eq!(
+            serde_json::to_string(&ReplicationFactorDefault::Nodes(2)).unwrap(),
+            "\"2\""
+        );
     }
 
     #[test]
@@ -2156,6 +2587,30 @@ mod cluster_validate_tests {
     }
 
     #[test]
+    fn validate_requires_a_rack_on_every_node_or_on_none() {
+        let racked = |name: &str, id: u8, rack: Option<&str>| ClusterNodeConfig {
+            rack: rack.map(str::to_owned),
+            ..node(name, id)
+        };
+        assert!(
+            cfg(vec![racked("n1", 0, Some("a")), racked("n2", 1, None)])
+                .validate()
+                .is_err()
+        );
+        assert!(
+            cfg(vec![racked("n1", 0, Some("a")), racked("n2", 1, Some(" "))])
+                .validate()
+                .is_err()
+        );
+        assert!(
+            cfg(vec![racked("n1", 0, Some("a")), racked("n2", 1, Some("b"))])
+                .validate()
+                .is_ok()
+        );
+        assert!(cfg(vec![node("n1", 0), node("n2", 1)]).validate().is_ok());
+    }
+
+    #[test]
     fn validate_rejects_duplicate_names() {
         let c = cfg(vec![node("n1", 0), node("n1", 1)]);
         assert!(c.validate().is_err());
@@ -2211,6 +2666,18 @@ mod cluster_validate_tests {
     fn validate_accepts_unique_contiguous_replica_ids() {
         let c = cfg(vec![node("n1", 0), node("n2", 1), node("n3", 2)]);
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_the_vsr_replica_limit() {
+        let nodes = (0..32).map(|id| node(&format!("n{id}"), id)).collect();
+        assert!(cfg(nodes).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_rosters_above_the_vsr_replica_limit() {
+        let nodes = (0..33).map(|id| node(&format!("n{id}"), id)).collect();
+        assert!(cfg(nodes).validate().is_err());
     }
 
     #[test]

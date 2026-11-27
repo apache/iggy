@@ -78,6 +78,7 @@ import static org.apache.iggy.client.async.AsyncClientIntegrationTest.clientChan
 import static org.apache.iggy.client.async.AsyncClientIntegrationTest.field;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientEventLoopGroupTest.await;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.assertServerError;
+import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.clusterMetadata;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.emptyPoll;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.registerBody;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.serve;
@@ -100,6 +101,8 @@ class AsyncIggyTcpClientSessionRulesTest {
     private static final Duration QUEUE_TIME = Duration.ofMillis(200);
     private static final long FIRST_SESSION = 42;
     private static final int EVICTION_NO_SESSION = 1;
+    // The reason of the eviction that the server sends for a Register on a link that another session holds.
+    private static final int EVICTION_SESSION_ERROR = 12;
     private static final int DELETE_STREAM_CODE = CommandCode.Stream.DELETE.getValue();
     // Stream 1 as a numeric identifier.
     private static final byte[] DELETE_STREAM_BODY = {1, 4, 1, 0, 0, 0};
@@ -225,6 +228,73 @@ class AsyncIggyTcpClientSessionRulesTest {
                 client.close().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
             }
             assertThat(server).isNotCompletedExceptionally();
+        }
+    }
+
+    /**
+     * The caller signs in again while the router still binds the session on a replica. The sign-in ends that bind
+     * with a local 40, but the server still holds the session. So the client logs out of it before the Register, and
+     * sends no Register on the link that the server keeps bound.
+     */
+    @Test
+    void shouldLogOutBeforeTheRegisterWhenASignInEndsABindOnAReplica() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        try (ServerSocket leaderSocket = new ServerSocket(0, 4, loopback);
+                ServerSocket replicaSocket = new ServerSocket(0, 4, loopback)) {
+            Supplier<ByteBuf> roster = () -> clusterMetadata(
+                    leaderSocket.getLocalPort(), replicaSocket.getLocalPort(), leaderSocket.getLocalPort());
+            Function<Request, Response> answer =
+                    request -> request.commandCode() == CommandCode.System.GET_CLUSTER_METADATA.getValue()
+                            ? Response.success(VsrOperation.NON_REPLICATED, roster.get())
+                            : Response.success(request.operation(), Unpooled.EMPTY_BUFFER);
+            AtomicInteger registers = new AtomicInteger();
+            AtomicReference<Request> boundBy = new AtomicReference<>();
+            List<Request> signIns = new CopyOnWriteArrayList<>();
+            MockNode leader = MockNode.serve(leaderSocket, request -> {
+                if (request.operation() == VsrOperation.REGISTER) {
+                    signIns.add(request);
+                    // Like the server, the leader evicts a Register of another client on a bound link.
+                    Request bound = boundBy.get();
+                    if (bound != null
+                            && (bound.clientLow() != request.clientLow()
+                                    || bound.clientHigh() != request.clientHigh())) {
+                        return Response.eviction(EVICTION_SESSION_ERROR);
+                    }
+                    boundBy.set(request);
+                    return Response.success(
+                            VsrOperation.REGISTER, registerBody(FIRST_SESSION + registers.getAndIncrement()));
+                }
+                if (request.operation() == VsrOperation.LOGOUT) {
+                    signIns.add(request);
+                    boundBy.set(null);
+                    return Response.success(VsrOperation.LOGOUT, Unpooled.EMPTY_BUFFER);
+                }
+                return answer.apply(request);
+            });
+            MockNode replica = MockNode.serve(replicaSocket, answer::apply);
+            replica.bindingHold = new CompletableFuture<>();
+            AsyncIggyTcpClient client = client(leaderSocket);
+            try {
+                client.connect().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                client.users().login("alice", "alice-password").get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                await(() -> replica.bindings.get() > 0, "the bind on the replica", Duration.ofSeconds(TIMEOUT_SECONDS));
+
+                client.users().login("bob", "bob-password").get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                client.sendBinaryRequest(GET_STATS_CODE, new byte[0]).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+                assertThat(signIns)
+                        .extracting(Request::operation)
+                        .as("the Registers and logouts on the leader")
+                        .containsExactly(VsrOperation.REGISTER, VsrOperation.LOGOUT, VsrOperation.REGISTER);
+                assertThat(signIns.get(1).clientLow())
+                        .as("the client id of the logout")
+                        .isEqualTo(signIns.get(0).clientLow());
+            } finally {
+                replica.bindingHold.complete(null);
+                client.close().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                leader.close();
+                replica.close();
+            }
         }
     }
 
@@ -1168,7 +1238,8 @@ class AsyncIggyTcpClientSessionRulesTest {
                     false,
                     Optional.empty(),
                     Optional.empty(),
-                    AsyncTcpConnection.DEFAULT_IO_THREADS);
+                    AsyncTcpConnection.DEFAULT_IO_THREADS,
+                    EventLoopShutdown.resolve(null, null));
         }
 
         @Override

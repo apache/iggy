@@ -111,6 +111,18 @@ func TestFeatures(t *testing.T) {
 		})
 	}
 
+	if feature == "all" || feature == "deferred_polling" {
+		suites = append(suites, godog.TestSuite{
+			ScenarioInitializer: initDeferredPollingScenario,
+			Options: &godog.Options{
+				Format:   "pretty",
+				Paths:    []string{"../../scenarios/deferred_polling.feature"},
+				Strict:   true,
+				TestingT: t,
+			},
+		})
+	}
+
 	if len(suites) == 0 {
 		t.Fatalf("unknown BDD_FEATURE=%q", feature)
 	}

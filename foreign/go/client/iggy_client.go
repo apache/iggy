@@ -63,6 +63,9 @@ func WithLogger(logger *slog.Logger) Option {
 
 type IggyClient struct{ iggcon.Client }
 
+// Unwrap is the client of the protocol, which a reader.PartitionReader reads through.
+func (c *IggyClient) Unwrap() iggcon.Client { return c.Client }
+
 // NewIggyClient creates the IggyClient instance without connecting.
 // Call Connect to establish the connection to the server.
 // If no Option is provided, NewIggyClient will create a default TCP client.

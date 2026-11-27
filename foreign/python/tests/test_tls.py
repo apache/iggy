@@ -30,6 +30,7 @@ Requirements:
       docker build -f core/server/Dockerfile --target runtime-prebuilt \
         --build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server \
         --build-arg PREBUILT_IGGY_CLI=target/debug/iggy \
+        --build-arg LICENSE_STAGE=license-skip \
         -t iggy-server:local .
 """
 
@@ -41,11 +42,13 @@ from testcontainers.core.container import DockerContainer
 from testcontainers.core.waiting_utils import wait_for_logs
 
 from apache_iggy import (
+    CommitPolicy,
     Consumer,
     IggyClient,
     MetadataChangeGroup,
     MetadataChangeKind,
     PollingStrategy,
+    PollOptions,
 )
 from apache_iggy import SendMessage as Message
 
@@ -154,20 +157,19 @@ class TestTlsConnectivity:
 
         # Consume messages
         polled = await tls_client.poll_messages(
-            stream=stream_name,
-            topic=topic_name,
+            stream_name,
+            topic_name,
             consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
-            count=10,
-            auto_commit=True,
+            options=PollOptions(count=10, commit=CommitPolicy.OnRead()),
         )
-        assert len(polled) >= len(test_messages)
+        assert len(polled.messages) >= len(test_messages)
 
         # Verify message payloads
         for i, expected_msg in enumerate(test_messages):
-            if i < len(polled):
-                assert polled[i].payload().decode("utf-8") == expected_msg
+            if i < len(polled.messages):
+                assert polled.messages[i].payload().decode("utf-8") == expected_msg
 
     @pytest.mark.asyncio
     async def test_follow_metadata_changes_over_tls(

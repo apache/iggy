@@ -42,6 +42,46 @@ mod poll_semantics_vsr;
 mod topic_admission_vsr;
 // Stats aggregates the cross-shard connected-client count, not a hardcoded 0.
 mod stats_vsr;
+// A geo topic on the `fs` object store: its sends reach the store before they
+// commit, and it keeps its partitions and options.
+mod geo_topic_fs;
+// Geo peers: two verified fs peers and one whose store refuses connections,
+// against a server that keeps serving and writes nothing to a peer.
+mod geo_peers;
+// Two clusters on fs: a peer's geo topic appears as a shadow stream, refuses
+// every client write, goes stale with the peer's store, and leaves after its
+// delete.
+mod geo_shadow_fs;
+// Two clusters on fs that read each other's bucket: both take sends to the
+// same geo topic, adopt each other's, stop and return, delete it, and never
+// write to the other's bucket.
+mod geo_two_clusters_fs;
+// Two clusters on fs: a retired origin's bucket takes only the reads of
+// polls, and its shadow topics expire by their own retention.
+mod geo_retire_origin_fs;
+// A consumer of a shadow topic reads a message once a manifest of the peer
+// lists it, seconds behind, and the peer's bucket gets only the listings and
+// reads of its manifests.
+mod geo_shadow_follow_fs;
+// A consumer group that moves between two clusters on fs resumes from about
+// where it stopped, exactly after a drain, and keeps a move backwards.
+mod geo_positions_fs;
+// One group reads a geo topic with its shadow topics through the SDK's geo
+// consumer: every message once with its origin, a shadow topic that appears
+// later, and a move to the other cluster that resumes each log.
+mod geo_consumer_fs;
+// A geo topic whose object store goes down: its sends are refused as
+// retryable, a normal topic keeps serving, and nothing refused is stored.
+mod geo_mode_faults_fs;
+// The geo topic scenarios on the `s3` backend, against Floci.
+mod geo_mode_faults_s3;
+pub(crate) mod tiered_storage_fs;
+// The sweep of the store root for the objects of deleted partitions.
+mod tiered_storage_orphans_fs;
+// A server on the `gcs` backend, against fake-gcs-server: the claim, a geo
+// topic read back from its long-term segments, and both token sources.
+mod tiered_storage_gcs;
+mod tiered_storage_s3;
 // /metrics carries per-topic size and message count.
 mod topic_metrics_vsr;
 // Shared HTTP transport plumbing (session + verb helpers) for the raw-HTTP
@@ -49,6 +89,8 @@ mod topic_metrics_vsr;
 pub(crate) mod http_client;
 // Raw-HTTP data-plane contract against the server's shard-0 listener.
 mod http_vsr;
+// Raw-HTTP page keys of the list routes.
+mod http_list_pages;
 // Raw-HTTP wire-contract residue against the server (status codes + typed error
 // bodies); the RBAC matrix lives in permissions_scenario.
 mod http_rbac;
@@ -81,10 +123,17 @@ mod concurrent_addition;
 // The node-wide cap on client sockets closes a socket past it at accept.
 mod connections_limit_vsr;
 mod consumer_offset_quota_vsr;
+mod consumer_offset_recovery;
 // A write that runs out of file descriptors flushes, then exits with status 4.
 mod descriptor_exhaustion_vsr;
+// The disk usage estimate stays within a stated bound of statvfs, and a
+// sample picks up writes the server cannot charge.
+mod disk_usage;
 mod general;
+// Boot gives every shard its share of the node repair ring budget, and the
+// shard tick reports it.
 mod partitions_limit_vsr;
+mod repair_ring_budget;
 // The expired-token cleaner deletes under the reserved client id, and later
 // writes must still commit behind that delete.
 mod personal_access_token_cleaner_vsr;
@@ -95,6 +144,12 @@ mod message_retrieval;
 // The full restart matrix (consumer variants included) runs under the server:
 // a restarted replica rejoins via the view probe + journal repair.
 mod delete_segments;
+mod external_auth;
 pub(crate) mod scenarios;
+// Stream and topic lists return exactly the entries the caller may read.
+mod scoped_lists;
+// A password change, a deactivation and a token delete or expiry end exactly
+// the sessions and tokens they revoke, on every transport.
+mod credential_revocation;
 mod specific;
 mod telemetry;

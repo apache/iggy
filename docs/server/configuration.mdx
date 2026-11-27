@@ -1,0 +1,529 @@
+---
+title: Configuration
+description: "The server's TOML configuration, how a file is merged over the embedded defaults, and what each section controls."
+---
+
+The server reads a single TOML file. A copy of [`core/server/config.toml`](https://github.com/apache/iggy/blob/server-0.10.0/core/server/config.toml) is embedded into the binary and serves as the default configuration, so the server boots with working defaults even without any file on disk. The embedded file is commented throughout and is the authoritative reference for the exact version you're running.
+
+A config file doesn't have to be complete. It is **merged over the embedded defaults**, so a minimal file overrides only what it names:
+
+```toml
+path = "/var/lib/iggy"
+
+[node]
+advertised_address = "iggy-1"
+
+[tcp]
+address = "0.0.0.0:8090"
+
+[http]
+address = "0.0.0.0:3000"
+```
+
+Both listeners here bind a wildcard, which tells the server nothing about where clients reach it, so [`[node]`](#node) has to name that address explicitly - without it this file is refused at boot.
+
+Host and kernel settings are configured separately from the server TOML. See [Linux tuning](/docs/server/linux-tuning) for service limits, memory policies, huge pages, CPU placement, and validation before deployment.
+
+## How configuration loads
+
+Configuration is resolved in three layers. Later layers win:
+
+1. **Embedded defaults**: the `config.toml` compiled into the binary.
+2. **Config file**: the path in `IGGY_CONFIG_PATH`, or `core/server/config.toml` resolved against the current working directory. A missing file is only a warning. The server continues on embedded defaults.
+3. **Environment variables**: any `IGGY_`-prefixed override.
+
+Before the environment is read, the server loads a `.env` file from the working directory or its parents, or from the path named by `IGGY_ENV_PATH`. Existing environment values take precedence over the `.env` file.
+
+After boot the server writes the effective configuration, including the addresses it actually bound, to `{path}/runtime/current_config.toml` with the default runtime subdirectory.
+
+### Environment variables
+
+Every configuration key can be overridden with an `IGGY_` variable. The name is the TOML path, uppercased, with dots turned into underscores:
+
+```bash
+export IGGY_TCP_ADDRESS=0.0.0.0:8090          # [tcp] address
+export IGGY_NODE_ADVERTISED_ADDRESS=iggy-1    # [node] advertised_address
+export IGGY_HTTP_ENABLED=true                 # [http] enabled
+export IGGY_PATH=/var/lib/iggy               # root path
+export IGGY_LOGGING_LEVEL=debug              # [logging] level
+export IGGY_SHARDING_CPU_ALLOCATION=4        # [sharding] cpu_allocation
+```
+
+Two variables live outside the config schema: `IGGY_ROOT_USERNAME` and `IGGY_ROOT_PASSWORD` set the root credentials, always as a pair. They initialize the root user **only at first creation**. On an existing data directory the stored root user is recovered unchanged, but supplied environment credentials must still pass validation.
+
+### Secrets
+
+Secret configuration includes: `http.jwt.encoding_secret`, `http.jwt.decoding_secret`, `encryption.key`, `encryption.previous_keys`, `external_auth.url`, `cluster.auth.shared_secret`, and `cluster.auth.previous_shared_secret`. Prefer setting them through their environment variables (`IGGY_HTTP_JWT_ENCODING_SECRET`, `IGGY_ENCRYPTION_KEY`, `IGGY_CLUSTER_AUTH_SHARED_SECRET`, and so on) instead of storing them in a file. Secret values are masked in logs and **never serialized** into `runtime/current_config.toml`.
+
+### Validation at boot
+
+- Array-valued environment settings replace the corresponding TOML array. For an indexed array such as `cluster.nodes`, supply every entry and its required fields through environment variables. A single field override does not merge into the existing TOML roster.
+- Unknown top-level TOML fields and unknown server `IGGY_` environment names **reject startup**. Some nested tables can still ignore unknown fields, so compare the effective configuration with the intended settings.
+- The old `[system]` table and its environment mappings are rejected. Removed placeholders such as `archive_expired` and `recreate_missing_state` must be removed, not set to `false`.
+- Several sections validate relationships between keys (QUIC windows, sharding shutdown budgets, metadata journal sizing, partition transfer floors). A violation aborts boot with an error naming the keys. The constraints are listed with their sections below.
+- The `RUST_LOG` environment variable takes precedence over `logging.level`. An invalid effective filter stops startup.
+
+## Command-line flags
+
+`iggy-server` accepts these four startup options, plus `--help` (`-h`) and `--version` (`-V`):
+
+| Flag | Description |
+|------|-------------|
+| `--fresh`, `-f` | Delete the configured data directory (`local_data` by default, see `IGGY_PATH`) before boot and start on empty state. In cluster mode this wipes **this replica only**. It rejoins and refills by state transfer from the others. Wiping a quorum at the same time can destroy committed data. Do not put `--fresh` in a service unit: it would re-transfer the whole dataset on every restart. |
+| `--with-default-root-credentials` | Set `IGGY_ROOT_USERNAME` and `IGGY_ROOT_PASSWORD` to `iggy` unless they are already present in the environment. These values initialize the root user only at first creation. Development only. |
+| `--replica-id <N>` | Identify this node within `cluster.nodes`. Required when `cluster.enabled = true`. The value must match exactly one `replica_id` in the roster. |
+| `--list-config-env-vars` | Print the supported configuration environment-variable names and templates, then exit without starting the server. See [Environment variables](#environment-variables). |
+
+Run `iggy-server --list-config-env-vars` to print every supported server variable and exit before loading dotenv or configuration files or creating runtime state. The output is sorted, contains names only, and uses `<N>` for indexed vector entries. Most indexed fields accept `0` through `255`. `cluster.nodes.<N>.advertised_addresses.<N>` accepts `0` through `15` for its inner index. Whole-value vector fields are listed once without a placeholder.
+
+## Relocated configuration keys
+
+The server configuration no longer has a `[system]` wrapper. Its runtime tables live at the root, and the data directory is the root `path` key. Old `IGGY_SYSTEM_*` overrides are rejected. Retention, durability, and segment layout are [topic creation options](/docs/server/topic-options), not server-wide defaults.
+
+| Old server key | Replacement |
+|----------------|-------------|
+| `system.path` / `IGGY_SYSTEM_PATH` | Root `path` / `IGGY_PATH` |
+| `system.runtime`, `system.logging`, `system.encryption`, `system.memory_pool`, `system.sharding` | Root tables `runtime`, `logging`, `encryption`, `memory_pool`, `sharding`. Remove `SYSTEM_` from their environment names |
+| `system.partition.validate_checksum` | `partition.validate_checksum` |
+| `system.partition.path`, `partition.path` / `IGGY_PARTITION_PATH` | Removed. The `partitions` path component is fixed. |
+| `system.topic.max_size` | `max_topic_size` topic option |
+| `system.topic.message_expiry` | `message_expiry` topic option |
+| `system.partition.enforce_fsync` | `durability` topic option: `replicated` or `persisted` |
+| `partition.consumer_offset_enforce_fsync` | `consumer_offset_durability` topic option: `replicated` or `persisted` |
+| `system.partition.messages_required_to_save` | `messages_required_to_save` topic option |
+| `system.partition.size_of_messages_required_to_save` | `size_of_messages_required_to_save` topic option |
+| `system.segment.size` | `segment_size` topic option |
+| `system.segment.preallocate` | `preallocate_segments` topic option |
+| `system.stream.path`, `system.topic.path` | Removed. The `streams` and `topics` path components are fixed. Root `[stream]` and `[topic]` tables are rejected. |
+| `system.segment.archive_expired`, `system.recovery.recreate_missing_state` | Removed. Delete the keys and their old tables. |
+| `system.message_deduplication` (whole section) | Removed. No equivalent configuration. |
+| `extra` (whole section) | Removed. Admission caps are compile-time constants. No replacement. |
+
+Remove the old tables and environment variables after migrating their values. Topic policies cannot be configured through TOML or `IGGY_` overrides, and the former `enforce_fsync` topic option is also rejected. Both new durability policies independently default to `replicated`. Explicitly select `persisted` at topic creation where required. Neither can change after topic creation.
+
+Other removed sections, such as `[message_saver]`, `[system.state]`, `[system.backup]`, `[system.compression]`, and `[tcp.socket]`, must also be removed. Consult the embedded configuration for the deployed binary rather than relying on ignored legacy fields.
+
+## Reference
+
+The tables below list every section with its shipped defaults. In cluster mode, every enabled transport takes its **port** from this node's `cluster.nodes` `ports` entry. The transport's own `address` picks only the bind interface.
+
+### `[http]`
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `true` | Serve the HTTP REST API. |
+| `address` | `"127.0.0.1:3000"` | Bind address and port. |
+| `max_request_size` | `"2 MB"` | Maximum request body size, at most `"256 MiB"`. Keep it at or below `message_bus.max_message_size` for multi-replica topics so an admitted batch fits replica frames. |
+| `web_ui` | `false` | Serve the embedded Web UI at `/ui`. Requires the `iggy-web` feature and static assets built with `npm --prefix web ci` and `npm --prefix web run build:static` before compiling the server. Without the feature, `true` logs a warning. Missing assets return 404. |
+
+HTTP sessions hold live server-side session state (they count against `metadata.clients_table_max`). Consumer group management (create, get, delete) is available over HTTP. Group membership (join, leave) is not and needs a stateful transport.
+
+In cluster mode, HTTP requests use the metadata or partition primary as appropriate. A contacted node can forward in one hop when shared JWT key material enables signed relay proofs. Partition polls also use the partition route. See [Client failover](/docs/clustering/client-failover).
+
+### `[http.cors]`
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `true` | Handle cross-origin requests with the rules below. |
+| `allowed_methods` | `["GET", "POST", "PUT", "DELETE"]` | Allowed HTTP methods. |
+| `allowed_origins` | `["*"]` | Permitted origins. `"*"` is only valid as the first entry (anything after it is ignored). `"*"` in any other position fails the config. |
+| `allowed_headers` | `["content-type", "authorization"]` | Request headers clients may send. |
+| `exposed_headers` | `["iggy-view"]` | Response headers browsers may read. `iggy-view` carries the current VSR view number. |
+| `allow_credentials` | `false` | Allow cookies and HTTP auth in CORS requests. `true` requires explicit (non-wildcard) origins, headers, and exposed headers. |
+| `allow_private_network` | `false` | Allow requests from private networks. |
+
+### `[http.jwt]`
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `algorithm` | `"HS256"` | Signing algorithm for self-issued tokens. |
+| `issuer` | `"iggy.apache.org"` | Issuer claim of minted tokens. |
+| `audience` | `"iggy.apache.org"` | Audience claim of minted tokens. |
+| `valid_issuers` | `["iggy.apache.org"]` | Issuers accepted during validation. |
+| `valid_audiences` | `["iggy.apache.org"]` | Audiences accepted during validation. |
+| `access_token_expiry` | `"1 h"` | Access token lifetime. |
+| `clock_skew` | `"5 s"` | Tolerance for clock differences during validation. |
+| `not_before` | `"0 s"` | Time before which a token is not valid. |
+| `encoding_secret` | `""` (empty) | Signing key. If only one secret is configured, it is used for both signing and verification. See the fallback rules below. |
+| `decoding_secret` | `""` (empty) | Verification key. If both secrets are set, they are used as supplied and must agree for self-issued tokens to verify. |
+| `use_base64_secret` | `false` | Treat the configured secrets as base64-encoded. |
+
+There is **no default secret**. When both secrets are empty and cluster authentication supplies no key, each server start mints a random signing key, so issued tokens **do not survive a restart** and are valid only on the node that issued them. If you configure a secret, set it through the environment (`IGGY_HTTP_JWT_ENCODING_SECRET` / `IGGY_HTTP_JWT_DECODING_SECRET`), never commit it, and use a long random value.
+
+In cluster mode the secret has an extra role: a configured secret, identical on every node, makes bearer tokens valid cluster-wide and activates follower-to-primary HTTP forwarding. When both JWT secrets are empty and `cluster.auth` is enabled, the JWT key is derived from the cluster PSK. Explicit JWT secrets take precedence. Without either, tokens are node-local and forwarding stays disabled.
+
+#### `[[http.jwt.trusted_issuers]]`
+
+Opt-in trust of external token issuers for application-to-application authentication. With none configured, the listener accepts only self-issued tokens using the configured HMAC algorithm (`HS256`, `HS384`, or `HS512`).
+
+```toml
+[[http.jwt.trusted_issuers]]
+issuer = "https://issuer.example.com"
+audience = "iggy.apache.org"
+jwks_url = "https://issuer.example.com/.well-known/jwks.json"
+username = "service-account"
+```
+
+`issuer`, `audience`, and `jwks_url` are required per entry. `username` names the active, non-root Iggy account to which the issuer maps. Provision that account before using its tokens. The old `user_id` key is rejected.
+
+Enabling an issuer opens an outbound JWKS fetch that is reachable before a token's signature is verified: a token naming the issuer with an unknown key id can trigger a fetch to `jwks_url`. The target is fixed (not attacker-chosen), concurrent misses coalesce onto one fetch, and repeats are rate-limited to one outbound request per issuer per short window. The same window bounds how quickly a freshly rotated signing key is picked up.
+
+### `[http.metrics]`
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `true` | Expose Prometheus metrics. |
+| `endpoint` | `"/metrics"` | Metrics path. Must start with `/`. |
+
+The metrics route **requires authentication**: a missing or invalid bearer credential is rejected with 401. Any authenticated user may scrape. There's no extra RBAC rule. Scrapers present a JWT or a personal access token as the bearer:
+
+```yaml
+scrape_configs:
+  - job_name: "iggy"
+    metrics_path: "/metrics"
+    authorization:
+      type: Bearer
+      credentials: "<personal-access-token>"
+    static_configs:
+      - targets: ["localhost:3000"]
+```
+
+### `[http.tls]`
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `false` | Serve HTTPS. |
+| `cert_file` | `"core/certs/iggy_cert.pem"` | PEM certificate path. |
+| `key_file` | `"core/certs/iggy_key.pem"` | PEM key path. |
+
+HTTP TLS is **file-based only**. There's no `self_signed` option for this listener. Both files must exist when enabled.
+
+### `[tcp]`
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `true` | Serve the TCP binary protocol. |
+| `address` | `"127.0.0.1:8090"` | Bind address and port. |
+
+TCP is the highest-throughput transport. These two keys, plus the TLS block below, are the entire section.
+
+#### `[tcp.tls]`
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `false` | Wrap TCP connections in TLS. |
+| `self_signed` | `true` | Generate an ephemeral loopback certificate, but only while `cert_file` does not exist on disk. An existing PEM pair is loaded instead (the server logs which way it went). `false` requires both files to exist. |
+| `cert_file` | `"core/certs/iggy_cert.pem"` | PEM certificate path. |
+| `key_file` | `"core/certs/iggy_key.pem"` | PEM key path. |
+
+### `[quic]`
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `true` | Serve the QUIC transport. |
+| `address` | `"127.0.0.1:8080"` | Bind address and port. |
+| `max_concurrent_bidi_streams` | `256` | Maximum concurrent bidirectional streams on one QUIC connection. |
+| `initial_mtu` | `"1200 B"` | Initial path MTU before MTU discovery runs. 1200 bytes is the QUIC minimum. Values below it are rejected at boot. Values above the real path MTU cause packet loss until black-hole detection resets to 1200. |
+| `send_window` | `"64 MiB"` | Flow-control budget for unacknowledged data in flight to one connection. A ceiling, not a reservation. |
+| `receive_window` | `"64 MiB"` | Flow-control budget for data buffered from one connection, shared by all its streams. |
+| `stream_receive_window` | `"64 MiB"` | Per-stream slice of `receive_window`. Must not exceed `receive_window`. Equality is allowed. Lower it below `receive_window` if you raise the stream cap, so one unread stream cannot pin the whole connection window. |
+| `keep_alive_interval` | `"10 s"` | Keep-alive PING interval. One third of `max_idle_timeout`, so two consecutive losses fit before the idle timer closes the connection. `"0 s"` disables. |
+| `max_idle_timeout` | `"30 s"` | Idle time before a connection is closed. `"0 s"` disables (not recommended). |
+
+Raising `max_concurrent_bidi_streams` is a transport decision only: the server's accept loop takes one stream at a time and waits for its reply before accepting the next, so a higher cap does **not** make command handling concurrent.
+
+#### `[quic.certificate]`
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `self_signed` | `true` | **Always** generate an ephemeral loopback certificate. Unlike TCP and WebSocket, files are ignored even when they exist on disk (the server logs a warning naming the skipped files). `false` requires both files. |
+| `cert_file` | `""` (empty) | PEM certificate path. Required when `self_signed = false`. |
+| `key_file` | `""` (empty) | PEM key path. Required when `self_signed = false`. |
+
+### `[websocket]`
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `true` | Serve the WebSocket transport. |
+| `address` | `"127.0.0.1:8092"` | Bind address and port. |
+| `read_buffer_size` | unset (`"128 KiB"`) | Target minimum size of the frame read buffer. |
+| `write_buffer_size` | unset (`"128 KiB"`) | Target buffer size for batched writes before flush. |
+| `max_write_buffer_size` | unset (unlimited) | Hard ceiling on the write buffer. Writes past it error instead of buffering. Must exceed `write_buffer_size` by at least one message. |
+| `max_message_size` | unset (`"64 MiB"`) | Upper bound on one inbound message after fragment reassembly. Must not exceed `message_bus.max_message_size`. |
+| `max_frame_size` | unset (`"16 MiB"`) | Upper bound on one inbound frame before reassembly. Must not exceed `max_message_size`. |
+| `accept_unmasked_frames` | `false` | Accept unmasked client frames in violation of RFC 6455. Strict by default. |
+
+The size knobs are optional. Leaving one unset keeps the `compio-ws` (tungstenite) default shown in parentheses. A malformed size string fails config load.
+
+#### `[websocket.tls]`
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `false` | Serve WSS. |
+| `self_signed` | `true` | Same load-or-generate behavior as `[tcp.tls]`: an existing PEM pair wins, otherwise an ephemeral loopback certificate is generated. |
+| `cert_file` | `"core/certs/iggy_cert.pem"` | PEM certificate path. |
+| `key_file` | `"core/certs/iggy_key.pem"` | PEM key path. |
+
+### TLS across transports
+
+The `self_signed` flag doesn't mean the same thing everywhere:
+
+| Listener | Behavior |
+|----------|----------|
+| TCP, WebSocket | `self_signed = true` generates an ephemeral certificate **only while `cert_file` does not exist**. An existing PEM pair is loaded instead. |
+| QUIC | `self_signed = true` **always** generates an ephemeral certificate and ignores configured files. |
+| HTTP | No `self_signed` option. Files only. |
+| Replica plane | Separate section, `[cluster.tls]`. See [Clustering](/docs/clustering/vsr). |
+
+Ephemeral certificates **change on every start** and are meant for loopback development, not production.
+
+### Root data path and runtime
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `path` | `"local_data"` | Base directory for all server data. Everything below is relative to it. |
+
+Set `path` before any TOML table header. `[runtime] path = "runtime"` and `[logging] path = "logs"` are relative to it. Data uses the fixed layout `{path}/streams/{stream_id}/topics/{topic_id}/partitions/{partition_id}`. Stream, topic, and partition path overrides are rejected.
+
+### `[logging]`
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `path` | `"logs"` | Log directory, relative to the root `path`. |
+| `level` | `"info"` | Filter directive in `RUST_LOG` syntax: simple levels or directives like `"warn,server=debug,iggy=trace"`. The `RUST_LOG` environment variable always takes precedence. |
+| `file_enabled` | `true` | Write logs to file as well as stdout. |
+| `max_file_size` | `"500 MB"` | Size at which a log file rotates. Zero disables size rotation. There is no hourly rotation. |
+| `max_total_size` | `"4 GB"` | Total log budget. Cleanup deletes the oldest archives first. Zero disables this size limit. Retention still applies. |
+| `rotation_check_interval` | `"1 h"` | How often rotation status is checked. Avoid values below 1 s. |
+| `retention` | `"7 days"` | How long log files are kept. Avoid values below 1 s. |
+| `sysinfo_print_interval` | `"10 s"` | Interval for system-information logging. |
+
+### `[encryption]`
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `false` | Generate a data key for each new stream. Existing streams retain their encryption choice. Payloads and user headers use AES-256-GCM-SIV. Metadata and structural headers are not encrypted as a whole. |
+| `key` | `""` (empty) | Base64 of 32 bytes. Derives the key that wraps stream data keys. Required when encryption is enabled or a client supplies a stream key. |
+| `previous_keys` | `[]` | Up to two previous server keys retained during rotation. Secret. |
+| `retired_kek_fingerprints` | `[]` | Fingerprints of wraps to remove after rotation. Cannot name a configured current or previous key. |
+
+See [Stream options](/docs/server/stream-options) for the rotation procedure. Environment overrides include `IGGY_ENCRYPTION_PREVIOUS_KEYS` and `IGGY_ENCRYPTION_RETIRED_KEK_FINGERPRINTS`, each accepting a JSON array.
+
+### `[external_auth]`
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `enabled` | `false` | Forward logins for unknown local usernames to an HTTP service. |
+| `url` | Empty | HTTP or HTTPS endpoint. Required when enabled and omitted from the effective configuration output. |
+| `timeout` | `"5 s"` | Positive callout timeout. |
+| `max_concurrent_callouts` | `64` | Positive per-shard limit. |
+
+The service maps a caller to an existing active, non-root account. Local usernames never use the callout. See [External authentication](/docs/server/external-authentication) for the JSON contract and failure behavior.
+
+### `[memory_pool]`
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `true` | Reuse aligned buffers through the memory pool. Buffers are allocated on demand. |
+| `size` | `"4 GiB"` | Pool allocation budget, not a process memory limit. When the pool cannot supply a buffer within this budget, allocation continues outside it. Minimum 512 MiB. Must be a multiple of 4096 (page size). |
+| `bucket_capacity` | `8192` | Maximum buffers per bucket. Must be a power of two. Minimum 128. |
+
+The pool has 28 buckets with buffer sizes from 4 KiB to 512 MiB.
+
+### `[data_maintenance.messages]`
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `cleaner_enabled` | `true` | Run the segment cleaner. It deletes the oldest **sealed** segments of topics with a finite `message_expiry` or `max_topic_size`, per partition, best-effort. The active segment is never touched, and stored consumer/group offsets can hold back deletion. |
+| `interval` | `"1 m"` | Cleaner run interval. |
+
+### `[heartbeat]`
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `true` | Verify client heartbeats. |
+| `interval` | `"30 s"` | Expected heartbeat interval. |
+
+When enabled, the per-shard verifier evicts stale group-member connections after the heartbeat threshold. Evicting a link does not itself end its logical session. The metadata liveness process expires the session lease and reassigns group membership. The session timeout is 1.2 times `heartbeat.interval`, or 36 seconds by default. Periodic checks mean expiry is not an exact wall-clock deadline.
+
+SDK clients maintain heartbeats when connected. The Java blocking client delegates to the async TCP implementation and also uses its heartbeat. Keep the client heartbeat interval below the server session expiry threshold. Call the SDK connection method before using a long-lived consumer, and close it through the SDK lifecycle API.
+
+### `[telemetry]`
+
+Server OTLP export is unavailable in this revision: `grpc` prevents startup, and `http` does not deliver logs or traces. Leave `enabled = false`.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `false` | Enable OpenTelemetry export. |
+| `service_name` | `"iggy"` | Reported service name. |
+| `telemetry.logs.transport` | `"grpc"` | Log export transport: `"grpc"` or `"http"`. |
+| `telemetry.logs.endpoint` | `"http://localhost:7281/v1/logs"` | Log export endpoint. |
+| `telemetry.traces.transport` | `"grpc"` | Trace export transport: `"grpc"` or `"http"`. |
+| `telemetry.traces.endpoint` | `"http://localhost:7281/v1/traces"` | Trace export endpoint. |
+
+### `[sharding]`
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `cpu_allocation` | `"numa:auto"` | Number of shards and their CPU affinity. See syntaxes below. |
+| `pin_cores` | `true` | Pin shard threads to dedicated cores, drawn from the process's allowed CPU set (cooperates with systemd `AllowedCPUs=` and container cpusets). Set `false` on hosts where the server shares cores with other workloads. |
+| `inbox_capacity` | `65536` | Per-shard inbox capacity for consensus, connection setup and reconciliation. |
+| `reply_inbox_capacity` | `1024` | Separate per-shard channel for forwarded client replies. Size for peak reply fan-out. Dropped replies have no bus retransmission. |
+| `poll_completion_capacity` | `1024` | Completed deferred reads waiting for their owning shard. |
+| `deferred_poll_max_wait` | `"30 s"` | Server cap on a requested wait, at most 600 seconds. |
+| `deferred_poll_max_pending` | `1024` | Maximum parked requests per shard. |
+| `deferred_poll_max_pending_per_session` | `64` | Maximum parked requests per session, or HTTP user without a binary session. |
+| `deferred_poll_max_read_bytes` | `"16 MiB"` | Read budget cap. A first message larger than the reply budget can return alone. |
+| `deferred_poll_max_inflight_bytes` | `"64 MiB"` | Combined deferred-read reservations per shard, at most 1 GiB. |
+| `partition_io_capacity` | `16` | Active partition file jobs and results awaiting acceptance per shard, from 1 through 256. |
+| `partition_io_bytes_max` | Derived | Admission ceiling for retained file-job allocations. Omission selects the largest legal job charge, slightly above 4 GiB per shard. |
+| `shutdown_drain_timeout` | `"10 s"` | Per-shard bus drain budget on shutdown. Slow-fsync hosts may need more. |
+| `shutdown_poll_interval` | `"50 ms"` | Poll cadence for the shutdown flag. Must be less than or equal to `shutdown_drain_timeout`. |
+| `shutdown_join_timeout` | `"30 s"` | Hard deadline for joining shard threads at exit. A wedged shard is abandoned with an error log. Must be at least `shutdown_drain_timeout`. |
+| `reconcile_periodic_interval` | `"1 s"` | Safety tick for the partition reconciliation loop, which also wakes on every metadata commit. The loop also compares every partition with committed metadata again in the background, and the tick does not change the pace of that. It reads 1,024 entries (streams, topics, partitions, routing rows) every 250 ms, and starts again 10 minutes after it ended. The time for all partitions grows with their number: about 17 minutes at one million streams of one partition each. |
+
+Valid `cpu_allocation` syntaxes:
+
+- `"all"`: one shard per available CPU core
+- a number, e.g. `4`: four shards on the first four CPUs in the process's allowed set when `pin_cores` is enabled
+- a range, e.g. `"5..8"`: three shards on cores 5, 6, 7
+- `"numa:auto"`: all NUMA nodes and cores, NUMA-aware
+- `"numa:nodes=0,1;cores=4;no_ht=true"`: NUMA nodes 0 and 1, four cores each, no hyperthreads
+
+### `[metadata]`
+
+Tunables for the metadata consensus plane (shard 0's VSR replica: users, streams, topics, sessions).
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `prepare_queue_depth` | `32` | Uncommitted metadata ops in flight at once. Submits beyond it are rejected with a transient error the SDKs retry. Capped at 127 by the view-change wire format. |
+| `journal_slots` | `65536` | In-memory index of the metadata WAL, in slots. A background checkpoint starts once half of the slots hold operations committed after the last checkpoint. A larger value buys rarer checkpoints at the cost of index memory (about 17 MiB at the default) and a longer replay at boot. Run the same value on every node: a replica with fewer slots than the primary can refuse a state transfer. The maximum is 1048576. Boot enforces `journal_slots >= 4 x max(64, prepare_queue_depth)`. If you reduce the value for an existing data directory, the boot refuses it when the live WAL entries do not fit in the smaller index. Restore the previous value to recover. An older server with a smaller default counts as a reduction. Before a rollback to such a server, set this key to the value that the node runs now, also when the boot would accept the smaller default. Without the key, the older server uses 1024 slots beside peers with more. |
+| `clients_table_max` | `8192` | Slots in the VSR client table: how many distinct clients (TCP/QUIC/WebSocket virtual clients and HTTP sessions together) hold live session state. When full, the client with the oldest last commit is evicted and re-registers on its next request. The HTTP session cap tracks this at half. Must be between 2 and 65536. |
+| `partitions_max` | `0` | Total partition admission limit. Zero leaves this limit disabled. |
+| `change_log_resource_capacity` | `65536` | Retained resource metadata changes. |
+| `change_log_activity_capacity` | `16384` | Retained activity metadata changes. |
+
+### `[partition]`
+
+Partition storage and consensus tunables share this table. Unlike `[metadata]` (one plane on shard 0), a pipeline exists per partition, so raising per-partition budgets **multiplies resource use by the partition count**.
+
+`durability`, `consumer_offset_durability`, segment size, preallocation, and the message/byte flush thresholds are [topic creation options](/docs/server/topic-options). `wal_bytes_max` sizes the persistence machinery without selecting the topic's completion policy.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `prepare_queue_depth` | `32` | Uncommitted produce and consumer-offset ops in flight per partition. Submits past it spill into a request queue of twice this depth. Once both are full the server rejects the request with `TransientNotAccepted`. A lost rejection reply can still make the client wait for its timeout. Must be between 1 and 127. |
+| `validate_checksum` | `true` | Re-hash batches read from segment storage and report a mismatch instead of serving them. |
+| `wal_bytes_max` | `"256 MiB"` | Active WAL plus queued/in-flight prepare budget per multi-replica partition when either topic policy is `persisted`. A 4 KiB multiple, from 128 MiB + 8 KiB through 4 GiB. Checkpointing reclaims history only after materialized state is synchronized. Temporary rewrites require extra disk space. Environment override: `IGGY_PARTITION_WAL_BYTES_MAX`. |
+| `repair_memory_bytes_max` | `"1 GiB"` | Node-wide budget shared by unproven repair walks and snapshot repair tails. |
+| `wal_group_commit_delay_micros` | `0` | Delay before a persisted partition WAL barrier, at most 10000 microseconds. Zero disables the delay. |
+| `dedup_clients_max` | `4096` | Initial slots for session-qualified retry protection per partition. A full table rejects new writers with `TransientNotAccepted`. Ordered session retirement releases slots. The first committed operation fixes this capacity, from 1 through 65536. |
+| `consumer_offsets_max` | `4096` | Durable offset keys admitted per partition, counted separately for standalone consumers and groups. Existing keys remain writable at the limit. New keys are rejected with `TooManyConsumerOffsets`. Between 1 and 262144. |
+| `offset_reservation_lease` | `65536` | Offsets reserved ahead in the superblock for single-replica partitions. Crash recovery skips the unused reservation to avoid reusing acknowledged offsets. Multi-replica groups ignore it. Between 1 and 16777216. |
+| `evicted_ring_capacity` | `65536` | Maximum repair entries per replicated partition. At most 65536 entries. Single-replica partitions retain none. |
+| `evicted_ring_bytes_max` | `"64 MiB"` | Byte ceiling for the repair ring. Older batches can leave memory and be read from disk. At most 256 MiB. |
+| `transfer_served_cache_bytes_max` | `"2176 MiB"` | Byte budget, **per shard**, for segment payloads kept resident to serve state-transfer chunk requests. The default fits two sealed segments at the 1 GiB ceiling, each with one max-message overshoot. Serving concurrency is `floor(this / max(transfer_artifact_bytes_max, 1 GiB + 64 MiB))`, minimum one. Boot warns when it drops below two. At most `"64 GiB"`. |
+| `transfer_artifact_bytes_max` | `"1088 MiB"` | Allocation ceiling for one received state-transfer artifact, per shard (up to four transfers run at once). Boot enforces the floor `1 GiB + message_bus.max_message_size`. The shipped value sits exactly at it. Raising `message_bus.max_message_size` alone therefore refuses boot: raise this by the same amount in the same edit. At most `"64 GiB"`. |
+
+### `[message_bus]`
+
+Tunables for the internal bus that ships consensus traffic between replicas and client traffic between shards.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `max_batch` | `256` | Messages coalesced into one `writev(2)` call. Hard upper bound 512 (`IOV_MAX/2` on Linux). |
+| `max_message_size` | `"64 MiB"` | Wire-level cap on a single framed message, at most `"256 MiB"`. Values above `"64 MiB"` exceed the Go SDK's frame limit. Coupled to `partition.transfer_artifact_bytes_max` and `websocket.max_message_size` (see those keys). |
+| `peer_queue_capacity` | `4096` | Per-peer message queue capacity. `cluster.repair_chunk_max` must stay below it. |
+| `replica_read_buffer_size` | `"32 KiB"` | Replica socket read buffer for batching small frames. |
+| `connections_max` | Half the open-file limit | Node-wide client connection cap when omitted. An explicit positive value overrides it. |
+| `client_queue_capacity` | `256` | Queue capacity for client traffic. |
+| `client_write_stall_timeout` | `"30 s"` | Deadline for a stalled client write. |
+| `client_request_queue_bytes_max` | `"256 MiB"` | Byte budget for queued client requests. |
+| `reconnect_period` | `"1 s"` | Interval between outbound reconnect attempts to peers. |
+| `close_peer_timeout` | `"2 s"` | Per-peer close drain budget before force-cancellation. |
+| `close_grace` | `"2 s"` | Bound on a single stream shutdown in the TLS-family transports. |
+| `handshake_grace` | `"10 s"` | Bound on a connection's handshake phase, so a slowloris peer cannot pin per-connection resources indefinitely. |
+
+### `[personal_access_token]`
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `max_tokens_per_user` | `100` | Maximum active tokens per user. |
+| `personal_access_token.cleaner.enabled` | `true` | Periodically remove expired tokens. |
+| `personal_access_token.cleaner.interval` | `"1 m"` | Cleaner run interval. |
+
+### `[consumer_group]`
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `rebalancing_timeout` | `"30s"` | Maximum time a partition can remain in pending revocation before being force-transferred to the target member. |
+| `heartbeat_interval` | `"5s"` | Membership heartbeat interval advertised to consumers. Session expiry derives separately from `heartbeat.interval`. |
+
+### `[tiered_storage]`
+
+Tiered storage keeps sealed segments in an object store. It is off until `backend` is set. The backend, the bucket and the credentials are described in the server README, and the server's embedded `config.toml` lists every key of the section.
+
+The keys below bound and retry the calls that each shard sends to the store. A create-only put whose body the node holds in memory (fresh objects and long-term segments) is sent again after a transient failure. Every attempt of one put carries the same `put-id` entry in the object's user metadata, so a create-only put that the store refuses because an earlier attempt stored the object counts as stored. An overwrite (a manifest, a positions object or a topic object) is sent again only when its request never left the node, for example when the connection was refused: an attempt that may have reached the store can land after a later overwrite of the same key and roll it back, so any other failure goes to the caller. A put that streams a sealed segment from its file is sent once.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `request_timeout` | `"30 s"` | Longest wait for one attempt at a head, a read, a listing or a delete. From 1 s to 1 h. |
+| `progress_timeout` | `"30 s"` | A put that streams from a file fails when the store takes no piece of its body, or gives no answer after the last piece, for this long. It has no total deadline. Each attempt at an overwrite held in memory, such as a manifest, waits the same. From 1 s to 1 h. |
+| `max_attempts` | `3` | Attempts at a call that keeps failing for a transient reason, the first one included: heads, reads, listings, deletes and the create-only puts whose body the node holds in memory. Every request of a put counts, a second attempt too. An overwrite is sent again only when its request never left the node. |
+| `retry_delay` | `"200 ms"` | Wait before the first retry, doubled for each retry after it. From 1 ms to 1 h. |
+| `max_retry_delay` | `"5 s"` | Longest wait between two attempts. From 1 ms to 1 h. |
+| `put_attempt_stall_timeout` | `"1 s"` | An attempt at a create-only put whose body the node holds in memory (a fresh object or a long-term segment) is given up and sent again when the store takes no 64 KiB piece of its body for this long. A late create finds the object and stores nothing. An overwrite waits `progress_timeout` instead, because an attempt cut early could land after a later put of other bytes, and so does every put on the `fs` backend. From 100 ms to 1 h. |
+| `put_attempt_answer_timeout` | `"5 s"` | The same for a create-only put, when the store gives no answer for this long after the last piece. From 100 ms to 1 h. |
+| `second_attempt_after` | `"300 ms"` | A create-only put whose body the node holds in memory, such as the upload of a fresh object, gets a second attempt on another connection once it has run this long plus `second_attempt_after_per_mib` for each MiB. The first attempt to store the object wins and the other is dropped. The `fs` backend sends none, since a slow put there means a busy volume. `"disabled"` sends none. Otherwise from 1 ms to 1 h. |
+| `second_attempt_after_per_mib` | `"60 ms"` | What each MiB of the body adds to `second_attempt_after`. With it, about the 99th percentile of a put of each size measured on GCS, so about one put in a hundred costs a second request. Up to 1 h. |
+| `jobs.second_attempts` | `4` | Second attempts that run at once on one shard. They take no slot of `jobs.fresh_uploads`, and a slow put that finds none free waits for its first attempt. At least 1. |
+| `part_size` | `"8 MiB"` | A long-term segment of at least twice this goes up in parts on `s3` and `gcs`, and one request then creates the object whole and create-only, with a CRC32C of all of it that the store checks: a multipart upload with a full object CRC32C on S3, temporary objects under `<prefix>/meta/uploads/` and a compose on GCS, through a temporary composite whose CRC32C the node checks first. Only an `https` endpoint of Google takes uploads in parts. Every other put goes whole, such as a fresh object that producers wait for. GCS composes at most 32 parts, so a part takes at least a 32nd of its object there. On GCS, a bucket with soft delete on keeps deleted objects billable for its retention, 7 days by default, so each long-term segment stored in parts is billed about twice for that time. Turning soft delete off on the bucket, or `part_size = "0"`, avoids it. A store that refuses multipart uploads makes the node put every object whole from then on. `"0"` puts every object whole. Otherwise from 5 MiB to 5 GiB. |
+| `jobs.parts_in_flight` | `8` | Parts of uploads in parts that run at once on one shard. An upload with no part in flight sends one even when they are all taken. At least 1. |
+| `abandoned_upload_grace` | `"1 h"` | How old an upload in parts that never completed must be before shard 0 of the metadata primary removes it, every hour or every grace when that is shorter, while the store identity check passes. An upload in parts gives up at half the grace, so the sweep never meets a live one. `"disabled"` turns the sweep off and leaves uploads in parts without a deadline. Otherwise at least 30 min, so the half that covers clock skew takes the 15 minutes that S3 accepts. On S3 the sweep needs `s3:ListBucketMultipartUploads` on the bucket (`arn:aws:s3:::<bucket>`) and `s3:AbortMultipartUpload` on its objects (`arn:aws:s3:::<bucket>/*`). Without them it removes nothing, and S3 keeps charging for the parts of every abandoned upload unless a bucket lifecycle rule aborts incomplete multipart uploads. |
+
+The keys below set how each shard reads back from object stores: its own store and the stores of its geo peers.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `read_cache_size` | `"64 MiB"` | Bytes of what one shard reads from object stores that it keeps in memory. The same budget holds the fresh objects the shard uploads for geo topics, in up to seven eighths of it. Each shard has its own cache, so a node uses up to this times its number of shards. `"0"` keeps nothing that reads fetch and turns readahead off. The shard then holds what it uploads in a fixed 64 MiB of its own. Otherwise at least 8 blocks of `read_cache_block_size`. |
+| `read_cache_block_size` | `"256 KiB"` | The piece of a segment that the cache fetches and keeps. From `"64 KiB"` to `"1 MiB"`. |
+| `read_ahead` | `"2 MiB"` | Bytes that a shard fetches past the last poll when polls read a segment in order. `"0"` turns readahead off. Otherwise at least 2 blocks, and at most an eighth of `read_cache_size`. |
+
+Readahead takes the speculative fetch caps of `[tiered_storage.jobs]`: at most `speculative_fetches` (default `4`) fetches at once, each at most `speculative_fetch_bytes` (default `"32 MiB"`). A readahead fetch starts only while no fetch that a poll waits for is queued. The server checks these keys while the cache is on, on a node with a `backend` or with geo peers, whose reads go through the same cache.
+
+### `[node]`
+
+This node's own client-facing identity. The address is read only while `cluster.enabled = false`: in cluster mode the roster answers the same question per node, so the address itself is ignored and the server says so at startup. The key is still validated in every mode, so a malformed value refuses boot even with `cluster.enabled = true`.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `advertised_address` | unset | The address clients dial, published in cluster metadata. A literal IP or a DNS hostname. Left unset, the server derives it from the bind address of the first enabled listener. That fails when the listener binds a wildcard, and the server refuses to start rather than publish an address no client can use. Declaring the unspecified address (`0.0.0.0`, `::`) is refused for the same reason. |
+
+### `[cluster]`
+
+Cluster mode is configured here but documented in [Clustering](/docs/clustering/vsr). The section contains:
+
+| Key | Default | One-liner |
+|-----|---------|-----------|
+| `enabled` | `false` | Participate in a cluster. Requires `--replica-id` at launch. |
+| `name` | `"iggy-cluster"` | Permanent cluster identity, hashed into every superblock on first boot. Renaming against existing data refuses start. |
+| `heartbeat_timeout` | `"5s"` | Primary liveness window. A silent primary triggers a view change. At least `"2s"` and at least 4 x `commit_broadcast_interval`. |
+| `commit_broadcast_interval` | `"500ms"` | How often the primary broadcasts its commit point. This is the liveness signal. |
+| `prepare_retransmit_interval` | `"250ms"` | Retransmit cadence for unacknowledged prepares. |
+| `view_change_retransmit_interval` | `"500ms"` | Retransmit cadence during a view change. |
+| `view_change_status_timeout` | `"5s"` | Backstop for a stalled view change. Escalates to a fresh election. At least 4 x `view_change_retransmit_interval`. |
+| `request_start_view_retransmit_interval` | `"1s"` | Re-request cadence for the current view's StartView. |
+| `view_probe_attempts_max` | `5` | Unanswered probes a recovering replica tolerates before electing on its recovered log. Between 1 and 100. |
+| `repair_retry_interval` | `"1s"` | Re-request cadence for a stalled journal-repair stream. |
+| `repair_gap_debounce_interval` | `"1s"` | How long a committed journal gap waits before repair starts, floored at 500 ms. Nonzero. Separate from retries of an already-open repair stream. |
+| `repair_chunk_max` | `128` | Prepares served per repair round. Must stay strictly below `message_bus.peer_queue_capacity`. Between 1 and 1024. |
+| `superblock_wedged_fatal_timeout` | `"2m"` | Exit if a metadata or partition superblock remains unwritable past this window. `"0"` leaves it fenced indefinitely. Nonzero values must be at least `"30s"`. |
+| `default_replication_factor` | `"all"` | Copies per partition for new topics that omit `replication_factor`. Accepts `all` or 1 through 32, within cluster membership. |
+
+Durations are **rounded down** to the consensus 10 ms tick. Values under 10 ms become one tick.
+
+Sub-sections:
+
+- `[cluster.auth]`: replica-to-replica authentication (PSK plus BLAKE3 keyed-MAC handshake). `shared_secret` must be at least 32 bytes of CSPRNG output, identical on every node. Prefer `IGGY_CLUSTER_AUTH_SHARED_SECRET`. `previous_shared_secret` enables rolling key rotation.
+- `[cluster.coordinator]`: `skip_shard_zero_for_replicas = true` and `skip_shard_zero_for_clients = false` control connection placement when more than one shard runs. `replica_connections_per_peer = 1` controls links per peer and must match on every node. `skip_shard_zero_for_partitions = false` keeps partitions off shard 0 when enabled. See [Coordinator placement](/docs/clustering/configuration#coordinator-placement).
+- `[cluster.tls]`: TLS 1.3 on the replica port. Requires `cluster.auth.enabled`. The PSK authenticates the peer, TLS supplies confidentiality.
+- `[[cluster.nodes]]`: the full roster, byte-identical on every node. Each entry has `name`, `ip`, `replica_id`, and `ports` (`tcp`, `quic`, `http`, `websocket`, `tcp_replica`). In cluster mode `ports` is the single source of listener ports: `tcp` and `tcp_replica` ports are always required, and every other enabled transport also needs an explicit per-node port or the server refuses to start. `advertised_address` and per-CIDR `advertised_addresses` selectors control what clients are told to dial.

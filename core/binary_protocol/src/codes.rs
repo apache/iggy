@@ -30,6 +30,7 @@ pub const DESCRIBE_OPTIONS_CODE: u32 = 13;
 pub const BIND_SESSION_CODE: u32 = 15;
 pub const UPDATE_RESOURCE_CODE: u32 = 16;
 pub const GET_METADATA_CHANGES_CODE: u32 = 17;
+pub const RETIRE_GEO_ORIGIN_CODE: u32 = 18;
 pub const GET_ME_CODE: u32 = 20;
 pub const GET_CLIENT_CODE: u32 = 21;
 pub const GET_CLIENTS_CODE: u32 = 22;
@@ -61,6 +62,16 @@ pub const SEND_MESSAGES_CODE: u32 = 101;
 /// The route of one partition: its incarnation, the group view and the primary
 /// of that view. Sends, polls and consumer offsets all route with it.
 pub const GET_PARTITION_ROUTE_CODE: u32 = 105;
+pub const POLL_MESSAGES_DEFERRED_CODE: u32 = 106;
+// 107 was WAIT_FOR_MESSAGES. Never reuse it: older clients still send it.
+/// Cancels a deferred request on the same authenticated connection.
+///
+/// The body is empty, `request` identifies the original request, and no reply
+/// is sent. A connection that is not authenticated gets an `Unauthenticated`
+/// deny instead.
+pub const CANCEL_DEFERRED_REQUEST_CODE: u32 = 108;
+/// Waits on many partitions of one topic and reads them into one reply.
+pub const FETCH_MESSAGES_CODE: u32 = 109;
 
 // -- Consumer Offsets --
 pub const GET_CONSUMER_OFFSET_CODE: u32 = 120;
@@ -86,6 +97,7 @@ pub const DELETE_TOPIC_CODE: u32 = 303;
 // -- Partitions --
 pub const CREATE_PARTITIONS_CODE: u32 = 402;
 pub const DELETE_PARTITIONS_CODE: u32 = 403;
+pub const GET_PARTITIONS_CODE: u32 = 404;
 
 // -- Segments --
 pub const DELETE_SEGMENTS_CODE: u32 = 503;
@@ -114,7 +126,7 @@ pub const fn command_name(code: u32) -> Result<&'static str, WireError> {
 mod tests {
     use super::*;
 
-    const RETIRED_CODES: &[u32] = &[14, 35, 102, 103, 104, 123, 124, 204, 205, 304, 305];
+    const RETIRED_CODES: &[u32] = &[14, 35, 102, 103, 104, 107, 123, 124, 204, 205, 304, 305];
 
     const ALL_CODES: &[u32] = &[
         PING_CODE,
@@ -125,6 +137,7 @@ mod tests {
         BIND_SESSION_CODE,
         UPDATE_RESOURCE_CODE,
         GET_METADATA_CHANGES_CODE,
+        RETIRE_GEO_ORIGIN_CODE,
         GET_ME_CODE,
         GET_CLIENT_CODE,
         GET_CLIENTS_CODE,
@@ -144,6 +157,9 @@ mod tests {
         LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE,
         POLL_MESSAGES_CODE,
         GET_PARTITION_ROUTE_CODE,
+        POLL_MESSAGES_DEFERRED_CODE,
+        CANCEL_DEFERRED_REQUEST_CODE,
+        FETCH_MESSAGES_CODE,
         SEND_MESSAGES_CODE,
         GET_CONSUMER_OFFSET_CODE,
         STORE_CONSUMER_OFFSET_CODE,
@@ -158,6 +174,7 @@ mod tests {
         DELETE_TOPIC_CODE,
         CREATE_PARTITIONS_CODE,
         DELETE_PARTITIONS_CODE,
+        GET_PARTITIONS_CODE,
         DELETE_SEGMENTS_CODE,
         GET_CONSUMER_GROUP_CODE,
         GET_CONSUMER_GROUPS_CODE,

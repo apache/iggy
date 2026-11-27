@@ -27,10 +27,13 @@ import org.apache.iggy.exception.IggyOperationNotSupportedException;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.system.NamedPageQuery;
+import org.apache.iggy.system.Page;
 import tools.jackson.core.type.TypeReference;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.function.Function;
 
 class ConsumerGroupsHttpClient implements ConsumerGroupsClient {
 
@@ -50,6 +53,13 @@ class ConsumerGroupsHttpClient implements ConsumerGroupsClient {
     public List<ConsumerGroup> getConsumerGroups(StreamId streamId, TopicId topicId) {
         var request = httpClient.prepareGetRequest(path(streamId, topicId));
         return httpClient.execute(request, new TypeReference<>() {});
+    }
+
+    @Override
+    public Page<ConsumerGroup> getConsumerGroupsPage(StreamId streamId, TopicId topicId, NamedPageQuery query) {
+        HttpPage<ConsumerGroup> page =
+                HttpPage.read(httpClient, path(streamId, topicId), query, new TypeReference<>() {});
+        return page.toPage(Function.identity());
     }
 
     @Override

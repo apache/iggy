@@ -27,10 +27,10 @@ use crate::{
     ConsumerGroupInfo, ConsumerGroupMember, ConsumerOffsetInfo, GlobalPermissions, HeaderKey,
     HeaderKind, HeaderValue, IdKind, Identifier, IdentityInfo, IggyByteSize, IggyError,
     OPTION_FLAG_CRITICAL, OPTION_FLAG_READ_ONLY, OPTION_FLAG_RESETTABLE, OPTION_FLAG_SECRET,
-    OPTION_FLAG_UPDATABLE, OptionSpec, OptionValue, OptionsProvenance, OptionsScope, Partition,
-    Permissions, PersonalAccessTokenInfo, RawPersonalAccessToken, ResourceOptions, Stats, Stream,
-    StreamDetails, StreamPermissions, Topic, TopicDetails, TopicPermissions, TransportEndpoints,
-    UserInfo, UserInfoDetails, UserStatus, descriptors_for,
+    OPTION_FLAG_UPDATABLE, OptionKey, OptionSpec, OptionValue, OptionsProvenance, OptionsScope,
+    Page, PageCursor, Partition, Permissions, PersonalAccessTokenInfo, RawPersonalAccessToken,
+    ResourceOptions, Stats, Stream, StreamDetails, StreamPermissions, Topic, TopicDetails,
+    TopicPermissions, TransportEndpoints, UserInfo, UserInfoDetails, UserStatus, descriptors_for,
 };
 use bytes::{BufMut, BytesMut};
 use iggy_binary_protocol::primitives::options::{MAX_OPTIONS, MAX_OPTIONS_BYTES, WireOptions};
@@ -46,24 +46,22 @@ use iggy_binary_protocol::responses::consumer_groups::consumer_group_response::C
 use iggy_binary_protocol::responses::consumer_groups::get_consumer_group::{
     ConsumerGroupDetailsResponse, ConsumerGroupMemberResponse,
 };
-use iggy_binary_protocol::responses::consumer_groups::get_consumer_groups::GetConsumerGroupsResponse;
 use iggy_binary_protocol::responses::consumer_offsets::get_consumer_offset::ConsumerOffsetResponse;
+use iggy_binary_protocol::responses::page::PageResponse;
 use iggy_binary_protocol::responses::personal_access_tokens::create_personal_access_token::RawPersonalAccessTokenResponse;
 use iggy_binary_protocol::responses::personal_access_tokens::get_personal_access_tokens::{
     GetPersonalAccessTokensResponse, PersonalAccessTokenResponse,
 };
 use iggy_binary_protocol::responses::streams::StreamResponse;
-use iggy_binary_protocol::responses::streams::get_stream::{GetStreamResponse, TopicHeader};
-use iggy_binary_protocol::responses::streams::get_streams::GetStreamsResponse;
+use iggy_binary_protocol::responses::streams::get_stream::{GetStreamResponse, TopicResponse};
 use iggy_binary_protocol::responses::system::get_cluster_metadata::{
     ClusterMetadataResponse, ClusterNodeResponse,
 };
 use iggy_binary_protocol::responses::system::get_stats::{CacheMetricEntry, StatsResponse};
 use iggy_binary_protocol::responses::topics::get_topic::{GetTopicResponse, PartitionResponse};
-use iggy_binary_protocol::responses::topics::get_topics::GetTopicsResponse;
+use iggy_binary_protocol::responses::users::UserDetailsResponse;
 use iggy_binary_protocol::responses::users::login_user::IdentityResponse;
 use iggy_binary_protocol::responses::users::user_response::UserResponse;
-use iggy_binary_protocol::responses::users::{GetUsersResponse, UserDetailsResponse};
 use iggy_binary_protocol::{WireConsumer, WireIdentifier, WireUserHeaderIterator};
 use std::collections::{BTreeMap, HashMap};
 
@@ -116,24 +114,34 @@ impl TryFrom<GetStreamResponse> for StreamDetails {
     }
 }
 
-pub fn streams_from_wire(w: GetStreamsResponse) -> Result<Vec<Stream>, IggyError> {
-    let mut streams: Vec<Stream> = w
-        .streams
-        .into_iter()
-        .map(Stream::try_from)
-        .collect::<Result<_, _>>()?;
-    streams.sort_by_key(|s| s.id);
-    Ok(streams)
+// ---------------------------------------------------------------------------
+// Pages
+// ---------------------------------------------------------------------------
+
+/// A wire page with each item converted by `convert`. The items keep the
+/// order of the server.
+pub fn page_from_wire<W, T>(
+    page: PageResponse<W>,
+    convert: impl FnMut(W) -> Result<T, IggyError>,
+) -> Result<Page<T>, IggyError> {
+    Ok(Page {
+        items: page
+            .items
+            .into_iter()
+            .map(convert)
+            .collect::<Result<_, _>>()?,
+        next: page.next.map(PageCursor::from),
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Topics
 // ---------------------------------------------------------------------------
 
-impl TryFrom<TopicHeader> for Topic {
+impl TryFrom<TopicResponse> for Topic {
     type Error = IggyError;
 
-    fn try_from(w: TopicHeader) -> Result<Self, Self::Error> {
+    fn try_from(w: TopicResponse) -> Result<Self, Self::Error> {
         let options = resource_options_from_wire_split(&w.options, &w.derived_options)?;
         Ok(Self {
             id: w.id,
@@ -157,6 +165,8 @@ impl From<PartitionResponse> for Partition {
             size: IggyByteSize::from(w.size_bytes),
             messages_count: w.messages_count,
             context: w.context,
+            members: w.members,
+            in_sync_members: w.in_sync_members,
         }
     }
 }
@@ -180,16 +190,6 @@ impl TryFrom<GetTopicResponse> for TopicDetails {
             options: topic.options,
         })
     }
-}
-
-pub fn topics_from_wire(w: GetTopicsResponse) -> Result<Vec<Topic>, IggyError> {
-    let mut topics: Vec<Topic> = w
-        .topics
-        .into_iter()
-        .map(Topic::try_from)
-        .collect::<Result<_, _>>()?;
-    topics.sort_by_key(|t| t.id);
-    Ok(topics)
 }
 
 // ---------------------------------------------------------------------------
@@ -225,16 +225,6 @@ impl TryFrom<UserDetailsResponse> for UserInfoDetails {
             options: user.options,
         })
     }
-}
-
-pub fn users_from_wire(w: GetUsersResponse) -> Result<Vec<UserInfo>, IggyError> {
-    let mut users: Vec<UserInfo> = w
-        .users
-        .into_iter()
-        .map(UserInfo::try_from)
-        .collect::<Result<_, _>>()?;
-    users.sort_by_key(|u| u.id);
-    Ok(users)
 }
 
 impl From<IdentityResponse> for IdentityInfo {
@@ -352,12 +342,6 @@ impl From<ConsumerGroupDetailsResponse> for ConsumerGroupDetails {
             members,
         }
     }
-}
-
-pub fn consumer_groups_from_wire(w: GetConsumerGroupsResponse) -> Vec<ConsumerGroup> {
-    let mut groups: Vec<ConsumerGroup> = w.groups.into_iter().map(ConsumerGroup::from).collect();
-    groups.sort_by_key(|g| g.id);
-    groups
 }
 
 // ---------------------------------------------------------------------------
@@ -787,6 +771,10 @@ pub fn user_headers_to_wire(
     }
     // Buffer was just encoded from valid HeaderKey/HeaderValue entries,
     // so structural TLV validity is guaranteed by construction.
+    debug_assert!(
+        iggy_binary_protocol::validate_user_headers(&buf).is_ok(),
+        "encoded user headers must be structurally valid TLV"
+    );
     WireUserHeaders::from_validated(buf.freeze())
 }
 
@@ -848,20 +836,10 @@ fn headers_from_validated_slice(
                 return Err(error);
             }
         };
-        if let Some(expected) = key_kind.expected_size()
-            && entry.key.len() != expected
-        {
-            return Err(IggyError::InvalidHeaderKey);
-        }
-        if let Some(expected) = value_kind.expected_size()
-            && entry.value.len() != expected
-        {
-            return Err(IggyError::InvalidHeaderValue);
-        }
 
         headers.insert(
-            HeaderKey::new_unchecked(key_kind, entry.key),
-            HeaderValue::new_unchecked(value_kind, entry.value),
+            HeaderKey::from_raw(key_kind, entry.key)?,
+            HeaderValue::from_raw(value_kind, entry.value)?,
         );
     }
     Ok(headers)
@@ -871,7 +849,8 @@ fn headers_from_validated_slice(
 
 /// The `DescribeOptions` response for `scope`: every catalog entry a client
 /// may see, with its kind, flags, default and description. Internal keys stay
-/// out.
+/// out. `server_defaults` fills in the defaults a server setting decides,
+/// such as `replication_factor`.
 ///
 /// # Errors
 ///
@@ -879,17 +858,22 @@ fn headers_from_validated_slice(
 /// catalog tests rule out.
 pub fn describe_options_response(
     scope: OptionsScope,
+    server_defaults: &[(OptionKey, HeaderValue)],
 ) -> Result<iggy_binary_protocol::responses::system::DescribeOptionsResponse, IggyError> {
     let entries = descriptors_for(scope)
         .filter(|descriptor| descriptor.is_described())
         .map(|descriptor| {
+            let server_default = server_defaults
+                .iter()
+                .find(|(key, _)| *key == descriptor.key)
+                .map(|(_, value)| value.clone());
             Ok(iggy_binary_protocol::responses::system::OptionDescriptor {
                 key: iggy_binary_protocol::WireName::new(descriptor.key.to_string())
                     .map_err(|_| IggyError::InvalidFormat)?,
                 kind: descriptor.kind.as_code(),
                 flags: descriptor.flags(),
-                default_value: descriptor
-                    .default_value()?
+                default_value: server_default
+                    .map_or_else(|| descriptor.default_value(), |value| Ok(Some(value)))?
                     .map(|value| bytes::Bytes::copy_from_slice(value.as_bytes()))
                     .unwrap_or_default(),
                 description: (descriptor.description)(),

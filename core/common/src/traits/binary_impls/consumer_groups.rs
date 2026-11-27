@@ -16,9 +16,11 @@
 // under the License.
 
 use crate::traits::binary_auth::fail_if_not_authenticated;
-use crate::wire_conversions::{consumer_groups_from_wire, identifier_to_wire};
+use crate::traits::binary_impls::messages::synced_group_assignment;
+use crate::wire_conversions::{identifier_to_wire, page_from_wire};
 use crate::{
-    BinaryClient, ConsumerGroup, ConsumerGroupClient, ConsumerGroupDetails, Identifier, IggyError,
+    BinaryClient, ConsumerGroup, ConsumerGroupAssignment, ConsumerGroupClient,
+    ConsumerGroupDetails, Identifier, IggyError, NamedPageQuery, Page,
 };
 use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::codec::WireEncode;
@@ -26,12 +28,14 @@ use iggy_binary_protocol::codes::{
     CREATE_CONSUMER_GROUP_CODE, DELETE_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUP_CODE,
     GET_CONSUMER_GROUPS_CODE, JOIN_CONSUMER_GROUP_CODE, LEAVE_CONSUMER_GROUP_CODE,
 };
+use iggy_binary_protocol::primitives::page::WirePageQuery;
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest, GetConsumerGroupRequest,
     GetConsumerGroupsRequest, JoinConsumerGroupRequest, LeaveConsumerGroupRequest,
 };
+use iggy_binary_protocol::responses::PageResponse;
+use iggy_binary_protocol::responses::consumer_groups::ConsumerGroupResponse;
 use iggy_binary_protocol::responses::consumer_groups::get_consumer_group::ConsumerGroupDetailsResponse;
-use iggy_binary_protocol::responses::consumer_groups::get_consumer_groups::GetConsumerGroupsResponse;
 
 #[async_trait::async_trait]
 impl<B: BinaryClient> ConsumerGroupClient for B {
@@ -68,24 +72,30 @@ impl<B: BinaryClient> ConsumerGroupClient for B {
         stream_id: &Identifier,
         topic_id: &Identifier,
     ) -> Result<Vec<ConsumerGroup>, IggyError> {
+        super::read_whole_list(self, |query| async move {
+            self.get_consumer_groups_page(stream_id, topic_id, &query)
+                .await
+        })
+        .await
+    }
+
+    async fn get_consumer_groups_page(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        query: &NamedPageQuery,
+    ) -> Result<Page<ConsumerGroup>, IggyError> {
         fail_if_not_authenticated(self).await?;
-        let wire_stream_id = identifier_to_wire(stream_id)?;
-        let wire_topic_id = identifier_to_wire(topic_id)?;
+        let request = GetConsumerGroupsRequest {
+            stream_id: identifier_to_wire(stream_id)?,
+            topic_id: identifier_to_wire(topic_id)?,
+            page: WirePageQuery::try_from(query)?,
+        };
         let response = self
-            .send_raw_with_response(
-                GET_CONSUMER_GROUPS_CODE,
-                GetConsumerGroupsRequest {
-                    stream_id: wire_stream_id,
-                    topic_id: wire_topic_id,
-                }
-                .to_bytes(),
-            )
+            .send_raw_with_response(GET_CONSUMER_GROUPS_CODE, request.to_bytes())
             .await?;
-        if response.is_empty() {
-            return Ok(Vec::new());
-        }
-        let wire_resp = super::decode_response::<GetConsumerGroupsResponse>(&response)?;
-        Ok(consumer_groups_from_wire(wire_resp))
+        let page = super::decode_response::<PageResponse<ConsumerGroupResponse>>(&response)?;
+        page_from_wire(page, |group| Ok(ConsumerGroup::from(group)))
     }
 
     async fn create_consumer_group(
@@ -191,5 +201,24 @@ impl<B: BinaryClient> ConsumerGroupClient for B {
             self.consumer_group_state().deregister_group(&key);
         }
         Ok(())
+    }
+
+    async fn sync_consumer_group(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        group_id: &Identifier,
+    ) -> Result<Option<ConsumerGroupAssignment>, IggyError> {
+        fail_if_not_authenticated(self).await?;
+        // What the sync put in the cache that group polls read, so the answer and the next poll
+        // agree, and an answer of a replaced session is never returned.
+        let synced = synced_group_assignment(self, stream_id, topic_id, group_id).await?;
+        Ok(synced.map(|(generation, mut partitions)| {
+            partitions.sort_unstable();
+            ConsumerGroupAssignment {
+                generation,
+                partitions,
+            }
+        }))
     }
 }

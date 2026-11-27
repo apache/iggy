@@ -29,6 +29,9 @@ use server_common::{Message, iobuf::Owned};
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
+#[cfg(test)]
+use std::task::{Poll, Waker};
+use std::time::Duration;
 
 /// Fixed synthetic epoch for [`SimClock`]: 2026-01-01T00:00:00Z in micros.
 ///
@@ -116,6 +119,12 @@ pub struct SimJournal<S: Storage> {
     slot_count: Cell<Option<usize>>,
     #[cfg(test)]
     fail_next_truncate: Cell<bool>,
+    /// Appends park while set, the way a write in flight stays unfinished in a
+    /// stopped process. See [`SimJournal::hold_appends`].
+    #[cfg(test)]
+    append_hold: Cell<bool>,
+    #[cfg(test)]
+    append_waiters: RefCell<Vec<Waker>>,
     /// Debug-only single-accessor tripwire. `entry` / `append` hold a
     /// [`JournalAccessGuard`] across their whole body, including the storage
     /// `.await`, so if a suspending storage tier ever let a second task touch
@@ -137,6 +146,10 @@ impl<S: Storage + Default> Default for SimJournal<S> {
             slot_count: Cell::new(None),
             #[cfg(test)]
             fail_next_truncate: Cell::new(false),
+            #[cfg(test)]
+            append_hold: Cell::new(false),
+            #[cfg(test)]
+            append_waiters: RefCell::new(Vec::new()),
             #[cfg(debug_assertions)]
             accessing: Cell::new(false),
         }
@@ -194,6 +207,10 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal for SimJournal<S> {
 
     fn last_op(&self) -> Option<u64> {
         self.last_op.get()
+    }
+
+    fn slot_count(&self) -> Option<usize> {
+        self.slot_count.get()
     }
 
     /// Slots left before a checkpoint is forced, mirroring
@@ -309,6 +326,18 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal for SimJournal<S> {
     }
 
     async fn append(&self, entry: Self::Entry) -> std::io::Result<()> {
+        #[cfg(test)]
+        std::future::poll_fn(|context| {
+            if self.append_hold.get() {
+                self.append_waiters
+                    .borrow_mut()
+                    .push(context.waker().clone());
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        })
+        .await;
         // Held across the write `.await`; see `entry` for the single-accessor
         // invariant this tripwire guards.
         #[cfg(debug_assertions)]
@@ -343,63 +372,20 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal for SimJournal<S> {
     ///
     /// The watermark moves last, as in `PrepareJournal::drain`: advancing it before
     /// the entries are gone would make live entries look evictable.
-    async fn drain(&self, ops: RangeInclusive<u64>) -> std::io::Result<Vec<Self::Entry>> {
+    async fn drain(&self, ops: RangeInclusive<u64>) -> std::io::Result<usize> {
         #[cfg(debug_assertions)]
         let _guard = JournalAccessGuard::new(&self.accessing);
         let end_op = *ops.end();
-        let doomed: Vec<u64> = {
-            let headers = unsafe { &*self.headers.get() };
-            let mut doomed: Vec<u64> = headers
-                .keys()
-                .copied()
-                .filter(|op| ops.contains(op))
-                .collect();
-            // Sorted: the trait promises op order, and hash order would make a
-            // replay of this drain diverge.
-            doomed.sort_unstable();
-            doomed
-        };
-
-        let mut drained = Vec::with_capacity(doomed.len());
-        for op in doomed {
-            // Read before removing, through `Storage` rather than the
-            // `MemStorage`-only sync path, so this stays generic. The borrow does
-            // NOT span the read, unlike `entry`'s: the block ends it and yields only
-            // `Copy` data, so the `.await` holds no reference into the `UnsafeCell`.
-            // Deliberate, since `drain` invalidates every outstanding
-            // `header`/`previous_header` reference too.
-            let located = {
-                let headers = unsafe { &*self.headers.get() };
-                let offsets = unsafe { &*self.offsets.get() };
-                headers
-                    .get(&op)
-                    .and_then(|header| offsets.get(&op).map(|offset| (header.size, *offset)))
-            };
-            // Propagated, not swallowed. Dropping the entry loses a WAL record while
-            // reporting a successful drain; `PrepareJournal` returns the error and
-            // poisons itself, and a harness surviving what production refuses to
-            // cannot find the bug this path exists to catch.
-            if let Some((size, offset)) = located {
-                let buffer = self.storage.read_at(offset, vec![0; size as usize]).await?;
-                let message =
-                    Message::try_from(Owned::<4096>::copy_from_slice(&buffer)).map_err(|_| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("drain: op {op} does not decode as a prepare"),
-                        )
-                    })?;
-                drained.push(message);
-            }
-            let headers = unsafe { &mut *self.headers.get() };
-            let offsets = unsafe { &mut *self.offsets.get() };
-            headers.remove(&op);
-            offsets.remove(&op);
-        }
+        let headers = unsafe { &mut *self.headers.get() };
+        let offsets = unsafe { &mut *self.offsets.get() };
+        let held = headers.len();
+        headers.retain(|op, _| !ops.contains(op));
+        offsets.retain(|op, _| !ops.contains(op));
 
         if end_op > self.snapshot_op.get() {
             self.snapshot_op.set(end_op);
         }
-        Ok(drained)
+        Ok(held - headers.len())
     }
 }
 
@@ -461,6 +447,23 @@ impl SimJournal<MemStorage> {
     #[cfg(test)]
     pub fn fail_next_truncate(&self) {
         self.fail_next_truncate.set(true);
+    }
+
+    /// Park every append from now on until [`Self::release_appends`]: a write
+    /// that is in flight when its process is stopped, and the submits queued
+    /// behind it, finish only after the process continues.
+    #[cfg(test)]
+    pub fn hold_appends(&self) {
+        self.append_hold.set(true);
+    }
+
+    /// Let the parked appends finish, in the order the executor polls them.
+    #[cfg(test)]
+    pub fn release_appends(&self) {
+        self.append_hold.set(false);
+        for waiter in self.append_waiters.borrow_mut().drain(..) {
+            waiter.wake();
+        }
     }
 
     /// The committed frontier proved by the contiguous chain above the local checkpoint.
@@ -553,6 +556,11 @@ pub struct SimSuperblock {
     /// interleave with a persist and every schedule-sensitive bug behind one is
     /// invisible to the simulator. The yield restores the window.
     yield_writes: Cell<bool>,
+    /// Fault injection: when set, every [`SuperblockStore::write`] completes
+    /// that long after it starts, on the virtual clock. A store behind a busy
+    /// disk answers late while its replica keeps ticking, and the default write
+    /// hides every timeout that runs out in that wait.
+    write_delay: RefCell<Option<(TimerHandle, Duration)>>,
 }
 
 impl SimSuperblock {
@@ -574,6 +582,12 @@ impl SimSuperblock {
     pub fn set_yield_writes(&self) {
         self.yield_writes.set(true);
     }
+
+    /// Make every subsequent write take `delay` on the clock of `timer`. See
+    /// `Self::write_delay`.
+    pub fn set_write_delay(&self, timer: TimerHandle, delay: Duration) {
+        *self.write_delay.borrow_mut() = Some((timer, delay));
+    }
 }
 
 #[allow(clippy::future_not_send)]
@@ -584,6 +598,10 @@ impl SuperblockStore for SimSuperblock {
         }
         if self.yield_writes.get() {
             yield_once().await;
+        }
+        let delay = self.write_delay.borrow().clone();
+        if let Some((timer, delay)) = delay {
+            timer.sleep(delay).await;
         }
         *self.latest.borrow_mut() = Some(payload.to_vec());
         Ok(())

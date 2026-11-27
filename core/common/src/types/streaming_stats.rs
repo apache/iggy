@@ -17,7 +17,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering},
 };
 use tracing::warn;
 
@@ -71,7 +71,7 @@ impl UnderflowSite {
     /// Count the clamp globally, then log this pair's first and every power of
     /// two after it.
     ///
-    /// The throttle is per pair, not global: a skewed tree emits up to three
+    /// The throttle is per pair, not global: a skewed tree emits up to four
     /// lines per counter per rollback and a bulk delete turns that into a
     /// flood, so a shared count would hold a quiet pair's first-ever
     /// divergence back for up to 1023 events behind a noisy one.
@@ -97,6 +97,9 @@ impl UnderflowSite {
     }
 }
 
+static NODE_SIZE_BYTES: UnderflowSite = UnderflowSite::new("node", "size_bytes");
+static NODE_MESSAGES_COUNT: UnderflowSite = UnderflowSite::new("node", "messages_count");
+static NODE_SEGMENTS_COUNT: UnderflowSite = UnderflowSite::new("node", "segments_count");
 static STREAM_SIZE_BYTES: UnderflowSite = UnderflowSite::new("stream", "size_bytes");
 static STREAM_MESSAGES_COUNT: UnderflowSite = UnderflowSite::new("stream", "messages_count");
 static STREAM_SEGMENTS_COUNT: UnderflowSite = UnderflowSite::new("stream", "segments_count");
@@ -107,8 +110,9 @@ static PARTITION_SIZE_BYTES: UnderflowSite = UnderflowSite::new("partition", "si
 static PARTITION_MESSAGES_COUNT: UnderflowSite = UnderflowSite::new("partition", "messages_count");
 static PARTITION_SEGMENTS_COUNT: UnderflowSite = UnderflowSite::new("partition", "segments_count");
 
-/// Subtract `amount`, clamping at zero instead of wrapping. Returns what was
-/// actually taken, which is what the caller passes on to its parent.
+/// Subtract `amount`, clamping at zero instead of wrapping. Returns the value
+/// before the subtraction and what was actually taken, which is what the
+/// caller passes on to its parent.
 ///
 /// `try_update` rather than a load followed by a subtract: the counters are
 /// written from the metadata shard and from whichever shard owns the partition,
@@ -116,7 +120,11 @@ static PARTITION_SEGMENTS_COUNT: UnderflowSite = UnderflowSite::new("partition",
 /// subtracts from another.
 macro_rules! clamped_sub {
     ($name:ident, $counter:ty, $amount:ty) => {
-        fn $name(counter: &$counter, amount: $amount, site: &'static UnderflowSite) -> $amount {
+        fn $name(
+            counter: &$counter,
+            amount: $amount,
+            site: &'static UnderflowSite,
+        ) -> ($amount, $amount) {
             let previous = counter
                 .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     // `None` on an already-zero counter: no store, and the
@@ -129,7 +137,7 @@ macro_rules! clamped_sub {
             if previous < amount {
                 site.report(u64::from(amount - previous));
             }
-            previous.min(amount)
+            (previous, previous.min(amount))
         }
     };
 }
@@ -137,42 +145,208 @@ macro_rules! clamped_sub {
 clamped_sub!(clamped_sub_u64, AtomicU64, u64);
 clamped_sub!(clamped_sub_u32, AtomicU32, u32);
 
+/// Move `counter` from `sampled` to `rebuilt` by their difference. A fall
+/// clamps like any other rollup decrement.
+fn move_by_difference(
+    counter: &AtomicU64,
+    sampled: u64,
+    rebuilt: u64,
+    site: &'static UnderflowSite,
+) {
+    if rebuilt >= sampled {
+        counter.fetch_add(rebuilt - sampled, Ordering::AcqRel);
+    } else {
+        clamped_sub_u64(counter, sampled - rebuilt, site);
+    }
+}
+
+/// The totals of every stream on the node, the root of the rollup. A stats
+/// read takes them without a walk over the streams.
+#[derive(Default, Debug)]
+pub struct NodeStats {
+    size_bytes: AtomicU64,
+    messages_count: AtomicU64,
+    segments_count: AtomicU64,
+    /// Partitions whose own segment count is above zero. Signed, because a
+    /// thread that empties a partition can report the loss before the thread
+    /// that filled it reports the gain. The sum is exact once both land.
+    partitions_with_segments: AtomicI64,
+}
+
+impl NodeStats {
+    fn increment_size_bytes(&self, size_bytes: u64) {
+        self.size_bytes.fetch_add(size_bytes, Ordering::AcqRel);
+    }
+
+    fn increment_messages_count(&self, messages_count: u64) {
+        self.messages_count
+            .fetch_add(messages_count, Ordering::AcqRel);
+    }
+
+    fn increment_segments_count(&self, segments_count: u32) {
+        self.segments_count
+            .fetch_add(u64::from(segments_count), Ordering::AcqRel);
+    }
+
+    // The root, so a clamp here has nowhere left to be forwarded.
+    fn decrement_size_bytes(&self, size_bytes: u64) {
+        clamped_sub_u64(&self.size_bytes, size_bytes, &NODE_SIZE_BYTES);
+    }
+
+    fn decrement_messages_count(&self, messages_count: u64) {
+        clamped_sub_u64(&self.messages_count, messages_count, &NODE_MESSAGES_COUNT);
+    }
+
+    fn decrement_segments_count(&self, segments_count: u32) {
+        clamped_sub_u64(
+            &self.segments_count,
+            u64::from(segments_count),
+            &NODE_SEGMENTS_COUNT,
+        );
+    }
+
+    fn partition_gained_segments(&self) {
+        self.partitions_with_segments.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn partition_lost_segments(&self) {
+        self.partitions_with_segments.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    pub fn size_bytes_inconsistent(&self) -> u64 {
+        self.size_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn messages_count_inconsistent(&self) -> u64 {
+        self.messages_count.load(Ordering::Relaxed)
+    }
+
+    pub fn segments_count_inconsistent(&self) -> u64 {
+        self.segments_count.load(Ordering::Relaxed)
+    }
+
+    pub fn partitions_with_segments_inconsistent(&self) -> u64 {
+        u64::try_from(self.partitions_with_segments.load(Ordering::Relaxed)).unwrap_or(0)
+    }
+
+    /// Read the totals that a later [`Self::apply_rebuilt`] moves from. The
+    /// partition count is read raw, below zero included, because the
+    /// difference has to be taken against what the counter really holds.
+    pub fn sample(&self) -> NodeStatsSample {
+        NodeStatsSample {
+            size_bytes: self.size_bytes.load(Ordering::Relaxed),
+            messages_count: self.messages_count.load(Ordering::Relaxed),
+            segments_count: self.segments_count.load(Ordering::Relaxed),
+            partitions_with_segments: self.partitions_with_segments.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Move the totals from `sampled` to the ones rebuilt from the partition
+    /// counters by the difference, not by a store: a change another shard made
+    /// after the sample is already in the totals, and it stays there.
+    pub fn apply_rebuilt(
+        &self,
+        sampled: NodeStatsSample,
+        size_bytes: u64,
+        messages_count: u64,
+        segments_count: u64,
+        partitions_with_segments: u64,
+    ) {
+        move_by_difference(
+            &self.size_bytes,
+            sampled.size_bytes,
+            size_bytes,
+            &NODE_SIZE_BYTES,
+        );
+        move_by_difference(
+            &self.messages_count,
+            sampled.messages_count,
+            messages_count,
+            &NODE_MESSAGES_COUNT,
+        );
+        move_by_difference(
+            &self.segments_count,
+            sampled.segments_count,
+            segments_count,
+            &NODE_SEGMENTS_COUNT,
+        );
+        let partitions_with_segments = i64::try_from(partitions_with_segments).unwrap_or(i64::MAX);
+        self.partitions_with_segments.fetch_add(
+            partitions_with_segments.saturating_sub(sampled.partitions_with_segments),
+            Ordering::AcqRel,
+        );
+    }
+}
+
+/// The node totals as one read saw them, the base [`NodeStats::apply_rebuilt`]
+/// moves from.
+#[derive(Debug, Clone, Copy)]
+pub struct NodeStatsSample {
+    size_bytes: u64,
+    messages_count: u64,
+    segments_count: u64,
+    partitions_with_segments: i64,
+}
+
 #[derive(Default, Debug)]
 pub struct StreamStats {
+    parent: Arc<NodeStats>,
     size_bytes: AtomicU64,
     messages_count: AtomicU64,
     segments_count: AtomicU32,
 }
 
 impl StreamStats {
+    pub fn new(parent: Arc<NodeStats>) -> Self {
+        Self {
+            parent,
+            size_bytes: AtomicU64::new(0),
+            messages_count: AtomicU64::new(0),
+            segments_count: AtomicU32::new(0),
+        }
+    }
+
     pub fn increment_size_bytes(&self, size_bytes: u64) {
         self.size_bytes.fetch_add(size_bytes, Ordering::AcqRel);
+        self.parent.increment_size_bytes(size_bytes);
     }
 
     pub fn increment_messages_count(&self, messages_count: u64) {
         self.messages_count
             .fetch_add(messages_count, Ordering::AcqRel);
+        self.parent.increment_messages_count(messages_count);
     }
 
     pub fn increment_segments_count(&self, segments_count: u32) {
         self.segments_count
             .fetch_add(segments_count, Ordering::AcqRel);
+        self.parent.increment_segments_count(segments_count);
     }
 
-    // A stream is the root, so a clamp here has nowhere left to be forwarded
-    // and no caller that could name a scope the `warn!` in `UnderflowSite`
-    // does not already carry. Only `PartitionStats` returns its shortfall,
-    // where the caller holds the namespace.
+    // Forward what this level actually gave up, as `TopicStats` does.
     pub fn decrement_size_bytes(&self, size_bytes: u64) {
-        clamped_sub_u64(&self.size_bytes, size_bytes, &STREAM_SIZE_BYTES);
+        let (_, taken) = clamped_sub_u64(&self.size_bytes, size_bytes, &STREAM_SIZE_BYTES);
+        self.parent.decrement_size_bytes(taken);
     }
 
     pub fn decrement_messages_count(&self, messages_count: u64) {
-        clamped_sub_u64(&self.messages_count, messages_count, &STREAM_MESSAGES_COUNT);
+        let (_, taken) =
+            clamped_sub_u64(&self.messages_count, messages_count, &STREAM_MESSAGES_COUNT);
+        self.parent.decrement_messages_count(taken);
     }
 
     pub fn decrement_segments_count(&self, segments_count: u32) {
-        clamped_sub_u32(&self.segments_count, segments_count, &STREAM_SEGMENTS_COUNT);
+        let (_, taken) =
+            clamped_sub_u32(&self.segments_count, segments_count, &STREAM_SEGMENTS_COUNT);
+        self.parent.decrement_segments_count(taken);
+    }
+
+    fn partition_gained_segments(&self) {
+        self.parent.partition_gained_segments();
+    }
+
+    fn partition_lost_segments(&self) {
+        self.parent.partition_lost_segments();
     }
 
     pub fn size_bytes_inconsistent(&self) -> u64 {
@@ -188,15 +362,18 @@ impl StreamStats {
     }
 
     pub fn zero_out_size_bytes(&self) {
-        self.size_bytes.store(0, Ordering::Relaxed);
+        let prev = self.size_bytes.swap(0, Ordering::AcqRel);
+        self.parent.decrement_size_bytes(prev);
     }
 
     pub fn zero_out_messages_count(&self) {
-        self.messages_count.store(0, Ordering::Relaxed);
+        let prev = self.messages_count.swap(0, Ordering::AcqRel);
+        self.parent.decrement_messages_count(prev);
     }
 
     pub fn zero_out_segments_count(&self) {
-        self.segments_count.store(0, Ordering::Relaxed);
+        let prev = self.segments_count.swap(0, Ordering::AcqRel);
+        self.parent.decrement_segments_count(prev);
     }
 
     pub fn zero_out_all(&self) {
@@ -265,18 +442,28 @@ impl TopicStats {
     // full amount up would take them out of a sibling's live data instead.
     // Under `parent == sum(children)` the two are equal and nothing changes.
     pub fn decrement_size_bytes(&self, size_bytes: u64) {
-        let taken = clamped_sub_u64(&self.size_bytes, size_bytes, &TOPIC_SIZE_BYTES);
+        let (_, taken) = clamped_sub_u64(&self.size_bytes, size_bytes, &TOPIC_SIZE_BYTES);
         self.parent.decrement_size_bytes(taken);
     }
 
     pub fn decrement_messages_count(&self, messages_count: u64) {
-        let taken = clamped_sub_u64(&self.messages_count, messages_count, &TOPIC_MESSAGES_COUNT);
+        let (_, taken) =
+            clamped_sub_u64(&self.messages_count, messages_count, &TOPIC_MESSAGES_COUNT);
         self.parent.decrement_messages_count(taken);
     }
 
     pub fn decrement_segments_count(&self, segments_count: u32) {
-        let taken = clamped_sub_u32(&self.segments_count, segments_count, &TOPIC_SEGMENTS_COUNT);
+        let (_, taken) =
+            clamped_sub_u32(&self.segments_count, segments_count, &TOPIC_SEGMENTS_COUNT);
         self.parent.decrement_segments_count(taken);
+    }
+
+    fn partition_gained_segments(&self) {
+        self.parent.partition_gained_segments();
+    }
+
+    fn partition_lost_segments(&self) {
+        self.parent.partition_lost_segments();
     }
 
     pub fn size_bytes_inconsistent(&self) -> u64 {
@@ -363,9 +550,13 @@ impl PartitionStats {
     }
 
     pub fn increment_segments_count(&self, segments_count: u32) {
-        self.segments_count
+        let previous = self
+            .segments_count
             .fetch_add(segments_count, Ordering::AcqRel);
         self.parent.increment_segments_count(segments_count);
+        if previous == 0 && segments_count > 0 {
+            self.parent.partition_gained_segments();
+        }
     }
 
     // Forward what this level actually gave up, not what was asked for. A
@@ -378,13 +569,13 @@ impl PartitionStats {
     // hold, zero when the decrement was covered -- so a caller that knows the
     // ids can name where the divergence is.
     pub fn decrement_size_bytes(&self, size_bytes: u64) -> u64 {
-        let taken = clamped_sub_u64(&self.size_bytes, size_bytes, &PARTITION_SIZE_BYTES);
+        let (_, taken) = clamped_sub_u64(&self.size_bytes, size_bytes, &PARTITION_SIZE_BYTES);
         self.parent.decrement_size_bytes(taken);
         size_bytes - taken
     }
 
     pub fn decrement_messages_count(&self, messages_count: u64) -> u64 {
-        let taken = clamped_sub_u64(
+        let (_, taken) = clamped_sub_u64(
             &self.messages_count,
             messages_count,
             &PARTITION_MESSAGES_COUNT,
@@ -394,12 +585,15 @@ impl PartitionStats {
     }
 
     pub fn decrement_segments_count(&self, segments_count: u32) -> u32 {
-        let taken = clamped_sub_u32(
+        let (previous, taken) = clamped_sub_u32(
             &self.segments_count,
             segments_count,
             &PARTITION_SEGMENTS_COUNT,
         );
         self.parent.decrement_segments_count(taken);
+        if previous > 0 && previous <= segments_count {
+            self.parent.partition_lost_segments();
+        }
         segments_count - taken
     }
 
@@ -413,6 +607,36 @@ impl PartitionStats {
 
     pub fn segments_count_inconsistent(&self) -> u32 {
         self.segments_count.load(Ordering::Relaxed)
+    }
+
+    /// Move every counter to the values another node reported, carrying the
+    /// difference into the parents.
+    pub fn store_reported(
+        &self,
+        size_bytes: u64,
+        messages_count: u64,
+        segments_count: u32,
+        current_offset: u64,
+    ) {
+        let size = self.size_bytes.load(Ordering::Relaxed);
+        if size_bytes >= size {
+            self.increment_size_bytes(size_bytes - size);
+        } else {
+            self.decrement_size_bytes(size - size_bytes);
+        }
+        let messages = self.messages_count.load(Ordering::Relaxed);
+        if messages_count >= messages {
+            self.increment_messages_count(messages_count - messages);
+        } else {
+            self.decrement_messages_count(messages - messages_count);
+        }
+        let segments = self.segments_count.load(Ordering::Relaxed);
+        if segments_count >= segments {
+            self.increment_segments_count(segments_count - segments);
+        } else {
+            self.decrement_segments_count(segments - segments_count);
+        }
+        self.set_current_offset(current_offset);
     }
 
     pub fn current_offset(&self) -> u64 {
@@ -436,6 +660,9 @@ impl PartitionStats {
     pub fn zero_out_segments_count(&self) {
         let prev = self.segments_count.swap(0, Ordering::AcqRel);
         self.parent.decrement_segments_count(prev);
+        if prev > 0 {
+            self.parent.partition_lost_segments();
+        }
     }
 
     pub fn zero_out_current_offset(&self) {
@@ -546,6 +773,89 @@ mod tests {
         // and its own call sites at all three levels.
         assert_eq!(topic.segments_count_inconsistent(), 0);
         assert_eq!(stream.segments_count_inconsistent(), 0);
+    }
+
+    fn partition_under(node: &Arc<NodeStats>) -> Arc<PartitionStats> {
+        let stream = Arc::new(StreamStats::new(node.clone()));
+        let topic = Arc::new(TopicStats::new(stream));
+        Arc::new(PartitionStats::new(topic))
+    }
+
+    #[test]
+    fn given_partitions_of_two_streams_when_counting_should_sum_them_on_the_node() {
+        let node = Arc::new(NodeStats::default());
+        let first = partition_under(&node);
+        let second = partition_under(&node);
+        first.increment_size_bytes(100);
+        first.increment_messages_count(10);
+        first.increment_segments_count(2);
+        second.increment_size_bytes(50);
+        second.increment_messages_count(5);
+        second.increment_segments_count(1);
+        assert_eq!(node.size_bytes_inconsistent(), 150);
+        assert_eq!(node.messages_count_inconsistent(), 15);
+        assert_eq!(node.segments_count_inconsistent(), 3);
+
+        first.decrement_size_bytes(40);
+        first.decrement_messages_count(4);
+        first.decrement_segments_count(1);
+        assert_eq!(node.size_bytes_inconsistent(), 110);
+        assert_eq!(node.messages_count_inconsistent(), 11);
+        assert_eq!(node.segments_count_inconsistent(), 2);
+
+        second.zero_out_all();
+        assert_eq!(node.size_bytes_inconsistent(), 60);
+        assert_eq!(node.messages_count_inconsistent(), 6);
+        assert_eq!(node.segments_count_inconsistent(), 1);
+    }
+
+    /// Stats reads add the floor of one segment for each partition outside
+    /// this count, so a missed transition shows up there as a wrong total.
+    #[test]
+    fn given_segment_counts_crossing_zero_when_counting_should_track_partitions_with_segments() {
+        let node = Arc::new(NodeStats::default());
+        let first = partition_under(&node);
+        let second = partition_under(&node);
+
+        first.increment_segments_count(0);
+        assert_eq!(node.partitions_with_segments_inconsistent(), 0);
+        first.increment_segments_count(1);
+        first.increment_segments_count(1);
+        second.increment_segments_count(3);
+        assert_eq!(node.partitions_with_segments_inconsistent(), 2);
+
+        first.decrement_segments_count(1);
+        assert_eq!(node.partitions_with_segments_inconsistent(), 2);
+        first.decrement_segments_count(1);
+        assert_eq!(node.partitions_with_segments_inconsistent(), 1);
+        // Nothing left to lose: an empty partition is already outside the count.
+        first.decrement_segments_count(1);
+        assert_eq!(node.partitions_with_segments_inconsistent(), 1);
+
+        // A clamped decrement still empties the partition.
+        second.decrement_segments_count(5);
+        assert_eq!(node.partitions_with_segments_inconsistent(), 0);
+
+        second.increment_segments_count(2);
+        second.zero_out_all();
+        second.zero_out_all();
+        assert_eq!(node.partitions_with_segments_inconsistent(), 0);
+        assert_eq!(node.segments_count_inconsistent(), 0);
+
+        // A read clamps a negative count to zero, so only the next gain shows
+        // whether zeroing the empty partition took one away.
+        first.increment_segments_count(1);
+        assert_eq!(node.partitions_with_segments_inconsistent(), 1);
+    }
+
+    #[test]
+    fn given_a_loss_landing_before_its_gain_when_reading_should_not_wrap() {
+        let node = NodeStats::default();
+        node.partition_lost_segments();
+        assert_eq!(node.partitions_with_segments_inconsistent(), 0);
+        node.partition_gained_segments();
+        node.partition_gained_segments();
+        assert_eq!(node.partitions_with_segments_inconsistent(), 1);
     }
 
     #[test]

@@ -97,14 +97,17 @@ func (c *GetUser) MarshalBinary() ([]byte, error) {
 	return c.Id.MarshalBinary()
 }
 
-type GetUsers struct{}
+// GetUsers asks for one page of the users.
+type GetUsers struct {
+	Query iggcon.NamedPageQuery
+}
 
 func (g *GetUsers) Code() Code {
 	return GetUsersCode
 }
 
 func (g *GetUsers) MarshalBinary() ([]byte, error) {
-	return []byte{}, nil
+	return g.Query.AppendBinary(nil)
 }
 
 type UpdatePermissions struct {

@@ -1432,9 +1432,12 @@ impl ConsensusHeader for PrepareOkHeader {
     }
 }
 
-// CommitHeader - primary -> replicas (commit, header-only)
+// CommitHeader - primary -> peer node (batch of Commit entries)
 
-/// Primary -> replicas: commit up to this op. Header-only (no body).
+/// Primary -> peer node: a batch of [`super::CommitEntry`], one per group.
+///
+/// `replica` is the id of the sending node. The body holds `entry_count`
+/// entries and `checksum_body` covers it. A lone `Commit` is a batch of one.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
 pub struct CommitHeader {
@@ -1448,22 +1451,13 @@ pub struct CommitHeader {
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
-    pub commit_checksum: u128,
-    pub timestamp_monotonic: u64,
-    pub commit: u64,
-    pub checkpoint_op: u64,
-    pub group: u64,
-    pub partition_incarnation: u64,
-    pub reserved: [u8; 72],
+    pub entry_count: u32,
+    pub reserved: [u8; 124],
 }
 const _: () = {
     assert!(size_of::<CommitHeader>() == HEADER_SIZE);
-    assert!(
-        offset_of!(CommitHeader, commit_checksum)
-            == offset_of!(CommitHeader, reserved_frame) + size_of::<[u8; 66]>()
-    );
-    assert!(offset_of!(CommitHeader, reserved) + size_of::<[u8; 72]>() == HEADER_SIZE);
-    assert!(offset_of!(CommitHeader, partition_incarnation) == 176);
+    assert!(offset_of!(CommitHeader, entry_count) == 128);
+    assert!(offset_of!(CommitHeader, reserved) + size_of::<[u8; 124]>() == HEADER_SIZE);
 };
 
 impl ConsensusHeader for CommitHeader {
@@ -1492,11 +1486,178 @@ impl ConsensusHeader for CommitHeader {
         if self.command != Command::Commit {
             return Err(ConsensusError::CommitInvalidCommand);
         }
-        if self.size != 256 {
-            return Err(ConsensusError::CommitInvalidSize(self.size));
+        validate_batch_size::<super::CommitEntry>(self.size, self.entry_count)
+    }
+}
+
+/// Backup -> primary node: a batch of [`super::CommitReplyEntry`], each
+/// echoing a heartbeat counter for quorum liveness.
+///
+/// This acknowledges connectivity, not journal or state-machine durability.
+/// `replica` is the id of the sending node. The body holds `entry_count`
+/// entries and `checksum_body` covers it.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
+pub struct CommitReplyHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+    pub entry_count: u32,
+    pub reserved: [u8; 124],
+}
+
+const _: () = {
+    assert!(size_of::<CommitReplyHeader>() == HEADER_SIZE);
+    assert!(offset_of!(CommitReplyHeader, entry_count) == 128);
+    assert!(offset_of!(CommitReplyHeader, reserved) + size_of::<[u8; 124]>() == HEADER_SIZE);
+};
+
+impl ConsensusHeader for CommitReplyHeader {
+    const FRAME_SEALED: bool = true;
+    const COMMAND: Command = Command::CommitReply;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+    fn command(&self) -> Command {
+        self.command
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Self::COMMAND {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Self::COMMAND,
+                found: self.command,
+            });
+        }
+        if self.release != 0 {
+            return Err(ConsensusError::InvalidField("release != 0".to_string()));
+        }
+        validate_batch_size::<super::CommitReplyEntry>(self.size, self.entry_count)
+    }
+}
+
+/// A batch holds at least one entry, and its size matches its entry count.
+/// A revision 1 frame fails here: its bytes at the count either read zero or
+/// name a count that does not match its 256-byte size.
+fn validate_batch_size<E>(size: u32, entry_count: u32) -> Result<(), ConsensusError> {
+    let expected = usize::try_from(entry_count)
+        .ok()
+        .filter(|count| *count > 0)
+        .and_then(super::batch_frame_size::<E>);
+    if expected != Some(size) {
+        return Err(ConsensusError::InvalidField(format!(
+            "batch of {entry_count} entries cannot be {size} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// Correlates a replication checkpoint with the backup's contiguous prefixes.
+///
+/// Probes must stay ordered with prepares on the sender's queue, so a reply
+/// proves that the backup consumed every frame sent before its probe. That FIFO
+/// position, not an op, releases transport credit. Progress never counts toward
+/// a commit quorum.
+/// Replies echo the nonce and observed op. `held_op` is the end of the prefix
+/// that the backup holds with proof in the current view, so the primary finds
+/// replication gaps from it. `received_op <= held_op` is the part of that
+/// prefix that meets the prepare acknowledgment rules, and `ready` certifies it. Probes advertise the primary's applied frontier for retention
+/// fallback.
+/// Nodes using this message require a coordinated cluster upgrade.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
+pub struct PrepareProgressHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+    pub nonce: u64,
+    pub group: u64,
+    pub partition_incarnation: u64,
+    pub observed_op: u64,
+    pub received_op: u64,
+    pub held_op: u64,
+    pub commit_op: u64,
+    pub kind: u8,
+    pub ready: u8,
+    pub reserved: [u8; 70],
+}
+
+const _: () = {
+    assert!(size_of::<PrepareProgressHeader>() == HEADER_SIZE);
+    assert!(offset_of!(PrepareProgressHeader, nonce) == 128);
+    assert!(offset_of!(PrepareProgressHeader, partition_incarnation) == 144);
+    assert!(offset_of!(PrepareProgressHeader, reserved) + size_of::<[u8; 70]>() == HEADER_SIZE);
+};
+
+impl ConsensusHeader for PrepareProgressHeader {
+    const FRAME_SEALED: bool = true;
+    const COMMAND: Command = Command::PrepareProgress;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+    fn command(&self) -> Command {
+        self.command
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Self::COMMAND {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Self::COMMAND,
+                found: self.command,
+            });
+        }
+        if usize::try_from(self.size) != Ok(HEADER_SIZE) {
+            return Err(ConsensusError::InvalidField(
+                "prepare_progress: invalid size".to_string(),
+            ));
+        }
+        if self.release != 0 {
+            return Err(ConsensusError::InvalidField("release != 0".to_string()));
+        }
+        if self.kind > Self::REPLY || self.ready > 1 {
+            return Err(ConsensusError::InvalidField(
+                "prepare_progress: invalid fields".to_string(),
+            ));
         }
         Ok(())
     }
+}
+
+impl PrepareProgressHeader {
+    pub const PROBE: u8 = 0;
+    pub const REPLY: u8 = 1;
 }
 
 // StartViewChangeHeader - failure detection (header-only)
@@ -3015,6 +3176,11 @@ pub const LIFECYCLE_COMPLETION_SIZE: usize = 2 * size_of::<u32>() + size_of::<u6
 /// The partition replicas prove a completion, and the primary may hold none of
 /// them, so a backup that holds one relays its evidence. No result frame comes
 /// back: the backup sees the commit through replication.
+///
+/// A `TruncatePartition` rides the same frame for the same reason: the primary
+/// of a tiered partition decides its retention, and it can sit on a metadata
+/// backup. A build that predates it refuses the operation in `validate`, so
+/// the frame is dropped there and the sender decides again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
 #[repr(C)]
 pub struct ForwardCompletionHeader {
@@ -3050,6 +3216,13 @@ impl ForwardCompletionHeader {
         + size_of::<u32>()
         + InstallConsumerGroupOwnerRequest::ENCODED_SIZE
         + size_of::<u64>();
+
+    /// The relay names the stream and topic by number, then carries the
+    /// partition id, the offset and the incarnation the offset was read from.
+    /// The incarnation is not optional here: a truncation without it would
+    /// apply to whatever partition holds the slot at commit.
+    const RETENTION_TRUNCATION_BODY_SIZE: usize =
+        2 * WireIdentifier::NUMERIC_ENCODED_SIZE + size_of::<u32>() + 2 * size_of::<u64>();
 }
 
 impl ConsensusHeader for ForwardCompletionHeader {
@@ -3094,9 +3267,12 @@ impl ConsensusHeader for ForwardCompletionHeader {
                             .contains(&(completions / LIFECYCLE_COMPLETION_SIZE))
                 }),
             Operation::CompleteConsumerGroupRevocation => body_size == Self::REVOCATION_BODY_SIZE,
+            Operation::TruncatePartition => body_size == Self::RETENTION_TRUNCATION_BODY_SIZE,
             _ => {
                 return Err(ConsensusError::InvalidField(
-                    "forward completion operation must be a partition completion".to_string(),
+                    "forward completion operation must be a partition completion or a \
+                     retention truncation"
+                        .to_string(),
                 ));
             }
         };
@@ -3105,9 +3281,9 @@ impl ConsensusHeader for ForwardCompletionHeader {
                 "forward completion body must have the size of its operation".to_string(),
             ));
         }
-        if self.operation == Operation::CompleteConsumerGroupRevocation && self.reporter != 0 {
+        if self.operation != Operation::CompleteLifecycle && self.reporter != 0 {
             return Err(ConsensusError::InvalidField(
-                "a forward revocation names no reporter".to_string(),
+                "only a forward lifecycle batch names a reporter".to_string(),
             ));
         }
         if self.release != 0 {
@@ -3156,13 +3332,14 @@ mod tests {
     }
     use super::prepare_identity_checksum_bytes;
     use super::{
-        Command, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader, EvictionHeader,
-        EvictionReason, ForwardCompletionHeader, ForwardLogoutHeader, ForwardLogoutOutcome,
-        ForwardLogoutResultHeader, ForwardRegisterHeader, ForwardRegisterOutcome,
-        ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, LIFECYCLE_BATCH_HEADER_SIZE,
-        LIFECYCLE_COMPLETION_SIZE, LIFECYCLE_COMPLETIONS_MAX, Operation, PrepareHeader,
-        PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader, ReplyHeader, RequestHeader,
-        RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
+        Command, CommitHeader, CommitReplyHeader, ConsensusError, ConsensusHeader,
+        DoViewChangeHeader, EvictionHeader, EvictionReason, ForwardCompletionHeader,
+        ForwardLogoutHeader, ForwardLogoutOutcome, ForwardLogoutResultHeader,
+        ForwardRegisterHeader, ForwardRegisterOutcome, ForwardRegisterResultHeader, GenericHeader,
+        HEADER_SIZE, LIFECYCLE_BATCH_HEADER_SIZE, LIFECYCLE_COMPLETION_SIZE,
+        LIFECYCLE_COMPLETIONS_MAX, Operation, PrepareHeader, PrepareOkHeader,
+        PrepareProgressHeader, RepairPrepareHeader, RepairRangeReplyHeader, ReplyHeader,
+        RequestHeader, RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
         RequestStateTransferHeader, RoutedRequestHeader, StartViewChangeHeader, StartViewHeader,
         StateChunkHeader, StateTransferTargetHeader,
     };
@@ -3226,6 +3403,8 @@ mod tests {
         seals!(
             PrepareOkHeader,
             CommitHeader,
+            CommitReplyHeader,
+            PrepareProgressHeader,
             StartViewChangeHeader,
             DoViewChangeHeader,
             StartViewHeader,
@@ -3291,7 +3470,7 @@ mod tests {
             })+};
         }
         check_incarnation!(
-            CommitHeader,
+            PrepareProgressHeader,
             StartViewChangeHeader,
             DoViewChangeHeader,
             StartViewHeader,
@@ -4197,12 +4376,17 @@ mod tests {
         assert_eq!(ForwardLogoutOutcome::OperationMismatch as u8, 6);
     }
 
-    /// A revocation, or else a lifecycle batch of one completion.
+    /// A revocation, a retention truncation, or else a lifecycle batch of one
+    /// completion.
     fn forward_completion(operation: Operation) -> ForwardCompletionHeader {
-        let (body_size, reporter) = if operation == Operation::CompleteConsumerGroupRevocation {
-            (ForwardCompletionHeader::REVOCATION_BODY_SIZE, 0)
-        } else {
-            (LIFECYCLE_BATCH_HEADER_SIZE + LIFECYCLE_COMPLETION_SIZE, 5)
+        let (body_size, reporter) = match operation {
+            Operation::CompleteConsumerGroupRevocation => {
+                (ForwardCompletionHeader::REVOCATION_BODY_SIZE, 0)
+            }
+            Operation::TruncatePartition => {
+                (ForwardCompletionHeader::RETENTION_TRUNCATION_BODY_SIZE, 0)
+            }
+            _ => (LIFECYCLE_BATCH_HEADER_SIZE + LIFECYCLE_COMPLETION_SIZE, 5),
         };
         let mut header = ForwardCompletionHeader {
             checksum: 0,
@@ -4227,6 +4411,7 @@ mod tests {
         for operation in [
             Operation::CompleteLifecycle,
             Operation::CompleteConsumerGroupRevocation,
+            Operation::TruncatePartition,
         ] {
             let header = forward_completion(operation);
             let mut bytes = aligned_zeroed(HEADER_SIZE);
@@ -4254,7 +4439,7 @@ mod tests {
         for operation in [
             Operation::Reserved,
             Operation::RemoveConsumerGroupMember,
-            Operation::TruncatePartition,
+            Operation::DeleteSegments,
             Operation::DeleteTopic,
             Operation::InstallConsumerGroupOwner,
         ] {
@@ -4336,6 +4521,39 @@ mod tests {
         assert!(
             matches!(header.validate(), Err(ConsensusError::InvalidField(_))),
             "the frame prefix reserved bytes must be zero"
+        );
+    }
+    #[test]
+    fn given_forward_retention_truncation_when_malformed_should_fail_validation() {
+        let truncation_body = ForwardCompletionHeader::RETENTION_TRUNCATION_BODY_SIZE;
+        assert_eq!(truncation_body, 32, "the relayed truncation body is pinned");
+        for (body_size, fits) in [
+            (truncation_body, true),
+            // The body of a truncation that names no incarnation.
+            (truncation_body - size_of::<u64>(), false),
+            (truncation_body - 1, false),
+            (truncation_body + 1, false),
+            (0, false),
+        ] {
+            let mut header = forward_completion(Operation::TruncatePartition);
+            header.size = u32::try_from(HEADER_SIZE + body_size).expect("the frame size fits u32");
+            assert_eq!(
+                header.validate().is_ok(),
+                fits,
+                "a truncation with a body of {body_size} bytes"
+            );
+        }
+        let mut header = forward_completion(Operation::TruncatePartition);
+        header.reporter = 5;
+        assert!(
+            matches!(header.validate(), Err(ConsensusError::InvalidField(_))),
+            "a forward truncation names no reporter"
+        );
+        header = forward_completion(Operation::TruncatePartition);
+        header.reserved[0] = 1;
+        assert!(
+            matches!(header.validate(), Err(ConsensusError::InvalidField(_))),
+            "a forward truncation carries nothing in the reserved bytes"
         );
     }
 }

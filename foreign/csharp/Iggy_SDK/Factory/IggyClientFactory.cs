@@ -17,6 +17,7 @@
 
 using System.ComponentModel;
 using Apache.Iggy.Configuration;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.IggyClient.Implementations;
@@ -33,6 +34,8 @@ namespace Apache.Iggy.Factory;
 /// </remarks>
 public static class IggyClientFactory
 {
+    private static readonly TimeSpan HttpTimeoutMargin = TimeSpan.FromSeconds(10);
+
     /// <summary>
     ///     Creates and returns an instance of <see cref="IIggyClient" /> based on the provided configuration options.
     /// </summary>
@@ -122,10 +125,13 @@ public static class IggyClientFactory
             options.AllowAutoCommitWithEncryptor);
     }
 
-    private static HttpClient CreateHttpClient(IggyClientConfigurator options)
+    internal static HttpClient CreateHttpClient(IggyClientConfigurator options)
     {
-        var client = new HttpClient(new TransientHttpRetryHandler(new HttpClientHandler()));
-        client.BaseAddress = new Uri(options.BaseAddress);
-        return client;
+        // A deferred poll ends itself at its request timeout, so the client timeout must not end it first.
+        return new HttpClient(new TransientHttpRetryHandler(new HttpClientHandler()))
+        {
+            BaseAddress = new Uri(options.BaseAddress),
+            Timeout = DeferredPollOptions.MaxRequestTimeout + HttpTimeoutMargin
+        };
     }
 }

@@ -54,7 +54,6 @@ export const topicToFile = async (
     partitionId,
     pollingStrategy: PollingStrategy.Next,
     count: 1,
-    interval: 1000,
     endOnLastOffset: true
   });
 

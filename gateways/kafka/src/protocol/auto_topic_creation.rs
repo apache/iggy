@@ -201,7 +201,7 @@ async fn create(
         .auto_create_kafka_topic(kafka_topic, partitions)
         .await
     {
-        Ok(TopicCreationOutcome::Created) => {
+        Ok(TopicCreationOutcome::Created { .. }) => {
             warnings.forget(kafka_topic);
             info!(
                 kafka_topic,

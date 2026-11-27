@@ -20,7 +20,6 @@
 //! whether the route is mounted. The scrape handler itself lives with the
 //! other route handlers so this leaf never imports the state hub.
 
-use std::fmt::Write;
 use std::mem;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -28,14 +27,14 @@ use std::sync::{Arc, Mutex, PoisonError};
 use configs::http::HttpMetricsConfig;
 use iggy_common::{IggyError, stats_rollup_underflows};
 use prometheus_client::collector::Collector;
-use prometheus_client::encoding::text::encode;
-use prometheus_client::encoding::{
-    DescriptorEncoder, EncodeLabelValue, EncodeMetric, LabelValueEncoder,
-};
+use prometheus_client::encoding::text::{encode_eof, encode_registry};
+use prometheus_client::encoding::{DescriptorEncoder, EncodeMetric};
 use prometheus_client::metrics::MetricType;
 use prometheus_client::metrics::counter::{ConstCounter, Counter};
 use prometheus_client::metrics::gauge::{ConstGauge, Gauge};
 use prometheus_client::registry::Registry;
+use server_common::{DISK_USAGE, DiskUsage};
+use shard::metrics::{LongTermLag, ShardMetrics};
 use tracing::error;
 
 /// Exports the process-wide clamped-rollup count as a counter series, read at
@@ -79,6 +78,55 @@ impl Collector for StatsRollupUnderflows {
         )?;
         counter.encode(metric_encoder)
     }
+}
+
+/// Exports the node's free-space reserve, read at encode time. Absent when
+/// the reserve is disabled. It describes the host's volume, so it lives in
+/// the stats registry next to [`DiskUsageMetrics`].
+#[derive(Debug)]
+struct DataDiskFreeSpace;
+
+impl Collector for DataDiskFreeSpace {
+    fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), std::fmt::Error> {
+        let Some(reserve) = crate::sysinfo_probe::free_space_reserve() else {
+            return Ok(());
+        };
+        encode_free_space(&mut encoder, &reserve)
+    }
+}
+
+fn encode_free_space(
+    encoder: &mut DescriptorEncoder,
+    reserve: &partitions::FreeSpaceReserve,
+) -> Result<(), std::fmt::Error> {
+    let gauges = [
+        (
+            "data_disk_free_bytes",
+            "estimated free space on the disk of the data directory in bytes: the last sample minus what Iggy wrote since and what it accepted and has not written yet",
+            reserve.free_bytes(),
+        ),
+        (
+            "data_disk_free_space_reserve_bytes",
+            "free space the node keeps on the disk of the data directory in bytes",
+            reserve.reserve_bytes(),
+        ),
+        (
+            "data_disk_below_free_space_reserve",
+            "1 while the data disk is below its reserve and the node refuses new messages, else 0",
+            u64::from(reserve.is_short()),
+        ),
+    ];
+    for (name, help, value) in gauges {
+        let gauge = ConstGauge::new(value);
+        gauge.encode(encoder.encode_descriptor(name, help, None, gauge.metric_type())?)?;
+    }
+    let refused = ConstCounter::new(reserve.refused_requests());
+    refused.encode(encoder.encode_descriptor(
+        "messages_refused_for_free_space",
+        "total count of message requests refused while the data disk was below its reserve",
+        None,
+        refused.metric_type(),
+    )?)
 }
 
 /// One topic's usage as the scrape handler sampled it from the streams STM.
@@ -155,45 +203,151 @@ fn encode_topic_gauge(
         let Some(value) = value(sample) else {
             continue;
         };
+        let labels = [("stream", &*sample.stream), ("topic", &*sample.topic)];
+        ConstGauge::new(value).encode(metric_encoder.encode_family(&labels)?)?;
+    }
+    Ok(())
+}
+
+/// What one partition has yet to rewrite into long-term segments, as the
+/// scrape handler named it from the streams STM.
+#[derive(Debug)]
+pub(in crate::http) struct LongTermLagSample {
+    pub(in crate::http) stream: Arc<str>,
+    pub(in crate::http) topic: Arc<str>,
+    pub(in crate::http) partition: usize,
+    pub(in crate::http) messages: u64,
+    /// `None` until the partition counted them, so the series is absent
+    /// rather than 0.
+    pub(in crate::http) bytes: Option<u64>,
+}
+
+/// Per-partition `{stream, topic, partition}` series of the partitions that
+/// place their batches and that this node leads, replaced wholesale on every
+/// scrape like [`TopicUsage`].
+#[derive(Debug, Clone, Default)]
+pub(in crate::http) struct LongTermLags {
+    samples: Arc<Mutex<Vec<LongTermLagSample>>>,
+}
+
+impl LongTermLags {
+    pub(in crate::http) fn replace(&self, samples: Vec<LongTermLagSample>) {
+        *self.samples.lock().unwrap_or_else(PoisonError::into_inner) = samples;
+    }
+}
+
+impl Collector for LongTermLags {
+    fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), std::fmt::Error> {
+        let samples = mem::take(&mut *self.samples.lock().unwrap_or_else(PoisonError::into_inner));
+        encode_long_term_lag_gauge(
+            &mut encoder,
+            "topic_partition_long_term_lag_messages",
+            "messages the partition committed that no long-term segment holds yet",
+            &samples,
+            |sample| Some(sample.messages),
+        )?;
+        encode_long_term_lag_gauge(
+            &mut encoder,
+            "topic_partition_long_term_lag_bytes",
+            concat!(
+                "bytes of the messages the partition committed that no long-term segment ",
+                "holds yet, absent until the partition counted them",
+            ),
+            &samples,
+            |sample| sample.bytes,
+        )
+    }
+}
+
+fn encode_long_term_lag_gauge(
+    encoder: &mut DescriptorEncoder,
+    name: &str,
+    help: &str,
+    samples: &[LongTermLagSample],
+    value: impl Fn(&LongTermLagSample) -> Option<u64>,
+) -> Result<(), std::fmt::Error> {
+    let mut metric_encoder = encoder.encode_descriptor(name, help, None, MetricType::Gauge)?;
+    for sample in samples {
+        let Some(value) = value(sample) else {
+            continue;
+        };
+        let partition = sample.partition.to_string();
         let labels = [
-            ("stream", EscapedLabelValue(&sample.stream)),
-            ("topic", EscapedLabelValue(&sample.topic)),
+            ("stream", &*sample.stream),
+            ("topic", &*sample.topic),
+            ("partition", partition.as_str()),
         ];
         ConstGauge::new(value).encode(metric_encoder.encode_family(&labels)?)?;
     }
     Ok(())
 }
 
-/// prometheus-client writes label values verbatim, and stream and topic names
-/// may contain any character the exposition format treats as syntax.
-struct EscapedLabelValue<'a>(&'a str);
+/// Exports the disk usage of the volume holding the data directory, read at
+/// encode time like [`StatsRollupUnderflows`].
+///
+/// `volume_used_bytes` is the estimate: the last `statvfs` sample plus what
+/// Iggy has written since, so it moves with a burst instead of once a second.
+/// It counts every file on the volume, not only Iggy's. It is not exported
+/// until the first sample, since the charges alone say nothing about the
+/// volume. Used means total minus free blocks (`f_blocks - f_bfree`), as `df`
+/// reports it. The free space in `/stats` is `f_bavail`, which leaves out the
+/// blocks reserved for root, so the two differ by that reserve.
+///
+/// `disk_allocated_bytes` counts what the write sites charged since the
+/// process started, the part of the estimate that samples never move. Its
+/// increase over an interval follows what Iggy allocated in it, with two
+/// overcounts: a write that failed stays charged, and so does a reservation
+/// that failed or allocated nothing, while the writes into its segment are
+/// charged again. A reservation charges up front what it adds to the blocks
+/// the file already owns, which is the whole segment only for a new file.
+/// Unlike `volume_used_bytes`, it does not move with deletes or with other
+/// processes on the volume.
+///
+/// Both describe the host's volume, which `/stats` shows only to a user its
+/// rule admits, so they live in [`HttpMetrics`]' stats registry.
+///
+/// It holds the estimate it reads, so a test can export one of its own
+/// instead of the process-wide one other tests charge concurrently.
+#[derive(Debug)]
+struct DiskUsageMetrics(&'static DiskUsage);
 
-impl EncodeLabelValue for EscapedLabelValue<'_> {
-    fn encode(&self, encoder: &mut LabelValueEncoder) -> Result<(), std::fmt::Error> {
-        if !self.0.contains(['\\', '"', '\n']) {
-            return encoder.write_str(self.0);
+impl Collector for DiskUsageMetrics {
+    fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), std::fmt::Error> {
+        if let Some(used_bytes) = self.0.used_bytes() {
+            let gauge = ConstGauge::new(used_bytes);
+            let metric_encoder = encoder.encode_descriptor(
+                "volume_used_bytes",
+                "estimated bytes used on the volume holding the data directory, as total minus free blocks like df",
+                None,
+                gauge.metric_type(),
+            )?;
+            gauge.encode(metric_encoder)?;
         }
-        for character in self.0.chars() {
-            match character {
-                '\\' => encoder.write_str("\\\\")?,
-                '"' => encoder.write_str("\\\"")?,
-                '\n' => encoder.write_str("\\n")?,
-                other => encoder.write_char(other)?,
-            }
-        }
-        Ok(())
+        let counter = ConstCounter::new(self.0.charged_bytes());
+        let metric_encoder = encoder.encode_descriptor(
+            "disk_allocated_bytes",
+            "bytes Iggy allocated on the volume holding the data directory since the process started, failed writes and reservations included",
+            None,
+            counter.metric_type(),
+        )?;
+        counter.encode(metric_encoder)
     }
 }
 
 /// The legacy server's metric set, registered under the same names and help
 /// texts so existing dashboards and alerts keep working unchanged.
 ///
-/// Unlike the legacy server, the entity gauges are not counted at mutation
-/// sites: the scrape handler (`http::handlers::get_metrics`) samples the live
-/// state on every scrape, so a gauge can never drift from the state it
-/// describes.
+/// The scrape handler (`http::handlers::get_metrics`) sets the entity gauges
+/// on every scrape, from the counts the metadata applies keep and from the
+/// node stats, so they walk no stream. Only the per-topic series walk every
+/// topic, and `[http.metrics] topic_gauges = false` turns them off, together
+/// with the per-partition series of [`LongTermLags`].
 pub(in crate::http) struct HttpMetrics {
     registry: Registry,
+    /// The per-topic and disk series. They name every stream and topic and
+    /// describe the host's volume, so a scrape encodes them only for a user
+    /// the `/stats` rule admits.
+    stats_registry: Registry,
     http_requests: Counter,
     pub(in crate::http) streams: Gauge,
     pub(in crate::http) topics: Gauge,
@@ -203,6 +357,9 @@ pub(in crate::http) struct HttpMetrics {
     pub(in crate::http) users: Gauge,
     pub(in crate::http) clients: Gauge,
     pub(in crate::http) topic_usage: TopicUsage,
+    pub(in crate::http) long_term_lags: LongTermLags,
+    /// Where each shard leaves the lags its tick found.
+    shard_metrics: Vec<ShardMetrics>,
     /// Partition primary lookups on the owning shard for HTTP partition requests.
     pub(in crate::http) partition_primary_probes: Counter,
     /// Attempts to relay an HTTP partition request to another node.
@@ -215,7 +372,7 @@ pub(in crate::http) struct HttpMetrics {
 }
 
 impl HttpMetrics {
-    pub(in crate::http) fn init(shard_metrics_all: &[shard::metrics::ShardMetrics]) -> Self {
+    pub(in crate::http) fn init(shard_metrics_all: &[ShardMetrics]) -> Self {
         let mut registry = Registry::default();
         let http_requests = Counter::default();
         let streams = Gauge::default();
@@ -269,8 +426,13 @@ impl HttpMetrics {
         // Not a legacy-parity metric, and not a mirrored one: the source is a
         // process-wide static the scrape reads directly.
         registry.register_collector(Box::new(StatsRollupUnderflows));
+        let mut stats_registry = Registry::default();
+        stats_registry.register_collector(Box::new(DataDiskFreeSpace));
         let topic_usage = TopicUsage::default();
-        registry.register_collector(Box::new(topic_usage.clone()));
+        stats_registry.register_collector(Box::new(topic_usage.clone()));
+        let long_term_lags = LongTermLags::default();
+        stats_registry.register_collector(Box::new(long_term_lags.clone()));
+        stats_registry.register_collector(Box::new(DiskUsageMetrics(&DISK_USAGE)));
         // Every shard's drop / reconcile / partition counters, one
         // `shard`-labelled sub-registry per shard so series stay per-shard
         // without a `shard_id` label in the counter label sets (see
@@ -286,6 +448,7 @@ impl HttpMetrics {
         }
         Self {
             registry,
+            stats_registry,
             http_requests,
             streams,
             topics,
@@ -295,6 +458,8 @@ impl HttpMetrics {
             users,
             clients,
             topic_usage,
+            long_term_lags,
+            shard_metrics: shard_metrics_all.to_vec(),
             partition_primary_probes,
             partition_relays,
             metadata_floor_reads,
@@ -303,20 +468,39 @@ impl HttpMetrics {
         }
     }
 
+    /// The lags the shards of this node found at their last ticks.
+    pub(in crate::http) fn shard_long_term_lags(&self) -> Vec<LongTermLag> {
+        let mut lags = Vec::new();
+        for shard_metrics in &self.shard_metrics {
+            lags.extend(shard_metrics.long_term_lags());
+        }
+        lags
+    }
+
     /// Handle for the router's request-counting layer. The counter is
     /// `Arc`-backed, so bumping the clone bumps the registered metric.
     pub(in crate::http) fn request_counter(&self) -> Counter {
         self.http_requests.clone()
     }
 
-    pub(in crate::http) fn formatted_output(&self) -> String {
+    /// The exposition for one scrape, with the stats registry only when
+    /// `exports_stats` says that the `/stats` rule admits the user.
+    pub(in crate::http) fn formatted_output(&self, exports_stats: bool) -> String {
         let last = self.last_output_len.load(Ordering::Relaxed);
         let mut buffer = String::with_capacity(last + last / 8);
-        if let Err(error) = encode(&mut buffer, &self.registry) {
+        if let Err(error) = self.encode(&mut buffer, exports_stats) {
             error!(%error, "failed to encode metrics");
         }
         self.last_output_len.store(buffer.len(), Ordering::Relaxed);
         buffer
+    }
+
+    fn encode(&self, buffer: &mut String, exports_stats: bool) -> Result<(), std::fmt::Error> {
+        encode_registry(buffer, &self.registry)?;
+        if exports_stats {
+            encode_registry(buffer, &self.stats_registry)?;
+        }
+        encode_eof(buffer)
     }
 }
 
@@ -356,14 +540,66 @@ pub(in crate::http) fn gauge_value(count: u64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prometheus_client::encoding::text::encode;
     use shard::metrics::{ShardMetrics, frame_drop_reason, frame_drop_variant};
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[derive(Debug)]
+    struct SampledFreeSpace(Arc<partitions::FreeSpaceReserve>);
+
+    impl Collector for SampledFreeSpace {
+        fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), std::fmt::Error> {
+            encode_free_space(&mut encoder, &self.0)
+        }
+    }
+
+    #[test]
+    fn given_a_short_data_disk_when_scraping_should_export_the_reserve_and_the_refusals() {
+        static USAGE: DiskUsage = DiskUsage::new();
+        USAGE.rebase(|| Some(((), 100 * MIB)));
+        let reserve = Arc::new(partitions::FreeSpaceReserve::new(MIB, &USAGE));
+        reserve.observe(2 * MIB, 100 * MIB);
+        // Written since the sample, so the scrape shows it before the next one.
+        drop(USAGE.charge(MIB + 1));
+        assert!(!reserve.admit(0));
+        reserve.count_refusal();
+        let mut registry = Registry::default();
+        registry.register_collector(Box::new(SampledFreeSpace(Arc::clone(&reserve))));
+
+        let mut short = String::new();
+        encode(&mut short, &registry).unwrap();
+        USAGE.rebase(|| Some(((), 98 * MIB)));
+        reserve.observe(4 * MIB, 98 * MIB);
+        let mut recovered = String::new();
+        encode(&mut recovered, &registry).unwrap();
+
+        for line in [
+            format!("data_disk_free_bytes {}", MIB - 1),
+            format!("data_disk_free_space_reserve_bytes {MIB}"),
+            "data_disk_below_free_space_reserve 1".to_owned(),
+            "messages_refused_for_free_space_total 1".to_owned(),
+        ] {
+            assert!(short.lines().any(|found| found == line), "{line}\n{short}");
+        }
+        for line in [
+            format!("data_disk_free_bytes {}", 4 * MIB),
+            "data_disk_below_free_space_reserve 0".to_owned(),
+            "messages_refused_for_free_space_total 1".to_owned(),
+        ] {
+            assert!(
+                recovered.lines().any(|found| found == line),
+                "{line}\n{recovered}"
+            );
+        }
+    }
 
     #[test]
     fn shard_metrics_land_in_the_exposition_under_a_shard_label() {
         let shard_metrics = ShardMetrics::for_shard();
         shard_metrics.record_frame_drop(frame_drop_variant::CONSENSUS, frame_drop_reason::FULL);
         let metrics = HttpMetrics::init(&[shard_metrics]);
-        let output = metrics.formatted_output();
+        let output = metrics.formatted_output(true);
         assert!(
             output.contains("frame_drops_total"),
             "shard frame-drop counter missing from exposition:\n{output}"
@@ -389,13 +625,14 @@ mod tests {
         HttpMetricsConfig {
             enabled,
             endpoint: endpoint.to_owned(),
+            topic_gauges: true,
         }
     }
 
     #[test]
     fn formatted_output_exposes_every_parity_metric() {
         let metrics = HttpMetrics::init(&[]);
-        let output = metrics.formatted_output();
+        let output = metrics.formatted_output(true);
         for name in PARITY_METRIC_NAMES {
             assert!(
                 output.contains(&format!("# TYPE {name} ")),
@@ -416,7 +653,7 @@ mod tests {
     #[test]
     fn rollup_underflow_collector_lands_in_the_exposition() {
         let metrics = HttpMetrics::init(&[]);
-        let output = metrics.formatted_output();
+        let output = metrics.formatted_output(true);
         assert!(
             output.contains("# TYPE stats_rollup_underflows counter\n"),
             "expected the collector's series in the exposition:\n{output}"
@@ -425,6 +662,96 @@ mod tests {
             output.contains("\nstats_rollup_underflows_total "),
             "expected the collector's sample in the exposition:\n{output}"
         );
+    }
+
+    /// The registry reads the process-wide estimate, which other tests in this
+    /// binary charge too, so this asserts that both series are registered and
+    /// leaves their values to the tests below.
+    #[test]
+    fn registered_metrics_include_both_disk_usage_series() {
+        DISK_USAGE.rebase(|| Some(((), 1)));
+        let output = HttpMetrics::init(&[]).formatted_output(true);
+        for series in ["volume_used_bytes gauge", "disk_allocated_bytes counter"] {
+            assert!(
+                output.contains(&format!("# TYPE {series}\n")),
+                "expected {series} in the exposition:\n{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_no_sample_when_encoding_disk_usage_should_export_only_the_allocated_bytes() {
+        static USAGE: DiskUsage = DiskUsage::new();
+        drop(USAGE.charge(3 * MIB));
+
+        let output = disk_usage_exposition(&USAGE);
+
+        assert!(
+            output.contains(&format!("\ndisk_allocated_bytes_total {}\n", 3 * MIB)),
+            "expected the allocated bytes in the exposition:\n{output}"
+        );
+        assert!(
+            !output.contains("volume_used_bytes"),
+            "the estimate must stay hidden until a sample sets its base:\n{output}"
+        );
+    }
+
+    #[test]
+    fn given_a_sample_and_a_charge_when_encoding_disk_usage_should_export_both_values() {
+        static USAGE: DiskUsage = DiskUsage::new();
+        USAGE.rebase(|| Some(((), 100 * MIB)));
+        let sampled = disk_usage_exposition(&USAGE);
+
+        drop(USAGE.charge(MIB));
+        let charged = disk_usage_exposition(&USAGE);
+
+        for (output, used, total) in [(&sampled, 100 * MIB, 0), (&charged, 101 * MIB, MIB)] {
+            assert!(
+                output.contains(&format!("\nvolume_used_bytes {used}\n")),
+                "expected the estimate {used} in the exposition:\n{output}"
+            );
+            assert!(
+                output.contains(&format!("\ndisk_allocated_bytes_total {total}\n")),
+                "expected the allocated bytes {total} in the exposition:\n{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_scrape_without_the_stats_permission_when_encoding_should_omit_topic_and_disk_series()
+    {
+        let metrics = HttpMetrics::init(&[]);
+        let stats_series = ["topic_size_bytes", "disk_allocated_bytes"];
+
+        metrics
+            .topic_usage
+            .replace(vec![topic_sample("orders", "eu", None)]);
+        let denied = metrics.formatted_output(false);
+        let allowed = metrics.formatted_output(true);
+
+        for name in stats_series {
+            assert!(
+                !denied.contains(name),
+                "a scrape without the permission must not export {name}:\n{denied}"
+            );
+            assert!(
+                allowed.contains(name),
+                "a scrape with the permission must export {name}:\n{allowed}"
+            );
+        }
+        assert!(
+            denied.contains("\nstreams ") && denied.ends_with("# EOF\n"),
+            "a denied scrape still gets the aggregates and the trailer:\n{denied}"
+        );
+    }
+
+    /// Both disk usage series of `usage`, encoded as `/metrics` would.
+    fn disk_usage_exposition(usage: &'static DiskUsage) -> String {
+        let mut registry = Registry::default();
+        registry.register_collector(Box::new(DiskUsageMetrics(usage)));
+        let mut output = String::new();
+        encode(&mut output, &registry).expect("encode disk usage metrics");
+        output
     }
 
     #[test]
@@ -438,7 +765,7 @@ mod tests {
         metrics.users.set(6);
         metrics.clients.set(7);
         metrics.request_counter().inc();
-        let output = metrics.formatted_output();
+        let output = metrics.formatted_output(true);
         for line in [
             "streams 1",
             "topics 2",
@@ -493,7 +820,7 @@ mod tests {
             topic_sample("orders", "eu", Some(1_000_000)),
             topic_sample("orders", "us", None),
         ]);
-        let output = metrics.formatted_output();
+        let output = metrics.formatted_output(true);
         for line in [
             "# TYPE topic_size_bytes gauge",
             "# TYPE topic_messages gauge",
@@ -515,6 +842,69 @@ mod tests {
         );
     }
 
+    fn lag_sample(partition: usize, messages: u64, bytes: Option<u64>) -> LongTermLagSample {
+        LongTermLagSample {
+            stream: Arc::from("orders"),
+            topic: Arc::from("eu"),
+            partition,
+            messages,
+            bytes,
+        }
+    }
+
+    #[test]
+    fn given_long_term_lag_samples_when_encoding_should_label_each_series_by_its_partition() {
+        let metrics = HttpMetrics::init(&[]);
+        let samples = || vec![lag_sample(0, 7, Some(4096)), lag_sample(3, 0, None)];
+        metrics.long_term_lags.replace(samples());
+        let output = metrics.formatted_output(true);
+        for line in [
+            "# TYPE topic_partition_long_term_lag_messages gauge",
+            "# TYPE topic_partition_long_term_lag_bytes gauge",
+            r#"topic_partition_long_term_lag_messages{stream="orders",topic="eu",partition="0"} 7"#,
+            r#"topic_partition_long_term_lag_messages{stream="orders",topic="eu",partition="3"} 0"#,
+            r#"topic_partition_long_term_lag_bytes{stream="orders",topic="eu",partition="0"} 4096"#,
+        ] {
+            assert!(
+                output.contains(&format!("\n{line}\n")),
+                "expected `{line}` in exposition:\n{output}"
+            );
+        }
+        assert!(
+            !output.contains(r#"lag_bytes{stream="orders",topic="eu",partition="3"}"#),
+            "a backlog that is not counted yet must not export bytes:\n{output}"
+        );
+        assert!(
+            !metrics.formatted_output(true).contains(r#"partition="0""#),
+            "a scrape that was handed no samples exports none"
+        );
+
+        metrics.long_term_lags.replace(samples());
+        assert!(
+            !metrics
+                .formatted_output(false)
+                .contains("topic_partition_long_term_lag"),
+            "the series name streams and topics, as the per-topic ones do"
+        );
+    }
+
+    #[test]
+    fn given_the_lags_of_two_shards_when_gathering_them_should_return_each_once() {
+        let lag = |partition, messages| LongTermLag {
+            namespace: server_common::sharding::IggyNamespace::new(1, 2, partition),
+            messages,
+            bytes: None,
+        };
+        let shards = [ShardMetrics::for_shard(), ShardMetrics::for_shard()];
+        shards[0].set_long_term_lags(vec![lag(0, 5)]);
+        shards[1].set_long_term_lags(vec![lag(1, 9)]);
+        let metrics = HttpMetrics::init(&shards);
+
+        assert_eq!(metrics.shard_long_term_lags(), [lag(0, 5), lag(1, 9)]);
+        shards[1].set_long_term_lags(Vec::new());
+        assert_eq!(metrics.shard_long_term_lags(), [lag(0, 5)]);
+    }
+
     #[test]
     fn given_replaced_snapshot_when_encoding_should_drop_topics_no_longer_present() {
         let metrics = HttpMetrics::init(&[]);
@@ -522,7 +912,7 @@ mod tests {
             .topic_usage
             .replace(vec![topic_sample("orders", "eu", None)]);
         metrics.topic_usage.replace(Vec::new());
-        let output = metrics.formatted_output();
+        let output = metrics.formatted_output(true);
         assert!(
             !output.contains(r#"topic="eu""#),
             "a deleted topic must not outlive the next scrape:\n{output}"
@@ -535,12 +925,12 @@ mod tests {
         metrics
             .topic_usage
             .replace(vec![topic_sample("orders", "eu", None)]);
-        let first = metrics.formatted_output();
+        let first = metrics.formatted_output(true);
         assert!(
             first.contains(r#"topic="eu""#),
             "the snapshot must be encoded before it is released:\n{first}"
         );
-        let second = metrics.formatted_output();
+        let second = metrics.formatted_output(true);
         assert!(
             !second.contains(r#"topic="eu""#),
             "the snapshot must not outlive the scrape that encoded it:\n{second}"
@@ -553,7 +943,7 @@ mod tests {
         metrics
             .topic_usage
             .replace(vec![topic_sample("a\"b", "c\\d\ne", None)]);
-        let output = metrics.formatted_output();
+        let output = metrics.formatted_output(true);
         assert!(
             output.contains(r#"topic_messages{stream="a\"b",topic="c\\d\ne"} 20"#),
             "label values must be escaped:\n{output}"

@@ -74,6 +74,45 @@ rust::Vec<std::uint8_t> ToFfiBytes(const std::vector<std::uint8_t> &bytes) {
     return ffi_bytes;
 }
 
+void SetGeoTopicDuration(bool &has_value, std::uint64_t &micros, std::optional<std::chrono::microseconds> duration) {
+    if (duration) {
+        has_value = true;
+        micros    = static_cast<std::uint64_t>(duration->count());
+    }
+}
+
+template <typename Options>
+ffi::GeoTopicDurations ToFfiGeoTopicDurations(const Options &options) {
+    ffi::GeoTopicDurations durations{};
+    SetGeoTopicDuration(durations.has_fresh_upload_interval, durations.fresh_upload_interval_micros,
+                        options.FreshUploadInterval());
+    SetGeoTopicDuration(durations.has_consumer_offset_upload_interval, durations.consumer_offset_upload_interval_micros,
+                        options.ConsumerOffsetUploadInterval());
+    SetGeoTopicDuration(durations.has_positions_publish_interval, durations.positions_publish_interval_micros,
+                        options.PositionsPublishInterval());
+    SetGeoTopicDuration(durations.has_tombstone_grace, durations.tombstone_grace_micros, options.TombstoneGrace());
+    SetGeoTopicDuration(durations.has_positions_resume_timeout, durations.positions_resume_timeout_micros,
+                        options.PositionsResumeTimeout());
+    SetGeoTopicDuration(durations.has_long_term_rewrite_max_interval, durations.long_term_rewrite_max_interval_micros,
+                        options.LongTermRewriteMaxInterval());
+    return durations;
+}
+
+void SetTopicReadCacheBytes(bool &has_value, std::uint64_t &bytes, std::optional<std::uint64_t> value) {
+    if (value) {
+        has_value = true;
+        bytes     = *value;
+    }
+}
+
+template <typename Options>
+ffi::TopicReadCache ToFfiTopicReadCache(const Options &options) {
+    ffi::TopicReadCache read_cache{};
+    SetTopicReadCacheBytes(read_cache.has_read_cache_size, read_cache.read_cache_size, options.ReadCacheSize());
+    SetTopicReadCacheBytes(read_cache.has_read_ahead, read_cache.read_ahead, options.ReadAhead());
+    return read_cache;
+}
+
 template <typename FfiOptions, typename Options>
 void SetMutableTopicOptions(FfiOptions &ffi_options, const Options &options) {
     if (const auto &value = options.MessageExpiry()) {
@@ -85,7 +124,22 @@ void SetMutableTopicOptions(FfiOptions &ffi_options, const Options &options) {
         ffi_options.has_max_topic_size = true;
         ffi_options.max_topic_size     = std::string(value->Value());
     }
-    ffi_options.raw_options = ToFfiRawOptions(options.RawEntries());
+    if (const auto value = options.TieredStorage()) {
+        ffi_options.has_tiered_storage = true;
+        ffi_options.tiered_storage     = *value;
+    }
+    if (const auto &value = options.LocalRetentionAge()) {
+        ffi_options.has_local_retention_age   = true;
+        ffi_options.local_retention_age_kind  = std::string(value->Kind());
+        ffi_options.local_retention_age_value = value->Value();
+    }
+    if (const auto &value = options.LocalRetentionSize()) {
+        ffi_options.has_local_retention_size = true;
+        ffi_options.local_retention_size     = std::string(value->Value());
+    }
+    ffi_options.geo_durations = ToFfiGeoTopicDurations(options);
+    ffi_options.read_cache    = ToFfiTopicReadCache(options);
+    ffi_options.raw_options   = ToFfiRawOptions(options.RawEntries());
 }
 
 }  // namespace
@@ -162,6 +216,29 @@ std::vector<UserInfo> IggyBlockingClient::GetUsers() {
     });
 }
 
+UsersPage IggyBlockingClient::GetUsersPage(const NamedPageQuery &query) {
+    return RethrowAsIggyException([this, &query](ffi::ErrorInfo &error_info) {
+        return UsersPage::FromFfi(Handle()->get_users_page(query.ToFfi(), error_info));
+    });
+}
+
+std::vector<PersonalAccessTokenInfo> IggyBlockingClient::GetPersonalAccessTokens() {
+    return RethrowAsIggyException([this] {
+        std::vector<PersonalAccessTokenInfo> tokens;
+        auto ffi_tokens = Handle()->get_personal_access_tokens();
+        tokens.reserve(ffi_tokens.size());
+        for (auto &token : ffi_tokens) {
+            tokens.push_back(PersonalAccessTokenInfo::FromFfi(std::move(token)));
+        }
+        return tokens;
+    });
+}
+
+void IggyBlockingClient::DeletePersonalAccessToken(std::string name) {
+    RethrowAsIggyException(
+        [this, &name](ffi::ErrorInfo &error_info) { Handle()->delete_personal_access_token(name, error_info); });
+}
+
 UserInfoDetails IggyBlockingClient::CreateUser(std::string username,
                                                std::string password,
                                                UserStatus status,
@@ -194,6 +271,13 @@ void IggyBlockingClient::UpdateUser(const Identifier &user, const UserUpdateOpti
         ffi_options.raw_reset    = ToFfiRawResetKeys(options.RawResetKeys());
         ffi_options.raw_options  = ToFfiRawOptions(options.RawEntries());
         Handle()->update_user(user.ToFfi(), std::move(ffi_options), error_info);
+    });
+}
+
+std::string IggyBlockingClient::CreatePersonalAccessToken(std::string name, const Expiry &expiry) {
+    return RethrowAsIggyException([this, &name, &expiry] {
+        return std::string(
+            Handle()->create_personal_access_token(std::move(name), std::string(expiry.Kind()), expiry.Value()));
     });
 }
 
@@ -234,6 +318,12 @@ std::vector<Stream> IggyBlockingClient::GetStreams() {
             streams.push_back(Stream::FromFfi(std::move(stream)));
         }
         return streams;
+    });
+}
+
+StreamsPage IggyBlockingClient::GetStreamsPage(const NamedPageQuery &query) {
+    return RethrowAsIggyException([this, &query](ffi::ErrorInfo &error_info) {
+        return StreamsPage::FromFfi(Handle()->get_streams_page(query.ToFfi(), error_info));
     });
 }
 
@@ -310,6 +400,26 @@ TopicDetails IggyBlockingClient::CreateTopic(const Identifier &stream,
             ffi_options.has_preallocate_segments = false;
             ffi_options.preallocate_segments     = false;
         }
+        if (auto value = options.ReplicationFactor()) {
+            ffi_options.has_replication_factor = true;
+            ffi_options.replication_factor     = *value;
+        } else {
+            ffi_options.has_replication_factor = false;
+            ffi_options.replication_factor     = 0;
+        }
+        if (const auto &value = options.SegmentMaxAge()) {
+            ffi_options.has_segment_max_age   = true;
+            ffi_options.segment_max_age_kind  = std::string(value->Kind());
+            ffi_options.segment_max_age_value = value->Value();
+        }
+        if (auto value = options.TopicType()) {
+            ffi_options.has_topic_type = true;
+            ffi_options.topic_type     = std::string(iggy::to_string(*value));
+        }
+        if (auto value = options.GeoMode()) {
+            ffi_options.has_geo_mode = true;
+            ffi_options.geo_mode     = std::string(iggy::to_string(*value));
+        }
         return TopicDetails::FromFfi(Handle()->create_topic(stream.ToFfi(), name, std::move(ffi_options), error_info));
     });
 }
@@ -341,6 +451,12 @@ std::vector<Topic> IggyBlockingClient::GetTopics(const Identifier &stream) {
     });
 }
 
+TopicsPage IggyBlockingClient::GetTopicsPage(const Identifier &stream, const NamedPageQuery &query) {
+    return RethrowAsIggyException([this, &stream, &query](ffi::ErrorInfo &error_info) {
+        return TopicsPage::FromFfi(Handle()->get_topics_page(stream.ToFfi(), query.ToFfi(), error_info));
+    });
+}
+
 TopicDetails IggyBlockingClient::GetTopic(const Identifier &stream, const Identifier &topic) {
     return RethrowAsIggyException(
         [this, &stream, &topic] { return TopicDetails::FromFfi(Handle()->get_topic(stream.ToFfi(), topic.ToFfi())); });
@@ -365,6 +481,15 @@ void IggyBlockingClient::DeletePartitions(const Identifier &stream,
                                           const std::uint32_t partitions_count) {
     RethrowAsIggyException([this, &stream, &topic, partitions_count](ffi::ErrorInfo &error_info) {
         Handle()->delete_partitions(stream.ToFfi(), topic.ToFfi(), partitions_count, error_info);
+    });
+}
+
+PartitionsPage IggyBlockingClient::GetPartitionsPage(const Identifier &stream,
+                                                     const Identifier &topic,
+                                                     const PageQuery &query) {
+    return RethrowAsIggyException([this, &stream, &topic, &query](ffi::ErrorInfo &error_info) {
+        return PartitionsPage::FromFfi(
+            Handle()->get_partitions_page(stream.ToFfi(), topic.ToFfi(), query.ToFfi(), error_info));
     });
 }
 
@@ -404,6 +529,15 @@ std::vector<ConsumerGroup> IggyBlockingClient::GetConsumerGroups(const Identifie
             groups.push_back(ConsumerGroup::FromFfi(std::move(group)));
         }
         return groups;
+    });
+}
+
+ConsumerGroupsPage IggyBlockingClient::GetConsumerGroupsPage(const Identifier &stream,
+                                                             const Identifier &topic,
+                                                             const NamedPageQuery &query) {
+    return RethrowAsIggyException([this, &stream, &topic, &query](ffi::ErrorInfo &error_info) {
+        return ConsumerGroupsPage::FromFfi(
+            Handle()->get_consumer_groups_page(stream.ToFfi(), topic.ToFfi(), query.ToFfi(), error_info));
     });
 }
 
@@ -448,13 +582,20 @@ void IggyBlockingClient::StoreConsumerOffset(const Consumer &consumer,
 void IggyBlockingClient::StoreConsumerPosition(const Consumer &consumer,
                                                const Identifier &stream,
                                                const Identifier &topic,
-                                               const std::uint32_t partition_id,
-                                               const std::uint64_t offset,
-                                               const PartitionContext &context) {
-    RethrowAsIggyException([this, &consumer, &stream, &topic, partition_id, offset,
-                            &context](ffi::ErrorInfo &error_info) {
-        Handle()->store_consumer_position(stream.ToFfi(), topic.ToFfi(), partition_id, std::string(consumer.KindName()),
-                                          consumer.Id().ToFfi(), offset, context.ToFfi(), error_info);
+                                               const Checkpoint &checkpoint) {
+    RethrowAsIggyException([this, &consumer, &stream, &topic, &checkpoint](ffi::ErrorInfo &error_info) {
+        Handle()->store_consumer_position(stream.ToFfi(), topic.ToFfi(), std::string(consumer.KindName()),
+                                          consumer.Id().ToFfi(), *checkpoint.inner_, error_info);
+    });
+}
+
+void IggyBlockingClient::DeleteConsumerPosition(const Consumer &consumer,
+                                                const Identifier &stream,
+                                                const Identifier &topic,
+                                                const Checkpoint &checkpoint) {
+    RethrowAsIggyException([this, &consumer, &stream, &topic, &checkpoint](ffi::ErrorInfo &error_info) {
+        Handle()->delete_consumer_position(stream.ToFfi(), topic.ToFfi(), std::string(consumer.KindName()),
+                                           consumer.Id().ToFfi(), *checkpoint.inner_, error_info);
     });
 }
 
@@ -530,6 +671,11 @@ MetadataChanges IggyBlockingClient::GetMetadataChanges(const MetadataChangesQuer
 
 Stats IggyBlockingClient::GetStats() {
     return RethrowAsIggyException([this] { return Stats::FromFfi(Handle()->get_stats()); });
+}
+
+void IggyBlockingClient::RetireGeoOrigin(const std::string &origin) {
+    RethrowAsIggyException(
+        [this, &origin](ffi::ErrorInfo &error_info) { Handle()->retire_geo_origin(origin, error_info); });
 }
 
 IggyBlockingClient::IggyBlockingClient(ffi::Client *client) : client_(client) {

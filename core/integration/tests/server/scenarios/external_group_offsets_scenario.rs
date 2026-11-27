@@ -85,11 +85,13 @@ pub async fn run(harness: &TestHarness) {
         .poll_messages(
             &stream,
             &topic,
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &external,
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap_err();

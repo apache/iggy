@@ -21,7 +21,11 @@ package org.apache.iggy.client.blocking.http;
 
 import org.apache.iggy.IggyVersion;
 import org.apache.iggy.client.blocking.UsersClient;
+import org.apache.iggy.exception.IggyAuthenticationException;
+import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.identifier.UserId;
+import org.apache.iggy.system.NamedPageQuery;
+import org.apache.iggy.system.Page;
 import org.apache.iggy.user.IdentityInfo;
 import org.apache.iggy.user.Permissions;
 import org.apache.iggy.user.TokenInfo;
@@ -59,6 +63,12 @@ class UsersHttpClient implements UsersClient {
         var request = httpClient.prepareGetRequest(USERS);
         List<HttpUser> users = httpClient.execute(request, new TypeReference<>() {});
         return users.stream().map(HttpUser::toUserInfo).toList();
+    }
+
+    @Override
+    public Page<UserInfo> getUsersPage(NamedPageQuery query) {
+        HttpPage<HttpUser> page = HttpPage.read(httpClient, USERS, query, new TypeReference<>() {});
+        return page.toPage(HttpUser::toUserInfo);
     }
 
     @Override
@@ -112,10 +122,21 @@ class UsersHttpClient implements UsersClient {
         return response;
     }
 
+    /**
+     * A token the server refuses has no session left to end, as after a password change, so the
+     * logout holds and the token is dropped too. A client that holds no token still gets the refusal.
+     */
     @Override
     public void logout() {
+        var signedIn = httpClient.hasToken();
         var request = httpClient.prepareDeleteRequest(USERS + "/logout");
-        httpClient.execute(request);
+        try {
+            httpClient.execute(request);
+        } catch (IggyAuthenticationException refused) {
+            if (!signedIn || refused.getErrorCode() != IggyErrorCode.UNAUTHENTICATED) {
+                throw refused;
+            }
+        }
         httpClient.setToken(Optional.empty());
     }
 

@@ -19,17 +19,21 @@
 declare(strict_types=1);
 
 use Iggy\Client as IggyClient;
+use Iggy\CommitPolicy;
 use Iggy\MetadataChangeGroup;
 use Iggy\MetadataChangeKind;
 use Iggy\MetadataChangeStart;
 use Iggy\MetadataChangeStatus;
 use Iggy\MetadataStreamChange;
 use Iggy\PollingStrategy;
+use Iggy\PollOptions;
 use Iggy\SendMessage;
 use PHPUnit\Framework\TestCase;
 
 final class TlsTest extends TestCase
 {
+    private const CONSUMER_ID = 1;
+
     public function testConnectionStringWithTlsParams(): void
     {
         $connectionString = getenv('IGGY_TLS_CONNECTION_STRING');
@@ -69,7 +73,14 @@ final class TlsTest extends TestCase
                 array_map(static fn (string $payload): SendMessage => new SendMessage($payload), $messages),
             );
 
-            $polled = $client->pollMessages($streamName, $topicName, $partitionId, PollingStrategy::first(), 10, true);
+            $polled = $client->pollMessages(
+                $streamName,
+                $topicName,
+                $partitionId,
+                self::CONSUMER_ID,
+                PollingStrategy::first(),
+                new PollOptions(count: 10, commit: CommitPolicy::onRead()),
+            )->messages;
             assert_count(count($messages), $polled, 'expected TLS messages');
             assert_same($messages, collect_payloads($polled));
         } finally {

@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod benchmark;
-pub mod gitref;
-pub mod hardware;
-pub mod ui;
-// pub mod view_mode;
+pub mod data;
+pub mod github;
+pub mod omb;
+pub mod selection;
+pub mod start;

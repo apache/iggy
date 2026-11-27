@@ -29,17 +29,41 @@ runs:
     # The macOS lane uses the Swift that ships with Xcode on the runner, and
     # the golden lane only runs the Rust generator.
     - name: Setup Swift
+      id: setup-swift
       if: inputs.task != 'build-macos' && inputs.task != 'golden'
       uses: ./.github/actions/utils/setup-swift
 
     # swift-format ships with the toolchain; the configuration lives in
-    # foreign/swift/.swift-format.
+    # foreign/swift/.swift-format and covers the examples and the BDD runner
+    # too, which compile in their own lanes.
     - name: Format Check
       shell: bash
       if: inputs.task == 'lint'
       run: |
         cd foreign/swift
-        swift format lint --strict --recursive Sources Tests Package.swift
+        swift format lint --strict --recursive Sources Tests Examples Package.swift
+        cd ../..
+        for package in examples/swift/getting-started bdd/swift/tests; do
+          swift format lint --strict --recursive --configuration foreign/swift/.swift-format "$package/Sources" "$package/Package.swift"
+        done
+        swift format lint --strict --configuration foreign/swift/.swift-format Package.swift
+
+    # Consumers and CI must build the same library from the two manifests.
+    - name: Check the root manifest matches the SDK manifest
+      shell: bash
+      if: inputs.task == 'lint'
+      run: |
+        set -euo pipefail
+        # Each side maps its expected Iggy path to one sentinel, so an extra root product or target, or a moved path, shows in the diff.
+        root_manifest=$(swift package --package-path . dump-package \
+          | jq -S 'del(.name, .packageKind) | .targets |= map(if .name == "Iggy" and .path == "foreign/swift/Sources/Iggy" then .path = "SDK" else . end)')
+        sdk_manifest=$(swift package --package-path foreign/swift dump-package \
+          | jq -S 'del(.name, .packageKind) | .products |= map(select(.name == "Iggy")) | .targets |= map(select(.name == "Iggy") | if (.path // "Sources/Iggy") == "Sources/Iggy" then .path = "SDK" else . end)')
+        if ! diff <(echo "$root_manifest") <(echo "$sdk_manifest"); then
+          echo "❌ Package.swift and foreign/swift/Package.swift disagree, see the diff above"
+          exit 1
+        fi
+        echo "✅ Root Package.swift matches foreign/swift/Package.swift"
 
     # A warning-free build is the lint gate the Swift compiler provides: the
     # SDK builds in Swift 6 language mode with strict concurrency checking.
@@ -58,6 +82,15 @@ runs:
       run: |
         cd foreign/swift
         swift test --parallel
+
+    # The lanes share one cache key, so only the test lane saves: the e2e lane
+    # builds the same debug products, and every lane reuses the checkouts.
+    - name: Save SwiftPM build directory
+      if: inputs.task == 'test' && steps.setup-swift.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6.1.0
+      with:
+        path: foreign/swift/.build
+        key: ${{ steps.setup-swift.outputs.cache-key }}
 
     - name: Build
       shell: bash

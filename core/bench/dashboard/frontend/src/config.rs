@@ -15,42 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use js_sys::Reflect;
-use wasm_bindgen::prelude::*;
+const PRODUCTION_API_BASE_URL: &str = "https://benchmarks.iggy.apache.org";
 
-#[wasm_bindgen]
-extern "C" {
-    #[wasm_bindgen(js_namespace = window)]
-    fn location() -> JsValue;
-}
-
+/// The origin of the page. Outside the browser it is empty, so the links that the server renders
+/// are relative to the page, and the browser makes them absolute when it hydrates the page.
 pub fn get_api_base_url() -> String {
-    if cfg!(debug_assertions) {
-        // In debug mode, always use localhost
-        return "http://127.0.0.1:8061".to_string();
+    if !cfg!(target_arch = "wasm32") {
+        return String::new();
     }
-
-    // In release mode, try to get from window.API_BASE_URL if it exists
-    let window = match web_sys::window() {
-        Some(win) => win,
-        None => return "https://benchmarks.iggy.apache.org".to_string(),
-    };
-
-    if let Some(api_url) = Reflect::get(&window, &JsValue::from_str("API_BASE_URL"))
-        .ok()
-        .and_then(|val| val.as_string())
-    {
-        return api_url;
-    }
-
-    // For other hosts in release mode, use the same host with port 8061
-    if let Ok(location) = window.location().host() {
-        if let Some(colon_pos) = location.find(':') {
-            return format!("https://{}", location.replace(&location[colon_pos..], ""));
-        }
-        return format!("https://{location}");
-    }
-
-    // Fallback to production URL
-    "https://benchmarks.iggy.apache.org".to_string()
+    // The dashboard server hosts the page next to the API, and `trunk serve` proxies the API
+    // for the dev page (see Trunk.toml), so the API is always on the page origin.
+    web_sys::window()
+        .and_then(|window| window.location().origin().ok())
+        .unwrap_or_else(|| PRODUCTION_API_BASE_URL.to_string())
 }

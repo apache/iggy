@@ -54,7 +54,10 @@ pub fn sample(
         }),
         // Not targeted, as for `create_stream`: the fixed wrap set is always a
         // valid option, and the slab ceiling is out of a run's reach.
-        Outcome::InvalidOptionValue | Outcome::TooManyStreams => None,
+        Outcome::InvalidOptionValue
+        | Outcome::TooManyStreams
+        // The sim client names no stream with the shadow prefix.
+        | Outcome::InvalidStreamName => None,
     }
 }
 
@@ -78,8 +81,9 @@ pub fn predicted_effect(input: &Input, outcome: Outcome) -> Effect {
         Outcome::Ok => Effect::AddStream {
             name: input.name.clone(),
         },
-        Outcome::NameAlreadyExists | Outcome::InvalidOptionValue | Outcome::TooManyStreams => {
-            Effect::None
-        }
+        Outcome::NameAlreadyExists
+        | Outcome::InvalidOptionValue
+        | Outcome::TooManyStreams
+        | Outcome::InvalidStreamName => Effect::None,
     }
 }

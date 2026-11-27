@@ -35,6 +35,7 @@ public interface CommandCode {
         BIND_SESSION(15),
         UPDATE_RESOURCE(16),
         GET_METADATA_CHANGES(17),
+        RETIRE_GEO_ORIGIN(18),
         GET_ME(20),
         GET_CLIENT(21),
         GET_ALL_CLIENTS(22);
@@ -98,7 +99,10 @@ public interface CommandCode {
         POLL(100),
         SEND(101),
         // 103 and 104 are retired and must never be reused.
-        GET_PARTITION_ROUTE(105);
+        GET_PARTITION_ROUTE(105),
+        POLL_DEFERRED(106),
+        CANCEL_DEFERRED_REQUEST(108),
+        FETCH_MESSAGES(109);
 
         private final int value;
 
@@ -170,7 +174,8 @@ public interface CommandCode {
 
     enum Partition implements CommandCode {
         CREATE(402),
-        DELETE(403);
+        DELETE(403),
+        GET_ALL(404);
 
         private final int value;
 

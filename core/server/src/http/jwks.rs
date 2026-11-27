@@ -42,12 +42,14 @@ use tokio::sync::Mutex;
 const JWKS_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(10);
 
 thread_local! {
-    // cyper's `Client` is `!Send`/`!Sync` (`Rc`-backed) and `new()` returns a
+    // cyper's `Client` is `!Send`/`!Sync` (`Rc`-backed) and its build returns a
     // `Result`, so it cannot be a global `OnceLock`. compio is thread-per-core;
     // keep one client per thread. The `Rc` inner makes cloning cheap, so callers
-    // take an owned handle.
-    static HTTP_CLIENT: cyper::Client =
-        cyper::Client::new().expect("failed to build cyper HTTP client for JWKS");
+    // take an owned handle. The issuer's host is looked up off the shard thread.
+    static HTTP_CLIENT: cyper::Client = cyper::Client::builder()
+        .custom_resolver(iggy_object_store::ShardResolver::default())
+        .build()
+        .expect("failed to build cyper HTTP client for JWKS");
 }
 
 fn get_http_client() -> cyper::Client {
@@ -270,6 +272,7 @@ mod tests {
         // Use HMAC secret to create a simple test DecodingKey
         // Note: This is only for testing cache logic, not a real RSA/EC key
         DecodingKey::from_secret(b"test-secret-key-for-cache-testing-only")
+            .expect("create a key from the non-empty test secret")
     }
 
     #[test]

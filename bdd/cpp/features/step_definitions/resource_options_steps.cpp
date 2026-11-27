@@ -139,10 +139,10 @@ void SendMessage(bdd::GlobalContext &context, const std::string &payload, rust::
 
 iggy::ffi::IggyMessagePolled PollFirst(bdd::GlobalContext &context) {
     iggy::ffi::ErrorInfo error_info{};
-    auto polled =
-        context.client->poll_messages(bdd::make_numeric_identifier(context.last_stream_id.value()),
-                                      bdd::make_numeric_identifier(context.last_topic_id.value()), kPartitionId,
-                                      "consumer", bdd::make_numeric_identifier(1), "offset", 0, 1, false, error_info);
+    auto polled = context.client->poll_messages(bdd::make_numeric_identifier(context.last_stream_id.value()),
+                                                bdd::make_numeric_identifier(context.last_topic_id.value()),
+                                                kPartitionId, "consumer", bdd::make_numeric_identifier(1),
+                                                bdd::make_offset_strategy(0), bdd::make_poll_options(1), error_info);
     if (polled.messages.empty()) {
         throw std::runtime_error("No message was polled");
     }

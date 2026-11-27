@@ -24,9 +24,9 @@ requires-python = ">=3.11"
 dependencies = [
     "apache-iggy",
     "argparse==1.4.0",
-    "loguru==0.7.3",
-    "pyrefly>=1.3.2",
-    "ruff>=0.17.0",
+    "loguru==0.8.0",
+    "pyrefly>=1.4.1",
+    "ruff>=0.17.4",
 ]
 
 [tool.ruff.lint]
@@ -58,4 +58,5 @@ search-path = [
     "message-headers",
     "message-headers/plain-headers",
     "message-headers/typed-headers",
+    "multi-tenant",
 ]

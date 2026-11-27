@@ -112,6 +112,7 @@ $client->loginUser('iggy', 'iggy');
 $stream = 'php-stream';
 $topic = 'php-topic';
 $partitionId = 0;
+$consumerId = 1;
 
 $client->createStream($stream);
 $client->createTopic($stream, $topic, 1, null, null, null, null);
@@ -121,24 +122,25 @@ $client->sendMessages($stream, $topic, $partitionId, [
     new \Iggy\SendMessage('hello from PHP 2'),
 ]);
 
-$messages = $client->pollMessages(
+$polled = $client->pollMessages(
     $stream,
     $topic,
     $partitionId,
+    $consumerId,
     \Iggy\PollingStrategy::first(),
-    10,
-    true,
+    new \Iggy\PollOptions(count: 10),
 );
 
-foreach ($messages as $message) {
+foreach ($polled->messages as $message) {
     echo $message->payload(), PHP_EOL;
 }
+
+$next = $client->pollMessages($stream, $topic, $partitionId, $consumerId, $polled->continuation());
 ```
 
-Consumer group callbacks require a finite message limit. The partition id
-argument is ignored for a consumer group, since the member reads the partitions
-the server assigns to it. After the example above, each loop below consumes one
-of its two messages:
+Consumer group callbacks require a finite message limit. The member reads the
+partitions that the server assigns to it. After the example above, each loop
+below consumes one of its two messages:
 
 ```php
 <?php
@@ -147,32 +149,43 @@ $consumer = $client->consumerGroup(
     'php-consumer',
     $stream,
     $topic,
-    null,
     \Iggy\PollingStrategy::next(),
-    10,
-    \Iggy\AutoCommit::disabled(),
-    true,
-    true,
-    1_000_000,
-    null,
-    null,
-    null,
-    false,
 );
 
 $consumer->consumeMessages(
     function (\Iggy\ReceiveMessage $message) use ($consumer): void {
         echo $message->payload(), PHP_EOL;
-        $consumer->storePosition($message->position());
+        $consumer->commit($message->checkpoint());
     },
     1,
 );
 
 foreach ($consumer->iterMessages() as $message) {
     echo $message->payload(), PHP_EOL;
-    $consumer->storePosition($message->position());
+    $consumer->commit($message->checkpoint());
 
     break;
+}
+
+$consumer->shutdown();
+```
+
+A reader returns whole batches of one partition, and it reads ahead in the
+background:
+
+```php
+<?php
+
+$reader = $client->reader($stream, $topic, 'php-reader', [$partitionId], \Iggy\PollingStrategy::first());
+
+try {
+    $batch = $reader->next();
+    foreach ($batch->messages as $message) {
+        echo $message->payload(), PHP_EOL;
+    }
+    $reader->commit($batch->checkpoint());
+} finally {
+    $reader->close();
 }
 ```
 
@@ -233,10 +246,53 @@ foreach ($client->describeOptions(Iggy\OptionsScope::Topic) as $spec) {
   The key, the `loginUser()` password and the `fromConnectionString()` string are marked `#[\SensitiveParameter]`, so exception traces hold a `SensitiveParameterValue` in their place. The `raw` arrays of `createStream()`, `updateStream()`, `createTopic()` and `updateTopic()` are marked as well, because an unknown key may hold a secret.
 
   Reads report only `encryption_key_source` (`stream`, `server`, or `none` for a plaintext stream), `encryption_key_fingerprint` and `encryption_kek_fingerprint`, comma-separated during a server key rotation. `Iggy\Client::encryptionKeyFingerprint($key)` computes the fingerprint of a key you hold. Without a key, a server with encryption enabled generates one.
-- `updateStream()` renames a stream and `updateTopic()` renames a topic or changes `message_expiry_micros` and `max_topic_size`. Null arguments keep stored values. `reset` takes `Iggy\StreamOptionKey` or `Iggy\TopicOptionKey` cases and returns keys to their server defaults. Only the topic's message expiry and size cap are resettable, every other case is refused with the server's error.
+- `updateStream()` renames a stream and `updateTopic()` renames a topic or changes `message_expiry_micros`, `max_topic_size`, `local_retention_age_micros` and `local_retention_size`, and turns `tiered_storage` on, never off. Null arguments keep stored values.
+- `reset` takes `Iggy\StreamOptionKey` or `Iggy\TopicOptionKey` cases and returns keys to their server defaults. Only the topic's message expiry, size cap, local retention age and local retention size are resettable, every other case is refused with the server's error.
+- A geo topic (`topic_type: 'geo'`) can override six server settings of the same name on each node:
+  `fresh_upload_interval_micros`, `consumer_offset_upload_interval_micros`, `positions_publish_interval_micros`,
+  `tombstone_grace_micros`, `positions_resume_timeout_micros` and `long_term_rewrite_max_interval_micros`.
+  `createTopic()` and `updateTopic()` take each as an int or a decimal string of microseconds. 0 is a value of its own,
+  for example no wait, and null leaves the server setting in force. An update can change them but cannot reset them.
+  A normal topic refuses them as `Invalid option value` (code 4042).
+  Topic reads have properties of the same names. If the topic does not set a duration, its property is null.
+- Any topic, geo included, can override two `[tiered_storage]` settings of the same name on each node, taken as an int
+  or a decimal string of bytes. `read_cache_size` is the memory each node keeps for what the topic's reads fetch from
+  the object store, divided between its partitions, and 0 keeps nothing they fetch. `read_ahead` is the most bytes
+  readahead fetches in front of a sequential reader of the topic, and 0 turns readahead off. Null leaves the server
+  setting in force. An update can change both on any topic but cannot reset them. On a geo topic, these and the six
+  durations are the only options an update can change. Topic reads have properties of the same names, null when the
+  topic does not set one.
 - `raw` on create and update sends string-valued keys this build does not know, and `raw_reset` resets keys by name. The server decides whether each one is accepted. A name listed twice across `reset` and `raw_reset` is refused as `Invalid command`.
+- `createTopic()` takes `replication_factor`, how many nodes store each partition: 1 to 32 and at most the cluster's node count. Null lets the server's `[cluster] default_replication_factor` apply. The factor is create-only, and a value out of range is refused as `Invalid replication factor` (code 2018).
+- A topic read's `partitions` holds one `Iggy\Partition` per partition with `id`, `segments_count`, `current_offset`, `size_bytes`, `messages_count`, `members` (the node ids that store the partition) and `in_sync_members` (the members its primary last reported in sync and that are up, empty until it first reports).
 - `describeOptions(Iggy\OptionsScope)` returns the server catalog as `Iggy\OptionSpec` objects with `key`, `kind`, `updatable`, `resettable`, `secret`, `read_only`, `critical`, `default_value` and `description`.
-- SDK exceptions carry the server error code in `getCode()`, for example 4103 (option cannot be updated), 4104 (option cannot be reset), 4105 (read-only option), 4108 (root user cannot be changed by this caller) and 4041 (unsupported option key).
+- SDK exceptions carry the server error code in `getCode()`, for example 4103 (option cannot be updated), 4104 (option cannot be reset), 4105 (read-only option), 4108 (root user cannot be changed by this caller), 4041 (unsupported option key), 4042 (invalid option value) and 2018 (invalid replication factor).
+
+## List Pages
+
+`getStreamsPage()`, `getTopicsPage()`, `getPartitionsPage()`, `getConsumerGroupsPage()` and `getUsersPage()` read one page of a list. Named arguments set the order, the direction, the limit, the cursor and a name filter. To read the next page, call the method again with the same arguments and the `next` of the page as `cursor`. A page can be empty and still have a `next`, so a walk ends at the first page without one.
+
+```php
+use Iggy\PageOrder;
+
+$cursor = null;
+do {
+    $page = $client->getStreamsPage(order: PageOrder::Created, limit: 50, cursor: $cursor, name: 'orders');
+    foreach ($page->items as $stream) {
+        echo $stream->id, ' ', $stream->name, PHP_EOL;
+    }
+    $cursor = $page->next;
+} while ($cursor !== null);
+```
+
+- A null `order` reads in `PageOrder::Id` order, and `descending: true` reverses the order. `PageOrder::Created` sorts by creation time and then by id. Partitions and consumer groups walk by id in both orders, because their ids follow creation.
+- `limit` is 1 to 1000, and a null `limit` reads 100. `name` keeps the entries whose name holds the text, case-sensitive, and is 1 to 255 bytes. A partition has no name, so `getPartitionsPage()` takes no `name`.
+- A cursor is the `pg1_` text that the CLI and the HTTP API use. It holds only a position, so send it back with the same order, direction, filter and parent ids.
+- A query out of range, or a cursor text that the client cannot read, throws `Invalid command` (code 3) before anything is sent. The server refuses a cursor that does not fit the query, and a partition name, with the same error. Over HTTP, these server refusals throw code 300, and the message holds the server's error.
+- The argument check runs first. A `limit` that is not an integer or does not fit 32 unsigned bits throws `IggyException` with code 0.
+- Each page is a separate read. An entity that someone creates or deletes during a walk can appear or not appear, so a walk is not a snapshot. `getMetadataChanges()` gives an exact copy. `getTopicsPage()` of a stream that does not exist returns an empty page without `next`.
+- Pages hold `Iggy\Stream`, `Iggy\Topic`, `Iggy\Partition`, `Iggy\ConsumerGroup` or `Iggy\UserInfo` objects with readonly snake_case properties. `created_at` is in microseconds. Streams, topics and users return `options` and `derived_options` arrays like `StreamDetails`, and streams also return its three `encryption_*` properties.
+- The reply of `getStream()` or `getTopic()` can pass the server cap of a little over 64 MB. Over TCP, QUIC and WebSocket, the call then throws `ReplyTooLarge` (code 97). The connection stays usable, and `getTopicsPage()` and `getPartitionsPage()` read such a stream or topic in pages.
 
 ## Metadata Changes
 
@@ -322,7 +378,10 @@ follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
   `max_pending_operation_bytes`, for example
   `iggy+quic://iggy:iggy@localhost:8080?max_pending_operations=256&max_pending_operation_bytes=67108864`.
 - `Iggy\Exception\PendingOperationException` preserves the read-only `operation_id`
-  decimal string and `kind` (`uncertain`, `lane_blocked`, or `not_retained`).
+  decimal string and `kind` (`uncertain`, `lane_blocked`, `fetch_progress_uncertain`,
+  or `not_retained`).
+  Its read-only `partition_id` names the blocked partition of a fetch, or is
+  `null` for other pending operations.
   `getCode()` returns the SDK error code. Keep IDs as strings: PHP integers cannot
   represent the full unsigned 64-bit range. `lane_blocked` identifies an earlier
   operation, and the blocked call was not sent. `not_retained` does not prove
@@ -334,16 +393,21 @@ follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
   `abandonOperation(string $operation_id)` releases it without proving whether it
   committed. Both methods reject malformed or overflowing IDs. HTTP does not support
   retained-operation recovery. A session reset, disconnect or shutdown discards
-  retained operations. The client keeps the proved outcomes of its last
+  replayable retained mutations. The client keeps the proved outcomes of its last
   `max_pending_operations` replays, also across a session reset. A later
   `resolveOperation()` of a proved operation returns the same outcome without a request.
+- Unknown committing fetch progress raises code 14010 with kind `fetch_progress_uncertain`. Its local recovery ID and affected progress blocks survive reconnect and session replacement.
+
+  `resolveOperation()` returns that error without I/O. `abandonOperation()` explicitly releases all its local blocks while accepting the unknown outcome. Abandonment does not stop the old request.
+
+  GetOffset and stateless reads remain available for inspection. Raw partial replies keep wire statuses. A later affected progress call raises code 14009 with the partition and recovery ID. Fetch retention uses a separate bounded pool with the configured operation/byte limits and stores target metadata only.
 - Receipt access follows the server's [session and revocation policy](../../core/server/README.md#sessions-and-retry-receipts).
   An unresolved operation cannot recover its receipt after its original session
   ends, even after a new login or account reactivation. A fresh send can duplicate it.
 - Each node counts the messages in its stream, topic and system stats. After a
   successful send, a node that is not the partition primary shows the new count
   only after the next prepare or commit broadcast. When no other write follows,
-  this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+  this delay is at most `cluster.commit_busy_heartbeat_interval` (500 ms by default).
   See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
 - Methods are exposed to PHP as camelCase, for example `createStream()` and
   `pollMessages()`.
@@ -354,29 +418,90 @@ follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
   current consumer partition, and is rejected until at least one message has been
   polled. Pass an explicit partition id before the first poll.
 - `consumeMessages()` requires an explicit finite limit. It does not run forever
-  by default.
+  by default. An exception of the callback ends the run, and `consumeMessages()`
+  throws it. In the callback, `commit()`, `storeOffset()`, `deleteOffset()` and the
+  getters work. `seek()`, `shutdown()`, `iterMessages()` and `consumeMessages()` throw
+  there.
 - `iterMessages()` returns a PHP `Iterator` and can be used with `foreach`.
   Break out of the loop when the caller's processing limit or shutdown signal is reached.
-- `AutoCommit::when()` may queue an offset commit before the PHP callback runs.
-  If callback success must control commits, use `AutoCommit::disabled()` and call
-  `storePosition($message->position())` after the callback work succeeds.
-- Every received message keeps the partition context of the poll that delivered it:
+  A new `foreach` over the same iterator reads on after the last message it yielded.
+- `pollMessages()` returns an `Iggy\PolledMessages` batch with `partition_id`,
+  `current_offset`, `count` and `messages`. `Iggy\PollOptions` sets `count`,
+  `max_wait_micros`, `min_count`, `max_bytes` and `commit`, and refuses
+  invalid limits before anything is sent.
+- `commit` takes an `Iggy\CommitPolicy`: `CommitPolicy::manual()`, the default, stores
+  nothing, `CommitPolicy::onRead()` makes the server store the offset of each reply, and
+  `CommitPolicy::auto(new AutoCommit(...))` makes a reader or a consumer store the latest
+  counted position every `interval_micros` or on a `CommitEvery` event, and on close or
+  shutdown. A message counts as its `CommitAfter` says: after processing (the default),
+  at delivery, or when `mark($checkpoint)` marks it. `AutoCommit::default()` stores every
+  10,000 messages or 5 seconds after processing. `pollMessages()` refuses `auto()`.
+- With `CommitPolicy::onRead()`, the server stores the offset of each reply. A lost reply, also to a `disconnect()` while the poll waits, then throws `FetchProgressUncertain` (14010), and the partition stays blocked until `abandonOperation()`. `disconnect()` closes the connection until the next `connect()`, after which `loginUser()` signs in again.
+- `consumerGroup()` builds a member of a consumer group, and creates a missing group
+  by default. `reader()` builds a batch reader of chosen partitions as a standalone
+  consumer, and `groupReader()` a batch reader of an existing consumer group. A group
+  create or join with an unknown outcome throws its error, and the next `groupReader()`
+  or `consumerGroup()` joins again. A join that landed keeps its member in the group
+  until the session ends.
+- `PartitionReader::next()` waits until a batch arrives. Give `timeout_micros` to
+  limit the wait. At the timeout, `next()` returns `null`, and the script gets control
+  back. A batch that arrives later stays in the reader for the next call.
+- `startPollMessages()` runs the poll of `pollMessages()` in the background and
+  returns a `PendingPoll` at once. `wait($timeout_micros)` returns its batch, or
+  `null` while the poll still runs, and `cancel()` drops the request, which cancels
+  a parked deferred poll on the server. A parked poll holds its connection, so start
+  it on a client that sends nothing else meanwhile.
+- The default options of a reader or a consumer wait 5 seconds for up to 1000
+  messages. A wait of 0 polls an idle topic in a busy loop. `prefetch_bytes`
+  (16 MiB) and `prefetch_messages` (16000) are the requested budgets for the
+  requests in flight and the queued batches. Each effective budget holds at
+  least 32 full batches: 32 MiB and 32000 messages with the default options.
+- With `CommitPolicy::manual()`, the consumer stores no offset. Commit checkpoints
+  after processing, or each restart reads the same messages again.
+- Under `CommitPolicy::auto()`, `consumeMessages()` counts a message after its callback
+  returns with `CommitAfter::Processing`, and before it with `CommitAfter::Delivery`. An
+  exception of the callback ends the run, and under `CommitAfter::Processing` its message
+  stays uncounted, so the next run reads it again.
+- Every received message has a `checkpoint()`: the position after the message, with
   the partition incarnation, which changes when the partition is deleted and recreated,
-  and the consumer group owner generation. `Iggy\Consumer::storePosition()` commits a
-  message's `position()` under that context, so a commit after a recreation or an owner
-  change is refused instead of landing on the newer partition. `storeOffset()` commits
-  under the context of the latest message consumed from that partition.
-- `Iggy\PollingStrategy::withContext()` continues a poll at an offset under the context
-  that produced it, for example
-  `PollingStrategy::offset($message->offset() + 1)->withContext($message->context())`.
-  A stale context fails the poll. To continue in another process, save the context's
-  `incarnation`, `owner_generation` and `metadata_op` with the offset and rebuild it with
-  `new Iggy\PartitionContext(...)`.
-- A poll or offset write without a caller context uses the context of its route. It can
-  fail once with `HistoryUnavailable` (87), or `ConsumerGroupPartitionNotOwned` (5009)
-  for a consumer group, after another client deleted and recreated the partition. The
-  failed route is dropped, and the next call routes again. Both errors surface as
-  `Iggy\Exception\IggyException`.
+  and the consumer group owner generation. Commit it with `Iggy\Consumer::commit()` or
+  `Iggy\PartitionReader::commit()`, on the consumer or the reader that delivered it. A
+  commit after a recreation or an owner change is refused instead of landing on the newer
+  partition. `storeOffset()` commits under the context of the latest message consumed
+  from that partition. `PolledMessages::checkpoint()` covers the whole batch.
+- PHP cannot cancel `commit()` and `seek()` of a reader or a consumer, or `storeOffset()`
+  and `deleteOffset()` of a consumer, so each one ends at a deadline 10 s after its start.
+- `PolledMessages::continuation()` continues a poll after the batch, under the
+  partition context of the batch. A read after a recreation fails with
+  `HistoryUnavailable` (87). A continuation cannot move to another process: store a
+  checkpoint there, and start the other process with `PollingStrategy::next()`.
+- `Client::deleteConsumerPosition()` deletes the offset stored for the partition of a
+  checkpoint, under the partition history that delivered it.
+- A failed read of a reader or of `iterMessages()` throws `Iggy\Exception\ReadException`.
+  `consumeMessages()` throws it only for an error that ends its run, such as
+  `HistoryUnavailable` (87), and the consumer retries the other failed reads.
+  `getCode()` is the error code, `getPrevious()` the typed exception that a direct call
+  would throw, `partition_id` the partition or `null`, and `skip` the continuation after
+  a message that does not decode. The reader retries by itself. `HistoryUnavailable`
+  (87) stops the partition until `seek()`. A lost read can commit messages that the
+  reader cannot read again. Then the reader throws `FetchProgressUncertain` (14010)
+  once. Its `lost` holds the first and last offset of those messages as `[first, last]`.
+  This error stops nothing and needs no seek. A seek after it drops the batch that
+  follows the range. If the reader stopped the partition, the error that stopped it
+  comes after that batch. Earlier versions gave this error a `skip` after the range.
+  Code that handles `FetchProgressUncertain` with `abandonOperation()` and a `seek()`
+  must now check `lost` first and do neither for this error.
+- Call `close()` on a reader and `shutdown()` on a consumer before the script ends.
+  Under `CommitPolicy::auto()`, they store the latest counted position first. Under
+  `CommitPolicy::onRead()`, they move the offset back to the last delivered
+  message, so the next run reads the prefetched messages again. Destroying the object
+  without them, or a crash, skips those messages. The loss is at most the effective
+  budget, which holds at least 32 batches.
+- A poll with a fresh strategy, or an offset write without a checkpoint, uses the
+  context of its route. It can fail once with `HistoryUnavailable` (87), or
+  `ConsumerGroupPartitionNotOwned` (5009) for a consumer group, after another client
+  deleted and recreated the partition. The failed route is dropped, and the next call
+  routes again. Both errors surface as `Iggy\Exception\IggyException`.
 - `Iggy\PollingStrategy::timestamp()` and `Iggy\PollingStrategy::timestampMicros()`
   expect microseconds since the Unix epoch. Use
   `Iggy\PollingStrategy::timestampSeconds()` for PHP `time()` values.

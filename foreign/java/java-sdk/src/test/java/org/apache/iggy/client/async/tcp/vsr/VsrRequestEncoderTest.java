@@ -24,10 +24,12 @@ import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.partition.PartitionContext;
+import org.apache.iggy.serde.CommandCode;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -218,6 +220,72 @@ class VsrRequestEncoderTest {
     }
 
     @Test
+    void shouldNameOnlyTheSessionWatermarkInTheFetchHeaderAndKeepTheTargetFences() {
+        session.bind(42);
+        session.observeMetadata(52);
+        ConsensusSession shared = new ConsensusSession();
+        shared.bindShared(session, session.clientIdLow(), session.clientIdHigh(), 42, session.bindSecret());
+        VsrRequestEncoder primary = new VsrRequestEncoder(shared);
+        PartitionContext context =
+                new PartitionContext(BigInteger.valueOf(17), BigInteger.valueOf(9), BigInteger.valueOf(49));
+        ByteBuf payload = fetchPayload(4, 17, 9);
+        byte[] originalBody = new byte[payload.readableBytes()];
+        payload.getBytes(payload.readerIndex(), originalBody);
+
+        try {
+            for (PartitionContext supplied : List.of(PartitionContext.EMPTY, context)) {
+                ByteBuf frame =
+                        primary.encode(alloc, CommandCode.Messages.FETCH_MESSAGES.getValue(), payload, supplied);
+                try {
+                    assertThat(frame.getLongLE(VsrHeaders.REQUEST_INCARNATION_OFFSET))
+                            .isZero();
+                    assertThat(frame.getLongLE(VsrHeaders.REQUEST_OWNER_GENERATION_OFFSET))
+                            .isZero();
+                    assertThat(frame.getLongLE(VsrHeaders.REQUEST_METADATA_OP_OFFSET))
+                            .isEqualTo(52);
+                    assertThat(frame.getLongLE(VsrHeaders.REQUEST_SESSION_OFFSET))
+                            .isEqualTo(42);
+                    byte[] encodedBody = new byte[originalBody.length];
+                    frame.getBytes(VsrHeaders.HEADER_SIZE, encodedBody);
+                    assertThat(encodedBody).isEqualTo(originalBody);
+                } finally {
+                    frame.release();
+                }
+            }
+        } finally {
+            payload.release();
+        }
+    }
+
+    @Test
+    void shouldKeepMetadataFencesForDeferredPollsAndMetadataReads() {
+        session.bind(42);
+        session.observeMetadata(52);
+        PartitionContext context =
+                new PartitionContext(BigInteger.valueOf(17), BigInteger.valueOf(9), BigInteger.valueOf(49));
+        ByteBuf fencedPoll =
+                encoder.encode(alloc, CommandCode.Messages.POLL_DEFERRED.getValue(), Unpooled.EMPTY_BUFFER, context);
+        ByteBuf poll = encoder.encode(alloc, CommandCode.Messages.POLL_DEFERRED.getValue(), Unpooled.EMPTY_BUFFER);
+        ByteBuf metadata = encoder.encode(alloc, GET_CLUSTER_METADATA_CODE, Unpooled.EMPTY_BUFFER);
+        try {
+            assertThat(fencedPoll.getLongLE(VsrHeaders.REQUEST_INCARNATION_OFFSET))
+                    .isEqualTo(17);
+            assertThat(fencedPoll.getLongLE(VsrHeaders.REQUEST_OWNER_GENERATION_OFFSET))
+                    .isEqualTo(9);
+            assertThat(fencedPoll.getLongLE(VsrHeaders.REQUEST_METADATA_OP_OFFSET))
+                    .isEqualTo(49);
+            assertThat(poll.getLongLE(VsrHeaders.REQUEST_METADATA_OP_OFFSET)).isEqualTo(52);
+            assertThat(metadata.getLongLE(VsrHeaders.REQUEST_METADATA_OP_OFFSET))
+                    .isEqualTo(52);
+            assertThat(metadata.getLongLE(VsrHeaders.REQUEST_SESSION_OFFSET)).isEqualTo(42);
+        } finally {
+            fencedPoll.release();
+            poll.release();
+            metadata.release();
+        }
+    }
+
+    @Test
     void shouldRetainClientIdAndSecretWhenRegistrationIsRepeated() {
         ByteBuf firstLogin = loginUserPayload();
         encoder.encode(alloc, LOGIN_USER_CODE, firstLogin).release();
@@ -314,6 +382,31 @@ class VsrRequestEncoderTest {
         payload.writeByte(1);
         payload.writeByte(0);
         payload.writeIntLE(0);
+        return payload;
+    }
+
+    private static ByteBuf fetchPayload(long partitionId, long incarnation, long ownerGeneration) {
+        ByteBuf payload = Unpooled.buffer();
+        // consumer group, stream, topic
+        payload.writeByte(2);
+        writeNumericIdentifier(payload, 7);
+        writeNumericIdentifier(payload, 2);
+        writeNumericIdentifier(payload, 3);
+        // wait, request timeout, min_count, count, max_bytes, auto_commit, target count
+        payload.writeLongLE(0);
+        payload.writeLongLE(1_000_000);
+        payload.writeIntLE(1);
+        payload.writeIntLE(10);
+        payload.writeIntLE(4096);
+        payload.writeByte(0);
+        payload.writeIntLE(1);
+        // target: partition, next offset strategy, max_bytes, then the fence of the partition
+        payload.writeIntLE((int) partitionId);
+        payload.writeByte(5);
+        payload.writeLongLE(0);
+        payload.writeIntLE(4096);
+        payload.writeLongLE(incarnation);
+        payload.writeLongLE(ownerGeneration);
         return payload;
     }
 

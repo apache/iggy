@@ -17,6 +17,21 @@
 
 //! Per-shard periodic segment cleaner.
 //!
+//! A tiered topic is the exception to what follows: its retention covers the
+//! segments in the object store too, so only the partition primary decides,
+//! and the decision is committed as a `TruncatePartition` that every replica
+//! enforces.
+//!
+//! A topic that places its batches is another: its messages are in the
+//! long-term segments of the object store, so the partition primary judges
+//! the policy over those and commits what it removes as a trim, which every
+//! replica follows.
+//!
+//! A shadow topic of a retired origin is the last: no manifest of the origin
+//! trims it again, so the partition primary judges the retention of the
+//! topic in the peer over the manifest it committed, and commits what that
+//! removes as one more manifest. Nothing reaches the peer's store.
+//!
 //! Local and unreplicated: every replica (primary and backup) trims its own
 //! expired or over-budget sealed segments. Divergence in physical log start is
 //! invisible to clients because reads are served by the partition primary. The
@@ -28,8 +43,10 @@
 
 use crate::shell::ServerShard;
 use consensus::{MetadataHandle, PartitionsHandle};
-use iggy_common::{IggyExpiry, IggyTimestamp, MaxTopicSize};
+use iggy_common::{IggyDuration, IggyExpiry, IggyTimestamp, MaxTopicSize};
 use metadata::impls::metadata::StreamsFrontend;
+use partitions::{LONG_TERM_SEGMENT_BYTES, LocalEnvelope};
+use server_common::sharding::IggyNamespace;
 use shard::Receiver;
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -59,10 +76,10 @@ pub async fn run_segment_cleaner(shard: Rc<ServerShard>, stop: Receiver<()>, int
     let mut reported_floors = HashSet::new();
     loop {
         // `Ok(_)`: stop signalled -> exit. `Err(_)`: interval elapsed -> pass.
-        match compio::time::timeout(interval, stop.recv()).await {
-            Ok(_) => break,
-            Err(_) => stage_owned_partitions(&shard, &mut reported_floors),
+        if compio::time::timeout(interval, stop.recv()).await.is_ok() {
+            break;
         }
+        stage_owned_partitions(&shard, &mut reported_floors);
     }
     trace!(shard = shard.id, "segment cleaner exited");
 }
@@ -75,20 +92,31 @@ pub async fn run_segment_cleaner(shard: Rc<ServerShard>, stop: Receiver<()>, int
 /// across passes, so the disclosure lands once per topic instead of once per
 /// interval tick. Slab ids are reused after a delete, so the creation revision
 /// is part of the key: a topic recreated into the same slots discloses again.
-fn stage_owned_partitions(
+pub fn stage_owned_partitions(
     shard: &Rc<ServerShard>,
     reported_floors: &mut HashSet<(usize, usize, u64)>,
 ) {
     let now = IggyTimestamp::now();
     let namespaces: Vec<_> = shard.plane.partitions().namespaces().copied().collect();
     let streams = shard.plane.metadata().mux_stm.streams();
+    let tiered_storage_ready = shard
+        .plane
+        .metadata()
+        .applied_frontier()
+        .tiered_storage_ready();
     let max_message_size = u64::try_from(shard.bus_max_message_size()).unwrap_or(u64::MAX);
+    let mut tiered = Vec::new();
     for namespace in namespaces {
+        if stage_retired_peer(shard, namespace, now) {
+            continue;
+        }
         let Some((message_expiry, max_topic_size, partition_count, segment_size)) =
             streams.topic_retention_config(namespace.stream_id(), namespace.topic_id())
         else {
             continue;
         };
+
+        let long_term = placing_incarnation(shard, namespace);
 
         // `ServerDefault` resolves to "never expire" here, matching the legacy
         // cleaner: a topic created with the server default never expires
@@ -102,13 +130,71 @@ fn stage_owned_partitions(
         let segment_size = segment_size.map_or(iggy_common::DEFAULT_SEGMENT_SIZE, |segment_size| {
             segment_size.as_bytes_u64()
         });
+        // The policy of a partition that places its batches removes
+        // long-term segments, so the least it can keep is one of those.
+        let sealed_segment_ceiling = if long_term.is_some() {
+            LONG_TERM_SEGMENT_BYTES as u64
+        } else {
+            segment_size.saturating_add(max_message_size)
+        };
         let budget = per_partition_size_budget(
             max_topic_size,
             iggy_common::DEFAULT_MAX_TOPIC_SIZE,
             partition_count,
-            segment_size.saturating_add(max_message_size),
+            sealed_segment_ceiling,
         );
+        let max_bytes = budget.map(|budget| budget.max_bytes);
+        if let Some(created_revision) = long_term {
+            let retention = (message_expiry, max_bytes);
+            stage_long_term_passes(shard, namespace, created_revision, now, retention);
+        }
 
+        if let Some((age, size)) =
+            streams.topic_local_retention(namespace.stream_id(), namespace.topic_id())
+        {
+            // An evicted segment is read back from the store, so a node
+            // evicts only while it can tier topics: it passes the store
+            // identity check and its partitions read remote segments.
+            if tiered_storage_ready {
+                shard.request_evict_partition(
+                    namespace,
+                    now,
+                    local_envelope(age, size, partition_count),
+                );
+            }
+            // One lookup, so both passes name the incarnation the watermark
+            // was read for.
+            let Some((created_revision, committed_up_to)) = streams
+                .with_committed_partition(namespace, |partition| {
+                    (partition.created_revision, partition.deleted_up_to_offset)
+                })
+            else {
+                continue;
+            };
+            // Staged after the loop, where the shard orders them.
+            tiered.push((namespace, created_revision, committed_up_to));
+            // Staged before the deletes, which wait for a manifest that
+            // stopped listing what they remove.
+            shard.request_publish_manifest(namespace, created_revision, now);
+            // Staged whatever the topic's policy is: a truncation a client
+            // asked for leaves objects behind as well. The same frame starts
+            // the jobs that verify the stored segments.
+            shard.request_delete_objects(namespace, created_revision, now, committed_up_to);
+            // Retention of a tiered topic covers its remote segments too, so
+            // no replica expires its own: the partition primary decides, and
+            // the decision reaches every replica as a committed truncation.
+            if has_expiry || budget.is_some() {
+                shard.request_retain_partition(
+                    namespace,
+                    created_revision,
+                    now,
+                    message_expiry,
+                    max_bytes,
+                    committed_up_to,
+                );
+            }
+            continue;
+        }
         if !has_expiry && budget.is_none() {
             continue;
         }
@@ -122,24 +208,111 @@ fn stage_owned_partitions(
                     .unwrap_or_default(),
             ))
         {
-            warn!(
-                shard = shard.id,
-                stream_id = namespace.stream_id(),
-                topic_id = namespace.topic_id(),
-                max_topic_size = budget.resolved_cap,
-                partition_count,
-                configured_share = budget.configured_share,
-                enforced_per_partition = budget.max_bytes,
-                "{UNENFORCEABLE_TOPIC_SIZE_WARN}"
-            );
+            report_floored_budget(shard, namespace, partition_count, budget);
         }
-        shard.request_clean_partition(
-            namespace,
-            now,
-            message_expiry,
-            budget.map(|budget| budget.max_bytes),
-        );
+        // The long-term passes hold the retention of a partition that
+        // places its batches.
+        if long_term.is_none() {
+            shard.request_clean_partition(namespace, now, message_expiry, max_bytes);
+        }
     }
+    // The timed pass is what retries an upload the store refused and an
+    // advance that did not commit. It is also the only upload pass that
+    // knows the committed truncation watermark.
+    shard.request_upload_passes(&tiered, now);
+}
+
+/// Stage the retention of `namespace` when it is a shadow partition whose
+/// origin retired: the topic's expiry in the peer, and its size shared
+/// evenly between its partitions. Returns whether it is one.
+fn stage_retired_peer(shard: &ServerShard, namespace: IggyNamespace, now: IggyTimestamp) -> bool {
+    let streams = shard.plane.metadata().mux_stm.streams();
+    let Some((created_revision, retention, partition_count)) =
+        streams.retired_shadow_retention(namespace)
+    else {
+        return false;
+    };
+    let message_expiry = retention
+        .expiry_micros()
+        .map_or(IggyExpiry::NeverExpire, |micros| {
+            IggyExpiry::ExpireDuration(IggyDuration::from(Duration::from_micros(micros)))
+        });
+    let max_bytes = retention
+        .max_bytes()
+        .map(|bytes| bytes / u64::try_from(partition_count.max(1)).unwrap_or(u64::MAX));
+    shard.request_retain_retired_peer(namespace, created_revision, now, message_expiry, max_bytes);
+    true
+}
+
+/// The incarnation of the partition of `namespace` when it is on this shard
+/// and places its batches, which is what its long-term passes are staged
+/// for.
+fn placing_incarnation(shard: &ServerShard, namespace: IggyNamespace) -> Option<u64> {
+    if !shard.plane.partitions().places_batches(&namespace) {
+        return None;
+    }
+    shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .with_committed_partition(namespace, |partition| partition.created_revision)
+}
+
+/// Say that `budget` enforces more than the topic's cap gives a partition.
+fn report_floored_budget(
+    shard: &ServerShard,
+    namespace: IggyNamespace,
+    partition_count: usize,
+    budget: PartitionSizeBudget,
+) {
+    warn!(
+        shard = shard.id,
+        stream_id = namespace.stream_id(),
+        topic_id = namespace.topic_id(),
+        max_topic_size = budget.resolved_cap,
+        partition_count,
+        configured_share = budget.configured_share,
+        enforced_per_partition = budget.max_bytes,
+        "{UNENFORCEABLE_TOPIC_SIZE_WARN}"
+    );
+}
+
+/// Stage the passes of a partition that places its batches: it rewrites them
+/// into long-term segments, trims the ones that left the topic's `retention`
+/// (its expiry and the partition's byte budget), publishes what it stored,
+/// and deletes the objects of the segments its long-term log stopped listing.
+/// A replica that is not the partition's primary only follows the trim: it
+/// removes its own segments of placed batches below it.
+///
+/// The retention pass is staged whatever the policy, so a replica follows a
+/// trim that committed before the policy was taken away.
+fn stage_long_term_passes(
+    shard: &ServerShard,
+    namespace: IggyNamespace,
+    created_revision: u64,
+    now: IggyTimestamp,
+    retention: (IggyExpiry, Option<u64>),
+) {
+    let (message_expiry, max_bytes) = retention;
+    shard.request_rewrite_segments(namespace, created_revision);
+    shard.request_retain_long_term(namespace, created_revision, now, message_expiry, max_bytes);
+    shard.request_publish_manifest(namespace, created_revision, now);
+    // The long-term log alone bounds these deletes, so no watermark.
+    shard.request_delete_objects(namespace, created_revision, now, 0);
+}
+
+/// What one partition of a tiered topic keeps on local disk. The topic's
+/// `local_retention_size` is shared evenly between its partitions, as
+/// `max_topic_size` is.
+fn local_envelope(age: IggyExpiry, size: MaxTopicSize, partition_count: usize) -> LocalEnvelope {
+    let size = match size {
+        MaxTopicSize::Custom(size) => {
+            Some(size.as_bytes_u64() / u64::try_from(partition_count.max(1)).unwrap_or(u64::MAX))
+        }
+        MaxTopicSize::Unlimited | MaxTopicSize::ServerDefault => None,
+    };
+    LocalEnvelope { age, size }
 }
 
 /// A topic's enforced per-partition budget, next to the share it was derived
@@ -203,6 +376,38 @@ fn per_partition_size_budget(
 #[cfg(test)]
 mod tests {
     use super::{PartitionSizeBudget, per_partition_size_budget};
+
+    #[test]
+    fn given_local_retention_when_resolving_an_envelope_should_share_the_size_between_partitions() {
+        let age = iggy_common::IggyExpiry::NeverExpire;
+        let size =
+            |bytes: u64| iggy_common::MaxTopicSize::Custom(iggy_common::IggyByteSize::from(bytes));
+        assert_eq!(
+            crate::segment_cleaner::local_envelope(age, size(900), 3),
+            partitions::LocalEnvelope {
+                age,
+                size: Some(300)
+            }
+        );
+        assert_eq!(
+            crate::segment_cleaner::local_envelope(age, size(900), 0).size,
+            Some(900)
+        );
+        assert_eq!(
+            crate::segment_cleaner::local_envelope(age, iggy_common::MaxTopicSize::Unlimited, 3)
+                .size,
+            None
+        );
+        assert_eq!(
+            crate::segment_cleaner::local_envelope(
+                age,
+                iggy_common::MaxTopicSize::ServerDefault,
+                3
+            )
+            .size,
+            None
+        );
+    }
     use iggy_common::MaxTopicSize;
 
     /// A ceiling low enough that the share is what the assertion is about.

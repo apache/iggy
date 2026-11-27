@@ -134,6 +134,7 @@ pub enum ControlActionKind {
     RebuildPipeline,
     CommitJournal,
     SendCommit,
+    SendCommitReply,
 }
 
 impl ControlActionKind {
@@ -150,6 +151,7 @@ impl ControlActionKind {
             Self::RebuildPipeline => "rebuild_pipeline",
             Self::CommitJournal => "commit_journal",
             Self::SendCommit => "send_commit",
+            Self::SendCommitReply => "send_commit_reply",
         }
     }
 }
@@ -420,6 +422,14 @@ impl ControlActionLogEvent {
                 target_replica: target,
                 op: None,
                 commit: Some(commit),
+                untrusted_log: None,
+            },
+            VsrAction::SendCommitReply { target, .. } => Self {
+                replica,
+                action: ControlActionKind::SendCommitReply,
+                target_replica: Some(target),
+                op: None,
+                commit: None,
                 untrusted_log: None,
             },
         }
@@ -744,6 +754,7 @@ pub const fn operation_as_str(operation: Operation) -> &'static str {
         Operation::RetireSession => "retire_session",
         Operation::CompleteLifecycle => "complete_lifecycle",
         Operation::RewrapStreamKeys => "rewrap_stream_keys",
+        Operation::ShadowTopic => "shadow_topic",
         Operation::TransitionPartitionHistory => "transition_partition_history",
         Operation::RetireConsumerGroupOwners => "retire_consumer_group_owners",
         Operation::InstallConsumerGroupOwner => "install_consumer_group_owner",
@@ -751,6 +762,7 @@ pub const fn operation_as_str(operation: Operation) -> &'static str {
         Operation::UpdateTopicResolved => "update_topic_resolved",
         Operation::UpdateUserResolved => "update_user_resolved",
         Operation::UpdateResource => "update_resource",
+        Operation::RetireGeoOrigin => "retire_geo_origin",
         Operation::CreateStream => "create_stream",
         Operation::DeleteStream => "delete_stream",
         Operation::CreateTopic => "create_topic",
@@ -774,6 +786,7 @@ pub const fn operation_as_str(operation: Operation) -> &'static str {
         Operation::SendMessages => "send_messages",
         Operation::StoreConsumerOffset => "store_consumer_offset",
         Operation::DeleteConsumerOffset => "delete_consumer_offset",
+        Operation::StateMachineCommand => "state_machine_command",
     }
 }
 

@@ -15,12 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::IggyError;
 use crate::text;
+use crate::{IggyError, IggyMessage};
 use aes_gcm::aead::{Aead, Generate};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use aes_gcm_siv::aead::AeadInOut;
 use aes_gcm_siv::{Aes256GcmSiv, Nonce as SivNonce, Tag as SivTag};
+use bytes::Bytes;
 use std::fmt::Debug;
 
 const AES_GCM_NONCE_SIZE: usize = 12;
@@ -46,6 +47,19 @@ impl EncryptorKind {
             EncryptorKind::Aes256Gcm(e) => e.decrypt(data),
             EncryptorKind::Aes256GcmSiv(e) => e.decrypt(data),
         }
+    }
+
+    /// Replaces the payload and the user headers of a polled `message` with
+    /// their plaintext.
+    pub fn decrypt_message(&self, message: &mut IggyMessage) -> Result<(), IggyError> {
+        message.payload = Bytes::from(self.decrypt(&message.payload)?);
+        message.header.payload_length = message.payload.len() as u32;
+        if let Some(user_headers) = &message.user_headers {
+            let user_headers = self.decrypt(user_headers)?;
+            message.header.user_headers_length = user_headers.len() as u32;
+            message.user_headers = Some(Bytes::from(user_headers));
+        }
+        Ok(())
     }
 }
 

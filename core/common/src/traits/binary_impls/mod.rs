@@ -27,14 +27,21 @@ mod system;
 mod topics;
 mod users;
 
-pub use messages::{BinarySendPartitioning, decode_send_confirmations, send_binary_messages};
+pub use messages::{
+    BinarySendPartitioning, decode_send_confirmations, fetch_binary_messages,
+    select_send_partition, send_binary_messages,
+};
+pub use messages::{group_cache_key, sync_group_assignment};
 
 use crate::IggyError;
 use crate::OptionsPatch;
 use crate::http::users::defaults::{
     MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
 };
-use crate::{BinaryClient, ClientState, Credentials, IdentityInfo};
+use crate::{
+    BinaryClient, ClientState, Credentials, IdentityInfo, NamedPageQuery, Page, PageQuery,
+    binary_operation_deadline, with_binary_deadline, with_binary_lineage,
+};
 use bytes::Bytes;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::{
@@ -49,6 +56,25 @@ use iggy_binary_protocol::{
 };
 use secrecy::ExposeSecret;
 use tokio::time::timeout_at;
+
+/// Reads a whole list as one call, as the one request before paging did. Every
+/// page keeps the caller sign-in and the budget that the walk started with, so
+/// a caller sign-in between two pages ends the walk.
+async fn read_whole_list<B, T, F, Fut>(client: &B, read_page: F) -> Result<Vec<T>, IggyError>
+where
+    B: BinaryClient + ?Sized,
+    F: FnMut(NamedPageQuery) -> Fut,
+    Fut: Future<Output = Result<Page<T>, IggyError>>,
+{
+    with_binary_lineage(
+        client.operation_lineage(),
+        with_binary_deadline(
+            binary_operation_deadline(),
+            NamedPageQuery::from(PageQuery::whole_list()).read_to_end(read_page),
+        ),
+    )
+    .await
+}
 
 /// Send one `UpdateResource` patch for `target`.
 async fn update_resource<B: BinaryClient + ?Sized>(

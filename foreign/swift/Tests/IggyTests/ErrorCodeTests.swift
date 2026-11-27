@@ -28,6 +28,12 @@ struct ErrorCodeTests {
         #expect(IggyErrorCode.incompatibleProtocolVersion.rawValue == 14003)
         #expect(IggyErrorCode(rawValue: 57) == .transientNotCommitted)
         #expect(IggyErrorCode(rawValue: 58) == .transientNotAccepted)
+        #expect(IggyErrorCode(rawValue: 96) == .tieredReadFailed)
+        #expect(IggyErrorCode.tieredReadFailed.name == "tiered_read_failed")
+        #expect(IggyError(wireCode: 96).code == .tieredReadFailed)
+        #expect(IggyErrorCode(rawValue: 97) == .replyTooLarge)
+        #expect(IggyErrorCode.replyTooLarge.name == "reply_too_large")
+        #expect(IggyError(wireCode: 97).code == .replyTooLarge)
         #expect(IggyErrorCode(rawValue: 1009) == .streamIdNotFound)
         #expect(IggyErrorCode(rawValue: 2010) == .topicIdNotFound)
         #expect(IggyErrorCode(rawValue: 2022) == .partitionsLimitReached)
@@ -61,5 +67,7 @@ struct ErrorCodeTests {
         #expect(IggyError(.invalidFormat) != IggyError(.invalidCommand))
         #expect(IggyError(wireCode: 65_535) != IggyError(.error))
         #expect(IggyError(.invalidFormat, context: "x").hashValue == IggyError(.invalidFormat).hashValue)
+        #expect(IggyError(.partitionLaneBlocked, operationID: 1, partitionID: 2) != IggyError(.partitionLaneBlocked, operationID: 3, partitionID: 2))
+        #expect(IggyError(.partitionLaneBlocked, operationID: 1, partitionID: 2) != IggyError(.partitionLaneBlocked, operationID: 1, partitionID: 3))
     }
 }

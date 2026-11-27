@@ -15,166 +15,74 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { Readable } from "node:stream";
-import type { ClientConfigOrString, RawClient } from "../client/client.type.js";
+import { Readable } from 'node:stream';
+import type { ClientConfigOrString } from '../client/client.type.js';
 import type { Id } from '../wire/identifier.utils.js';
-import { SimpleClient } from "../client/client.js";
-import { normalizeClientConfig } from "../client/client.config.js";
-import { debug } from "../client/client.debug.js";
-import { getRawClient } from "../client/client.socket.js";
-import {
-  NotConnectedError, OperationUncertainError, VsrResponseTimeoutError
-} from "../client/client.operation.js";
+import { SimpleClient } from '../client/client.js';
+import { normalizeClientConfig } from '../client/client.config.js';
 import { ConnectionClosedError } from '../client/client.connection.js';
-import { ResponseError } from "../wire/error.utils.js";
-import { LEAVE_GROUP } from "../wire/consumer-group/leave-group.command.js";
-import { ConsumerKind } from "../wire/offset/offset.utils.js";
+import { debug } from '../client/client.debug.js';
 import {
-  NO_ASSIGNED_PARTITION,
-  type PollMessages
-} from "../wire/message/poll-messages.command.js";
-import {
-  type PollingStrategy,
-  type CommandAPI,
-  Consumer
-} from "../wire/index.js";
+  FetchProgressUncertainError, LaneBlockedError, NotConnectedError, OperationUncertainError, VsrResponseTimeoutError
+} from '../client/client.operation.js';
+import { getRawClient } from '../client/client.socket.js';
+import { ResponseError } from '../wire/error.utils.js';
+import { Consumer } from '../wire/offset/offset.utils.js';
+import type { PollingStrategy } from '../wire/message/poll.utils.js';
+import type { DeferredPollOptions } from '../wire/message/deferred-poll.utils.js';
+import { CommitPolicy, pollOptions, type PollOptions } from '../wire/message/poll-options.js';
+import type { PolledBatch } from '../wire/message/checkpoint.js';
+import { ReadError, type PartitionReader } from './partition-reader.js';
 
+const DEFAULT_POLLING_RETRY_INTERVAL_MS = 1_000;
+// A closing stream keeps its client this long for the rewind and the leave of
+// its reader. A membership that it could not leave ends with the session lease.
+const CLOSE_TIMEOUT_MS = 5_000;
 const STALE_CLIENT = 30;
 const UNAUTHENTICATED = 40;
 const TRANSIENT_NOT_COMMITTED = 57;
 const TRANSIENT_NOT_ACCEPTED = 58;
 const NOT_PRIMARY = 89;
+const DEFERRED_POLL_CAPACITY_EXCEEDED = 90;
 const RECOVERED_ERROR_CODES = new Set([
-  STALE_CLIENT, UNAUTHENTICATED, TRANSIENT_NOT_COMMITTED, TRANSIENT_NOT_ACCEPTED, NOT_PRIMARY
+  STALE_CLIENT, UNAUTHENTICATED, TRANSIENT_NOT_COMMITTED, TRANSIENT_NOT_ACCEPTED, NOT_PRIMARY,
+  DEFERRED_POLL_CAPACITY_EXCEEDED
 ]);
-// A closed group stream keeps its client until the leave ends. A leave that
-// misses this deadline leaves the membership to its lease.
-const LEAVE_GROUP_TIMEOUT_MS = 5_000;
 
-const wait = (interval: number, cb?: () => void): Promise<void> =>
-  new Promise((resolve) => {
-    setTimeout(() => resolve(cb ? cb() : undefined), interval)
-  });
-
-// The client binds the session again, signs in again, reconnects or routes
-// again on its own after these errors, so they must not end a stream that
-// nothing restarts.
-const pollsAgainAfter = (error: unknown): boolean =>
-  error instanceof OperationUncertainError || error instanceof VsrResponseTimeoutError ||
-  error instanceof NotConnectedError || error instanceof ConnectionClosedError ||
-  (error instanceof ResponseError && RECOVERED_ERROR_CODES.has(error.errorCode));
-
-const isUnauthenticated = (error: unknown): boolean =>
-  error instanceof ResponseError && error.errorCode === UNAUTHENTICATED;
-
-async function* genEagerUntilPoll(
-  c: CommandAPI,
-  poll: PollMessages,
-  signIn: () => Promise<unknown>,
-  stopped: () => boolean,
-  interval = 1000,
-  endOnLastOffset = false
-) {
-  const state: Map<string, number> = new Map();
-
-  while (!stopped()) {
-    const r = await c.message.poll(poll).catch(async (error: unknown) => {
-      if (!pollsAgainAfter(error)) throw error;
-      debug('consumer stream poll failed, polling again', error);
-      // A 40 also comes from a sign-in that the server refuses, as for an
-      // inactive user, and every later sign-in gets the same refusal. So after
-      // a 40 the stream waits for the next sign-in, and a refused one ends it.
-      if (isUnauthenticated(error))
-        await signIn().catch((failure: unknown) => {
-          if (isUnauthenticated(failure) || !pollsAgainAfter(failure)) throw failure;
-          debug('consumer stream sign-in failed, polling again', failure);
-        });
-      return undefined;
-    });
-    if (!r || (r.count === 0 && r.partitionId === NO_ASSIGNED_PARTITION)) {
-      await wait(interval);
-      continue;
-    }
-    yield r;
-    state.set(`${r.partitionId}`, r.count);
-
-    if (Array.from(state).every(([, last]) => last === 0)) {
-      if( endOnLastOffset )
-        return;
-      else
-        await wait(interval);
-    }
-  }
+// The client binds the session again, reconnects or routes again on its own
+// after these errors, and the reader reads again, so they do not end a stream
+// that nothing restarts. A message that does not decode and a block that
+// needs explicit recovery end it.
+const readsAgainAfter = (error: unknown): boolean => {
+  if (error instanceof ReadError && error.skip) return false;
+  const cause = error instanceof ReadError ? error.error : error;
+  if (cause instanceof FetchProgressUncertainError || (cause instanceof LaneBlockedError && cause.requiresExplicitRecovery))
+    return false;
+  return cause instanceof OperationUncertainError || cause instanceof VsrResponseTimeoutError ||
+    cause instanceof NotConnectedError || cause instanceof ConnectionClosedError ||
+    (cause instanceof ResponseError && RECOVERED_ERROR_CODES.has(cause.errorCode));
 };
 
-/** The client that a stream owns, and the sign-in that the stream waits for. */
-type StreamClient = { client: SimpleClient, raw: RawClient, signIn: () => Promise<boolean> };
-
-// A running stream polls again after NotConnectedError, so the factory signs
-// in first: a wrong address or broken TLS then rejects the factory call. The
-// stream owns this client, so a failed sign-in or setup destroys it.
-const openClient = async (
-  config: ClientConfigOrString,
-  setup?: (c: SimpleClient) => Promise<unknown>
-): Promise<StreamClient> => {
-  const options = normalizeClientConfig(config);
-  const raw = getRawClient(options);
-  const signIn = () => raw.authenticate(options.credentials);
-  try {
-    await signIn();
-    const client = new SimpleClient(raw);
-    await setup?.(client);
-    return { client, raw, signIn };
-  } catch (error) {
-    raw.destroy();
-    throw error;
-  }
+const isUnauthenticated = (error: unknown): boolean => {
+  const cause = error instanceof ReadError ? error.error : error;
+  return cause instanceof ResponseError && cause.errorCode === UNAUTHENTICATED;
 };
-
-// A client without a session would have to sign in again to leave, and that
-// new session is not the member.
-const leaveConsumerGroup = async (raw: RawClient, { streamId, topicId, consumer }: PollMessages): Promise<void> => {
-  if (consumer.kind !== ConsumerKind.Group || !raw.isAuthenticated) return;
-  await raw.sendCommand(LEAVE_GROUP.code, LEAVE_GROUP.serialize({ streamId, topicId, groupId: consumer.id }),
-    { deadline: Date.now() + LEAVE_GROUP_TIMEOUT_MS });
-};
-
-// The stream owns its client, so a closed stream must not keep the links,
-// heartbeat and group membership of that client alive.
-const pollStream = (
-  { client, raw, signIn }: StreamClient, poll: PollMessages, interval: number, endOnLastOffset: boolean
-) => {
-  const stream: Readable = Readable.from(
-    genEagerUntilPoll(client, poll, signIn, () => stream.destroyed, interval, endOnLastOffset),
-    { objectMode: true }
-  );
-  // A destroyed stream closes only after its running poll ends, and a poll
-  // can wait for a sign-in until its deadline. A client without a session has
-  // no membership to leave, so it goes at once, also when it loses its
-  // session later.
-  const closeGenerator = stream._destroy.bind(stream);
-  stream._destroy = (error, callback) => {
-    const releaseSignedOut = () => { if (!raw.isAuthenticated) raw.destroy(); };
-    releaseSignedOut();
-    raw.on('sessionReset', releaseSignedOut);
-    closeGenerator(error, callback);
-  };
-  stream.once('close', () => {
-    void leaveConsumerGroup(raw, poll)
-      .catch((error: unknown) => { debug('consumer stream group leave failed', error); })
-      .finally(() => raw.destroy());
-  });
-  return stream;
-};
-
 
 export type ConsumerStreamRequest = {
   streamId: Id,
   topicId: Id,
   pollingStrategy: PollingStrategy,
   count: number,
-  interval?: number,
+  /**
+   * How each read waits on the server for messages: `maxWait`, `minCount`
+   * and `maxBytes` of `PollOptions`. A read waits up to 5 s by default.
+   */
+  pollOptions?: Partial<DeferredPollOptions>,
+  /** The pause in milliseconds before a refused partition reads again. Defaults to 1000. */
+  pollingRetryInterval?: number,
+  /** Whether the server stores the offset of each read (`CommitPolicy.OnRead`). Defaults to true. */
   autocommit?: boolean
+  /** Ends the stream once the last read of every partition found no message. */
   endOnLastOffset?: boolean
 }
 
@@ -184,55 +92,131 @@ export type SingleConsumerStreamRequest = ConsumerStreamRequest & {
 
 export type GroupConsumerStreamRequest = ConsumerStreamRequest & { groupName: string };
 
-export const singleConsumerStream = (config: ClientConfigOrString) => async (
-  {
-    streamId,
-    topicId,
-    partitionId,
-    pollingStrategy,
+/** The reader options of a stream request. */
+const readerOptions = ({ count, pollOptions: wait = {}, autocommit = true }: ConsumerStreamRequest):
+  Partial<PollOptions> => {
+  const options: Partial<PollOptions> = {
     count,
-    interval = 1000,
-    autocommit = true,
-    endOnLastOffset = false
-  }: SingleConsumerStreamRequest
-): Promise<Readable> => {
-  const c = await openClient(config);
-
-  const poll = {
-    streamId,
-    topicId,
-    partitionId,
-    consumer: Consumer.Single,
-    pollingStrategy,
-    count,
-    autocommit
+    ...(wait.maxWait === undefined ? {} : { maxWait: wait.maxWait }),
+    ...(wait.minCount === undefined ? {} : { minCount: wait.minCount }),
+    ...(wait.maxBytes === undefined ? {} : { maxBytes: wait.maxBytes }),
+    commit: autocommit ? CommitPolicy.OnRead : CommitPolicy.Manual
   };
-
-  return pollStream(c, poll, interval, endOnLastOffset);
+  // Invalid options fail here, before the stream owns a client.
+  pollOptions({ maxWait: 5_000, ...options });
+  return options;
 };
 
+/** A `Readable` of the batches of a reader on a client of its own, which it closes with the stream. */
+const readerStream = async (
+  config: ClientConfigOrString,
+  open: (client: SimpleClient) => Promise<PartitionReader>,
+  endOnLastOffset: boolean,
+  committing: boolean
+): Promise<Readable> => {
+  const options = normalizeClientConfig(config);
+  const raw = getRawClient(options);
+  let reader: PartitionReader;
+  try {
+    await raw.authenticate(options.credentials);
+    reader = await open(new SimpleClient(raw));
+  } catch (error) {
+    raw.destroy();
+    throw error;
+  }
+  // A 40 also comes from a sign-in that the server refuses, as for an
+  // inactive user, so a refused sign-in ends the stream.
+  const signInAgain = async (error: unknown): Promise<void> => {
+    if (!isUnauthenticated(error)) return;
+    await raw.authenticate(options.credentials).catch((failure: unknown) => {
+      if (isUnauthenticated(failure) || !readsAgainAfter(failure)) throw failure;
+      debug('consumer stream sign-in failed, reading again', failure);
+    });
+  };
+  // The last batches pushed, so a destroy can take back those still in the buffer.
+  const pushed: PolledBatch[] = [];
+  const read = async (stream: Readable): Promise<void> => {
+    while (!stream.destroyed) {
+      try {
+        const batch = endOnLastOffset ? await reader.nextUntilEnd() : await reader.next();
+        if (stream.destroyed) {
+          if (batch) reader.returned(batch);
+          return;
+        }
+        if (batch) {
+          pushed.push(batch);
+          if (pushed.length > 2) pushed.shift();
+        }
+        stream.push(batch ?? null);
+        return;
+      } catch (error) {
+        if (stream.destroyed) return;
+        if (!readsAgainAfter(error)) throw error;
+        debug('consumer stream read failed, reading again', error);
+        await signInAgain(error);
+      }
+    }
+  };
+  // A destroy closes the reader, which ends a read that waits for messages. Each
+  // batch in the buffer of a stream that commits on read is stored already, so
+  // that stream reads only when its consumer asks for more.
+  return new Readable({
+    objectMode: true,
+    highWaterMark: committing ? 0 : 1,
+    read() {
+      read(this).catch((error: unknown) => {
+        if (!this.destroyed) this.destroy(error as Error);
+      });
+    },
+    destroy(error, callback) {
+      let released = false;
+      const release = () => {
+        if (released) return;
+        released = true;
+        raw.destroy();
+      };
+      for (const batch of pushed.slice(pushed.length - this.readableLength).reverse()) reader.returned(batch);
+      // A client without a session can neither rewind nor leave, so it goes at once.
+      if (!raw.isAuthenticated) release();
+      const timer = setTimeout(release, CLOSE_TIMEOUT_MS);
+      reader.close().catch(() => undefined).finally(() => {
+        clearTimeout(timer);
+        release();
+        callback(error);
+      });
+    }
+  });
+};
 
+/**
+ * A `Readable` of the batches of one partition, read by a `PartitionReader`
+ * of a standalone consumer on a client of its own. Prefer
+ * `client.consumer`, which hands over one message at a time on your client.
+ */
+export const singleConsumerStream = (config: ClientConfigOrString) =>
+  async (request: SingleConsumerStreamRequest): Promise<Readable> => {
+    const options = readerOptions(request);
+    return readerStream(config, (client) => client.message.reader({
+      streamId: request.streamId, topicId: request.topicId, consumer: Consumer.Single,
+      partitions: [request.partitionId], start: request.pollingStrategy, options,
+      retryInterval: request.pollingRetryInterval ?? DEFAULT_POLLING_RETRY_INTERVAL_MS
+    }), request.endOnLastOffset ?? false, options.commit === CommitPolicy.OnRead);
+  };
+
+/**
+ * A `Readable` of the batches of a consumer group member, read by a
+ * `PartitionReader` on a client of its own, which creates the group when it is
+ * missing. Prefer `client.consumerGroup`.
+ */
 export const groupConsumerStream = (config: ClientConfigOrString) =>
-  async function groupConsumerStream({
-    groupName,
-    streamId,
-    topicId,
-    pollingStrategy,
-    count,
-    interval = 1000,
-    autocommit = true,
-    endOnLastOffset = false
-  }: GroupConsumerStreamRequest): Promise<Readable> {
-    const s = await openClient(config, (client) => client.group.ensureAndJoin(streamId, topicId, groupName));
-
-    const poll = {
-      streamId,
-      topicId,
-      consumer: Consumer.Group(groupName),
-      partitionId: null,
-      pollingStrategy,
-      count,
-      autocommit
-    };
-    return pollStream(s, poll, interval, endOnLastOffset);
+  async (request: GroupConsumerStreamRequest): Promise<Readable> => {
+    const options = readerOptions(request);
+    return readerStream(config, async (client) => {
+      await client.group.ensure(request.streamId, request.topicId, request.groupName);
+      return client.message.reader({
+        streamId: request.streamId, topicId: request.topicId, consumer: Consumer.Group(request.groupName),
+        start: request.pollingStrategy, options,
+        retryInterval: request.pollingRetryInterval ?? DEFAULT_POLLING_RETRY_INTERVAL_MS
+      });
+    }, request.endOnLastOffset ?? false, options.commit === CommitPolicy.OnRead);
   };

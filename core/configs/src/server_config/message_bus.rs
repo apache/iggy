@@ -20,7 +20,7 @@
 //! Mirrors the runtime `core::message_bus::config::MessageBusConfig`,
 //! using configs-crate idioms:
 //!
-//! - `Duration` -> [`IggyDuration`] (DisplayFromStr-serde, `"5 s"` syntax)
+//! - `Duration` -> [`IggyDuration`] (`DisplayFromStrOrNumber`, `"5 s"` syntax)
 //! - `usize` / `u32` -> kept as the underlying integer type
 //!
 //! Transport-section concerns the bus does NOT own:
@@ -42,10 +42,10 @@
 //! per-peer queue depth, close-grace, reconnect period,
 //! handshake-grace).
 //!
-//! Liveness detection is NOT done via TCP keepalive on the bus: SDK
-//! clients manage their own keepalive policy; replica<->replica
-//! liveness is observed by VSR heartbeats. No keepalive knobs live in
-//! this section.
+//! Client sockets get no TCP keepalive: SDK clients manage their own
+//! keepalive policy. Replica sockets get keepalive probes, and on Linux
+//! `cluster.commit_busy_heartbeat_timeout` bounds how long they may go unanswered.
+//! No keepalive knobs live in this section.
 //!
 //! Construction of the runtime type from this struct happens in the
 //! follow-up PR that wires `core/server` to call
@@ -54,10 +54,10 @@
 use super::COMPONENT;
 use super::defaults::SERVER_CONFIG;
 use crate::ConfigurationError;
-use configs::ConfigEnv;
+use configs::{ConfigEnv, DisplayFromStrOrNumber};
 use iggy_common::{IggyByteSize, IggyDuration, MAX_MESSAGE_SIZE_UPPER_BYTES, Validatable};
 use serde::{Deserialize, Serialize};
-use serde_with::{DisplayFromStr, serde_as};
+use serde_with::serde_as;
 
 /// Hard upper bound on [`MessageBusConfig::max_batch`], in iovecs.
 ///
@@ -123,7 +123,7 @@ pub struct MessageBusConfig {
     /// How long a reply waits for room in a full client queue before the
     /// connection is closed.
     #[serde(default = "default_client_write_stall_timeout")]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
     pub client_write_stall_timeout: IggyDuration,
 
@@ -137,13 +137,13 @@ pub struct MessageBusConfig {
     /// `peer_id > self_id`. Also bounds each dial, so a peer that drops
     /// SYNs cannot stall the sweep.
     #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     pub reconnect_period: IggyDuration,
 
     /// Timeout for per-peer close drain (flush writer, tear down
     /// reader) before force-cancellation.
     #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     pub close_peer_timeout: IggyDuration,
 
     /// Wall-clock bound on a single `stream.shutdown()` (or
@@ -152,7 +152,7 @@ pub struct MessageBusConfig {
     /// (which bounds the registry-level drain over both reader and
     /// writer joins).
     #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     pub close_grace: IggyDuration,
 
     /// Wall-clock bound on a single connection's handshake phase: the
@@ -162,8 +162,14 @@ pub struct MessageBusConfig {
     /// Threaded into `compio::time::timeout(handshake_grace, ...)` at
     /// each handshake site so a slowloris peer cannot pin per-conn
     /// channels + registry slot + spawned task indefinitely.
+    ///
+    /// A replica link gets one such window for the placement preamble,
+    /// TLS and the replica handshake together. The window also bounds how
+    /// long the links to a peer may stay incomplete before they close and
+    /// redial, so a value below [`Self::reconnect_period`] lets them form
+    /// only when all of them connect in one sweep.
     #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     pub handshake_grace: IggyDuration,
 
     /// Node-wide cap on open client sockets: TCP, TCP-TLS, WS, WSS, HTTP and

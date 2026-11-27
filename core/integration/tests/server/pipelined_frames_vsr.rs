@@ -23,16 +23,21 @@
 //! each reply before it sends the next frame.
 
 use iggy::prelude::*;
-use iggy_binary_protocol::codes::{GET_ME_CODE, GET_STREAM_CODE, PING_CODE, POLL_MESSAGES_CODE};
+use iggy_binary_protocol::codes::{
+    FETCH_MESSAGES_CODE, GET_ME_CODE, GET_STREAM_CODE, PING_CODE, POLL_MESSAGES_CODE,
+};
 use iggy_binary_protocol::consensus::{Operation, ReplyHeader, result_code};
 use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
-use iggy_binary_protocol::requests::messages::PollMessagesRequest;
+use iggy_binary_protocol::requests::messages::{
+    FetchMessagesRequest, FetchMessagesTarget, PollMessagesRequest,
+};
 use iggy_binary_protocol::requests::streams::{CreateStreamRequest, GetStreamRequest};
 use iggy_binary_protocol::responses::streams::GetStreamResponse;
 use iggy_binary_protocol::{
     AckLevel, HEADER_SIZE, WireConsumer, WireDecode, WireEncode, WireIdentifier, WireName,
     WireOptions, WirePollingStrategy,
 };
+use iggy_common::{DeferredPollOptions, FetchedSection};
 use integration::harness::{TestBinary, TestHarness};
 use integration::iggy_harness;
 
@@ -156,7 +161,7 @@ async fn given_a_pending_metadata_write_when_a_read_and_ping_follow_should_order
 async fn given_two_pipelined_next_polls_when_auto_committing_should_return_distinct_messages(
     harness: &mut TestHarness,
 ) {
-    let context = seed_poll_messages(harness).await;
+    let context = seed_poll_messages(harness, 1).await;
     let mut socket = connect(harness).await;
     let session = register_root(&mut socket, CLIENT_ID).await;
     let body = next_poll().to_bytes();
@@ -172,7 +177,7 @@ async fn given_two_pipelined_next_polls_when_auto_committing_should_return_disti
         let reply = reply_header(&header);
         assert_eq!(reply.status, 0);
         assert_eq!(reply.request, offset + 1);
-        let polled = PolledMessages::from_bytes(body.into()).unwrap();
+        let polled = PolledMessages::from_bytes(body.into(), &PollingStrategy::next()).unwrap();
         assert_eq!(polled.messages.len(), 1);
         assert_eq!(polled.messages[0].header.offset, offset);
     }
@@ -182,7 +187,7 @@ async fn given_two_pipelined_next_polls_when_auto_committing_should_return_disti
 async fn given_a_pipelined_poll_then_store_when_both_complete_should_preserve_consumer_progress(
     harness: &mut TestHarness,
 ) {
-    let context = seed_poll_messages(harness).await;
+    let context = seed_poll_messages(harness, 1).await;
     let mut socket = connect(harness).await;
     let session = register_root(&mut socket, CLIENT_ID).await;
     let poll = next_poll();
@@ -218,7 +223,7 @@ async fn given_a_pipelined_poll_then_store_when_both_complete_should_preserve_co
         "the poll must finish before its following store"
     );
     assert_eq!(reply.status, 0);
-    let polled = PolledMessages::from_bytes(body.into()).unwrap();
+    let polled = PolledMessages::from_bytes(body.into(), &PollingStrategy::next()).unwrap();
     assert_eq!(polled.messages.len(), 1);
     assert_eq!(polled.messages[0].header.offset, 0);
     let (header, _) = read_reply(&mut socket).await;
@@ -242,7 +247,102 @@ async fn given_a_pipelined_poll_then_store_when_both_complete_should_preserve_co
 const STREAM: &str = "pipelined-stream";
 const TOPIC: &str = "pipelined-topic";
 
-async fn seed_poll_messages(harness: &mut TestHarness) -> PartitionContext {
+#[iggy_harness(cluster_nodes = 1)]
+async fn given_a_committing_fetch_when_a_store_follows_on_its_second_target_should_preserve_progress(
+    harness: &mut TestHarness,
+) {
+    const FETCH_REQUEST: u64 = 1;
+    const STORE_REQUEST: u64 = 2;
+    const SECOND_PARTITION: u32 = 1;
+    const STORED_OFFSET: u64 = 2;
+    const FIRST_PARTITION_END: u64 = 3;
+    let first_context = seed_poll_messages(harness, 2).await;
+    let client = harness.tcp_root_client().await.unwrap();
+    let stream = Identifier::named(STREAM).unwrap();
+    let topic = Identifier::named(TOPIC).unwrap();
+    let second_context = partition_context(&client, &stream, &topic, SECOND_PARTITION).await;
+    let mut socket = connect(harness).await;
+    let session = register_root(&mut socket, CLIENT_ID).await;
+    let options = DeferredPollOptions::default();
+    let poll = next_poll();
+    let fetch = FetchMessagesRequest {
+        consumer: poll.consumer,
+        stream_id: poll.stream_id,
+        topic_id: poll.topic_id,
+        wait_us: 0,
+        request_timeout_us: options.request_timeout.as_micros(),
+        min_count: 1,
+        count: 1,
+        max_bytes: options.max_bytes,
+        auto_commit: true,
+        targets: [
+            (0, FIRST_PARTITION_END, first_context),
+            (SECOND_PARTITION, 0, second_context),
+        ]
+        .map(|(partition_id, offset, context)| FetchMessagesTarget {
+            partition_id,
+            strategy: WirePollingStrategy::offset(offset),
+            max_bytes: options.max_bytes,
+            incarnation: context.incarnation,
+            owner_generation: context.owner_generation,
+        })
+        .into(),
+    };
+    let body = fetch.to_bytes();
+    let mut header = non_replicated_header(CLIENT_ID, session, FETCH_REQUEST, FETCH_MESSAGES_CODE);
+    header.size = u32::try_from(HEADER_SIZE + body.len()).unwrap();
+    write_frame(&mut socket, &header, &body).await;
+    let store = StoreConsumerOffsetRequest {
+        consumer: fetch.consumer,
+        stream_id: fetch.stream_id,
+        topic_id: fetch.topic_id,
+        partition_id: Some(SECOND_PARTITION),
+        offset: STORED_OFFSET,
+        ack: AckLevel::Quorum,
+    }
+    .to_bytes();
+    let mut header = request_header(
+        Operation::StoreConsumerOffset,
+        CLIENT_ID,
+        session,
+        STORE_REQUEST,
+        store.len(),
+    );
+    header.partition_incarnation = second_context.incarnation;
+    header.minimum_metadata_op = second_context.metadata_op;
+    write_frame(&mut socket, &header, &store).await;
+    let (header, body) = read_reply(&mut socket).await;
+    let reply = reply_header(&header);
+    assert_eq!(
+        reply.request, FETCH_REQUEST,
+        "a store on the second target waits for its committing fetch"
+    );
+    assert_eq!(reply.status, 0);
+    let sections = FetchedSection::from_reply(&body.into()).unwrap();
+    assert_eq!(sections.len(), 1);
+    assert_eq!(sections[0].partition_id, SECOND_PARTITION);
+    assert_eq!(sections[0].decode().unwrap().messages[0].header.offset, 0);
+    let (header, _) = read_reply(&mut socket).await;
+    let reply = reply_header(&header);
+    assert_eq!(reply.request, STORE_REQUEST);
+    assert_eq!(reply.status, 0);
+    let stored = client
+        .get_consumer_offset(
+            &Consumer::new(Identifier::numeric(1).unwrap()),
+            &stream,
+            &topic,
+            Some(SECOND_PARTITION),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.stored_offset, STORED_OFFSET,
+        "the earlier fetch must not overwrite the later store"
+    );
+}
+
+async fn seed_poll_messages(harness: &mut TestHarness, partitions: u32) -> PartitionContext {
     let client = harness.tcp_root_client().await.unwrap();
     let stream = Identifier::named(STREAM).unwrap();
     let topic = Identifier::named(TOPIC).unwrap();
@@ -255,7 +355,7 @@ async fn seed_poll_messages(harness: &mut TestHarness) -> PartitionContext {
             &stream,
             TOPIC,
             &TopicCreateOptions {
-                partitions_count: Some(1),
+                partitions_count: Some(partitions),
                 messages_required_to_save: Some(1),
                 durability: Durability::Persisted,
                 ..Default::default()
@@ -271,15 +371,17 @@ async fn seed_poll_messages(harness: &mut TestHarness) -> PartitionContext {
                 .unwrap()
         })
         .collect::<Vec<_>>();
-    client
-        .send_messages(
-            &stream,
-            &topic,
-            &Partitioning::partition_id(0),
-            &mut messages,
-        )
-        .await
-        .unwrap();
+    for partition in 0..partitions {
+        client
+            .send_messages(
+                &stream,
+                &topic,
+                &Partitioning::partition_id(partition),
+                &mut messages,
+            )
+            .await
+            .unwrap();
+    }
     drop(client);
     // Recovery leaves the messages on disk, so polling must yield for I/O.
     harness.restart_server().await.unwrap();

@@ -21,8 +21,8 @@ use crate::PartitionContext;
 use crate::PartitioningKind;
 use crate::Validatable;
 use crate::error::IggyError;
-use crate::types::message::HeaderEntry;
 use crate::types::message::partitioning::Partitioning;
+use crate::types::message::{HeaderEntry, RawHeaderEntry, UserHeaders};
 use crate::{
     IggyMessage, IggyMessagesBatch, SendMessagesConfirmationResponse, SendMessagesResponse,
 };
@@ -31,7 +31,6 @@ use bytes::Bytes;
 use serde::de::{self, MapAccess, Visitor};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::BTreeMap;
 use std::fmt::Formatter;
 
 /// `SendMessages` command is used to send messages to a topic in a stream.
@@ -142,6 +141,33 @@ impl<'de> Deserialize<'de> for SendMessages {
     where
         D: Deserializer<'de>,
     {
+        Self::deserialize_recording(deserializer, &mut None)
+    }
+}
+
+impl SendMessages {
+    /// The error of the typed user header that refused the JSON `body`, `None`
+    /// when the body parses or failed on something else. A refused header is
+    /// otherwise only a serde error, so the server reads this to answer the
+    /// header's own `InvalidHeaderKey` or `InvalidHeaderValue`.
+    pub fn refused_user_header(body: &[u8]) -> Option<IggyError> {
+        let mut refused = None;
+        let parsed = Self::deserialize_recording(
+            &mut serde_json::Deserializer::from_slice(body),
+            &mut refused,
+        );
+        parsed.err().and(refused)
+    }
+
+    /// Deserializes the HTTP body, keeping in `refused` the error of a typed
+    /// user header that the header codec refuses.
+    fn deserialize_recording<'de, D>(
+        deserializer: D,
+        refused: &mut Option<IggyError>,
+    ) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
         const FIELDS: &[&str] = &["partitioning", "messages", "context"];
 
         enum Field {
@@ -181,9 +207,11 @@ impl<'de> Deserialize<'de> for SendMessages {
             }
         }
 
-        struct SendMessagesVisitor;
+        struct SendMessagesVisitor<'a> {
+            refused: &'a mut Option<IggyError>,
+        }
 
-        impl<'de> Visitor<'de> for SendMessagesVisitor {
+        impl<'de> Visitor<'de> for SendMessagesVisitor<'_> {
             type Value = SendMessages;
 
             fn expecting(&self, formatter: &mut Formatter) -> std::fmt::Result {
@@ -246,18 +274,7 @@ impl<'de> Deserialize<'de> for SendMessages {
                                             })?;
                                             (None, Some(Bytes::from(raw)))
                                         } else {
-                                            let entries: Vec<HeaderEntry> = serde_json::from_value(
-                                                headers.clone(),
-                                            )
-                                            .map_err(|e| {
-                                                de::Error::custom(format!(
-                                                    "Invalid headers format: {e}"
-                                                ))
-                                            })?;
-                                            let mut map = BTreeMap::new();
-                                            for entry in entries {
-                                                map.insert(entry.key, entry.value);
-                                            }
+                                            let map = typed_user_headers(headers, self.refused)?;
                                             (Some(map), None)
                                         }
                                     } else {
@@ -317,7 +334,7 @@ impl<'de> Deserialize<'de> for SendMessages {
             }
         }
 
-        deserializer.deserialize_struct("SendMessages", FIELDS, SendMessagesVisitor)
+        deserializer.deserialize_struct("SendMessages", FIELDS, SendMessagesVisitor { refused })
     }
 }
 
@@ -373,6 +390,27 @@ impl From<SendMessagesConfirmations> for SendMessagesResponse {
                 .collect(),
         }
     }
+}
+
+/// The typed `user_headers` of one HTTP message, keeping in `refused` the
+/// error of a field the header codec refuses.
+fn typed_user_headers<E: de::Error>(
+    headers: &serde_json::Value,
+    refused: &mut Option<IggyError>,
+) -> Result<UserHeaders, E> {
+    let entries: Vec<RawHeaderEntry> = serde_json::from_value(headers.clone())
+        .map_err(|e| E::custom(format!("Invalid headers format: {e}")))?;
+    entries
+        .into_iter()
+        .map(|entry| {
+            let entry = HeaderEntry::try_from(entry).map_err(|error| {
+                let message = format!("Invalid headers format: {error}");
+                *refused = Some(error);
+                E::custom(message)
+            })?;
+            Ok((entry.key, entry.value))
+        })
+        .collect()
 }
 
 fn parse_message_id(value: Option<&serde_json::Value>) -> Result<u128, String> {
@@ -576,5 +614,135 @@ mod tests {
         let value = serde_json::json!("not-a-valid-id");
         let result = parse_message_id(Some(&value));
         assert!(result.is_err());
+    }
+
+    fn send(headers: serde_json::Value) -> Result<SendMessages, serde_json::Error> {
+        serde_json::from_value(serde_json::json!({
+            "partitioning": { "kind": "balanced", "value": "" },
+            "messages": [{ "id": 1, "payload": "aGVsbG8=", "user_headers": headers }]
+        }))
+    }
+
+    #[test]
+    fn typed_header_with_valid_headers_is_accepted_at_the_http_boundary() {
+        let parsed = send(serde_json::json!([{
+            "key":   { "kind": "string", "value": "a2V5" },
+            "value": { "kind": "string", "value": "dmFs" }
+        }]));
+        assert!(parsed.is_ok());
+    }
+
+    #[test]
+    fn typed_header_with_wrong_size_value_is_rejected_at_the_http_boundary() {
+        let parsed = send(serde_json::json!([{
+            "key":   { "kind": "string", "value": "a2V5" },
+            "value": { "kind": "int32",  "value": "AQ==" }
+        }]));
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn typed_header_with_empty_value_is_rejected_at_the_http_boundary() {
+        let parsed = send(serde_json::json!([
+            { "key": { "kind": "string", "value": "b2s=" }, "value": { "kind": "string", "value": "dmFs" } },
+            { "key": { "kind": "string", "value": "a2V5" }, "value": { "kind": "raw", "value": "" } }
+        ]));
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn typed_header_with_wrong_size_key_is_rejected_at_the_http_boundary() {
+        let parsed = send(serde_json::json!([{
+            "key":   { "kind": "int32", "value": "AQ==" },
+            "value": { "kind": "string", "value": "dmFs" }
+        }]));
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn typed_header_with_empty_key_is_rejected_at_the_http_boundary() {
+        let parsed = send(serde_json::json!([{
+            "key":   { "kind": "string", "value": "" },
+            "value": { "kind": "string", "value": "dmFs" }
+        }]));
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn typed_header_with_oversized_fields_is_rejected_at_the_http_boundary() {
+        let oversized = BASE64.encode([0u8; 256]);
+        let parsed_key = send(serde_json::json!([{
+            "key":   { "kind": "string", "value": oversized },
+            "value": { "kind": "string", "value": "dmFs" }
+        }]));
+        assert!(parsed_key.is_err());
+
+        let parsed_val = send(serde_json::json!([{
+            "key":   { "kind": "string", "value": "a2V5" },
+            "value": { "kind": "string", "value": oversized }
+        }]));
+        assert!(parsed_val.is_err());
+    }
+
+    fn body(payload: &str, headers: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "partitioning": { "kind": "balanced", "value": "" },
+            "messages": [
+                { "id": 1, "payload": "aGVsbG8=" },
+                { "id": 2, "payload": payload, "user_headers": headers }
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn refused_user_header_names_the_error_of_the_refused_field() {
+        let wrong_size_key = body(
+            "aGVsbG8=",
+            serde_json::json!([{
+                "key":   { "kind": "int32",  "value": "AQ==" },
+                "value": { "kind": "string", "value": "dmFs" }
+            }]),
+        );
+        assert_eq!(
+            SendMessages::refused_user_header(&wrong_size_key),
+            Some(IggyError::InvalidHeaderKey)
+        );
+
+        let empty_value = body(
+            "aGVsbG8=",
+            serde_json::json!([
+                { "key": { "kind": "string", "value": "b2s=" }, "value": { "kind": "string", "value": "dmFs" } },
+                { "key": { "kind": "string", "value": "a2V5" }, "value": { "kind": "raw", "value": "" } }
+            ]),
+        );
+        assert_eq!(
+            SendMessages::refused_user_header(&empty_value),
+            Some(IggyError::InvalidHeaderValue)
+        );
+    }
+
+    #[test]
+    fn refused_user_header_is_none_when_no_header_refused_the_body() {
+        let valid_header = serde_json::json!([{
+            "key":   { "kind": "string", "value": "a2V5" },
+            "value": { "kind": "int32",  "value": "AQAAAA==" }
+        }]);
+        assert_eq!(
+            SendMessages::refused_user_header(&body("aGVsbG8=", valid_header.clone())),
+            None
+        );
+        assert_eq!(
+            SendMessages::refused_user_header(&body("not base64!", valid_header)),
+            None
+        );
+        let missing_kind = serde_json::json!([{
+            "key":   { "value": "a2V5" },
+            "value": { "kind": "string", "value": "dmFs" }
+        }]);
+        assert_eq!(
+            SendMessages::refused_user_header(&body("aGVsbG8=", missing_kind)),
+            None
+        );
     }
 }

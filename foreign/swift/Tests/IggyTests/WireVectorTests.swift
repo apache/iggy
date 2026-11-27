@@ -61,7 +61,7 @@ struct RequestVectorTests {
             try Requests.createStream(name: "test-stream", options: try OptionsBlock.encode(sampleOptions)) == golden.bytes("request.create_stream.options"))
         #expect(try encode(5) == golden.bytes("request.delete_stream"))
         #expect(try encode("my-stream") == golden.bytes("request.get_stream"))
-        #expect(golden.bytes("request.get_streams").isEmpty)
+        #expect(try Requests.listPage(query: PageQuery()) == golden.bytes("request.get_streams"))
         let key = Data((0..<UInt8(EncryptionKey.length)).map { $0 })
         #expect(
             try Requests.createStream(name: "test-stream", options: StreamCreateOptions(encryptionKey: key).encode())
@@ -76,7 +76,9 @@ struct RequestVectorTests {
                 == golden.bytes("request.create_topic"))
         #expect(try Requests.streamAndTopic(1, 5) == golden.bytes("request.delete_topic"))
         #expect(try Requests.streamAndTopic("my-stream", "my-topic") == golden.bytes("request.get_topic"))
-        #expect(try encode(42) == golden.bytes("request.get_topics"))
+        let topicsQuery = NamedPageQuery(
+            page: PageQuery(order: .created, descending: true, limit: 20, cursor: PageCursor.created(at: 1_710_000_000_000_000, id: 7)), name: "ord")
+        #expect(try Requests.listPage(42, query: topicsQuery) == golden.bytes("request.get_topics"))
         let update = TopicUpdateOptions(name: "updated-topic", messageExpiry: .after(.seconds(604_800)), reset: [.maxTopicSize])
         #expect(try Requests.updateResource(.topic(stream: 1, topic: 2), update.toPatch()) == golden.bytes("request.update_resource.topic"))
         // Reset names travel in byte order, whatever order they were named in.
@@ -90,13 +92,15 @@ struct RequestVectorTests {
         #expect(try Requests.partitions(streamID: 1, topicID: 2, partitionsCount: 5) == golden.bytes("request.create_partitions"))
         #expect(try Requests.partitions(streamID: "stream", topicID: "topic", partitionsCount: 2) == golden.bytes("request.delete_partitions"))
         #expect(try Requests.deleteSegments(streamID: 1, topicID: 2, partitionID: 3, segmentsCount: 10) == golden.bytes("request.delete_segments"))
+        let partitionsQuery = PageQuery(descending: true, limit: PageQuery.maxLimit, cursor: PageCursor.id(2))
+        #expect(try Requests.listPage("stream", "topic", query: partitionsQuery) == golden.bytes("request.get_partitions"))
     }
 
     @Test func consumerGroups() throws {
         #expect(try Requests.createConsumerGroup(streamID: 1, topicID: 2, name: "grp") == golden.bytes("request.create_consumer_group"))
         #expect(try Requests.consumerGroup(streamID: 1, topicID: 2, groupID: 3) == golden.bytes("request.delete_consumer_group"))
         #expect(try Requests.consumerGroup(streamID: "stream-1", topicID: "topic-1", groupID: "group-1") == golden.bytes("request.get_consumer_group"))
-        #expect(try Requests.streamAndTopic(1, 2) == golden.bytes("request.get_consumer_groups"))
+        #expect(try Requests.listPage(1, 2, query: PageQuery()) == golden.bytes("request.get_consumer_groups"))
         #expect(try Requests.consumerGroup(streamID: 1, topicID: 2, groupID: 3) == golden.bytes("request.join_consumer_group"))
         #expect(try Requests.consumerGroup(streamID: 1, topicID: 2, groupID: "g") == golden.bytes("request.leave_consumer_group"))
         #expect(try Requests.consumerGroup(streamID: "stream-1", topicID: "topic-1", groupID: "group-1") == golden.bytes("request.sync_consumer_group"))
@@ -136,6 +140,21 @@ struct RequestVectorTests {
         #expect(encoded == golden.bytes("request.send_messages"))
     }
 
+    @Test func deferredMessages() throws {
+        func poll(_ options: DeferredPollOptions) throws -> [UInt8] {
+            try Requests.pollMessages(
+                consumer: .group(7), streamID: 1, topicID: "orders", partitionID: 3, strategy: .next, count: 100, autoCommit: true, options: options)
+        }
+        #expect(try poll(DeferredPollOptions()) == golden.bytes("request.poll_messages_deferred"))
+        let limits = DeferredPollOptions(maxWait: .seconds(600), minCount: 100, maxBytes: 344, requestTimeout: .seconds(630))
+        try limits.validate(count: 100)
+        #expect(try poll(limits) == golden.bytes("request.poll_messages_deferred.limits"))
+        // A deferred poll is the poll with its options appended.
+        let plain = try Requests.pollMessages(
+            consumer: .group(7), streamID: 1, topicID: "orders", partitionID: 3, strategy: .next, count: 100, autoCommit: true)
+        #expect(golden.bytes("request.poll_messages_deferred").starts(with: plain))
+    }
+
     @Test func users() throws {
         #expect(
             try Requests.createUser(username: "admin", password: "p@ssw0rd", status: .active, permissions: samplePermissions)
@@ -145,7 +164,8 @@ struct RequestVectorTests {
                 == golden.bytes("request.create_user.no_permissions"))
         #expect(try encode("old-user") == golden.bytes("request.delete_user"))
         #expect(try encode(42) == golden.bytes("request.get_user"))
-        #expect(golden.bytes("request.get_users").isEmpty)
+        // The first page of the walk that the whole-list methods do.
+        #expect(try Requests.listPage(query: PageQuery(limit: PageQuery.maxLimit)) == golden.bytes("request.get_users"))
         #expect(
             try Requests.updateResource(.user(1), UserUpdateOptions(username: "new-name", status: .inactive).toPatch())
                 == golden.bytes("request.update_resource.user"))
@@ -291,6 +311,44 @@ struct VSRHeaderVectorTests {
         #expect(header(request) == golden.bytes("vsr.request.send_messages.fenced"))
         #expect(Array(request.bytes[VSRFrame.headerSize...]) == [9, 9, 9, 9])
         #expect(request.bytes.count == VSRFrame.headerSize + 4)
+    }
+
+    /// A cancellation repeats the header of the request it cancels, with its
+    /// own code, no body and no partition context.
+    @Test func deferredPollAndItsCancellation() throws {
+        var session = ConsensusSession(clientID: clientID)
+        try session.bind(99)
+        for _ in 0..<5 {
+            _ = try session.nextRequestID()
+        }
+        let request = try VSRFrame.encodeRequest(
+            session: &session, code: CommandCode.pollMessagesDeferred.rawValue, payload: golden.bytes("request.poll_messages_deferred"),
+            partitionContext: PartitionContext(incarnation: 17, ownerGeneration: 9, metadataOp: 52))
+        #expect(header(request) == golden.bytes("vsr.request.poll_messages_deferred"))
+        #expect(request.requestID == 6)
+        #expect(request.operation == .nonReplicated)
+        #expect(request.deferredCancellation == golden.bytes("vsr.request.cancel_deferred"))
+        #expect(request.deferredCancellation.flatMap { VSRFrame.readRequestID($0[...]) } == 6)
+
+        let poll = try VSRFrame.encodeRequest(session: &session, code: CommandCode.pollMessages.rawValue, payload: [])
+        #expect(poll.deferredCancellation == nil)
+    }
+
+    /// Each target of a fetch carries its own fence, so the header of the
+    /// fetch carries no partition context.
+    @Test func fetchAndItsCancellation() throws {
+        var session = ConsensusSession(clientID: clientID)
+        try session.bind(99)
+        for _ in 0..<6 {
+            _ = try session.nextRequestID()
+        }
+        let request = try VSRFrame.encodeRequest(
+            session: &session, code: CommandCode.fetchMessages.rawValue, payload: golden.bytes("request.fetch_messages"))
+        #expect(header(request) == golden.bytes("vsr.request.fetch_messages"))
+        #expect(request.requestID == 7)
+        #expect(request.operation == .nonReplicated)
+        #expect(request.deferredCancellation == golden.bytes("vsr.request.cancel_fetch"))
+        #expect(request.deferredCancellation.flatMap { VSRFrame.readRequestID($0[...]) } == 7)
     }
 
     @Test func logoutAndUnknownCodes() throws {

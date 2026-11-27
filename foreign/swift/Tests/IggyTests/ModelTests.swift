@@ -345,6 +345,121 @@ struct PartitioningTests {
     }
 }
 
+@Suite("Deferred poll options")
+struct DeferredPollOptionsTests {
+    @Test func defaultsAreTheRustSDKDefaults() {
+        let options = DeferredPollOptions()
+        #expect(options.maxWait == .seconds(1))
+        #expect(options.minCount == 1)
+        #expect(options.maxBytes == 1_048_576)
+        #expect(options.requestTimeout == .seconds(11))
+    }
+
+    /// The count is checked first, then the wait and the timeout, then the
+    /// size, as `DeferredPollOptions::validate` checks them.
+    @Test func optionsAreRefusedAsTheRustSDKRefusesThem() {
+        let refused: [(DeferredPollOptions, IggyErrorCode)] = [
+            (DeferredPollOptions(minCount: 0), .invalidMessagesCount),
+            (DeferredPollOptions(minCount: 101), .invalidMessagesCount),
+            (DeferredPollOptions(minCount: 0, maxBytes: 0, requestTimeout: .zero), .invalidMessagesCount),
+            (DeferredPollOptions(maxBytes: 0, requestTimeout: .zero), .invalidCommand),
+            (DeferredPollOptions(maxWait: .microseconds(600_000_001), requestTimeout: .seconds(630)), .invalidCommand),
+            (DeferredPollOptions(maxWait: .zero, requestTimeout: .microseconds(630_000_001)), .invalidCommand),
+            (DeferredPollOptions(maxWait: .seconds(1), requestTimeout: .microseconds(1_999_999)), .invalidCommand),
+            (DeferredPollOptions(maxWait: .zero, requestTimeout: .nanoseconds(500)), .invalidCommand),
+            (DeferredPollOptions(maxWait: .milliseconds(-500)), .invalidCommand),
+            (DeferredPollOptions(requestTimeout: .milliseconds(-500)), .invalidCommand),
+            (DeferredPollOptions(maxBytes: 343), .invalidSizeBytes),
+        ]
+        for (options, code) in refused {
+            #expect(throws: IggyError(code), "\(options)") { try options.validate(count: 100) }
+        }
+        let accepted = [
+            DeferredPollOptions(), DeferredPollOptions(minCount: 100), DeferredPollOptions(maxBytes: 344),
+            DeferredPollOptions(maxWait: .seconds(600), requestTimeout: .seconds(630)), DeferredPollOptions(maxWait: .seconds(1), requestTimeout: .seconds(2)),
+            DeferredPollOptions(maxWait: .zero, requestTimeout: .microseconds(1)),
+        ]
+        for options in accepted {
+            #expect(throws: Never.self, "\(options)") { try options.validate(count: 100) }
+        }
+    }
+
+    /// An attempt keeps what is left of the call: the wait and the timeout
+    /// shrink together, and a spent timeout never leaves the client.
+    @Test func eachAttemptCarriesWhatIsLeftOfTheCall() throws {
+        let options = DeferredPollOptions(maxWait: .seconds(5), requestTimeout: .seconds(11))
+        let later = try options.remaining(after: .seconds(2))
+        #expect(later.maxWait == .seconds(3))
+        #expect(later.requestTimeout == .seconds(9))
+        #expect(later.minCount == options.minCount && later.maxBytes == options.maxBytes)
+        let waited = try options.remaining(after: .seconds(6))
+        #expect(waited.maxWait == .zero)
+        #expect(waited.requestTimeout == .seconds(5))
+        for spent in [Duration.seconds(11), .seconds(11) - .nanoseconds(500), .seconds(12)] {
+            #expect(throws: IggyError(.transientNotAccepted), "\(spent)") { try options.remaining(after: spent) }
+        }
+    }
+
+    /// Whole microseconds cannot cost a wait its reply margin, as
+    /// `deferred_payload` in the Rust SDK clamps it.
+    @Test func theWireWaitLeavesTheReplyMargin() throws {
+        #expect(try DeferredPollOptions().wireBudget() == (1_000_000, 11_000_000))
+        #expect(try DeferredPollOptions(maxWait: .seconds(5), requestTimeout: .seconds(3)).wireBudget() == (2_000_000, 3_000_000))
+        #expect(try DeferredPollOptions(maxWait: .seconds(5), requestTimeout: .milliseconds(500)).wireBudget() == (0, 500_000))
+    }
+
+    @Test func fetchAdmissionUsesWholeMicroseconds() throws {
+        for timeout in [Duration.microseconds(1), .microseconds(999_999), .seconds(1), .seconds(1) + .nanoseconds(999)] {
+            let options = DeferredPollOptions(maxWait: .zero, requestTimeout: timeout)
+            #expect(throws: IggyError(.invalidCommand), "\(timeout)") { try options.validateFetch(count: 1) }
+            try options.validate(count: 1)
+            try options.validateBudget()
+        }
+        for timeout in [Duration.microseconds(1_000_001), .seconds(1) + .nanoseconds(1999)] {
+            try DeferredPollOptions(maxWait: .zero, requestTimeout: timeout).validateFetch(count: 1)
+        }
+        try DeferredPollOptions(maxWait: .microseconds(1), requestTimeout: .microseconds(1_000_001)).validateFetch(count: 1)
+        #expect(throws: IggyError(.invalidCommand)) {
+            try DeferredPollOptions(maxWait: .microseconds(2), requestTimeout: .microseconds(1_000_001)).validateFetch(count: 1)
+        }
+    }
+
+    @Test func aFetchAttemptCanUseExactlyItsLastReplyMargin() throws {
+        let options = DeferredPollOptions(maxWait: .seconds(1), requestTimeout: .seconds(2))
+        try options.validateFetch(count: 1)
+        let remaining = try options.remaining(after: .seconds(1))
+        #expect(try remaining.fetchWireBudget() == (0, DeferredPollOptions.replyMarginMicroseconds))
+        let payload = try Requests.fetchMessages(
+            consumer: .default, streamID: 1, topicID: 2,
+            targets: [.init(partitionID: 1, strategy: .next, maxBytes: remaining.maxBytes, fence: .empty)],
+            count: 1, autoCommit: false, options: remaining)
+        // Numeric consumer, stream and topic ids precede the two wire timers.
+        let timerOffset = 1 + 3 * (2 + MemoryLayout<UInt32>.size)
+        var reader = ByteReader(payload)
+        try reader.skip(timerOffset)
+        #expect(try reader.readUInt64() == 0)
+        #expect(try reader.readUInt64() == DeferredPollOptions.replyMarginMicroseconds)
+        let exhausted = try options.remaining(after: .seconds(1) + .nanoseconds(1))
+        #expect(throws: IggyError(.transientNotAccepted)) {
+            try Requests.fetchMessages(
+                consumer: .default, streamID: 1, topicID: 2,
+                targets: [.init(partitionID: 1, strategy: .next, maxBytes: exhausted.maxBytes, fence: .empty)],
+                count: 1, autoCommit: false, options: exhausted)
+        }
+    }
+
+    /// A reply larger than a frame would fail the connection that reads it.
+    @Test func theByteLimitFitsAFrame() throws {
+        func encodedMaxBytes(_ maxBytes: UInt32) throws -> UInt32 {
+            var writer = ByteWriter()
+            try DeferredPollOptions(maxBytes: maxBytes).encode(into: &writer)
+            return UInt32(littleEndianBytes: writer.bytes[12..<16])
+        }
+        #expect(try encodedMaxBytes(.max) == UInt32(VSRFrame.maxFrameSize - VSRFrame.headerSize))
+        #expect(try encodedMaxBytes(344) == 344)
+    }
+}
+
 @Suite("Permissions")
 struct PermissionsTests {
     @Test func roundTripWithNestedTopics() throws {
@@ -403,8 +518,150 @@ struct TopicOptionsTests {
         #expect(try TopicCreateOptions(messageExpiry: .after(.microseconds(1))).toResourceOptions()[key] == .explicit(.uint64(1)))
         #expect(try TopicCreateOptions(messageExpiry: .never).toResourceOptions()[key] == .explicit(.uint64(UInt64.max)))
         #expect(try TopicCreateOptions(messageExpiry: .serverDefault).toResourceOptions()[key] == nil)
+        let ageKey = TopicOptionKey.segmentMaxAge.rawValue
+        #expect(throws: IggyError(.invalidOptionValue)) { try TopicCreateOptions(segmentMaxAge: .after(.zero)).encode() }
+        #expect(try TopicCreateOptions(segmentMaxAge: .after(.seconds(3_600))).toResourceOptions()[ageKey] == .explicit(.uint64(3_600_000_000)))
+        #expect(try TopicCreateOptions(segmentMaxAge: .never).toResourceOptions()[ageKey] == .explicit(.uint64(UInt64.max)))
+        #expect(try TopicCreateOptions(segmentMaxAge: .serverDefault).toResourceOptions()[ageKey] == nil)
+        let localAgeKey = TopicOptionKey.localRetentionAge.rawValue
+        #expect(throws: IggyError(.invalidOptionValue)) { try TopicCreateOptions(localRetentionAge: .after(.zero)).encode() }
+        #expect(throws: IggyError(.invalidOptionValue)) { try TopicUpdateOptions(localRetentionAge: .after(.zero)).toPatch() }
+        #expect(try TopicCreateOptions(localRetentionAge: .after(.seconds(1_800))).toResourceOptions()[localAgeKey] == .explicit(.uint64(1_800_000_000)))
+        #expect(try TopicCreateOptions(localRetentionAge: .never).toResourceOptions()[localAgeKey] == .explicit(.uint64(UInt64.max)))
+        #expect(try TopicCreateOptions(localRetentionAge: .serverDefault).toResourceOptions()[localAgeKey] == nil)
         // On an update the server default changes nothing. A reset restores the default.
         #expect(
             try TopicUpdateOptions(name: "renamed", messageExpiry: .serverDefault, maxTopicSize: .serverDefault).toResourceOptions().keys.sorted() == ["name"])
+        #expect(
+            try TopicUpdateOptions(name: "renamed", localRetentionAge: .serverDefault, localRetentionSize: .serverDefault).toResourceOptions().keys.sorted()
+                == ["name"])
+    }
+
+    /// A tiered topic keeps nothing on local disk longer, or in a larger
+    /// amount, than it keeps at all, so a read bounds both by the topic's own.
+    @Test func localRetentionReadsYieldToTheTopicBounds() {
+        func topic(_ options: ResourceOptions) -> Topic {
+            Topic(
+                id: 1, createdAt: IggyTimestamp(microseconds: 0), name: "events", sizeBytes: 0, messagesCount: 0, partitionsCount: 1,
+                options: options)
+        }
+        let unreported = topic([:])
+        #expect(!unreported.tieredStorage)
+        #expect(unreported.localRetentionAge == .after(.seconds(86_400)))
+        #expect(unreported.localRetentionSize == .unlimited)
+        let bounded = topic([
+            TopicOptionKey.messageExpiry.rawValue: .explicit(.uint64(3_600_000_000)),
+            TopicOptionKey.maxTopicSize.rawValue: .explicit(.uint64(1 << 30)),
+            TopicOptionKey.tieredStorage.rawValue: .explicit(.bool(true)),
+        ])
+        #expect(bounded.tieredStorage)
+        #expect(bounded.localRetentionAge == .after(.seconds(3_600)))
+        #expect(bounded.localRetentionSize == .bytes(1 << 30))
+        let explicit = topic([
+            TopicOptionKey.messageExpiry.rawValue: .explicit(.uint64(3_600_000_000)),
+            TopicOptionKey.localRetentionAge.rawValue: .explicit(.uint64(1_800_000_000)),
+            TopicOptionKey.localRetentionSize.rawValue: .explicit(.uint64(1 << 20)),
+        ])
+        #expect(explicit.localRetentionAge == .after(.seconds(1_800)))
+        #expect(explicit.localRetentionSize == .bytes(1 << 20))
+    }
+
+    /// The type and mode travel as the server's canonical names. Both are
+    /// fixed at create, so an update refuses a reset before anything is sent.
+    @Test func topicTypeAndGeoModeAreCreateOnly() throws {
+        let typeKey = TopicOptionKey.topicType.rawValue
+        let modeKey = TopicOptionKey.geoMode.rawValue
+        let defaults = try TopicCreateOptions().toResourceOptions()
+        #expect(defaults[typeKey] == nil)
+        #expect(defaults[modeKey] == nil)
+        let geo = try TopicCreateOptions(topicType: .geo, geoMode: .geoTiered).toResourceOptions()
+        #expect(geo[typeKey] == .explicit("geo"))
+        #expect(geo[modeKey] == .explicit("geo_tiered"))
+        #expect(try TopicCreateOptions(topicType: .normal).toResourceOptions()[typeKey] == .explicit("normal"))
+        #expect(try TopicCreateOptions(topicType: .geo, geoMode: .geo).toResourceOptions()[modeKey] == .explicit("geo"))
+        for key in [TopicOptionKey.topicType, .geoMode] {
+            #expect(throws: IggyError(.optionNotUpdatable)) { try TopicUpdateOptions(reset: [key]).toPatch() }
+        }
+    }
+
+    /// The durations of a geo topic travel as whole microseconds. Zero is a
+    /// value, so it is sent, and an unset duration is left out. An update
+    /// sets them, zero included, but never resets them.
+    @Test func geoDurationsSendZeroAndAreNeverReset() throws {
+        let create = try TopicCreateOptions(topicType: .geo, consumerOffsetUploadInterval: .zero, tombstoneGrace: .seconds(3_600)).toResourceOptions()
+        #expect(create[TopicOptionKey.consumerOffsetUploadInterval.rawValue] == .explicit(.uint64(0)))
+        #expect(create[TopicOptionKey.tombstoneGrace.rawValue] == .explicit(.uint64(3_600_000_000)))
+        for key in [TopicOptionKey.freshUploadInterval, .positionsPublishInterval, .positionsResumeTimeout, .longTermRewriteMaxInterval] {
+            #expect(create[key.rawValue] == nil, "\(key)")
+        }
+        #expect(throws: IggyError(.invalidOptionValue)) { try TopicCreateOptions(tombstoneGrace: .seconds(-1)).encode() }
+        #expect(throws: IggyError(.invalidOptionValue)) { try TopicUpdateOptions(positionsResumeTimeout: .milliseconds(-1)).toPatch() }
+
+        let patch = try TopicUpdateOptions(positionsResumeTimeout: .zero).toPatch()
+        #expect(patch.set == [TopicOptionKey.positionsResumeTimeout.rawValue: .explicit(.uint64(0))])
+        #expect(patch.reset.isEmpty)
+        let durations: [TopicOptionKey] = [
+            .freshUploadInterval, .consumerOffsetUploadInterval, .positionsPublishInterval, .tombstoneGrace, .positionsResumeTimeout,
+            .longTermRewriteMaxInterval,
+        ]
+        for key in durations {
+            #expect(throws: IggyError(.optionNotResettable), "\(key)") { try TopicUpdateOptions(reset: [key]).toPatch() }
+        }
+    }
+
+    /// Only a geo topic has durations. A read reports the ones it sets and
+    /// nil for the others, so each node applies its own server setting.
+    @Test func geoDurationReadsAreNilUnlessTheGeoTopicSetsThem() {
+        func topic(_ options: ResourceOptions) -> Topic {
+            Topic(
+                id: 1, createdAt: IggyTimestamp(microseconds: 0), name: "orders", sizeBytes: 0, messagesCount: 0, partitionsCount: 1,
+                options: options)
+        }
+        let geo = topic([
+            TopicOptionKey.topicType.rawValue: .explicit("geo"),
+            TopicOptionKey.freshUploadInterval.rawValue: .explicit(.uint64(50_000)),
+            TopicOptionKey.positionsResumeTimeout.rawValue: .explicit(.uint64(0)),
+        ])
+        #expect(geo.freshUploadInterval == Duration.milliseconds(50))
+        #expect(geo.positionsResumeTimeout == Duration.zero)
+        #expect(geo.tombstoneGrace == nil)
+        let normal = topic([TopicOptionKey.freshUploadInterval.rawValue: .explicit(.uint64(50_000))])
+        #expect(normal.freshUploadInterval == nil)
+    }
+
+    /// The read cache settings travel as bytes on any topic. Zero turns one
+    /// off, so it is sent, and an unset one is left out. An update sets
+    /// them, zero included, but never resets them.
+    @Test func readCacheSendsZeroOnAnyTopicAndIsNeverReset() throws {
+        let create = try TopicCreateOptions(readAheadBytes: 0).toResourceOptions()
+        #expect(create[TopicOptionKey.readAhead.rawValue] == .explicit(.uint64(0)))
+        #expect(create[TopicOptionKey.readCacheSize.rawValue] == nil)
+        #expect(create[TopicOptionKey.topicType.rawValue] == nil)
+
+        let patch = try TopicUpdateOptions(readCacheSizeBytes: 0).toPatch()
+        #expect(patch.set == [TopicOptionKey.readCacheSize.rawValue: .explicit(.uint64(0))])
+        #expect(patch.reset.isEmpty)
+        for key in [TopicOptionKey.readCacheSize, .readAhead] {
+            #expect(throws: IggyError(.optionNotResettable), "\(key)") { try TopicUpdateOptions(reset: [key]).toPatch() }
+        }
+    }
+
+    /// A read reports the read cache settings a topic of either type sets,
+    /// zero as a value, and nil for one it leaves to each node.
+    @Test func readCacheReadsKeepZeroAndAreNilWhenUnset() {
+        func topic(_ options: ResourceOptions) -> Topic {
+            Topic(
+                id: 1, createdAt: IggyTimestamp(microseconds: 0), name: "archive", sizeBytes: 0, messagesCount: 0, partitionsCount: 1,
+                options: options)
+        }
+        let normal = topic([TopicOptionKey.readCacheSize.rawValue: .explicit(.uint64(0))])
+        #expect(normal.readCacheSizeBytes == 0)
+        #expect(normal.readAheadBytes == nil)
+        let geo = topic([
+            TopicOptionKey.topicType.rawValue: .explicit("geo"),
+            TopicOptionKey.readAhead.rawValue: .explicit(.uint64(1_048_576)),
+        ])
+        #expect(geo.readCacheSizeBytes == nil)
+        #expect(geo.readAheadBytes == 1_048_576)
     }
 }

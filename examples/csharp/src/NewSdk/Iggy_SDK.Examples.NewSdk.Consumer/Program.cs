@@ -18,6 +18,7 @@
 using Apache.Iggy;
 using Apache.Iggy.Configuration;
 using Apache.Iggy.Consumers;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Extensions;
 using Apache.Iggy.Factory;
@@ -41,9 +42,14 @@ await client.LoginUserAsync("iggy", "iggy");
 var consumer = client.CreateConsumerBuilder(Identifier.String("new-sdk-stream"), Identifier.String("new-sdk-topic"),
         Consumer.Group("new-sdk-consumer-group"))
     .WithPollingStrategy(PollingStrategy.Next())
-    .WithConsumerGroup("new-sdk-consumer-group", true, true)
-    .WithBatchSize(20)
-    .WithAutoCommitMode(AutoCommitMode.AfterReceive)
+    .WithConsumerGroup("new-sdk-consumer-group")
+    // The consumer stores the offset of each message once the loop asks for the next one, and on shutdown.
+    .WithPollOptions(new PollOptions
+    {
+        Count = 20,
+        MaxWait = TimeSpan.FromSeconds(5),
+        Commit = CommitPolicy.Auto(new AutoCommit { Every = CommitEvery.Message, After = CommitAfter.Processing })
+    })
     .WithLogger(loggerFactory)
     .SubscribeOnPollingError(e =>
     {
