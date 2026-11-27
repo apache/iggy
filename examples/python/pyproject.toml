@@ -26,7 +26,7 @@ dependencies = [
     "argparse==1.4.0",
     "loguru==0.8.0",
     "pyrefly>=1.4.1",
-    "ruff>=0.17.4",
+    "ruff>=0.17.5",
 ]
 
 [tool.ruff.lint]
