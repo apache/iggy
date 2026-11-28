@@ -75,13 +75,15 @@ describe('DeleteSegments', () => {
 
     it('throws on segments count < 1', () => {
       assert.throws(
-        () => DELETE_SEGMENTS.serialize({ ...params, segmentsCount: 0 })
+        () => DELETE_SEGMENTS.serialize({ ...params, segmentsCount: 0 }),
+        { message: 'Topic partition_count must be between 1 and 1000' }
       );
     });
 
     it('throws on segments count > 1000', () => {
       assert.throws(
-        () => DELETE_SEGMENTS.serialize({ ...params, segmentsCount: 1001 })
+        () => DELETE_SEGMENTS.serialize({ ...params, segmentsCount: 1001 }),
+        { message: 'Topic partition_count must be between 1 and 1000' }
       );
     });
 
