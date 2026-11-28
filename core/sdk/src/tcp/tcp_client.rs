@@ -1594,7 +1594,7 @@ mod tests {
         let heartbeat_interval = "10s";
         let reconnection_retries = "10";
         let value = format!(
-            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}?heartbeat_interval={heartbeat_interval}&reconnection_retries={reconnection_retries}"
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}?heartbeat_interval={heartbeat_interval}&reconnection_max_retries={reconnection_retries}"
         );
         let tcp_client = TcpClient::from_connection_string(&value);
         assert!(tcp_client.is_ok());

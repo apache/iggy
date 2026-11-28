@@ -132,7 +132,12 @@ impl ConnectionStringOptions for WebSocketConnectionStringOptions {
                     parsed_options.heartbeat_interval = NonZeroIggyDuration::from_str(parts[1])
                         .map_err(|_| IggyError::InvalidConnectionString)?;
                 }
-                "reconnection_retries" => {
+                "reconnection_max_retries" | "reconnection_retries" => {
+                    if parts[0] == "reconnection_retries" {
+                        tracing::warn!(
+                            "WebSocket connection string option `reconnection_retries` is deprecated; use `reconnection_max_retries` instead"
+                        );
+                    }
                     let retries = match parts[1] {
                         "unlimited" => None,
                         val => Some(
@@ -184,11 +189,16 @@ impl ConnectionStringOptions for WebSocketConnectionStringOptions {
                 }
 
                 "accept_unmasked_frames" => {
-                    parsed_options.accept_unmasked_frames = Some(parts[1] == "true");
+                    let accept_unmasked_frames = parts[1]
+                        .parse::<bool>()
+                        .map_err(|_| IggyError::InvalidConnectionString)?;
+                    parsed_options.accept_unmasked_frames = Some(accept_unmasked_frames);
                 }
 
                 "tls" => {
-                    parsed_options.tls_enabled = parts[1] == "true";
+                    parsed_options.tls_enabled = parts[1]
+                        .parse::<bool>()
+                        .map_err(|_| IggyError::InvalidConnectionString)?;
                 }
                 "tls_domain" => {
                     parsed_options.tls_domain = parts[1].to_string();
@@ -197,7 +207,9 @@ impl ConnectionStringOptions for WebSocketConnectionStringOptions {
                     parsed_options.tls_ca_file = Some(parts[1].to_string());
                 }
                 "tls_validate_certificate" => {
-                    parsed_options.tls_validate_certificate = parts[1] == "true";
+                    parsed_options.tls_validate_certificate = parts[1]
+                        .parse::<bool>()
+                        .map_err(|_| IggyError::InvalidConnectionString)?;
                 }
 
                 _ => return Err(IggyError::InvalidConnectionString),
@@ -223,6 +235,134 @@ impl Default for WebSocketConnectionStringOptions {
             tls_domain: "".to_string(),
             tls_ca_file: None,
             tls_validate_certificate: false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn given_valid_retry_options_when_parsing_should_use_the_last_value() {
+        for (query, expected) in [
+            ("", None),
+            ("reconnection_max_retries=5", Some(5)),
+            ("reconnection_retries=5", Some(5)),
+            ("reconnection_retries=3&reconnection_max_retries=8", Some(8)),
+            ("reconnection_max_retries=8&reconnection_retries=3", Some(3)),
+            (
+                "reconnection_max_retries=1&reconnection_max_retries=2",
+                Some(2),
+            ),
+            ("reconnection_retries=1&reconnection_retries=2", Some(2)),
+            (
+                "reconnection_retries=3&reconnection_max_retries=8&reconnection_retries=unlimited",
+                None,
+            ),
+            ("reconnection_max_retries=0", Some(0)),
+            ("reconnection_max_retries=4294967295", Some(u32::MAX)),
+        ] {
+            let options = WebSocketConnectionStringOptions::parse_options(query).unwrap();
+            assert_eq!(options.retries(), expected, "{query}");
+        }
+    }
+
+    #[test]
+    fn given_an_invalid_retry_occurrence_when_parsing_should_reject_the_query() {
+        for query in [
+            "reconnection_max_retries=invalid",
+            "reconnection_retries=-1",
+            "reconnection_max_retries=4294967296",
+            "reconnection_max_retries=",
+            "reconnection_max_retries= 5",
+            "reconnection_retries=invalid&reconnection_max_retries=5",
+            "reconnection_max_retries=5&reconnection_retries=invalid",
+        ] {
+            assert_eq!(
+                WebSocketConnectionStringOptions::parse_options(query).unwrap_err(),
+                IggyError::InvalidConnectionString,
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_cooldown_options_when_parsing_should_preserve_duration_rules() {
+        for (query, expected) in [
+            ("", Duration::from_secs(5)),
+            ("reestablish_after=500ms", Duration::from_millis(500)),
+            ("reestablish_after=0", Duration::ZERO),
+        ] {
+            let options = WebSocketConnectionStringOptions::parse_options(query).unwrap();
+            assert_eq!(
+                options.reconnection().reestablish_after.get_duration(),
+                expected
+            );
+        }
+        for query in [
+            "reestablish_after=500",
+            "reestablish_after=invalid",
+            "reestablish_after=",
+        ] {
+            assert_eq!(
+                WebSocketConnectionStringOptions::parse_options(query).unwrap_err(),
+                IggyError::InvalidConnectionString,
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_tls_validation_options_when_parsing_should_accept_exact_booleans() {
+        for (query, expected) in [
+            ("", false),
+            ("tls_validate_certificate=true", true),
+            ("tls_validate_certificate=false", false),
+        ] {
+            let options = WebSocketConnectionStringOptions::parse_options(query).unwrap();
+            assert_eq!(options.tls_validate_certificate(), expected);
+        }
+        for value in [
+            concat!("tu", "re"),
+            "yes",
+            "1",
+            "TRUE",
+            "",
+            "invalid",
+            "true ",
+            "%74rue",
+        ] {
+            let query = format!("tls_validate_certificate={value}");
+            assert_eq!(
+                WebSocketConnectionStringOptions::parse_options(&query).unwrap_err(),
+                IggyError::InvalidConnectionString,
+                "{query}"
+            );
+        }
+        assert_eq!(
+            WebSocketConnectionStringOptions::parse_options(
+                "tls_validate_certificate=invalid&tls_validate_certificate=true"
+            )
+            .unwrap_err(),
+            IggyError::InvalidConnectionString,
+        );
+    }
+
+    #[test]
+    fn accept_unmasked_frames_accepts_only_exact_booleans() {
+        for (value, expected) in [("true", true), ("false", false)] {
+            let query = format!("accept_unmasked_frames={value}");
+            let options = WebSocketConnectionStringOptions::parse_options(&query).unwrap();
+            assert_eq!(options.accept_unmasked_frames(), Some(expected));
+        }
+        for value in ["1", "TRUE", ""] {
+            let query = format!("accept_unmasked_frames={value}");
+            assert!(matches!(
+                WebSocketConnectionStringOptions::parse_options(&query),
+                Err(IggyError::InvalidConnectionString)
+            ));
         }
     }
 }
