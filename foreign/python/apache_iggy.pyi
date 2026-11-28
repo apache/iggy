@@ -37,6 +37,7 @@ __all__ = [
     "CommitAfter",
     "CommitEvery",
     "CommitPolicy",
+    "ConnectionInfo",
     "Consumer",
     "ConsumerGroup",
     "ConsumerGroupDetails",
@@ -511,6 +512,23 @@ class CommitPolicy:
         def __new__(cls, _0: AutoCommit) -> CommitPolicy.Auto: ...
         def __len__(self) -> builtins.int: ...
         def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
+
+@typing.final
+class ConnectionInfo:
+    r"""
+    The transport and server address reported by the client at the time of the call.
+    """
+    @property
+    def protocol(self) -> builtins.str:
+        r"""
+        One of `tcp`, `quic`, `http`, or `ws`.
+        """
+    @property
+    def server_address(self) -> builtins.str:
+        r"""
+        For binary transports, the metadata leader's address if known, otherwise
+        the bootstrap or configured address. For HTTP, the API URL.
+        """
 
 class Consumer:
     r"""
@@ -1267,6 +1285,14 @@ class IggyClient:
         r"""
         Sends a ping request to the server to check connectivity.
         Raises `RuntimeError` if the connection fails.
+        """
+    def get_connection_info(self) -> collections.abc.Awaitable[ConnectionInfo]:
+        r"""
+        Get the client's current transport and server address.
+
+        For example, after connecting through a follower, read
+        `(await client.get_connection_info()).server_address` to see which
+        endpoint the client selected.
         """
     def get_stats(self) -> collections.abc.Awaitable[Stats]:
         r"""

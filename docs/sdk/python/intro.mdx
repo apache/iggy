@@ -128,6 +128,7 @@ asyncio.run(main())
 
 ## Beyond the basics
 
+- **Connection info** is available in the source build. Use `info = await client.get_connection_info()` to read `info.protocol` and `info.server_address`. On TCP, QUIC or WebSocket, the address can change from the bootstrap endpoint to the metadata leader. HTTP reports the API URL.
 - **TLS**: use `TcpConfig` with `tls_enabled` and `tls_ca_file`, or the TLS options in a [connection string](/docs/sdk/connection-strings). The certificate must match `tls_domain`, which defaults to the dialed host. The [getting-started example](https://github.com/apache/iggy/tree/server-0.10.0/examples/python/getting-started) shows the full setup.
 - **Consumer groups**: `await client.consumer_group(...)` returns an `IggyConsumer` that creates and joins the group by default and commits offsets according to the `commit` policy in `poll_options`, which defaults to manual commits. Groups require a binary transport. HTTP supports ordinary consumers only.
 - **User headers**: `SendMessage(data, user_headers=...)` accepts a plain `dict` with `str`, `bytes`, `bool`, `int`, or `float` values. `HeaderKey`/`HeaderValue` give explicit control over the wire type. See the [message-headers examples](https://github.com/apache/iggy/tree/server-0.10.0/examples/python/message-headers).
